@@ -254,6 +254,8 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     scheduleHeartbeat();
 
     request.raw.on("close", cleanup);
+    request.raw.on("error", cleanup);
+    raw.on("error", cleanup);
   });
 
   app.get("/v1/config/effective", () => {
