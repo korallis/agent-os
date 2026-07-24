@@ -24,3 +24,6 @@ dist/
 
 # TypeScript incremental build info
 *.tsbuildinfo
+
+# Local editor config
+.cursor/
