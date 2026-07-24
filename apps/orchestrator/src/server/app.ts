@@ -177,12 +177,6 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
 
     reply.hijack();
     const raw = reply.raw;
-    raw.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-    });
 
     let closed = false;
     let unsubscribe: (() => void) | null = null;
@@ -209,6 +203,21 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         }
       }
     };
+
+    request.raw.on("close", cleanup);
+    request.raw.on("error", cleanup);
+    raw.on("error", cleanup);
+    if (request.raw.destroyed || raw.destroyed || request.raw.closed || raw.writableEnded) {
+      cleanup();
+      return;
+    }
+
+    raw.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    });
 
     const safeWrite = (chunk: string): boolean => {
       if (closed) return false;
@@ -252,10 +261,6 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       }, seconds * 1000);
     };
     scheduleHeartbeat();
-
-    request.raw.on("close", cleanup);
-    request.raw.on("error", cleanup);
-    raw.on("error", cleanup);
   });
 
   app.get("/v1/config/effective", () => {
