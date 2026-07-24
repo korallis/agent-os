@@ -129,6 +129,14 @@ export class EventStore {
     return this.projection.configRevisionCount();
   }
 
+  latestQuotaByConnection(): Map<string, unknown> {
+    return this.projection.latestQuotaByConnection();
+  }
+
+  listConnectionPayloads(): unknown[] {
+    return this.projection.listConnectionPayloads();
+  }
+
   close(): void {
     this.listeners.clear();
     this.log.close();

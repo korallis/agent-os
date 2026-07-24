@@ -1,0 +1,49 @@
+name: Pi canary
+
+# Weekly harness contract suite vs latest Pi (master plan §2.1 / §11 Phase 2).
+# Exact pin remains deliberate; this job reports drift only.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build protocol + extension
+        run: pnpm --filter @agent-os/protocol --filter @agent-os/pi-extension run build
+
+      - name: Resolve pinned vs latest Pi
+        id: pi
+        run: |
+          PINNED=$(node -e "const {PI_PINNED_VERSION}=require('./packages/protocol/dist/pi.js'); process.stdout.write(PI_PINNED_VERSION)")
+          LATEST=$(npm view @earendil-works/pi-coding-agent version)
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Pi pinned=$PINNED latest=$LATEST"
+          if [ "$PINNED" != "$LATEST" ]; then
+            echo "::warning::Pi drift: pinned $PINNED, latest $LATEST — upgrade is deliberate"
+          fi
+
+      - name: Extension contract tests
+        run: pnpm --filter @agent-os/pi-extension test
+
+      - name: Family / Claude SDK contract tests
+        run: pnpm --filter @agentos/claude-agent-sdk-pi test
+
+      - name: Phase 2 unit suite (orchestrator)
+        run: pnpm --filter @agent-os/orchestrator test

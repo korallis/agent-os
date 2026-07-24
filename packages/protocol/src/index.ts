@@ -1,12 +1,17 @@
 /**
  * @agent-os/protocol — the one shared schema surface (master plan §2.1).
- * REST DTOs, SSE frames, event envelopes, and config schemas; the daemon,
- * console, and CLI all compile against this package. Zero `any`.
+ * REST DTOs, SSE frames, event envelopes, config, providers, quota, sockets.
+ * Zero `any`.
  */
 export * from "./ids.js";
 export * from "./config.js";
 export * from "./events.js";
 export * from "./rest.js";
+export * from "./providers.js";
+export * from "./quota.js";
+export * from "./sockets.js";
+export * from "./onboarding.js";
+export * from "./pi.js";
 
 import { z } from "zod";
 
@@ -16,4 +21,4 @@ export const protocolVersionSchema = z.strictObject({
 });
 export type ProtocolVersion = z.infer<typeof protocolVersionSchema>;
 
-export const PROTOCOL_VERSION = "1.0.0-phase1";
+export const PROTOCOL_VERSION = "1.1.0-phase2";

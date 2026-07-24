@@ -11,19 +11,31 @@ import Fastify, {
 import type { Logger } from "pino";
 import { z } from "zod";
 import {
+  apiKeyConnectRequestSchema,
   configDomainSchema,
   configLayerSchema,
+  oauthStartRequestSchema,
+  onboardingAdvanceRequestSchema,
+  PI_PINNED_VERSION,
   SAFETY_CONFIRM_HEADER,
   safetyPoliciesConfigSchema,
   type ApiErrorCode,
   type ConfigValidationIssue,
   type EventsReplayResponse,
   type HealthResponse,
+  type QuotaSample,
   type StatusResponse,
 } from "@agent-os/protocol";
 import type { EventStore } from "@agent-os/event-store";
 import { ConfigService, ConfigWriteError } from "../config/service.js";
 import { AGENTOSD_VERSION } from "../version.js";
+import type { ConnectionRegistry } from "../pi/connections.js";
+import { writeApiKeyFile } from "../pi/connections.js";
+import type { PiDetection } from "../pi/manager.js";
+import type { OnboardingService } from "../onboarding/state.js";
+import { OnboardingBlockedError } from "../onboarding/state.js";
+import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
+import { resolvePiAuthPaths } from "../security/auth-store.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -38,6 +50,12 @@ export interface ServerDeps {
   port: number;
   startedAt: string;
   logger: Logger;
+  /** Phase 2 services — optional for pure Phase 1 unit paths. */
+  connections?: ConnectionRegistry;
+  onboarding?: OnboardingService;
+  pi?: PiDetection;
+  /** In-memory latest quota samples (connectionId → sample). */
+  quotaSamples?: Map<string, QuotaSample>;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -164,7 +182,203 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         lastSeq: deps.store.lastSeq(),
         lastId: deps.store.lastEventId(),
       },
+      pi: {
+        pinnedVersion: PI_PINNED_VERSION,
+        detectedVersion: deps.pi?.version ?? null,
+        binary: deps.pi?.binary ?? null,
+        managedHome: deps.pi?.managedHome ?? null,
+        configDirEnv: deps.pi?.configDirEnv ?? null,
+      },
     };
+  });
+
+  // ── Phase 2: connections / quota / onboarding ──────────────────────────
+
+  app.get("/v1/connections", async (_request, reply) => {
+    if (deps.connections === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "connections service unavailable");
+      return;
+    }
+    deps.connections.syncFromAuthStore();
+    return {
+      connections: deps.connections.list(),
+      piPinnedVersion: PI_PINNED_VERSION,
+    };
+  });
+
+  app.post("/v1/connections/oauth/start", async (request, reply) => {
+    if (deps.connections === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "connections service unavailable");
+      return;
+    }
+    const body = oauthStartRequestSchema.safeParse(request.body);
+    if (!body.success) {
+      sendError(reply, 400, "BAD_REQUEST", "invalid oauth start body");
+      return;
+    }
+    const connection = deps.connections.createConnection({
+      provider: body.data.provider,
+      kind: "pi-oauth",
+      billingMode: body.data.billingMode ?? null,
+    });
+    // Visible tmux login is driven by the host; we record the attach contract.
+    const session = "agentos";
+    const window = `login-${body.data.provider}`;
+    return {
+      connectionId: connection.id,
+      tmuxSession: session,
+      tmuxWindow: window,
+      attachCommand: `tmux -L agentos new-session -A -s ${session} \\; new-window -n ${window} -- pi /login ${body.data.provider}`,
+    };
+  });
+
+  app.post("/v1/connections/api-key", async (request, reply) => {
+    if (deps.connections === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "connections service unavailable");
+      return;
+    }
+    const body = apiKeyConnectRequestSchema.safeParse(request.body);
+    if (!body.success) {
+      sendError(reply, 400, "BAD_REQUEST", "invalid api-key body");
+      return;
+    }
+    // Never log the key. Write to 0600 file under AGENTOS_HOME/secrets.
+    writeApiKeyFile(deps.home, body.data.provider, body.data.apiKey);
+    const connection = deps.connections.createConnection({
+      provider: body.data.provider,
+      kind: "pi-api-key",
+      billingMode: body.data.provider === "anthropic" ? "api-key" : null,
+      ...(body.data.label !== undefined ? { label: body.data.label } : {}),
+    });
+    const healthy = {
+      ...connection,
+      health: "healthy" as const,
+      effectiveCredentialPath: "env-keychain" as const,
+      updatedAt: new Date().toISOString(),
+    };
+    deps.connections.update(healthy);
+    return { connection: healthy };
+  });
+
+  app.get("/v1/quota", async (_request, reply) => {
+    if (deps.quotaSamples === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "quota service unavailable");
+      return;
+    }
+    return { samples: [...deps.quotaSamples.values()] };
+  });
+
+  app.get<{ Params: { id: string } }>("/v1/connections/:id/quota", async (request, reply) => {
+    if (deps.quotaSamples === undefined || deps.connections === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "quota service unavailable");
+      return;
+    }
+    const connection = deps.connections.get(request.params.id);
+    if (connection === null) {
+      sendError(reply, 404, "NOT_FOUND", "connection not found");
+      return;
+    }
+    return {
+      connectionId: connection.id,
+      sample: deps.quotaSamples.get(connection.id) ?? null,
+    };
+  });
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/connections/:id/quota/refresh",
+    async (request, reply) => {
+      if (
+        deps.quotaSamples === undefined ||
+        deps.connections === undefined ||
+        deps.pi === undefined
+      ) {
+        sendError(reply, 404, "NOT_FOUND", "quota service unavailable");
+        return;
+      }
+      const connection = deps.connections.get(request.params.id);
+      if (connection === null) {
+        sendError(reply, 404, "NOT_FOUND", "connection not found");
+        return;
+      }
+      const paths = resolvePiAuthPaths(
+        deps.pi.isolationMode === "managed" ? deps.pi.managedHome : null,
+      );
+      const { sample, events } = await probeConnection({
+        connection,
+        config: deps.config.config.quota,
+        authJsonPath: paths.authJsonPath,
+      });
+      deps.quotaSamples.set(connection.id, sample);
+      for (const event of events) {
+        deps.store.append(event);
+      }
+      const limit = isLimitReached(sample);
+      deps.connections.setLimitReached(connection.id, limit.reached, limit.reason);
+      return { connectionId: connection.id, sample };
+    },
+  );
+
+  app.get("/v1/onboarding", async (_request, reply) => {
+    if (deps.onboarding === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "onboarding service unavailable");
+      return;
+    }
+    return { state: deps.onboarding.getState() };
+  });
+
+  app.post("/v1/onboarding", async (request, reply) => {
+    if (deps.onboarding === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "onboarding service unavailable");
+      return;
+    }
+    const body = onboardingAdvanceRequestSchema.safeParse(request.body);
+    if (!body.success) {
+      sendError(reply, 400, "BAD_REQUEST", "invalid onboarding action");
+      return;
+    }
+    try {
+      const svc = deps.onboarding;
+      switch (body.data.action) {
+        case "refresh-doctor":
+          return { state: svc.refreshDoctor() };
+        case "set-providers":
+          return { state: svc.setProviders(body.data.providers ?? []) };
+        case "verify-auth":
+          if (body.data.provider === undefined) {
+            sendError(reply, 400, "BAD_REQUEST", "provider required");
+            return;
+          }
+          return { state: svc.verifyAuth(body.data.provider) };
+        case "set-claude-billing":
+          if (body.data.claudeBillingMode === undefined) {
+            sendError(reply, 400, "BAD_REQUEST", "claudeBillingMode required");
+            return;
+          }
+          return { state: svc.setClaudeBilling(body.data.claudeBillingMode) };
+        case "verify-claude-sdk":
+          return { state: svc.verifyClaudeSdk() };
+        case "enable-probes": {
+          // Auto-enable probes for selected+verified providers (R5.1).
+          if (deps.connections !== undefined) {
+            deps.connections.syncFromAuthStore();
+          }
+          return { state: svc.getState() };
+        }
+        case "complete":
+          return { state: svc.complete() };
+        case "restart":
+          return { state: svc.restart() };
+        default:
+          sendError(reply, 400, "BAD_REQUEST", "unknown action");
+          return;
+      }
+    } catch (error) {
+      if (error instanceof OnboardingBlockedError) {
+        sendError(reply, 409, "ONBOARDING_BLOCKED", error.message);
+        return;
+      }
+      throw error;
+    }
   });
 
   const replayQuerySchema = z.object({

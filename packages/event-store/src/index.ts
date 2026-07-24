@@ -5,4 +5,4 @@
 export { NdjsonEventLog, readLog, quarantineCorruptTail, type LogReadResult } from "./log.js";
 export { SqliteProjection } from "./projection.js";
 export { EventStore, type EventListener, type EventStoreOpenResult } from "./store.js";
-export { events, configRevisions, MIGRATIONS } from "./schema.js";
+export { events, configRevisions, connections, quotaSamples, MIGRATIONS } from "./schema.js";

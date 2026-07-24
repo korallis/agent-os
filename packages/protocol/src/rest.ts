@@ -2,10 +2,18 @@ import { z } from "zod";
 import { eventEnvelopeSchema } from "./events.js";
 import { configValidationIssueSchema } from "./config.js";
 import { isoTimestampSchema, ulidSchema } from "./ids.js";
+import {
+  claudeBillingModeSchema,
+  connectionKindSchema,
+  piProviderIdSchema,
+  providerConnectionSchema,
+} from "./providers.js";
+import { quotaSampleSchema } from "./quota.js";
+import { onboardingStateSchema } from "./onboarding.js";
+import { PI_PINNED_VERSION } from "./pi.js";
 
-/** REST DTOs for the Phase 1 `/v1/*` surface (master plan §8.2). */
+/** REST DTOs for `/v1/*` (master plan §8.2). Phase 1 + Phase 2 surfaces. */
 
-/** GET `/v1/health` — unauthenticated liveness (used by `agentos status` + BFF). */
 export const healthResponseSchema = z.strictObject({
   ok: z.literal(true),
   name: z.literal("agentosd"),
@@ -14,7 +22,6 @@ export const healthResponseSchema = z.strictObject({
 });
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 
-/** GET `/v1/status` — authenticated daemon status snapshot. */
 export const statusResponseSchema = z.strictObject({
   daemon: z.strictObject({
     version: z.string(),
@@ -29,18 +36,24 @@ export const statusResponseSchema = z.strictObject({
     lastSeq: z.number().int().min(0),
     lastId: ulidSchema.nullable(),
   }),
+  pi: z
+    .strictObject({
+      pinnedVersion: z.literal(PI_PINNED_VERSION),
+      detectedVersion: z.string().nullable(),
+      binary: z.string().nullable(),
+      managedHome: z.string().nullable(),
+      configDirEnv: z.string().nullable(),
+    })
+    .optional(),
 });
 export type StatusResponse = z.infer<typeof statusResponseSchema>;
 
-/** GET `/v1/events/replay?after=<ulid>&limit=<n>` — REST event replay. */
 export const eventsReplayResponseSchema = z.strictObject({
   events: z.array(eventEnvelopeSchema),
-  /** True when more events exist beyond `limit`. */
   truncated: z.boolean(),
 });
 export type EventsReplayResponse = z.infer<typeof eventsReplayResponseSchema>;
 
-/** Typed API error codes (§8.1 "typed errors"). */
 export const apiErrorCodeSchema = z.enum([
   "UNAUTHORIZED",
   "FORBIDDEN",
@@ -49,21 +62,22 @@ export const apiErrorCodeSchema = z.enum([
   "CONFIG_INVALID",
   "CONFIRMATION_REQUIRED",
   "LAYER_NOT_WRITABLE",
+  "BILLING_MISMATCH",
+  "ONBOARDING_BLOCKED",
+  "PROBE_FAILED",
+  "CONFLICT",
 ]);
 export type ApiErrorCode = z.infer<typeof apiErrorCodeSchema>;
 
-/** The one error envelope every non-2xx `/v1/*` response uses. */
 export const apiErrorResponseSchema = z.strictObject({
   error: z.strictObject({
     code: apiErrorCodeSchema,
     message: z.string(),
-    /** Path-precise issues for CONFIG_INVALID responses. */
     issues: z.array(configValidationIssueSchema).nullable(),
   }),
 });
 export type ApiErrorResponse = z.infer<typeof apiErrorResponseSchema>;
 
-/** PUT `/v1/config/:layer/:domain` success response. */
 export const configWriteResponseSchema = z.strictObject({
   applied: z.literal(true),
   domain: z.string(),
@@ -72,8 +86,78 @@ export const configWriteResponseSchema = z.strictObject({
 });
 export type ConfigWriteResponse = z.infer<typeof configWriteResponseSchema>;
 
-/**
- * Header required on safety-policy writes (§11 Phase 1 config gate:
- * "safety-policy write requires confirmation and emits policy.changed").
- */
 export const SAFETY_CONFIRM_HEADER = "x-agentos-confirm-safety";
+
+/** GET `/v1/connections` */
+export const connectionsListResponseSchema = z.strictObject({
+  connections: z.array(providerConnectionSchema),
+  piPinnedVersion: z.literal(PI_PINNED_VERSION),
+});
+export type ConnectionsListResponse = z.infer<typeof connectionsListResponseSchema>;
+
+/** POST `/v1/connections/oauth/start` */
+export const oauthStartRequestSchema = z.strictObject({
+  provider: piProviderIdSchema,
+  billingMode: claudeBillingModeSchema.nullable().optional(),
+});
+export type OauthStartRequest = z.infer<typeof oauthStartRequestSchema>;
+
+export const oauthStartResponseSchema = z.strictObject({
+  connectionId: ulidSchema,
+  tmuxSession: z.string(),
+  tmuxWindow: z.string(),
+  /** Attach hint for the Console terminal / human. */
+  attachCommand: z.string(),
+});
+export type OauthStartResponse = z.infer<typeof oauthStartResponseSchema>;
+
+/** POST `/v1/connections/api-key` */
+export const apiKeyConnectRequestSchema = z.strictObject({
+  provider: piProviderIdSchema,
+  /** Never logged; written only to keychain. */
+  apiKey: z.string().min(1),
+  label: z.string().min(1).optional(),
+});
+export type ApiKeyConnectRequest = z.infer<typeof apiKeyConnectRequestSchema>;
+
+export const apiKeyConnectResponseSchema = z.strictObject({
+  connection: providerConnectionSchema,
+});
+export type ApiKeyConnectResponse = z.infer<typeof apiKeyConnectResponseSchema>;
+
+/** GET `/v1/connections/:id/quota` */
+export const connectionQuotaResponseSchema = z.strictObject({
+  connectionId: ulidSchema,
+  sample: quotaSampleSchema.nullable(),
+});
+export type ConnectionQuotaResponse = z.infer<typeof connectionQuotaResponseSchema>;
+
+/** GET `/v1/quota` — all latest samples. */
+export const quotaListResponseSchema = z.strictObject({
+  samples: z.array(quotaSampleSchema),
+});
+export type QuotaListResponse = z.infer<typeof quotaListResponseSchema>;
+
+/** GET/PUT `/v1/onboarding` */
+export const onboardingResponseSchema = z.strictObject({
+  state: onboardingStateSchema,
+});
+export type OnboardingResponse = z.infer<typeof onboardingResponseSchema>;
+
+export const onboardingAdvanceRequestSchema = z.strictObject({
+  action: z.enum([
+    "refresh-doctor",
+    "set-providers",
+    "verify-auth",
+    "set-claude-billing",
+    "verify-claude-sdk",
+    "enable-probes",
+    "complete",
+    "restart",
+  ]),
+  providers: z.array(piProviderIdSchema).optional(),
+  provider: piProviderIdSchema.optional(),
+  claudeBillingMode: claudeBillingModeSchema.optional(),
+  kind: connectionKindSchema.optional(),
+});
+export type OnboardingAdvanceRequest = z.infer<typeof onboardingAdvanceRequestSchema>;

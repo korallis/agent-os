@@ -3,7 +3,7 @@ import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { desc, eq, gt } from "drizzle-orm";
 import type { EventEnvelope } from "@agent-os/protocol";
-import { MIGRATIONS, configRevisions, events } from "./schema.js";
+import { MIGRATIONS, configRevisions, connections, events, quotaSamples } from "./schema.js";
 
 /**
  * SQLite projection (WAL) rebuilt/reconciled from the NDJSON log on boot
@@ -95,6 +95,46 @@ export class SqliteProjection {
           .onConflictDoNothing()
           .run();
       }
+      if (envelope.event.type === "provider.connection_updated") {
+        const p = envelope.event.payload;
+        this.sqlite
+          .prepare(
+            `INSERT INTO connections (id, provider, kind, health, billing_surface, billing_mode, family, limit_reached, payload, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               provider=excluded.provider,
+               kind=excluded.kind,
+               health=excluded.health,
+               billing_surface=excluded.billing_surface,
+               billing_mode=excluded.billing_mode,
+               family=excluded.family,
+               limit_reached=excluded.limit_reached,
+               payload=excluded.payload,
+               updated_at=excluded.updated_at`,
+          )
+          .run(
+            p.connectionId,
+            p.provider,
+            p.kind,
+            p.health,
+            p.billingSurface,
+            p.billingMode,
+            p.family,
+            p.limitReached ? 1 : 0,
+            JSON.stringify(p),
+            envelope.ts,
+          );
+      }
+      if (envelope.event.type === "quota.updated") {
+        const p = envelope.event.payload;
+        this.sqlite
+          .prepare(
+            `INSERT INTO quota_samples (id, connection_id, provider, sampled_at, payload)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO NOTHING`,
+          )
+          .run(p.sampleId, p.connectionId, p.provider, envelope.ts, JSON.stringify(p));
+      }
     });
     tx();
   }
@@ -122,10 +162,36 @@ export class SqliteProjection {
     return row.n;
   }
 
+  /** Latest quota sample payload per connection (projection helper). */
+  latestQuotaByConnection(): Map<string, unknown> {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT connection_id, payload FROM quota_samples
+         WHERE sampled_at IN (
+           SELECT MAX(sampled_at) FROM quota_samples GROUP BY connection_id
+         )`,
+      )
+      .all() as { connection_id: string; payload: string }[];
+    const map = new Map<string, unknown>();
+    for (const row of rows) {
+      map.set(row.connection_id, JSON.parse(row.payload));
+    }
+    return map;
+  }
+
+  listConnectionPayloads(): unknown[] {
+    const rows = this.sqlite
+      .prepare("SELECT payload FROM connections ORDER BY updated_at DESC")
+      .all() as { payload: string }[];
+    return rows.map((r) => JSON.parse(r.payload));
+  }
+
   /** Drops all projected rows so a full rebuild from the log can run. */
   reset(): void {
     const tx = this.sqlite.transaction(() => {
-      this.sqlite.exec("DELETE FROM events; DELETE FROM config_revisions;");
+      this.sqlite.exec(
+        "DELETE FROM events; DELETE FROM config_revisions; DELETE FROM connections; DELETE FROM quota_samples;",
+      );
     });
     tx();
   }
@@ -134,3 +200,7 @@ export class SqliteProjection {
     this.sqlite.close();
   }
 }
+
+// Silence unused-export noise if drizzle tables are only used for types elsewhere.
+void connections;
+void quotaSamples;

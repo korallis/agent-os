@@ -2,11 +2,12 @@ import type { Metadata } from "next";
 import { cn } from "@agent-os/ui";
 import { Topbar } from "@/components/shell/Topbar";
 import { Icon } from "@/components/shell/Icon";
+import { QuotaUsageStrip } from "@/components/analytics/QuotaUsageStrip";
 
 export const metadata: Metadata = { title: "Token Usage — AgentOS" };
 
-/* Pixel-faithful placeholder analytics from the Figma design — live quota
-   probes and usage projections land in Phase 2 (§7.3, §11). */
+/* Figma Token Usage frame + live probe strip (Phase 2). Historical chart
+   figures remain illustrative until telemetry aggregation (Phase 6/8). */
 
 const STATS = [
   { label: "Total Spend", value: "$23,094", delta: "-37.2%", deltaClass: "text-ok" },
@@ -43,8 +44,7 @@ function Card({ className, children }: { className?: string; children: React.Rea
 }
 
 /**
- * Analytics (§7.7) — the Figma "Token Usage & Billing" screen. Static
- * placeholder figures until Phase 2 quota probes feed real usage.
+ * Analytics — Figma "Token Usage" (`37:2265`) with live quota probe strip.
  */
 export default function AnalyticsPage() {
   return (
@@ -73,6 +73,8 @@ export default function AnalyticsPage() {
             </span>
           </div>
         </div>
+
+        <QuotaUsageStrip />
 
         <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
           {STATS.map((stat) => (

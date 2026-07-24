@@ -1,12 +1,11 @@
 import { z } from "zod";
+import { quotaConfigSchema } from "./quota.js";
 
 /**
  * Config schemas — the Policy Packs foundation (master plan §2.6, §9).
  *
- * Phase 1 ships three domains: `supervision` (carries the hot-reload gate
- * value), `policies` (safety toggles, default ON), and `console` (layout
- * preferences). Every domain file is validated as a whole — invalid config
- * is rejected with path-precise issues and nothing partially applies.
+ * Phase 1: supervision, policies, console.
+ * Phase 2: + quota (surface #14).
  */
 
 /** Layer precedence, lowest → highest (§2.6). */
@@ -65,6 +64,7 @@ export const consoleConfigSchema = z.strictObject({
     "analytics",
     "policies",
     "settings",
+    "onboarding",
   ]),
   columnDensity: z.enum(["comfortable", "compact"]),
   wakeQueueVisible: z.boolean(),
@@ -76,15 +76,17 @@ export const configDomainSchemas = {
   supervision: supervisionConfigSchema,
   policies: safetyPoliciesConfigSchema,
   console: consoleConfigSchema,
+  quota: quotaConfigSchema,
 } as const;
 
-export const configDomainSchema = z.enum(["supervision", "policies", "console"]);
+export const configDomainSchema = z.enum(["supervision", "policies", "console", "quota"]);
 export type ConfigDomain = z.infer<typeof configDomainSchema>;
 
 export const CONFIG_DOMAINS: readonly ConfigDomain[] = [
   "supervision",
   "policies",
   "console",
+  "quota",
 ];
 
 /** The fully-resolved effective config across all domains. */
@@ -92,6 +94,7 @@ export const agentOsConfigSchema = z.strictObject({
   supervision: supervisionConfigSchema,
   policies: safetyPoliciesConfigSchema,
   console: consoleConfigSchema,
+  quota: quotaConfigSchema,
 });
 export type AgentOsConfig = z.infer<typeof agentOsConfigSchema>;
 

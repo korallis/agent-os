@@ -5,14 +5,21 @@ import {
   configLayerSchema,
   configValidationIssueSchema,
 } from "./config.js";
+import {
+  authStorePresenceSchema,
+  billingSurfaceSchema,
+  claudeBillingModeSchema,
+  connectionHealthSchema,
+  connectionKindSchema,
+  modelFamilySchema,
+  piProviderIdSchema,
+} from "./providers.js";
+import { honestyTierSchema, quotaMetricSchema } from "./quota.js";
+import { onboardingStepSchema } from "./onboarding.js";
 
 /**
- * The Phase 1 orchestrator event union (master plan §8.2, §9).
- *
- * Events are the source of truth: appended (fsync'd) to the NDJSON log
- * first, projected to SQLite second, and fanned out over SSE third. The
- * union grows in later phases (task.state, agent.*, provider.*, quota.*);
- * Phase 1 carries the daemon-lifecycle and config-layer members.
+ * Orchestrator event union (master plan §8.2, §9).
+ * Phase 1: daemon + config. Phase 2: provider, quota, extension, onboarding.
  */
 
 export const daemonStartedEventSchema = z.strictObject({
@@ -33,7 +40,6 @@ export const daemonStoppingEventSchema = z.strictObject({
   }),
 });
 
-/** Shipped defaults installed into `~/.agentos/config/` on init (§2.6 layer 1→2). */
 export const configInstalledEventSchema = z.strictObject({
   type: z.literal("config.installed"),
   payload: z.strictObject({
@@ -41,19 +47,16 @@ export const configInstalledEventSchema = z.strictObject({
   }),
 });
 
-/** A config layer file changed and was applied (hot-reload where safe, §2.6). */
 export const configChangedEventSchema = z.strictObject({
   type: z.literal("config.changed"),
   payload: z.strictObject({
     domain: configDomainSchema,
     layer: configLayerSchema,
     hotReloaded: z.boolean(),
-    /** SHA-256 of the applied layer-file content. */
     contentHash: z.string(),
   }),
 });
 
-/** An invalid config write/edit was rejected — nothing partially applied (§2.6). */
 export const configRejectedEventSchema = z.strictObject({
   type: z.literal("config.rejected"),
   payload: z.strictObject({
@@ -63,14 +66,106 @@ export const configRejectedEventSchema = z.strictObject({
   }),
 });
 
-/** A safety-policy write was confirmed and applied (§8.2 `policy.changed`). */
 export const policyChangedEventSchema = z.strictObject({
   type: z.literal("policy.changed"),
   payload: z.strictObject({
     domain: z.literal("policies"),
     layer: configLayerSchema,
-    /** True when any safety toggle is now weakened below default-ON. */
     safetyOverride: z.boolean(),
+  }),
+});
+
+/** A provider connection was created or its health/presence flipped. */
+export const providerConnectionUpdatedEventSchema = z.strictObject({
+  type: z.literal("provider.connection_updated"),
+  payload: z.strictObject({
+    connectionId: ulidSchema,
+    provider: piProviderIdSchema,
+    kind: connectionKindSchema,
+    health: connectionHealthSchema,
+    billingSurface: billingSurfaceSchema,
+    billingMode: claudeBillingModeSchema.nullable(),
+    family: modelFamilySchema,
+    limitReached: z.boolean(),
+  }),
+});
+
+/** Auth-store presence changed (mtime/hash) — never carries token material. */
+export const providerCredentialRefreshedEventSchema = z.strictObject({
+  type: z.literal("provider.credential_refreshed"),
+  payload: z.strictObject({
+    provider: piProviderIdSchema,
+    presence: authStorePresenceSchema,
+  }),
+});
+
+/** BILLING_MISMATCH: cast credential path ≠ observed telemetry path (§4.2). */
+export const providerBillingMismatchEventSchema = z.strictObject({
+  type: z.literal("provider.billing_mismatch"),
+  payload: z.strictObject({
+    connectionId: ulidSchema,
+    expectedPath: z.string(),
+    observedPath: z.string(),
+    detail: z.string(),
+  }),
+});
+
+export const quotaUpdatedEventSchema = z.strictObject({
+  type: z.literal("quota.updated"),
+  payload: z.strictObject({
+    connectionId: ulidSchema,
+    provider: piProviderIdSchema,
+    metrics: z.array(quotaMetricSchema),
+    sampleId: ulidSchema,
+  }),
+});
+
+export const quotaThresholdEventSchema = z.strictObject({
+  type: z.literal("quota.threshold"),
+  payload: z.strictObject({
+    connectionId: ulidSchema,
+    provider: piProviderIdSchema,
+    kind: z.string(),
+    tier: honestyTierSchema,
+    value: z.number(),
+    level: z.enum(["warn", "critical", "limit-reached"]),
+    reason: z.string(),
+  }),
+});
+
+export const extensionHelloEventSchema = z.strictObject({
+  type: z.literal("ext.hello"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    role: z.string(),
+    piVersion: z.string(),
+  }),
+});
+
+export const extensionUsageEventSchema = z.strictObject({
+  type: z.literal("ext.usage"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    provider: z.string(),
+    model: z.string(),
+    inputTokens: z.number().int().min(0).nullable(),
+    outputTokens: z.number().int().min(0).nullable(),
+    costUsd: z.number().min(0).nullable(),
+  }),
+});
+
+export const onboardingStepEventSchema = z.strictObject({
+  type: z.literal("onboarding.step"),
+  payload: z.strictObject({
+    step: onboardingStepSchema,
+    previous: onboardingStepSchema.nullable(),
+  }),
+});
+
+export const onboardingCompletedEventSchema = z.strictObject({
+  type: z.literal("onboarding.completed"),
+  payload: z.strictObject({
+    at: isoTimestampSchema,
   }),
 });
 
@@ -81,16 +176,20 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   configChangedEventSchema,
   configRejectedEventSchema,
   policyChangedEventSchema,
+  providerConnectionUpdatedEventSchema,
+  providerCredentialRefreshedEventSchema,
+  providerBillingMismatchEventSchema,
+  quotaUpdatedEventSchema,
+  quotaThresholdEventSchema,
+  extensionHelloEventSchema,
+  extensionUsageEventSchema,
+  onboardingStepEventSchema,
+  onboardingCompletedEventSchema,
 ]);
 export type OrchestratorEvent = z.infer<typeof orchestratorEventSchema>;
 
 export type OrchestratorEventType = OrchestratorEvent["type"];
 
-/**
- * The typed envelope every event is recorded and transported in.
- * `seq` is a strictly-monotonic per-log sequence; `id` is a ULID
- * (also the SSE `id:` field used for `Last-Event-ID` replay).
- */
 export const eventEnvelopeSchema = z.strictObject({
   id: ulidSchema,
   seq: z.number().int().positive(),
@@ -99,10 +198,6 @@ export const eventEnvelopeSchema = z.strictObject({
 });
 export type EventEnvelope = z.infer<typeof eventEnvelopeSchema>;
 
-/**
- * SSE frame contract for `/v1/events` (§8.2): `id:` carries the envelope
- * ULID, `event:` carries the event type, `data:` carries the JSON envelope.
- */
 export const sseFrameSchema = z.strictObject({
   id: ulidSchema,
   event: z.string(),

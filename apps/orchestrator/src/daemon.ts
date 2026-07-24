@@ -12,6 +12,11 @@ import {
 import { ConfigService } from "./config/service.js";
 import { buildServer, type AgentosdServer } from "./server/app.js";
 import { AGENTOSD_VERSION, DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";
+import { ConnectionRegistry } from "./pi/connections.js";
+import { detectPi } from "./pi/manager.js";
+import { SocketHub } from "./pi/socket-hub.js";
+import { OnboardingService } from "./onboarding/state.js";
+import type { QuotaSample } from "@agent-os/protocol";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
@@ -112,7 +117,42 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
 
     const startedAt = new Date().toISOString();
 
-    const deps = { store, config, token, home, port, startedAt, logger };
+    const pi = detectPi(home);
+    const connections = new ConnectionRegistry(home);
+    connections.onEvent((event) => {
+      eventStore.append(event);
+    });
+    connections.syncFromAuthStore();
+
+    const onboarding = new OnboardingService(home);
+    onboarding.onEvent((event) => {
+      eventStore.append(event);
+    });
+
+    const quotaSamples = new Map<string, QuotaSample>();
+    const socketHub = new SocketHub(join(home, "sockets"));
+    socketHub.onEvent((event) => {
+      eventStore.append(event);
+    });
+    try {
+      await socketHub.listen();
+    } catch (error) {
+      logger.warn({ err: error }, "socket hub failed to listen — extension channel unavailable");
+    }
+
+    const deps = {
+      store,
+      config,
+      token,
+      home,
+      port,
+      startedAt,
+      logger,
+      connections,
+      onboarding,
+      pi,
+      quotaSamples,
+    };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });
     const address = server.server.address();
@@ -125,7 +165,16 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       type: "daemon.started",
       payload: { version: AGENTOSD_VERSION, pid: process.pid, home, port: boundPort },
     });
-    logger.info({ home, port: boundPort, version: AGENTOSD_VERSION }, "agentosd started");
+    logger.info(
+      {
+        home,
+        port: boundPort,
+        version: AGENTOSD_VERSION,
+        piVersion: pi.version,
+        piPinned: pi.pinnedVersion,
+      },
+      "agentosd started",
+    );
 
     const runningStore = store;
     const runningConfig = config;
@@ -150,6 +199,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
             payload: { reason, signal: signal ?? null },
           });
           runningConfig.stop();
+          await socketHub.close();
           const closePromise = runningServer.close();
           await new Promise<void>((resolve) => setTimeout(resolve, SSE_SHUTDOWN_GRACE_MS));
           runningServer.destroySseStreams();
