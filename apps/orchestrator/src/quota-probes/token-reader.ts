@@ -39,10 +39,13 @@ function extractBearer(entry: unknown): string | null {
 
 /**
  * Read a token for a probe. Caller MUST pass the destination URL for allowlist check first.
+ * When multiple auth.json paths are provided, try managed then shared per provider.
  */
 export function readProbeToken(options: {
   provider: string;
   authJsonPath: string;
+  /** Ordered auth.json candidates (managed then shared). Falls back to authJsonPath. */
+  authJsonPaths?: string[];
   url: string;
   /** Test-only fixture token (never used in production paths). */
   fixtureToken?: string;
@@ -82,10 +85,22 @@ export function readProbeToken(options: {
     }
   }
 
-  if (!existsSync(options.authJsonPath)) return null;
+  const paths =
+    options.authJsonPaths !== undefined && options.authJsonPaths.length > 0
+      ? options.authJsonPaths
+      : [options.authJsonPath];
+  for (const authJsonPath of paths) {
+    const fromStore = readTokenFromAuthJson(authJsonPath, options.provider);
+    if (fromStore !== null) return fromStore;
+  }
+  return null;
+}
+
+function readTokenFromAuthJson(authJsonPath: string, provider: string): ProbeToken | null {
+  if (!existsSync(authJsonPath)) return null;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(options.authJsonPath, "utf8"));
+    parsed = JSON.parse(readFileSync(authJsonPath, "utf8"));
   } catch {
     return null;
   }
@@ -99,7 +114,7 @@ export function readProbeToken(options: {
     openrouter: ["openrouter"],
     "kimi-coding": ["kimi-coding", "kimi", "moonshot"],
   };
-  const keys = aliases[options.provider] ?? [options.provider];
+  const keys = aliases[provider] ?? [provider];
   if (!isRecord(root)) return null;
   for (const key of keys) {
     const entry = root[key];

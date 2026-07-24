@@ -17,6 +17,8 @@ export interface ProbeContext {
   connection: ProviderConnection;
   config: QuotaConfig;
   authJsonPath: string;
+  /** Ordered auth.json candidates (managed then shared). Falls back to authJsonPath. */
+  authJsonPaths?: string[];
   /** AGENTOS_HOME — used to read secrets/<provider>.key for pi-api-key probes. */
   agentosHome?: string;
   /** Injectable clock for fake-clock countdown tests. */
@@ -88,6 +90,7 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
       const token = readProbeToken({
         provider: mapAllowlistProvider(provider),
         authJsonPath: ctx.authJsonPath,
+        ...(ctx.authJsonPaths !== undefined ? { authJsonPaths: ctx.authJsonPaths } : {}),
         url: endpoint.url,
         billingMode: ctx.connection.billingMode,
         connectionKind: ctx.connection.kind,

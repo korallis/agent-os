@@ -23,6 +23,7 @@ import {
   type ConfigValidationIssue,
   type EventsReplayResponse,
   type HealthResponse,
+  type OnboardingState,
   type QuotaSample,
   type StatusResponse,
 } from "@agent-os/protocol";
@@ -37,7 +38,7 @@ import type { OnboardingService } from "../onboarding/state.js";
 import { OnboardingBlockedError } from "../onboarding/state.js";
 import { enableQuotaProviders } from "../quota-probes/enable.js";
 import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
-import { resolveAuthJsonPathWithFallback } from "../security/auth-store.js";
+import { resolveAuthJsonPathsWithFallback } from "../security/auth-store.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -310,13 +311,14 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         sendError(reply, 404, "NOT_FOUND", "connection not found");
         return;
       }
-      const authJsonPath = resolveAuthJsonPathWithFallback(
+      const authJsonPaths = resolveAuthJsonPathsWithFallback(
         deps.pi.isolationMode === "managed" ? deps.pi.managedHome : null,
       );
       const { sample, events } = await probeConnection({
         connection,
         config: deps.config.config.quota,
-        authJsonPath,
+        authJsonPath: authJsonPaths[0] ?? "",
+        authJsonPaths,
         agentosHome: deps.home,
       });
       deps.quotaSamples.set(connection.id, sample);
@@ -360,12 +362,15 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
             return;
           }
           return { state: svc.verifyAuth(body.data.provider) };
-        case "set-claude-billing":
+        case "set-claude-billing": {
           if (body.data.claudeBillingMode === undefined) {
             sendError(reply, 400, "BAD_REQUEST", "claudeBillingMode required");
             return;
           }
-          return { state: svc.setClaudeBilling(body.data.claudeBillingMode) };
+          const state = svc.setClaudeBilling(body.data.claudeBillingMode);
+          syncAnthropicBillingFromWizard(deps, state);
+          return { state };
+        }
         case "verify-claude-sdk":
           return { state: svc.verifyClaudeSdk() };
         case "enable-probes": {
@@ -383,10 +388,15 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
             );
             return;
           }
-          return { state: svc.enableProbes() };
+          const state = svc.enableProbes();
+          syncAnthropicBillingFromWizard(deps, state);
+          return { state };
         }
-        case "complete":
-          return { state: svc.complete() };
+        case "complete": {
+          const state = svc.complete();
+          syncAnthropicBillingFromWizard(deps, state);
+          return { state };
+        }
         case "restart":
           return { state: svc.restart() };
         default:
@@ -746,6 +756,38 @@ function enableProbesForOnboarding(
     presence.map((p) => ({ provider: p.provider, billingMode: null })),
   );
   return "ok";
+}
+
+/**
+ * Keep anthropic ProviderConnection.billingMode/billingSurface aligned with the
+ * wizard so probes/readProbeToken take the subscription-sdk Claude Code path.
+ */
+function syncAnthropicBillingFromWizard(deps: ServerDeps, state: OnboardingState): void {
+  if (deps.connections === undefined) return;
+  const claude = state.providers.find(
+    (p) => p.provider === "anthropic" && p.selected && p.claudeBillingMode !== null,
+  );
+  if (claude === undefined || claude.claudeBillingMode === null) return;
+  const mode = claude.claudeBillingMode;
+  const kind = mode === "api-key" ? "pi-api-key" : "pi-oauth";
+  const existing = deps.connections
+    .list()
+    .filter((c) => c.provider === "anthropic");
+  if (existing.length === 0) {
+    deps.connections.upsertConnection({
+      provider: "anthropic",
+      kind,
+      billingMode: mode,
+    });
+    return;
+  }
+  for (const connection of existing) {
+    deps.connections.upsertConnection({
+      provider: "anthropic",
+      kind: connection.kind,
+      billingMode: mode,
+    });
+  }
 }
 
 /**

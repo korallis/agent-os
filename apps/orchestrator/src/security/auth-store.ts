@@ -25,16 +25,41 @@ export function resolvePiAuthPaths(managedHome: string | null): AuthStorePaths {
 }
 
 /**
- * Prefer managed auth.json when it has presence; otherwise fall back to shared ~/.pi.
- * Mirrors listDetectedProviders so OAuth probes and detection agree on the store.
+ * Ordered auth.json paths for probe token reads: managed first, then shared ~/.pi.
+ * Never all-or-nothing on "managed has any entry" — partial multi-provider
+ * migration keeps credentials reachable in either store.
+ */
+export function resolveAuthJsonPathsWithFallback(managedHome: string | null): string[] {
+  const shared = resolvePiAuthPaths(null).authJsonPath;
+  if (managedHome === null) return [shared];
+  const managed = resolvePiAuthPaths(managedHome).authJsonPath;
+  if (managed === shared) return [managed];
+  return [managed, shared];
+}
+
+/**
+ * Primary auth.json path (managed when set, else shared). Prefer
+ * resolveAuthJsonPathsWithFallback for probe token reads.
  */
 export function resolveAuthJsonPathWithFallback(managedHome: string | null): string {
-  const managed = resolvePiAuthPaths(managedHome);
-  if (readAuthStorePresence(managed.authJsonPath).length > 0) {
-    return managed.authJsonPath;
+  return resolveAuthJsonPathsWithFallback(managedHome)[0] ?? resolvePiAuthPaths(null).authJsonPath;
+}
+
+/**
+ * Union presence across managed + shared stores. Managed wins on the same provider.
+ */
+export function readAuthStorePresenceUnion(managedHome: string | null): AuthStorePresence[] {
+  const paths = resolveAuthJsonPathsWithFallback(managedHome);
+  const byProvider = new Map<string, AuthStorePresence>();
+  // Apply shared first, then managed so managed overwrites on collision.
+  for (let i = paths.length - 1; i >= 0; i--) {
+    const path = paths[i];
+    if (path === undefined) continue;
+    for (const entry of readAuthStorePresence(path)) {
+      byProvider.set(entry.provider, entry);
+    }
   }
-  const shared = resolvePiAuthPaths(null);
-  return shared.authJsonPath;
+  return [...byProvider.values()];
 }
 
 /** Shape we accept from Pi's auth.json without claiming full fidelity. */

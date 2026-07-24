@@ -7,10 +7,7 @@ import {
   PI_PINNED_VERSION,
   type PiSpawnSpec,
 } from "@agent-os/protocol";
-import {
-  resolveAuthJsonPathWithFallback,
-  readAuthStorePresence,
-} from "../security/auth-store.js";
+import { readAuthStorePresenceUnion } from "../security/auth-store.js";
 import { scrubEnv, type ProviderKeyEnvName } from "../security/env-scrub.js";
 
 /**
@@ -159,11 +156,12 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
   };
 }
 
-export function listDetectedProviders(agentosHome: string): ReturnType<typeof readAuthStorePresence> {
+export function listDetectedProviders(
+  agentosHome: string,
+): ReturnType<typeof readAuthStorePresenceUnion> {
   const configDirEnv = detectConfigDirEnv();
   const managedHome = configDirEnv !== null ? managedPiHome(agentosHome) : null;
-  const authJsonPath = resolveAuthJsonPathWithFallback(managedHome);
-  return readAuthStorePresence(authJsonPath);
+  return readAuthStorePresenceUnion(managedHome);
 }
 
 export function installHintForPi(): string {

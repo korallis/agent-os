@@ -4,7 +4,7 @@ import { quotaSampleSchema, type QuotaSample } from "@agent-os/protocol";
 import type { ConfigService } from "../config/service.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
-import { resolveAuthJsonPathWithFallback } from "../security/auth-store.js";
+import { resolveAuthJsonPathsWithFallback } from "../security/auth-store.js";
 import { hasProbeEndpoints } from "./allowlist.js";
 import { isLimitReached, isProbeEnabled, probeConnection } from "./probes.js";
 
@@ -82,9 +82,10 @@ export class QuotaProbeScheduler {
     this.deps.connections.syncFromAuthStore();
 
     const quota = this.deps.config.config.quota;
-    const authJsonPath = resolveAuthJsonPathWithFallback(
+    const authJsonPaths = resolveAuthJsonPathsWithFallback(
       this.deps.pi.isolationMode === "managed" ? this.deps.pi.managedHome : null,
     );
+    const authJsonPath = authJsonPaths[0] ?? "";
     const now = Date.now();
 
     for (const connection of this.deps.connections.list()) {
@@ -101,6 +102,7 @@ export class QuotaProbeScheduler {
           connection,
           config: quota,
           authJsonPath,
+          authJsonPaths,
           agentosHome: this.deps.home,
         });
         this.deps.quotaSamples.set(connection.id, sample);
