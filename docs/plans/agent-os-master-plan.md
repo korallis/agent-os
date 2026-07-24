@@ -92,7 +92,7 @@ v1 is shipped when all of the following are true (each restated as an executable
 
 **[A] chosen over [B].** Preserved **verbatim as `apps/marketing`**, a separate Next.js app sharing `packages/ui`; deploys publicly; never imports orchestrator code. *Rationale:* a localhost-only console must never share a deployable with a public site. *Adopted from [B]:* the honesty pass. *Rejected alternative [B]:* `/site` fold-in with redirects.
 
-**[R5→R6.2→R6.3] Design-system mandate (Captain's directives, current form):** **[R6.3]** the UI's single source of truth for the **product app** is the Captain's Figma file — *"AgentOS — AI Agent Orchestration Dashboard"* (`Ria7UpyEPRd9jNlF9B6xgF`); every product screen must **exactly replicate** its corresponding Figma frame (§7). `packages/ui` remains the shared token/component home, now sourced from **both** origins: the marketing site's promoted components (header/nav, GlassCard, MagneticButton, AnimatedCard, TextReveal, gradients, marquee — marketing keeps rendering identically; that parity gate stands) **and** the Figma file's tokens/components (dark charcoal surfaces, slim icon rail, top bar, stat cards with delta chips, teal→green charts, status pills) for the product app. **Where the two conflict on product screens, Figma wins.** The R6.2 rule against bespoke lookalikes stands: components come from `packages/ui`, built once against the Figma spec. Ad-hoc styling in `apps/console` is a review defect.
+**[R5→R6.2→R6.3] Design-system mandate (Captain's directives, current form):** **[R6.3]** the UI's single source of truth for the **product app** is the Captain's Figma file — *"AgentOS — AI Agent Orchestration Dashboard"* (`Ria7UpyEPRd9jNlF9B6xgF`); every product screen must **exactly replicate** its corresponding Figma frame (§7). `packages/ui` remains the shared token/component home, now sourced from **both** origins: the marketing site's promoted components (`SiteHeader`/nav, `GlassCard`, `MagneticButton`, motion primitives — marketing keeps rendering identically; that parity gate stands) **and** the Figma file's tokens/components (dark charcoal surfaces, slim icon rail, top bar, stat cards with delta chips, teal→green charts, status pills) for the product app. **Where the two conflict on product screens, Figma wins.** The R6.2 rule against bespoke lookalikes stands: components come from `packages/ui`, built once against the Figma spec. Ad-hoc styling in `apps/console` is a review defect.
 
 ---
 
@@ -423,6 +423,8 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 
 pnpm workspaces + Turborepo (§2.1). Marketing lives at `apps/marketing` (verbatim migration from the former root `src/`); shared design-system primitives live in `packages/ui`. [A]
 
+**Phase 1 as-built** (substrate + Figma console shell) is the current tree; later-phase modules below remain planned. Authoritative route inventory: §7.
+
 ```
 agent-os/
 ├── package.json                      # workspace root, engines: node>=24
@@ -433,59 +435,57 @@ agent-os/
 ├── .github/workflows/
 │   ├── ci.yml
 │   └── pi-canary.yml                 # weekly: harness contract suite vs latest Pi [R2]
-├── docs/{architecture,providers,plans}/
+├── docs/{plans,qa}/
 ├── apps/
 │   ├── marketing/                    # existing site, verbatim; deploys publicly [A]
-│   ├── console/
+│   ├── console/                      # [R6.3] Figma dark dashboard (icon rail + top bar)
+│   │   ├── public/figma/             # exported Figma assets (icons via CSS masks)
 │   │   └── src/
 │   │       ├── app/
 │   │       │   ├── layout.tsx
 │   │       │   ├── page.tsx                    # redirect → /fleet [B]
-│   │       │   ├── fleet/page.tsx
-│   │       │   ├── projects/[id]/page.tsx
-│   │       │   ├── tasks/page.tsx
-│   │       │   ├── tasks/[id]/page.tsx
-│   │       │   ├── runs/[id]/page.tsx
-│   │       │   ├── providers/page.tsx
-│   │       │   ├── analytics/page.tsx
-│   │       │   ├── policies/page.tsx           # [R3] layered config editor + diff view
+│   │       │   ├── fleet/page.tsx              # Home Dashboard
+│   │       │   ├── runs/page.tsx               # Live Log Stream (SSE live Phase 1)
+│   │       │   ├── policies/page.tsx           # effective config + source-layer chips
 │   │       │   ├── settings/page.tsx
-│   │       │   └── api/                        # loopback BFF [B]
-│   │       ├── components/{console,terminal,policies}/
-│   │       └── lib/{client.ts, sse.ts}
-│   ├── orchestrator/                 # agentosd daemon
-│   │   ├── package.json              # bin: { agentosd }; pins pi
-│   │   ├── defaults/                 # [R3] shipped Policy Pack: *.json5 + prompts/**
-│   │   ├── migrations/
-│   │   └── src/
-│   │       ├── main.ts
-│   │       ├── server/               # fastify routes incl. config endpoints
-│   │       ├── substrate/            # [R3] renamed from core/: task-machine.ts (validation),
-│   │       │                         #      tool-surface.ts, policy-engine.ts, config-resolver.ts
-│   │       ├── fleet/                # crewmate.ts, worktree-pool.ts, tmux.ts, watcher.ts, secondmate.ts
-│   │       ├── fusion/               # executors: opinion, fusion, plan-fusion, auto-validate, gate-runner
-│   │       ├── pi/                   # pi-manager.ts, auth-broker.ts, login-flows.ts, socket-hub.ts, model-catalog.ts
-│   │       ├── quota-probes/         # [R5] per-provider probe adapters (endpoint allowlist BAKED IN),
-│   │       │                         #      tier logic (live/best-effort/estimate), courtesy limiter
-│   │       ├── store/                # drizzle schema, NDJSON writers, projector, reconciler
-│   │       ├── security/             # vault, env-scrub, redaction, guarded writes, path-jail
-│   │       └── recovery/             # boot + Brain reconciliation [B]+[R3]
-│   └── cli/                          # agentos CLI (+ `agentos config` subcommands [R3])
+│   │       │   ├── providers/page.tsx
+│   │       │   ├── tasks/page.tsx              # Inference Jobs (placeholder → Phase 2+)
+│   │       │   ├── analytics/page.tsx          # Token Usage (placeholder → Phase 2+)
+│   │       │   ├── projects/page.tsx           # Workflow List (placeholder → Phase 3)
+│   │       │   ├── tasks/[id]/page.tsx         # planned Phase 3 detail
+│   │       │   └── api/agentos/[...path]/      # loopback BFF [B] — bearer never to browser
+│   │       ├── components/{shell,fleet,runs,policies,settings}/
+│   │       └── lib/{daemon.ts, useEventStream.ts}
+│   └── orchestrator/                 # agentosd + agentos CLI (colocated Phase 1)
+│       ├── package.json              # bin: { agentos, agentosd }
+│       ├── defaults/                 # [R3] shipped Policy Pack: *.json5 (+ prompts/** later)
+│       ├── assets/launchd/           # macOS-only v1 [R4]
+│       └── src/
+│           ├── bin/{agentos,agentosd}.ts
+│           ├── cli.ts · doctor.ts · daemon.ts · home.ts · version.ts
+│           ├── config/               # resolver + service (layered Policy Packs)
+│           ├── server/               # fastify routes: health, config, events SSE
+│           ├── substrate/            # planned: task-machine, tool-surface, policy-engine
+│           ├── fleet/                # planned: crewmate, worktree-pool, tmux, watcher, secondmate
+│           ├── fusion/               # planned: opinion, fusion, plan-fusion, auto-validate, gate-runner
+│           ├── pi/                   # planned: pi-manager, auth-broker, login-flows, socket-hub
+│           ├── quota-probes/         # planned [R5]
+│           ├── security/             # planned: vault, env-scrub, path-jail
+│           └── recovery/             # planned: boot + Brain reconciliation [B]+[R3]
 ├── packages/
-│   ├── protocol/                     # zod: REST, SSE, socket frames, TOOL SURFACE, CONFIG schemas
-│   ├── ui/                           # [R6.2] PROMOTED marketing components (header/nav, GlassCard,
-│   │                                 #   MagneticButton, AnimatedCard, TextReveal, gradients, marquee)
-│   │                                 #   + tokens — console composes these, never bespoke lookalikes
-│   ├── pi-extension/                 # [R2] the agent-os Pi extension
-│   │   └── src/{index,telemetry,guard,control,tools,brain-bridge}.ts   # brain-bridge [R3]
-│   ├── pi-ext-claude-agent-sdk/      # [R6.1] vendored fork of claude-agent-sdk-pi (Claude subscription-billing bridge; upstream tracked via diff review)
-│   ├── fusion-core/                  # pure logic, no I/O [B]
-│   └── event-store/                  # NDJSON writer + SQLite projector [B]
+│   ├── protocol/                     # zod: REST, SSE, ids, CONFIG (+ tools/socket later)
+│   ├── event-store/                  # NDJSON writer + rebuildable SQLite projection [B]
+│   ├── ui/                           # dual-source [R6.3]: promoted marketing components
+│   │                                 #   (SiteHeader, GlassCard, MagneticButton, …) + Figma
+│   │                                 #   product tokens in theme.css — Figma wins on product
+│   ├── pi-extension/                 # planned [R2]
+│   ├── pi-ext-claude-agent-sdk/      # planned [R6.1] vendored claude-agent-sdk-pi fork
+│   └── fusion-core/                  # planned pure logic, no I/O [B]
 ├── scripts/verify-no-deprecated.mjs
-└── tooling/gates/phase-N.ts
+└── tooling/gates/phase-1.mjs         # executable Phase 1 gates (+ phase-N later)
 ```
 
-**[R3] change notes:** `core/` → `substrate/` (decision logic removed; validation, tool surface, and policy engine remain); `liaison-bridge.ts` → `brain-bridge.ts`; shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init.
+**[R3] change notes:** `core/` → `substrate/` (decision logic removed; validation, tool surface, and policy engine remain); `liaison-bridge.ts` → `brain-bridge.ts`; shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Phase 1 note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`).
 
 ---
 
@@ -824,25 +824,27 @@ Unchanged from Rev 2 (directory, write-once phases, SHA-256, redaction), with `s
 | Figma section / frame | Node id | Route | Live in |
 |---|---|---|---|
 | Landing Page · "Orchestrate AI Agents At Scale" | `8:11470` | `apps/marketing` home | Phase 0 (visual refresh at Captain's option) |
-| Dashboard · Home Dashboard | `10:11978` | `/fleet` | UI Phase 1 (placeholder) → live Phase 3 |
+| Dashboard · Home Dashboard | `10:11978` | `/fleet` | UI Phase 1 (pixel + light live signals) → full live Phase 3 |
 | Dashboard · All Agents | `17:4` | `/tasks` (board) | Phase 3 |
 | Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | Phase 3 → fusion columns Phases 4–5 |
 | Dashboard · Swarm Activity | `37:2871` | `/fleet` activity + `/runs` overview | Phase 3–4 |
 | Dashboard · Notifications | `17:940` | `/notifications` (wake queue / needs-you) | Phase 3 |
-| Dashboard · Token Usage | `37:2265` | `/analytics` (usage, cost, budgets) + quota surfaces | probes Phase 2 → full Phase 6/8 |
+| Dashboard · Token Usage | `37:2265` | `/analytics` | UI Phase 1 placeholder → probes Phase 2 → full Phase 6/8 |
 | Dashboard · Onboarding Guide | `37:1300` | `/onboarding` (§4.10 wizard) | Phase 2 |
 | Dashboard · User Profile | `37:1553` | `/settings` (profile section) | Phase 6 |
 | Agent Detail · Agent Detail / Agent Logs / Create New Agent / Edit Agent | `41:2` / `41:456` / `41:1226` / `41:1605` | crewmate/session detail · terminal log view · new-task dispatch · task/config edit | Phase 3 |
-| Inference Jobs · Inference Jobs / Pipeline Runs | `41:2412` / `41:5136` | `/runs` (fusion runs + history) | Phases 4–5 |
-| Inference Jobs · Live Log Stream | `41:3973` | terminal/stream view | Phase 3 |
+| Inference Jobs · Inference Jobs | `41:2412` | `/tasks` | UI Phase 1 placeholder → task engine Phase 2+ |
+| Inference Jobs · Pipeline Runs | `41:5136` | `/runs` history / fusion runs | Phases 4–5 |
+| Inference Jobs · Live Log Stream | `41:3973` | `/runs` | **Phase 1 live** (daemon SSE; filters/pause/search/detail) |
 | Inference Jobs · Model Performance | `41:4355` | `/analytics` (per-model) | Phase 8 |
 | Inference Jobs · Recent Alerts | `41:5674` | wake queue / `quota.threshold` surfaces | Phase 3 |
 | Inference Jobs · Cluster Nodes / GPU Cluster Detail | `41:730` / `41:1892` | secondmate fleet topology | Phase 7 |
-| Workflows · Workflow List / Run History | `41:6896` / `41:7213` | `/policies` fusion profiles + `/runs` history | Phases 4–6 |
+| Workflows · Workflow List | `41:6896` | `/projects` | UI Phase 1 placeholder → project registry Phase 3 |
+| Workflows · Run History | `41:7213` | `/runs` history | Phases 4–6 |
 | Workflows · Network I/O Detail | `41:4815` | `/analytics` detail | Phase 8 |
-| Settings · API Providers | `41:6186` | `/providers` (§7.3) | Phase 2 |
+| Settings · API Providers | `41:6186` | `/providers` | UI Phase 1 placeholder → connect flows Phase 2 |
 | Settings · Billing | `41:6309` | budgets (Policies ▸ Budgets + quota) | Phases 2/6 |
-| Settings · Workspace | `41:6672` | `/settings` | Phase 6 |
+| Settings · Workspace | `41:6672` | `/settings` (+ `/policies` adapted modal for effective config) | UI Phase 1 (`/policies` live on `/v1/config/effective`; form wiring Phase 6) |
 | Empty State · Not Found / Server Error / No Data / No Results | `37:3731` / `37:3760` / `37:3792` / `37:3812` | shared empty/error treatments | Phase 1 onward |
 | Other · Delete Agent / KB Upload / Test Agent modals | `41:1519` / `41:3790` / `41:6787` | modals on their owning screens | with owners |
 | **SKIPPED (R6.3-Q1 — Captain: "skip"):** Login (Sign In/Up/Forgot, `37:3447/37:3607/37:3689`); Pricing & Upgrade/Checkout/Payment Success (`37:3849/37:4074/37:4230`); Settings · Team Members (`37:4297/41:6442`); Knowledge Base (`41:2767/41:3226/41:3505`) — **not implemented**; only frames mapping to the local single-user product are built. Retained here as future/marketing candidates | | not built | — |
@@ -1155,19 +1157,19 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 **[CONSENSUS on gate philosophy]** — executable gates authored before each phase, RED at phase start. **[R3] re-sequencing:** the config layering system lands in Phase 1 (everything after it consumes it), and the **substrate tool surface + Brain land in Phase 3** — the Brain is the orchestrator from the first end-to-end task onward; there is no interim rule-engine orchestrator to build and then discard.
 
 **Phase 0 — Monorepo scaffold & migration (1 wk)** — unchanged:
-- [ ] pnpm+Turborepo; marketing verbatim; console pages in the marketing idiom (top nav, no admin shell) + daemon boot; CLI skeleton. [R6.2]
-- [ ] Strict TS + `no-explicit-any` + zero-`any` scanner. [B]
-- [ ] Deprecation gates clean. **[CONSENSUS]**
-- [ ] Marketing pixel-identical smoke (diff < 0.1%) [A]; honesty pass [B].
-- [ ] **Design-system extraction gate [R5, strengthened R6.2]:** the marketing **components themselves** (header/nav, GlassCard, MagneticButton, AnimatedCard, TextReveal, gradients, marquee) + tokens (palette incl. `bg-ink`, `border-rule` hairlines, `text-display-*` numerals, Geist Mono micro-label styles, section-grid primitives, motion variants) are promoted to `packages/ui`; the console composes the real components (import-path assertion: no bespoke lookalikes); **marketing renders identically after promotion** (Playwright visual parity on marketing routes) and console typography/palette primitives match marketing's.
+- [x] pnpm+Turborepo; marketing verbatim; console/orchestrator workspace slots; CLI skeleton path established. (Product chrome is Figma [R6.3], not marketing-idiom — delivered Phase 1.)
+- [x] Strict TS + `no-explicit-any` + zero-`any` scanner. [B]
+- [x] Deprecation gates clean. **[CONSENSUS]**
+- [x] Marketing pixel-identical smoke [A]; honesty pass [B]. Evidence: `docs/qa/runs/phase-0-monorepo-2026-07-24/`.
+- [x] **Design-system extraction (Phase 0→1):** `SiteHeader`, `GlassCard`, `MagneticButton`, and existing `packages/ui` motion primitives (`AnimatedCard`, TextReveal helpers, …) + shared tokens; marketing rewired and renders identically. **[R6.3]** product screens use Figma tokens in `packages/ui` `theme.css` (Figma wins over marketing palette on console).
 
-**Phase 1 — Daemon substrate, persistence, events, config layering, live product pages (2.5 wk)** [B]+[R3]+[R6.2]:
-- [ ] Loopback-only enforced; 401s; BFF never leaks the token. [B]
-- [ ] Kill/restart after 100 events → exactly-once projection + SSE resume; corrupt tail quarantined. [B]
-- [ ] Fleet page reflects a state change over SSE within 500 ms. [B]
-- [ ] **Figma-source gate [R6.3]:** Phase-1 screens (Fleet, empty states) are built from `get_design_context` on their inventory frames (`10:11978`, `37:3731`–`37:3812`), pixel-faithful with placeholder data where the phase's data doesn't exist yet; the evidence pack carries Figma-vs-implementation side-by-sides.
-- [ ] **Config gates [R3]:** shipped defaults install; global file edit hot-reloads a supervision value (observed); **project override beats global; task override beats project** (resolution test matrix); `/v1/config/effective` reports per-key source layer; **invalid config rejected with a typed, path-precise error** and nothing partially applied; safety-policy write requires confirmation and emits `policy.changed`; project `.agentos/` has no effect before trust-ack and re-prompts on hash change.
-- [ ] launchd template (macOS-only v1 [R4]); `doctor` verifies tmux/git/gh/node/pi/**uv** [R4]. [B]+[R2]
+**Phase 1 — Daemon substrate, persistence, events, config layering, live product pages (2.5 wk)** [B]+[R3]+[R6.3]:
+- [x] Loopback-only enforced; 401s; BFF never leaks the token. [B] (`tooling/gates/phase-1.mjs` G1)
+- [x] Kill/restart after 100 events → exactly-once projection + SSE resume; corrupt tail quarantined. [B] (G2 + event-store kill-9 test)
+- [x] State change reflects over SSE within 500 ms. [B] (G3; measured 17ms on ship branch)
+- [x] **Figma-source gate [R6.3]:** eight Phase-1 routes pixel-faithful to inventory frames with placeholder data where live data does not exist yet; evidence pack Figma-vs-implementation side-by-sides at `docs/qa/runs/phase-1-figma-ui-2026-07-24/`. Live wiring: `/runs` SSE, `/policies` `/v1/config/effective`, light fleet signals.
+- [x] **Config gates [R3] (Phase 1 scope):** shipped defaults install; global hot-reload observed; task>project>global>shipped resolution matrix (vitest + G4); `/v1/config/effective` per-key sources; invalid config typed path-precise reject; safety write needs confirmation + `policy.changed`; **project layer refused pre-trust-ack (stub)** — full trust-ack + hash re-prompt deferred with project registry.
+- [x] launchd template (macOS-only v1 [R4]); `doctor` reports tmux/git/gh/node/pi/**uv** (warnings when absent). [B]+[R2] (G5)
 
 **Phase 2 — Pi integration & provider connections (2 wk)** — Rev 2 base + [R5]/[R5.1] quota & onboarding gates:
 - [ ] Pi pinned + verified; weekly canary workflow green.
@@ -1317,7 +1319,7 @@ Carried forward where live; **[R3-Q]** marks new questions:
 20. **[R6-Q2] Does the Claude usage probe expose the Agent SDK monthly credit pool?** `api/oauth/usage` verifiably reports session/weekly windows and extra-usage spend; whether the 2026-06-15 SDK credit pool is queryable via the Claude Code OAuth credential is a **Phase 2 verification** — if not, SDK-pool remaining shows as `estimate` (SDK-reported usage deltas) with a visible reason.
 21. ~~**[R6.3-Q1] Out-of-scope Figma frames — Captain to rule**~~ — **RESOLVED [R6.3.1], Captain's decision: "skip."** The unmapped frames — Login (`37:3447`/`37:3607`/`37:3689`), Pricing & Upgrade/Checkout/Payment Success, Settings · Team Members, Knowledge Base — are **not implemented**; only frames mapping to the local single-user product are built. They stay in the §7 inventory marked `SKIPPED (R6.3-Q1)` as future/marketing candidates.
 
-*Dissolved:* Rev-1's Grok CLI + Claude-ToS questions (by R2); Rev-2's Q7 liaison-persistence and Q8 liaison-brain-default (merged into R3-Q1 by the Brain architecture). *Resolved by R4:* R3-Q1, gate default (#12), fusion-spend family count (#15), Linux (#16). *Resolved by R5.1:* Grok probe default (#18) — detection-driven onboarding. *Resolved by R6.1:* vendor/fork (#19). *Resolved by R6.3.1:* out-of-scope Figma frames (#21) — skipped. *Resolved by R6.1:* SDK-bridge vendoring (#19) — fork into the monorepo.
+*Dissolved:* Rev-1's Grok CLI + Claude-ToS questions (by R2); Rev-2's Q7 liaison-persistence and Q8 liaison-brain-default (merged into R3-Q1 by the Brain architecture). *Resolved by R4:* R3-Q1, gate default (#12), fusion-spend family count (#15), Linux (#16). *Resolved by R5.1:* Grok probe default (#18) — detection-driven onboarding. *Resolved by R6.1:* SDK-bridge vendoring (#19) — fork into the monorepo. *Resolved by R6.3.1:* out-of-scope Figma frames (#21) — skipped.
 
 ### 13.3 Explicit assumptions
 

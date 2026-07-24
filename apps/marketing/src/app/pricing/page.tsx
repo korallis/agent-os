@@ -32,7 +32,7 @@ export default function PricingPage() {
             animate={pricingInView ? "visible" : "hidden"}
             className="grid grid-cols-1 md:grid-cols-3 gap-6 lg:gap-8"
           >
-            {pricingPlans.map((plan, i) => (
+            {pricingPlans.map((plan) => (
               <motion.div key={plan.name} variants={fadeUp}>
                 <PricingCard plan={plan} />
               </motion.div>

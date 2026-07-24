@@ -68,7 +68,7 @@ function StoriesSection() {
           animate={inView ? "visible" : "hidden"}
           className="space-y-8"
         >
-          {customerStories.map((story, i) => (
+          {customerStories.map((story) => (
             <motion.div key={story.company} variants={fadeUp}>
               <GlassCard className="p-8 md:p-10">
                 <div className="flex flex-col md:flex-row gap-8">
