@@ -159,7 +159,12 @@ export class ConnectionRegistry {
       if (presentProviders.has(existing.provider)) continue;
       // API-key connections are not driven by auth-store presence.
       if (existing.kind === "pi-api-key") continue;
-      if (existing.authStorePresence === null && existing.health === "unknown") continue;
+      if (
+        existing.authStorePresence === null &&
+        (existing.health === "unknown" || existing.health === "setup")
+      ) {
+        continue;
+      }
       const cleared: ProviderConnection = {
         ...existing,
         authStorePresence: null,

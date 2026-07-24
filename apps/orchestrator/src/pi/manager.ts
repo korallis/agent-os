@@ -160,8 +160,8 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
 }
 
 export function listDetectedProviders(agentosHome: string): ReturnType<typeof readAuthStorePresence> {
-  const detection = detectPi(agentosHome);
-  const managedHome = detection.isolationMode === "managed" ? detection.managedHome : null;
+  const configDirEnv = detectConfigDirEnv();
+  const managedHome = configDirEnv !== null ? managedPiHome(agentosHome) : null;
   const authJsonPath = resolveAuthJsonPathWithFallback(managedHome);
   return readAuthStorePresence(authJsonPath);
 }

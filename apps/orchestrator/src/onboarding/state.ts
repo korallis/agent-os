@@ -163,7 +163,7 @@ export class OnboardingService {
           provider,
           selected: selected.has(provider),
           detected: detected.has(provider),
-          authVerified: existing?.authVerified ?? detected.has(provider),
+          authVerified: detected.has(provider),
           claudeBillingMode: existing?.claudeBillingMode ?? null,
           claudeSdk: existing?.claudeSdk ?? null,
         };
@@ -180,15 +180,15 @@ export class OnboardingService {
       ...this.state,
       providers: this.state.providers.map((p) =>
         p.provider === provider
-          ? { ...p, authVerified: detected.has(provider) || p.authVerified, detected: detected.has(provider) }
+          ? { ...p, authVerified: detected.has(provider), detected: detected.has(provider) }
           : p,
       ),
     };
     const claude = this.state.providers.find((p) => p.provider === "anthropic" && p.selected);
     if (claude?.selected === true) {
-      this.state = { ...this.state, step: "claude-billing" };
+      this.state = { ...this.state, step: stepAtOrAdvance(this.state.step, "claude-billing") };
     } else if (this.state.providers.filter((p) => p.selected).every((p) => p.authVerified)) {
-      this.state = { ...this.state, step: "probes" };
+      this.state = { ...this.state, step: stepAtOrAdvance(this.state.step, "probes") };
     }
     this.save(previous);
     return this.state;
@@ -288,7 +288,7 @@ export class OnboardingService {
       sdk.isolationDefaults &&
       sdk.catalogHealthcheck
     ) {
-      this.state = { ...this.state, step: "probes" };
+      this.state = { ...this.state, step: stepAtOrAdvance(this.state.step, "probes") };
     }
     this.save(previous);
     return this.state;
