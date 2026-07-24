@@ -318,6 +318,140 @@ describe("SCOUT read-only enforcement", () => {
     const lease = service.worktrees.list().find((l) => l.path === session.worktreePath);
     expect(lease?.state).toBe("quarantined");
   });
+
+  it("fails closed when git status cannot verify the worktree", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId } = seedTask(service, { name: "scout-audit-fail", shape: "SCOUT", role: "scout" });
+
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "scout",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const session = (spawned.data as { session: { sessionId: string; worktreePath: string } }).session;
+
+    // Destroy the git metadata so status cannot run — policy must not report clean.
+    rmSync(join(session.worktreePath, ".git"), { recursive: true, force: true });
+    const failed = service.tools.auditScoutSession(session.sessionId);
+    expect(failed.clean).toBe(false);
+    expect(failed.changedPaths.join(" ")).toMatch(/audit could not be performed/i);
+
+    const lease = service.worktrees.list().find((l) => l.path === session.worktreePath);
+    expect(lease?.state).toBe("quarantined");
+  });
+});
+
+describe("worktree lease reclaim on stop/respawn", () => {
+  it("stop/respawn cycles never exceed poolSize leased trees", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "respawn-pool",
+      shape: "SHIP",
+      role: "builder",
+    });
+
+    // Shipped default is 4; cycles beyond that must not exhaust the pool.
+    const poolSize = 4;
+    let sessionId: string | undefined;
+
+    for (let i = 0; i < poolSize + 2; i++) {
+      if (sessionId !== undefined) {
+        const stopped = service.tools.invoke("stop_crewmate", {
+          sessionId,
+          reason: `cycle-${i}`,
+        });
+        expect(stopped.ok).toBe(true);
+      }
+
+      const spawn =
+        sessionId === undefined
+          ? service.tools.invoke("spawn_crewmate", {
+              taskId,
+              role: "builder",
+              model,
+              thinking: "low",
+              vars: {},
+            })
+          : service.tools.invoke("respawn_crewmate", {
+              sessionId,
+              reason: `cycle-${i}`,
+            });
+      expect(spawn.ok).toBe(true);
+      sessionId = (spawn.data as { session: { sessionId: string } }).session.sessionId;
+
+      const leased = service.worktrees.list().filter((l) => l.state === "leased");
+      expect(leased.length).toBeLessThanOrEqual(poolSize);
+      expect(leased.length).toBe(1);
+    }
+  });
+});
+
+describe("send_to_crew delivery", () => {
+  it("throws CONFLICT when both inject and send-keys fail", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId } = seedTask(service, { name: "dead-channels", shape: "SHIP", role: "builder" });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+
+    // No session sockets in the harness; force tmux fallback dead too.
+    const original = service.tmux.sendKeys.bind(service.tmux);
+    service.tmux.sendKeys = (): void => {
+      throw new Error("tmux channel dead");
+    };
+    try {
+      const result = service.tools.invoke("send_to_crew", {
+        sessionId,
+        message: "gate FAIL: verbatim lines must not report success undelivered",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("CONFLICT");
+    } finally {
+      service.tmux.sendKeys = original;
+    }
+  });
+});
+
+describe("worktree verified-reset fail-closed", () => {
+  it("quarantines when git status cannot prove the tree clean", async () => {
+    const { WorktreePool } = await import("../src/fleet/worktree-pool.js");
+    const home = temp("agentos-wt-fail-");
+    const pool = new WorktreePool(home, {
+      poolSize: 4,
+      reclaimPolicy: "verified-reset",
+    });
+    const projectId = "01JPROJ0000000000000000001";
+    const taskId = "01JTASK0000000000000000001";
+    const sessionId = "01JSESS0000000000000000001";
+    const prev = process.env.AGENTOS_FAKE_GIT;
+    process.env.AGENTOS_FAKE_GIT = "1";
+    let lease;
+    try {
+      lease = pool.lease({
+        projectId,
+        repoPath: home,
+        taskId,
+        sessionId,
+        branch: "ao/test",
+      });
+    } finally {
+      if (prev === undefined) delete process.env.AGENTOS_FAKE_GIT;
+      else process.env.AGENTOS_FAKE_GIT = prev;
+    }
+    // Marker directory has no real git — status fails, so release must quarantine.
+    const released = pool.release(lease.id, {});
+    expect(released.state).toBe("quarantined");
+    expect(released.quarantineReason ?? "").toMatch(/git status|not a git|exit/i);
+  });
 });
 
 describe("crewmate questions", () => {

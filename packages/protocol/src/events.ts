@@ -299,6 +299,7 @@ export const worktreeReleasedEventSchema = z.strictObject({
     projectId: ulidSchema,
     path: z.string(),
     quarantined: z.boolean(),
+    reason: z.string().optional(),
   }),
 });
 

@@ -227,8 +227,9 @@ export class WorktreePool {
   }
 
   /**
-   * Release a lease. On verified-reset, reset the tree; on unexpected dirt,
-   * quarantine without destructive git.
+   * Release a lease. On verified-reset, reset the tree; on unexpected dirt or
+   * any git failure we could not prove clean for, quarantine without treating
+   * the tree as idle.
    */
   release(leaseId: string, options: { finalSha?: string; forceQuarantine?: boolean } = {}): WorktreeLease {
     const lease = this.leases.get(leaseId);
@@ -237,15 +238,65 @@ export class WorktreePool {
     }
 
     let quarantined = options.forceQuarantine === true;
+    let quarantineReason: string | undefined = quarantined
+      ? "forceQuarantine"
+      : undefined;
     if (this.config.reclaimPolicy === "quarantine-always") {
       quarantined = true;
+      quarantineReason = "reclaimPolicy=quarantine-always";
     } else if (!quarantined && process.env.AGENTOS_FAKE_GIT !== "1") {
       const dirty = spawnSync("git", ["-C", lease.path, "status", "--porcelain"], {
         encoding: "utf8",
         timeout: 15_000,
       });
-      if (dirty.status === 0 && dirty.stdout.trim().length > 0 && options.finalSha === undefined) {
+      if (dirty.error !== undefined || dirty.status !== 0) {
+        // Could not prove the tree is clean — fail closed into quarantine.
         quarantined = true;
+        quarantineReason = (
+          dirty.error?.message ||
+          dirty.stderr ||
+          dirty.stdout ||
+          `git status exit ${String(dirty.status)}`
+        )
+          .toString()
+          .trim();
+      } else if (dirty.stdout.trim().length > 0 && options.finalSha === undefined) {
+        quarantined = true;
+        quarantineReason = "dirty worktree without finalSha";
+      }
+    }
+
+    if (!quarantined && process.env.AGENTOS_FAKE_GIT !== "1" && existsSync(join(lease.path, ".git"))) {
+      const reset = spawnSync("git", ["-C", lease.path, "reset", "--hard", "HEAD"], {
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      if (reset.error !== undefined || reset.status !== 0) {
+        quarantined = true;
+        quarantineReason = (
+          reset.error?.message ||
+          reset.stderr ||
+          reset.stdout ||
+          `git reset --hard exit ${String(reset.status)}`
+        )
+          .toString()
+          .trim();
+      } else {
+        const clean = spawnSync("git", ["-C", lease.path, "clean", "-fd"], {
+          encoding: "utf8",
+          timeout: 30_000,
+        });
+        if (clean.error !== undefined || clean.status !== 0) {
+          quarantined = true;
+          quarantineReason = (
+            clean.error?.message ||
+            clean.stderr ||
+            clean.stdout ||
+            `git clean -fd exit ${String(clean.status)}`
+          )
+            .toString()
+            .trim();
+        }
       }
     }
 
@@ -257,6 +308,7 @@ export class WorktreePool {
         sessionId: null,
         leasedAt: null,
         lastSha: options.finalSha ?? lease.lastSha,
+        ...(quarantineReason !== undefined ? { quarantineReason } : {}),
       };
       this.leases.set(leaseId, q);
       this.persistProject(lease.projectId);
@@ -267,28 +319,20 @@ export class WorktreePool {
           projectId: lease.projectId,
           path: lease.path,
           quarantined: true,
+          ...(quarantineReason !== undefined ? { reason: quarantineReason } : {}),
         },
       });
       return q;
     }
 
-    // verified-reset path
-    if (process.env.AGENTOS_FAKE_GIT !== "1" && existsSync(join(lease.path, ".git"))) {
-      spawnSync("git", ["-C", lease.path, "reset", "--hard", "HEAD"], {
-        encoding: "utf8",
-        timeout: 30_000,
-      });
-      spawnSync("git", ["-C", lease.path, "clean", "-fd"], {
-        encoding: "utf8",
-        timeout: 30_000,
-      });
-    }
-
     const idle: WorktreeLease = {
-      ...lease,
+      id: lease.id,
+      projectId: lease.projectId,
+      path: lease.path,
       state: "idle",
       taskId: null,
       sessionId: null,
+      branch: lease.branch,
       leasedAt: null,
       lastSha: options.finalSha ?? lease.lastSha,
     };

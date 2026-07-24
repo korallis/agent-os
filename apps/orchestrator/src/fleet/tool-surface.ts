@@ -499,7 +499,33 @@ export class ToolSurface {
   private cancelTask(raw: Record<string, unknown>): TaskSnapshot {
     const input = cancelTaskInputSchema.parse(raw);
     const task = this.requireTask(input.taskId);
+    this.releaseWorktreeLeases({ taskId: input.taskId });
     return this.transition(task, "CANCELLED", input.reason);
+  }
+
+  /**
+   * Reclaim worktree slots for a session and/or task. No finalSha so the pool
+   * verified-resets clean trees and quarantines dirty ones.
+   */
+  private releaseWorktreeLeases(filter: {
+    sessionId?: string;
+    taskId?: string | null;
+  }): void {
+    for (const lease of this.deps.worktrees.list()) {
+      if (lease.state !== "leased" && lease.state !== "reclaiming") continue;
+      const sessionMatch =
+        filter.sessionId !== undefined && lease.sessionId === filter.sessionId;
+      const taskMatch =
+        filter.taskId !== undefined &&
+        filter.taskId !== null &&
+        lease.taskId === filter.taskId;
+      if (!sessionMatch && !taskMatch) continue;
+      try {
+        this.deps.worktrees.release(lease.id);
+      } catch {
+        // best-effort — do not block stop/lost/cancel on a reclaim race
+      }
+    }
   }
 
   private readTask(raw: Record<string, unknown>): TaskSnapshot {
@@ -839,6 +865,7 @@ export class ToolSurface {
     }
     this.deps.tmux.killWindow(session.tmuxWindow);
     void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
+    this.releaseWorktreeLeases({ sessionId: input.sessionId });
     this.sessions.set(input.sessionId, { ...session, status: "stopped" });
     this.sink({
       type: "session.stopped",
@@ -1051,6 +1078,12 @@ export class ToolSurface {
         sent = false;
       }
     }
+    if (!sent) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `no live channel to session ${input.sessionId} — message not delivered`,
+      );
+    }
     return { sent };
   }
 
@@ -1148,7 +1181,9 @@ export class ToolSurface {
   /**
    * SCOUT sessions are read-only by policy. Enforcement is an audit of the real
    * worktree: any tracked modification or untracked file quarantines the lease
-   * and escalates. Called when a scout session settles or is stopped.
+   * and escalates. Only a successful empty porcelain status is clean — git
+   * failure or a missing .git on a real lease fails closed. Called when a
+   * scout session settles or is stopped.
    */
   auditScoutSession(sessionId: string): { clean: boolean; changedPaths: string[] } {
     const session = this.sessions.get(sessionId);
@@ -1159,25 +1194,70 @@ export class ToolSurface {
       return { clean: true, changedPaths: [] };
     }
     const path = session.worktreePath;
-    if (path === null || !existsSync(join(path, ".git"))) {
+    if (path === null) {
       return { clean: true, changedPaths: [] };
+    }
+
+    // Fake-git marker trees are not auditable via git; real leases must have .git.
+    if (process.env.AGENTOS_FAKE_GIT === "1") {
+      return { clean: true, changedPaths: [] };
+    }
+    if (!existsSync(join(path, ".git"))) {
+      return this.failScoutAudit(
+        session,
+        sessionId,
+        path,
+        ["(audit could not be performed: worktree is not a git repository)"],
+        `SCOUT ${sessionId} worktree is not a git repository — write policy could not be verified`,
+      );
     }
 
     const status = spawnSync("git", ["-C", path, "status", "--porcelain"], {
       encoding: "utf8",
       timeout: 15_000,
     });
-    const changedPaths =
-      status.status === 0
-        ? status.stdout
-            .split("\n")
-            .map((l) => l.trim())
-            .filter((l) => l.length > 0)
-        : [];
+    if (status.error !== undefined || status.status !== 0) {
+      const detail = (
+        status.error?.message ||
+        status.stderr ||
+        status.stdout ||
+        `exit ${String(status.status)}`
+      )
+        .toString()
+        .trim();
+      return this.failScoutAudit(
+        session,
+        sessionId,
+        path,
+        [`(audit could not be performed: git status failed: ${detail})`],
+        `SCOUT ${sessionId} git status failed — write policy could not be verified: ${detail}`,
+      );
+    }
+
+    const changedPaths = status.stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
     if (changedPaths.length === 0) {
       return { clean: true, changedPaths: [] };
     }
 
+    return this.failScoutAudit(
+      session,
+      sessionId,
+      path,
+      changedPaths,
+      `SCOUT ${sessionId} wrote ${changedPaths.length} path(s) in a read-only worktree`,
+    );
+  }
+
+  private failScoutAudit(
+    session: FleetSession,
+    sessionId: string,
+    path: string,
+    changedPaths: string[],
+    summary: string,
+  ): { clean: boolean; changedPaths: string[] } {
     let quarantined = false;
     for (const lease of this.deps.worktrees.list().filter((l) => l.sessionId === sessionId)) {
       this.deps.worktrees.release(lease.id, { forceQuarantine: true });
@@ -1196,7 +1276,7 @@ export class ToolSurface {
     if (session.taskId !== null) {
       this.invoke("escalate_to_captain", {
         taskId: session.taskId,
-        summary: `SCOUT ${sessionId} wrote ${changedPaths.length} path(s) in a read-only worktree`,
+        summary,
         severity: "critical",
       });
     }
@@ -1407,6 +1487,7 @@ export class ToolSurface {
     if (session === undefined) return;
     this.sessions.set(sessionId, { ...session, status: "lost" });
     void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
+    this.releaseWorktreeLeases({ sessionId });
     this.sink({
       type: "session.lost",
       payload: { sessionId, taskId: session.taskId, reason },

@@ -40,6 +40,8 @@ export const worktreeLeaseSchema = z.strictObject({
   branch: z.string().nullable(),
   leasedAt: isoTimestampSchema.nullable(),
   lastSha: z.string().nullable(),
+  /** Present when state is quarantined — why the tree was not returned to idle. */
+  quarantineReason: z.string().optional(),
 });
 export type WorktreeLease = z.infer<typeof worktreeLeaseSchema>;
 
