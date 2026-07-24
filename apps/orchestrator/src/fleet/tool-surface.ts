@@ -647,6 +647,8 @@ export class ToolSurface {
 
     let worktreePath: string | null = null;
     let branch: string | null = task.branch;
+    let leaseId: string | null = null;
+    let sessionSocketOpened = false;
 
     if (input.role === "builder" || input.role === "scout" || input.role === "planner") {
       try {
@@ -659,151 +661,171 @@ export class ToolSurface {
         });
         worktreePath = lease.path;
         branch = lease.branch;
+        leaseId = lease.id;
       } catch (error) {
         if (error instanceof Error && error.message.includes("exhausted")) {
           task = this.transition(task, "WAITING_WORKTREE", error.message);
           throw new ToolSurfaceError("CONFLICT", error.message);
         }
-        if (error instanceof Error && error.message.includes("git worktree add failed")) {
+        if (
+          error instanceof Error &&
+          (error.message.includes("git worktree add failed") ||
+            error.message.includes("git worktree branch"))
+        ) {
           throw new ToolSurfaceError("SPAWN_FAILED", error.message);
         }
         throw error;
       }
     }
 
-    const cwd = worktreePath ?? project.path;
-    const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
+    try {
+      const cwd = worktreePath ?? project.path;
+      const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
 
-    let tmuxWindow = `agentos:${windowName}`;
-    if (fake) {
-      this.deps.tmux.newWindow({
-        windowName,
-        argv: ["echo", "fake-pi", input.role, sessionId],
-        cwd,
-      });
-    } else {
-      if (this.deps.pi?.binary == null) {
-        throw new ToolSurfaceError(
-          "PI_UNAVAILABLE",
-          "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
-        );
-      }
-      if (this.deps.extensionPath === undefined) {
-        throw new ToolSurfaceError(
-          "PI_UNAVAILABLE",
-          "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
-        );
-      }
-      // Control channel is a hard precondition of spawn — never launch Pi with a dead socket.
-      let socketPath: string;
-      try {
-        if (this.deps.sockets !== undefined) {
-          socketPath = this.deps.sockets.openSession(sessionId);
-        } else {
-          socketPath = join(this.deps.home, "sockets", `${sessionId}.sock`);
+      let tmuxWindow = `agentos:${windowName}`;
+      if (fake) {
+        this.deps.tmux.newWindow({
+          windowName,
+          argv: ["echo", "fake-pi", input.role, sessionId],
+          cwd,
+        });
+      } else {
+        if (this.deps.pi?.binary == null) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
+          );
         }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new ToolSurfaceError(
-          "SPAWN_FAILED",
-          `session control channel failed to open: ${message}`,
-        );
+        if (this.deps.extensionPath === undefined) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
+          );
+        }
+        // Control channel is a hard precondition of spawn — never launch Pi with a dead socket.
+        let socketPath: string;
+        try {
+          if (this.deps.sockets !== undefined) {
+            socketPath = this.deps.sockets.openSession(sessionId);
+            sessionSocketOpened = true;
+          } else {
+            socketPath = join(this.deps.home, "sockets", `${sessionId}.sock`);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new ToolSurfaceError(
+            "SPAWN_FAILED",
+            `session control channel failed to open: ${message}`,
+          );
+        }
+
+        const prompt =
+          input.prompt ??
+          `Agent OS role=${input.role}. Task: ${task.title}\n\n${task.intent}`;
+        const spec = buildPiSpawnSpec({
+          agentosHome: this.deps.home,
+          detection: this.deps.pi,
+          args: ["--mode", "json", "-p", prompt, "--model", input.model],
+          cwd,
+          sessionId,
+          role: input.role,
+          socketPath,
+          extensionPath: this.deps.extensionPath,
+          cleanRoom: input.cleanRoom,
+        });
+        const win = this.deps.tmux.newWindow({
+          windowName,
+          argv: [spec.binary, ...spec.args],
+          env: spec.env,
+          cwd,
+        });
+        tmuxWindow = win.target;
       }
 
-      const prompt =
-        input.prompt ??
-        `Agent OS role=${input.role}. Task: ${task.title}\n\n${task.intent}`;
-      const spec = buildPiSpawnSpec({
-        agentosHome: this.deps.home,
-        detection: this.deps.pi,
-        args: ["--mode", "json", "-p", prompt, "--model", input.model],
-        cwd,
+      const now = new Date().toISOString();
+      const taskSession: TaskSession = {
         sessionId,
         role: input.role,
-        socketPath,
-        extensionPath: this.deps.extensionPath,
-        cleanRoom: input.cleanRoom,
-      });
-      const win = this.deps.tmux.newWindow({
-        windowName,
-        argv: [spec.binary, ...spec.args],
-        env: spec.env,
-        cwd,
-      });
-      tmuxWindow = win.target;
-    }
-
-    const now = new Date().toISOString();
-    const taskSession: TaskSession = {
-      sessionId,
-      role: input.role,
-      model: input.model,
-      thinking: input.thinking,
-      family,
-      tmuxWindow,
-      worktreePath,
-      status: fake ? "settled" : "running",
-      startedAt: now,
-      lastEventAt: now,
-    };
-    const fleetSession: FleetSession = {
-      sessionId,
-      taskId: task.id,
-      role: input.role,
-      model: input.model,
-      thinking: input.thinking,
-      family,
-      tmuxWindow,
-      status: fake ? "settled" : "running",
-      worktreePath,
-      startedAt: now,
-    };
-    this.sessions.set(sessionId, fleetSession);
-
-    task = {
-      ...task,
-      sessions: [...task.sessions.filter((s) => s.sessionId !== sessionId), taskSession],
-      worktreePath: worktreePath ?? task.worktreePath,
-      branch: branch ?? task.branch,
-      updatedAt: now,
-    };
-
-    if (input.role === "builder" && task.phase !== "BUILDING") {
-      task = this.transition(task, "BUILDING", "builder spawned");
-    } else if (input.role === "scout" && task.phase === "QUEUED") {
-      task = this.transition(task, "BUILDING", "scout spawned");
-    } else if (input.role === "planner" && task.phase === "DISPATCH_RESOLVED") {
-      task = this.transition(task, "PLANNING", "planner spawned");
-    } else if (input.role === "validator" && task.phase === "DISPATCH_RESOLVED") {
-      task = this.transition(task, "GATE_AUTHORING", "validator spawned");
-    } else {
-      this.saveTask(task);
-    }
-
-    this.sink({
-      type: "session.spawned",
-      payload: {
+        model: input.model,
+        thinking: input.thinking,
+        family,
+        tmuxWindow,
+        worktreePath,
+        status: fake ? "settled" : "running",
+        startedAt: now,
+        lastEventAt: now,
+      };
+      const fleetSession: FleetSession = {
         sessionId,
         taskId: task.id,
         role: input.role,
         model: input.model,
+        thinking: input.thinking,
         family,
         tmuxWindow,
+        status: fake ? "settled" : "running",
         worktreePath,
-      },
-    });
+        startedAt: now,
+      };
+      this.sessions.set(sessionId, fleetSession);
 
-    // Fake Pi auto-settles for zero-token idle proofs and local-only SHIP.
-    if (fake) {
-      this.deps.watcher.classify({
-        class: "AGENT_SETTLED",
-        taskId: task.id,
-        sessionId,
-        summary: `${input.role} settled (fake pi)`,
+      task = {
+        ...task,
+        sessions: [...task.sessions.filter((s) => s.sessionId !== sessionId), taskSession],
+        worktreePath: worktreePath ?? task.worktreePath,
+        branch: branch ?? task.branch,
+        updatedAt: now,
+      };
+
+      if (input.role === "builder" && task.phase !== "BUILDING") {
+        task = this.transition(task, "BUILDING", "builder spawned");
+      } else if (input.role === "scout" && task.phase === "QUEUED") {
+        task = this.transition(task, "BUILDING", "scout spawned");
+      } else if (input.role === "planner" && task.phase === "DISPATCH_RESOLVED") {
+        task = this.transition(task, "PLANNING", "planner spawned");
+      } else if (input.role === "validator" && task.phase === "DISPATCH_RESOLVED") {
+        task = this.transition(task, "GATE_AUTHORING", "validator spawned");
+      } else {
+        this.saveTask(task);
+      }
+
+      this.sink({
+        type: "session.spawned",
+        payload: {
+          sessionId,
+          taskId: task.id,
+          role: input.role,
+          model: input.model,
+          family,
+          tmuxWindow,
+          worktreePath,
+        },
       });
-    }
 
-    return { session: fleetSession, task: this.requireTask(task.id) };
+      // Fake Pi auto-settles for zero-token idle proofs and local-only SHIP.
+      if (fake) {
+        this.deps.watcher.classify({
+          class: "AGENT_SETTLED",
+          taskId: task.id,
+          sessionId,
+          summary: `${input.role} settled (fake pi)`,
+        });
+      }
+
+      return { session: fleetSession, task: this.requireTask(task.id) };
+    } catch (error) {
+      if (sessionSocketOpened) {
+        void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
+      }
+      if (leaseId !== null) {
+        try {
+          this.deps.worktrees.release(leaseId);
+        } catch {
+          // best-effort reclaim so a spawn failure cannot exhaust the pool
+        }
+      }
+      throw error;
+    }
   }
 
   private stopCrewmate(raw: Record<string, unknown>): { sessionId: string } {
@@ -1012,12 +1034,24 @@ export class ToolSurface {
     if (message.length === 0) {
       throw new ToolSurfaceError("VALIDATION_ERROR", "message or gateFailRef required");
     }
-    try {
-      this.deps.tmux.sendKeys(session.tmuxWindow, message);
-    } catch {
-      // fake tmux ok
+    // Prefer the live extension inject path when the session socket is up;
+    // fall back to tmux send-keys for panes whose control channel has dropped.
+    let sent =
+      this.deps.sockets?.sendControl(input.sessionId, {
+        type: "ctl.injectMessage",
+        sessionId: input.sessionId,
+        message,
+        ts: new Date().toISOString(),
+      }) ?? false;
+    if (!sent) {
+      try {
+        this.deps.tmux.sendKeys(session.tmuxWindow, message);
+        sent = true;
+      } catch {
+        sent = false;
+      }
     }
-    return { sent: true };
+    return { sent };
   }
 
   /** Record a blocking question a crewmate asked over its extension socket. */

@@ -153,6 +153,112 @@ describe("missing Pi is an error, not a stub", () => {
     expect(spawned.ok).toBe(false);
     expect(spawned.error?.code).toBe("PI_UNAVAILABLE");
   });
+
+  it("PI_UNAVAILABLE releases the worktree lease so the pool is not exhausted", () => {
+    const service = fleet();
+    const { taskId } = seedTask(service, { name: "pool-leak", shape: "SHIP", role: "builder" });
+
+    for (let i = 0; i < 3; i++) {
+      const spawned = service.tools.invoke("spawn_crewmate", {
+        taskId,
+        role: "builder",
+        model: "openai/gpt-4.1",
+        thinking: "low",
+        vars: {},
+      });
+      expect(spawned.ok).toBe(false);
+      expect(spawned.error?.code).toBe("PI_UNAVAILABLE");
+    }
+
+    const leased = service.worktrees.list().filter((l) => l.state === "leased");
+    expect(leased).toHaveLength(0);
+  });
+});
+
+describe("worktree idle reuse moves HEAD to the new branch", () => {
+  it("after deliver + re-lease, git HEAD matches the new lease branch", () => {
+    const service = fleet({ fakePi: true });
+    const repo = gitRepo();
+    const project = service.projects.register({
+      name: "reuse",
+      path: repo,
+      mode: "local-only",
+      trusted: true,
+    });
+
+    const create = (title: string): string => {
+      const created = service.tools.invoke("create_task", {
+        spec: {
+          shape: "SHIP" as const,
+          title,
+          intent: "i",
+          projectId: project.id,
+          mode: "local-only" as const,
+          yolo: true,
+        },
+      });
+      expect(created.ok).toBe(true);
+      const taskId = (created.data as { id: string }).id;
+      const cast = service.tools.invoke("resolve_cast", {
+        taskId,
+        roles: [
+          {
+            role: "builder",
+            model: "openai/gpt-4.1",
+            thinking: "low",
+            cleanRoom: true,
+          },
+        ],
+        familyCheckOverride: false,
+      });
+      expect(cast.ok).toBe(true);
+      return taskId;
+    };
+
+    const task1 = create("first");
+    const spawn1 = service.tools.invoke("spawn_crewmate", {
+      taskId: task1,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawn1.ok).toBe(true);
+    const path = (spawn1.data as { session: { worktreePath: string } }).session.worktreePath;
+    const branch1 = (spawn1.data as { task: { branch: string } }).task.branch;
+    expect(
+      execFileSync("git", ["-C", path, "rev-parse", "--abbrev-ref", "HEAD"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe(branch1);
+
+    writeFileSync(join(path, "change.txt"), "first task\n");
+    execFileSync("git", ["-C", path, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", path, "commit", "-qm", "first task"], { stdio: "ignore" });
+
+    const deliver = service.tools.invoke("deliver_task", { taskId: task1 });
+    expect(deliver.ok).toBe(true);
+    expect(service.worktrees.list().find((l) => l.path === path)?.state).toBe("idle");
+
+    const task2 = create("second");
+    const spawn2 = service.tools.invoke("spawn_crewmate", {
+      taskId: task2,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawn2.ok).toBe(true);
+    const path2 = (spawn2.data as { session: { worktreePath: string } }).session.worktreePath;
+    const branch2 = (spawn2.data as { task: { branch: string } }).task.branch;
+    expect(path2).toBe(path);
+    expect(branch2).not.toBe(branch1);
+    expect(
+      execFileSync("git", ["-C", path2, "rev-parse", "--abbrev-ref", "HEAD"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe(branch2);
+  });
 });
 
 describe("tool bridge authorization", () => {

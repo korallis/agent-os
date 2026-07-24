@@ -91,14 +91,16 @@ export class WorktreePool {
     sessionId?: string;
     branch?: string;
   }): WorktreeLease {
+    const branch = input.branch ?? `ao/${input.taskId.slice(0, 10).toLowerCase()}`;
     const idle = this.listForProject(input.projectId).find((l) => l.state === "idle");
     if (idle !== undefined) {
+      this.checkoutBranchForReuse(idle.path, input.repoPath, branch);
       const leased: WorktreeLease = {
         ...idle,
         state: "leased",
         taskId: input.taskId,
         sessionId: input.sessionId ?? null,
-        branch: input.branch ?? idle.branch,
+        branch,
         leasedAt: new Date().toISOString(),
       };
       this.leases.set(leased.id, leased);
@@ -126,7 +128,6 @@ export class WorktreePool {
     }
 
     const id = nextUlid();
-    const branch = input.branch ?? `ao/${input.taskId.slice(0, 10).toLowerCase()}`;
     const path = join(this.poolRoot, input.projectId, id);
     mkdirSync(join(this.poolRoot, input.projectId), { recursive: true, mode: 0o700 });
 
@@ -170,6 +171,59 @@ export class WorktreePool {
       },
     });
     return lease;
+  }
+
+  /**
+   * On idle reuse of a real git worktree, move HEAD to the requested branch so
+   * lease.branch matches the tree. Non-git / AGENTOS_FAKE_GIT paths are metadata-only.
+   */
+  private checkoutBranchForReuse(worktreePath: string, repoPath: string, branch: string): void {
+    if (process.env.AGENTOS_FAKE_GIT === "1") return;
+    if (!existsSync(join(worktreePath, ".git"))) return;
+
+    const current = spawnSync("git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    if (current.status === 0 && current.stdout.trim() === branch) {
+      return;
+    }
+
+    const exists = spawnSync(
+      "git",
+      ["-C", worktreePath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    if (exists.status === 0) {
+      const sw = spawnSync("git", ["-C", worktreePath, "switch", branch], {
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      if (sw.status !== 0) {
+        const detail = (sw.stderr || sw.stdout || "git switch failed").trim();
+        throw new Error(`git worktree branch switch failed: ${detail}`);
+      }
+      return;
+    }
+
+    const base = spawnSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    if (base.status !== 0) {
+      const detail = (base.stderr || base.stdout || "rev-parse failed").trim();
+      throw new Error(`git worktree branch create failed: cannot resolve project HEAD: ${detail}`);
+    }
+    const startPoint = base.stdout.trim();
+    const create = spawnSync(
+      "git",
+      ["-C", worktreePath, "switch", "-c", branch, startPoint],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    if (create.status !== 0) {
+      const detail = (create.stderr || create.stdout || "git switch -c failed").trim();
+      throw new Error(`git worktree branch create failed: ${detail}`);
+    }
   }
 
   /**
