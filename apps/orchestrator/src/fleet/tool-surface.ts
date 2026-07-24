@@ -5,6 +5,7 @@ import { monotonicFactory } from "ulid";
 import { ZodError } from "zod";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
+import { enforceFusionContract } from "@agent-os/fusion-core";
 import {
   answerCrewmateInputSchema,
   authorGateInputSchema,
@@ -69,7 +70,8 @@ const nextUlid = monotonicFactory();
  */
 export interface SessionChannel {
   sessionSocketPath(sessionId: string): string;
-  openSession(sessionId: string): Promise<string>;
+  /** Open the per-session listener; must succeed before Pi is spawned. Throws on bind failure. */
+  openSession(sessionId: string): string;
   closeSession(sessionId: string): Promise<void>;
   sendControl(sessionId: string, frame: DaemonControlFrame): boolean;
 }
@@ -662,6 +664,9 @@ export class ToolSurface {
           task = this.transition(task, "WAITING_WORKTREE", error.message);
           throw new ToolSurfaceError("CONFLICT", error.message);
         }
+        if (error instanceof Error && error.message.includes("git worktree add failed")) {
+          throw new ToolSurfaceError("SPAWN_FAILED", error.message);
+        }
         throw error;
       }
     }
@@ -689,12 +694,21 @@ export class ToolSurface {
           "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
         );
       }
-      const socketPath =
-        this.deps.sockets?.sessionSocketPath(sessionId) ??
-        join(this.deps.home, "sockets", `${sessionId}.sock`);
-      // Listener first, then spawn: the extension retries, but opening early
-      // keeps the common case race-free.
-      void this.deps.sockets?.openSession(sessionId).catch(() => undefined);
+      // Control channel is a hard precondition of spawn — never launch Pi with a dead socket.
+      let socketPath: string;
+      try {
+        if (this.deps.sockets !== undefined) {
+          socketPath = this.deps.sockets.openSession(sessionId);
+        } else {
+          socketPath = join(this.deps.home, "sockets", `${sessionId}.sock`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new ToolSurfaceError(
+          "SPAWN_FAILED",
+          `session control channel failed to open: ${message}`,
+        );
+      }
 
       const prompt =
         input.prompt ??
@@ -854,17 +868,13 @@ export class ToolSurface {
     // When a fused artifact is supplied as instruction for kind=fusion, enforce contract.
     let contractOk: boolean | undefined;
     if (input.kind === "fusion" && input.instruction !== undefined) {
-      // Dynamic import avoided — pure check inline for packaging simplicity.
-      const hasTags =
-        /\[ARCHITECT\]/i.test(input.instruction) &&
-        /\[BUILDER\]/i.test(input.instruction) &&
-        /\[FUSION\]/i.test(input.instruction) &&
-        /consensus\s*&\s*divergence/i.test(input.instruction);
-      contractOk = hasTags;
-      if (!hasTags) {
+      const contract = enforceFusionContract(input.instruction);
+      contractOk = contract.ok;
+      if (!contract.ok) {
         throw new ToolSurfaceError(
           "FUSION_CONTRACT",
-          "fusion artifact missing required spans or Consensus & Divergence",
+          `fusion artifact contract failed: ${contract.errors.join("; ")}`,
+          { errors: contract.errors },
         );
       }
       writeFileSync(join(dir, "fused.md"), input.instruction, { mode: 0o600 });
@@ -1198,9 +1208,23 @@ export class ToolSurface {
       { mode: 0o600 },
     );
 
-    // Release worktrees
+    // Release worktrees with durable HEAD so the pool verified-resets instead of quarantining.
     for (const lease of this.deps.worktrees.list().filter((l) => l.taskId === task.id)) {
-      this.deps.worktrees.release(lease.id, {});
+      let finalSha: string | undefined;
+      if (process.env.AGENTOS_FAKE_GIT !== "1") {
+        const rev = spawnSync("git", ["-C", lease.path, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+          timeout: 15_000,
+        });
+        if (rev.status === 0) {
+          const sha = rev.stdout.trim();
+          if (sha.length > 0) finalSha = sha;
+        }
+      }
+      this.deps.worktrees.release(
+        lease.id,
+        finalSha !== undefined ? { finalSha } : {},
+      );
     }
 
     task = {

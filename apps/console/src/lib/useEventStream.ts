@@ -1,45 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { eventEnvelopeSchema, type EventEnvelope } from "@agent-os/protocol";
+import {
+  ORCHESTRATOR_EVENT_TYPES,
+  eventEnvelopeSchema,
+  type EventEnvelope,
+} from "@agent-os/protocol";
 
-/** Named SSE event types (Phase 1–3). Named events do not fire onmessage. */
-const EVENT_TYPES = [
-  "daemon.started",
-  "daemon.stopping",
-  "config.installed",
-  "config.changed",
-  "config.rejected",
-  "policy.changed",
-  "provider.connection_updated",
-  "provider.credential_refreshed",
-  "provider.billing_mismatch",
-  "quota.updated",
-  "quota.threshold",
-  "ext.hello",
-  "ext.usage",
-  "onboarding.step",
-  "onboarding.completed",
-  "project.registered",
-  "project.updated",
-  "task.created",
-  "task.phase_changed",
-  "task.updated",
-  "task.cast_resolved",
-  "session.spawned",
-  "session.stopped",
-  "session.lost",
-  "worktree.leased",
-  "worktree.released",
-  "wake.classified",
-  "brain.status",
-  "brain.handoff",
-  "brain.down",
-  "tool.invoked",
-  "gate.result",
-  "fusion.dispatched",
-  "captain.escalation",
-] as const;
+/** Named SSE event types derived from the protocol schema so they cannot drift. */
+const EVENT_TYPES = ORCHESTRATOR_EVENT_TYPES;
 
 export type StreamState = "connecting" | "live" | "down";
 

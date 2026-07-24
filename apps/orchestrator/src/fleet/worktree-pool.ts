@@ -131,6 +131,7 @@ export class WorktreePool {
     mkdirSync(join(this.poolRoot, input.projectId), { recursive: true, mode: 0o700 });
 
     if (process.env.AGENTOS_FAKE_GIT === "1" || !existsSync(join(input.repoPath, ".git"))) {
+      // Explicit test seam / non-git fixture path: marker directory only.
       mkdirSync(path, { recursive: true, mode: 0o700 });
       writeFileSync(join(path, ".agentos-worktree"), `${input.taskId}\n`, { mode: 0o600 });
     } else {
@@ -140,13 +141,8 @@ export class WorktreePool {
         { encoding: "utf8", timeout: 60_000 },
       );
       if (add.status !== 0) {
-        // Fallback: plain copy-less dir marker for non-git fixtures
-        mkdirSync(path, { recursive: true, mode: 0o700 });
-        writeFileSync(
-          join(path, ".agentos-worktree-error"),
-          add.stderr || add.stdout || "worktree add failed",
-          { mode: 0o600 },
-        );
+        const detail = (add.stderr || add.stdout || "worktree add failed").trim();
+        throw new Error(`git worktree add failed: ${detail}`);
       }
     }
 

@@ -475,6 +475,12 @@ export type OrchestratorEvent = z.infer<typeof orchestratorEventSchema>;
 
 export type OrchestratorEventType = OrchestratorEvent["type"];
 
+/** All orchestrator SSE event type names — derived from the schema so UIs cannot drift. */
+export const ORCHESTRATOR_EVENT_TYPES: readonly OrchestratorEventType[] =
+  orchestratorEventSchema.options.map(
+    (option) => option.shape.type.value as OrchestratorEventType,
+  );
+
 export const eventEnvelopeSchema = z.strictObject({
   id: ulidSchema,
   seq: z.number().int().positive(),

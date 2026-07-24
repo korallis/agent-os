@@ -1,7 +1,9 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
+import { Type } from "typebox";
 import {
   agentRoleSchema,
+  BRAIN_TOOL_NAMES,
   type DaemonControlFrame,
   type ExtensionToDaemonFrame,
   type AgentRole,
@@ -13,11 +15,8 @@ import {
  * Injected into every spawned Pi via `-e`. Streams lifecycle telemetry to
  * agentosd over a per-session Unix socket, receives control injections, and
  * carries the Brain's tool bridge (`ext.tool_call` → `ctl.tool_result`).
- * Telemetry-only in the model-visible sense: it injects nothing into context
- * that the daemon did not explicitly send.
- *
- * Pi's real extension API is adapter-shaped; this module exports a portable
- * host that both the real Pi entrypoint and our contract tests can drive.
+ * Registers the typed agent-os tool surface as Pi-visible tools that proxy
+ * over the socket; the daemon authorizes by session.
  */
 
 export const EXTENSION_VERSION = "0.2.0";
@@ -47,6 +46,29 @@ export interface ExtensionHostOptions {
 
 interface PendingToolCall {
   resolve: (result: { ok: boolean; data?: unknown; error?: { code: string; message: string } }) => void;
+}
+
+/** Minimal Pi extension API surface we depend on (real Pi 0.82+ plus contract hosts). */
+export interface PiExtensionApi {
+  on?: (event: string, handler: (...args: unknown[]) => void) => void;
+  version?: string;
+  registerTool?: (definition: {
+    name: string;
+    label: string;
+    description: string;
+    parameters: unknown;
+    execute: (
+      toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: unknown,
+      onUpdate?: unknown,
+      ctx?: unknown,
+    ) => Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
+  }) => void;
+  sendMessage?: (
+    message: { customType: string; content: string; display?: boolean },
+    options?: { triggerTurn?: boolean; deliverAs?: string },
+  ) => void;
 }
 
 export class AgentOsExtensionHost {
@@ -276,17 +298,75 @@ export class AgentOsExtensionHost {
   }
 }
 
+/** Loose object schema for proxy tools — daemon validates the real input. */
+const proxyParams = Type.Object({}, { additionalProperties: true });
+
+function registerAgentOsTools(pi: PiExtensionApi, host: AgentOsExtensionHost): void {
+  if (typeof pi.registerTool !== "function") {
+    return;
+  }
+
+  for (const toolName of BRAIN_TOOL_NAMES) {
+    pi.registerTool({
+      name: toolName,
+      label: toolName,
+      description: `Agent OS substrate tool \`${toolName}\`. Proxied to agentosd; authorization is by session.`,
+      parameters: proxyParams,
+      async execute(_toolCallId, params) {
+        const result = await host.callTool(toolName, params);
+        if (result.ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(result.data ?? null),
+              },
+            ],
+            details: { ok: true },
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                ok: false,
+                error: result.error ?? { code: "INTERNAL", message: "tool failed" },
+              }),
+            },
+          ],
+          details: { ok: false },
+        };
+      },
+    });
+  }
+
+  pi.registerTool({
+    name: "agent_os_ask",
+    label: "agent_os_ask",
+    description:
+      "Ask the Captain or Brain a blocking question. Returns a questionId; the answer arrives as an injected message.",
+    parameters: Type.Object({
+      question: Type.String({ description: "Question for the Captain or Brain" }),
+    }),
+    async execute(_toolCallId, params) {
+      const question =
+        typeof params.question === "string" ? params.question : String(params.question ?? "");
+      const questionId = host.ask(question);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ questionId }) }],
+        details: { questionId },
+      };
+    },
+  });
+}
+
 /**
  * Pi extension entry — Pi loads this when passed with `-e`.
  * Uses AGENTOS_SOCKET / AGENTOS_SESSION_ID / AGENTOS_ROLE from the scrubbed
- * spawn env. Returns the host so a Pi adapter can expose `callTool`/`ask` as
- * Pi tools for the Brain seat.
+ * spawn env. Registers the agent-os tool surface when `pi.registerTool` exists.
  */
-export default function agentOsPiExtension(pi: {
-  on?: (event: string, handler: (...args: unknown[]) => void) => void;
-  version?: string;
-  sendUserMessage?: (message: string) => void;
-}): AgentOsExtensionHost | undefined {
+export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtensionHost | undefined {
   const socketPath = process.env.AGENTOS_SOCKET;
   const sessionId = process.env.AGENTOS_SESSION_ID;
   if (socketPath === undefined || sessionId === undefined) {
@@ -306,8 +386,13 @@ export default function agentOsPiExtension(pi: {
   // Daemon-side injections (wake digests, verbatim gate FAILs, answers) are the
   // only text that reaches the model, and only when the daemon sends it.
   host.onInjectedMessage = (message) => {
-    pi.sendUserMessage?.(message);
+    pi.sendMessage?.(
+      { customType: "agent-os", content: message, display: true },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
   };
+
+  registerAgentOsTools(pi, host);
 
   pi.on?.("agent_start", () => host.lifecycle("session_start"));
   pi.on?.("turn_start", () => host.lifecycle("turn_start"));

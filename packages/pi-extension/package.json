@@ -24,7 +24,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@agent-os/protocol": "workspace:*"
+    "@agent-os/protocol": "workspace:*",
+    "typebox": "1.1.38"
   },
   "devDependencies": {
     "@types/node": "26.1.1",

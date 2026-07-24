@@ -11,6 +11,10 @@ import {
 /**
  * Per-session Unix domain socket hub (master plan §2.1).
  * Extension streams NDJSON frames; daemon fans out as orchestrator events.
+ *
+ * `hub.sock` is liveness-only: it accepts connections but never dispatches
+ * session-claiming `ext.*` frames. Session traffic must arrive on the
+ * per-session listener opened via `openSession` before Pi is spawned.
  */
 
 export type ExtensionFrameHandler = (frame: ExtensionToDaemonFrame) => void;
@@ -35,7 +39,7 @@ export class SocketHub {
     this.eventSink = sink;
   }
 
-  /** Listen on a directory of session sockets: `${socketDir}/hub.sock` as accept path. */
+  /** Listen on hub.sock as a liveness/handshake endpoint only (no session traffic). */
   async listen(): Promise<string> {
     mkdirSync(this.socketDir, { recursive: true, mode: 0o700 });
     const path = `${this.socketDir}/hub.sock`;
@@ -48,6 +52,8 @@ export class SocketHub {
     }
 
     return new Promise((resolve, reject) => {
+      // Unbound accept path: connections are accepted for liveness probes but
+      // every session-claiming frame is refused in handleConnection.
       const server = createServer((socket) => this.handleConnection(socket));
       server.on("error", reject);
       // Owner-only socket: restrict group/other access on multi-user hosts.
@@ -71,9 +77,10 @@ export class SocketHub {
    * Open a dedicated 0600 listener for one session before its Pi is spawned.
    * Per-session sockets (rather than one shared hub) mean a session's control
    * channel cannot be claimed by another local process asserting a `sessionId`
-   * in `ext.hello`. Idempotent.
+   * in `ext.hello`. Idempotent. Synchronous: Unix bind is ready when
+   * `server.listening` is true; callers must not spawn Pi until this returns.
    */
-  async openSession(sessionId: string): Promise<string> {
+  openSession(sessionId: string): string {
     const existing = this.sessionServers.get(sessionId);
     const path = this.sessionSocketPath(sessionId);
     if (existing !== undefined) return path;
@@ -87,19 +94,36 @@ export class SocketHub {
       }
     }
 
-    return new Promise((resolve, reject) => {
-      const server = createServer((socket) => this.handleConnection(socket, sessionId));
-      server.on("error", reject);
-      server.listen({ path, readableAll: false, writableAll: false }, () => {
-        try {
-          chmodSync(path, HUB_SOCK_MODE);
-        } catch {
-          // Best-effort; parent dir is already 0o700.
-        }
-        this.sessionServers.set(sessionId, server);
-        resolve(path);
-      });
+    const server = createServer((socket) => this.handleConnection(socket, sessionId));
+    let listenError: Error | undefined;
+    server.once("error", (error: Error) => {
+      listenError = error;
+      this.sessionServers.delete(sessionId);
     });
+    server.listen({ path, readableAll: false, writableAll: false });
+    if (listenError !== undefined) {
+      try {
+        server.close();
+      } catch {
+        // ignore
+      }
+      throw listenError;
+    }
+    if (!server.listening) {
+      try {
+        server.close();
+      } catch {
+        // ignore
+      }
+      throw new Error(`failed to bind session socket ${path}`);
+    }
+    try {
+      chmodSync(path, HUB_SOCK_MODE);
+    } catch {
+      // Best-effort; parent dir is already 0o700.
+    }
+    this.sessionServers.set(sessionId, server);
+    return path;
   }
 
   /** Tear down a session listener and its socket file. */
@@ -126,7 +150,8 @@ export class SocketHub {
 
   /**
    * @param boundSessionId when the connection arrived on a per-session
-   * listener, the only `sessionId` this peer is allowed to claim.
+   * listener, the only `sessionId` this peer is allowed to claim. When
+   * omitted (hub.sock), no session-claiming frames are dispatched.
    */
   private handleConnection(socket: Socket, boundSessionId?: string): void {
     let buffer = "";
@@ -147,8 +172,12 @@ export class SocketHub {
         }
         const frame = extensionToDaemonFrameSchema.safeParse(parsed);
         if (!frame.success) continue;
+        // hub.sock is liveness-only: refuse every session-claiming ext.* frame.
+        if (boundSessionId === undefined) {
+          continue;
+        }
         // A per-session peer may only speak for the session it connected as.
-        if (boundSessionId !== undefined && frame.data.sessionId !== boundSessionId) {
+        if (frame.data.sessionId !== boundSessionId) {
           continue;
         }
         if (frame.data.type === "ext.hello") {

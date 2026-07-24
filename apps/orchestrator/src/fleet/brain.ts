@@ -138,10 +138,18 @@ export class BrainManager {
         );
         return this.getSnapshot();
       }
-      const socketPath =
-        this.deps.sockets?.sessionSocketPath(sessionId) ??
-        join(this.deps.home, "sockets", `${sessionId}.sock`);
-      void this.deps.sockets?.openSession(sessionId).catch(() => undefined);
+      let socketPath: string;
+      try {
+        if (this.deps.sockets !== undefined) {
+          socketPath = this.deps.sockets.openSession(sessionId);
+        } else {
+          socketPath = join(this.deps.home, "sockets", `${sessionId}.sock`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.enterDown(`session control channel failed to open: ${message}`);
+        return this.getSnapshot();
+      }
       this.deps.tools.setBrainSessionId(sessionId);
 
       const spec = buildPiSpawnSpec({
