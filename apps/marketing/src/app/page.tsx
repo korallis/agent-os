@@ -619,7 +619,7 @@ const agents = [
     category: "Research",
     name: "Autonomous research\nthat drives decisions",
     desc: "Scans sources, summarizes insights, and turns messy information into structured decisions. Market research, competitive analysis, and trend scanning — executed automatically.",
-    href: "/agents/research-agent",
+    href: "/agents/research",
     image: "/autonomous-research.png",
   },
   {
