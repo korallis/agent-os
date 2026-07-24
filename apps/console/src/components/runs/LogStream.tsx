@@ -60,7 +60,9 @@ function messageOf(envelope: EventEnvelope): string {
     case "config.installed":
       return `Shipped defaults installed — ${event.payload.domains.join(", ")}`;
     case "config.changed":
-      return `Config hot-reloaded — ${event.payload.domain} from ${event.payload.layer} layer (${event.payload.contentHash.slice(0, 8)})`;
+      return event.payload.hotReloaded
+        ? `Config hot-reloaded — ${event.payload.domain} from ${event.payload.layer} layer (${event.payload.contentHash.slice(0, 8)})`
+        : `Config applied — ${event.payload.domain} from ${event.payload.layer} layer (${event.payload.contentHash.slice(0, 8)})`;
     case "config.rejected":
       return `Config rejected — ${event.payload.domain}: ${event.payload.issues[0]?.path ?? ""} ${event.payload.issues[0]?.message ?? ""}`;
     case "policy.changed":

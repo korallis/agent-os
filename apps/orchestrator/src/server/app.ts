@@ -315,13 +315,27 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     void (async () => {
       if (!(await enqueueWrite(`retry: 2000\n\n`))) return;
 
-      // Replay every page after the cursor (truncated pages are continued)
-      // before switching to live subscribe so Last-Event-ID clients never skip.
+      // Subscribe first into a buffer so appends during paged replay are not lost;
+      // after replay, drain with id de-dupe then switch to direct fan-out.
+      const liveBuffer: Array<{ id: string; event: { type: string } }> = [];
+      let buffering = true;
+      const seenIds = new Set<string>();
+
+      unsubscribe = deps.store.subscribe((envelope) => {
+        if (closed) return;
+        if (buffering) {
+          liveBuffer.push(envelope);
+          return;
+        }
+        void writeFrame(envelope);
+      });
+
       let afterId: string | null = cursor;
       for (;;) {
         const page = deps.store.eventsAfterId(afterId, SSE_REPLAY_PAGE);
         for (const envelope of page.events) {
           if (closed) return;
+          seenIds.add(envelope.id);
           if (!(await writeFrame(envelope))) return;
         }
         if (!page.truncated || page.events.length === 0) break;
@@ -331,9 +345,17 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       }
       if (closed) return;
 
-      unsubscribe = deps.store.subscribe((envelope) => {
-        void writeFrame(envelope);
-      });
+      while (liveBuffer.length > 0) {
+        const batch = liveBuffer.splice(0, liveBuffer.length);
+        for (const envelope of batch) {
+          if (closed) return;
+          if (seenIds.has(envelope.id)) continue;
+          seenIds.add(envelope.id);
+          if (!(await writeFrame(envelope))) return;
+        }
+      }
+      // Buffer empty and no await between check and flip: single-threaded handoff.
+      buffering = false;
 
       // Heartbeat: cadence follows supervision.heartbeatSeconds live, so a
       // hot-reloaded value is observable on the wire (§11 config gate).

@@ -3,6 +3,8 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -88,22 +90,117 @@ function readLockPid(lockPath: PathLike): number | null {
   }
 }
 
+/** Brief busy-wait (no async) so a concurrent creator can finish writing its PID. */
+function sleepMs(ms: number): void {
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+/**
+ * Create `lockPath` with full PID content atomically (write temp → hard link).
+ * Falls back to O_EXCL open when link is unavailable. Returns an open fd held
+ * for the process lifetime.
+ */
+function tryCreateLock(lockPath: string): number {
+  const tmp = `${lockPath}.${process.pid}.${randomBytes(8).toString("hex")}`;
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeSync(fd, `${process.pid}\n`);
+    try {
+      fsyncSync(fd);
+    } catch {
+      // some platforms/tmpfs ignore fsync
+    }
+    try {
+      linkSync(tmp, lockPath);
+    } catch (linkError) {
+      const linkCode = (linkError as NodeJS.ErrnoException).code;
+      if (linkCode === "EEXIST") {
+        throw linkError;
+      }
+      // Filesystems without hard links: exclusive create then write (content
+      // may briefly be empty; waiters poll before treating null PID as stale).
+      closeSync(fd);
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // ignore
+      }
+      const excl = openSync(lockPath, "wx", 0o600);
+      try {
+        writeSync(excl, `${process.pid}\n`);
+        try {
+          fsyncSync(excl);
+        } catch {
+          // ignore
+        }
+        return excl;
+      } catch (writeError) {
+        try {
+          closeSync(excl);
+        } catch {
+          // ignore
+        }
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // ignore
+        }
+        throw writeError;
+      }
+    }
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // best-effort: lockPath hard-link remains
+    }
+    return fd;
+  } catch (error) {
+    try {
+      closeSync(fd);
+    } catch {
+      // ignore
+    }
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // ignore
+    }
+    throw error;
+  }
+}
+
+const LOCK_PID_GRACE_MS = 250;
+const LOCK_PID_POLL_MS = 25;
+
 /**
  * Exclusive single-writer lock for `AGENTOS_HOME` (master plan `daemon.lock`).
- * Uses O_EXCL create + PID so a second process fails fast; stale locks from
- * dead holders are reclaimed. The fd is held open for the process lifetime.
+ * Creates the lock with full PID content (hard-link or O_EXCL), holds the fd
+ * open for the process lifetime, and reclaims only when the holder PID is gone
+ * (or still unreadable after a short grace for in-flight writers). Reclaim is
+ * always guarded by a second exclusive create after unlink.
  */
 export function acquireHomeLock(home: string): HomeLock {
   const { lockPath } = homePaths(home);
-  const tryOpenExclusive = (): number => openSync(lockPath, "wx", 0o600);
 
-  let fd: number;
-  try {
-    fd = tryOpenExclusive();
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST") throw error;
-    const holderPid = readLockPid(lockPath);
+  const acquireOrNull = (): number | null => {
+    try {
+      return tryCreateLock(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+      throw error;
+    }
+  };
+
+  let fd = acquireOrNull();
+  if (fd === null) {
+    const deadline = Date.now() + LOCK_PID_GRACE_MS;
+    let holderPid: number | null = readLockPid(lockPath);
+    while (holderPid === null && Date.now() < deadline) {
+      sleepMs(LOCK_PID_POLL_MS);
+      holderPid = readLockPid(lockPath);
+    }
+
     if (holderPid !== null && isProcessAlive(holderPid)) {
       throw new HomeLockError(
         `AGENTOS_HOME already in use by agentosd pid ${holderPid} (lock: ${lockPath})`,
@@ -112,28 +209,25 @@ export function acquireHomeLock(home: string): HomeLock {
         holderPid,
       );
     }
+
+    // Holder dead, or PID still unreadable after grace — reclaim carefully.
     try {
       unlinkSync(lockPath);
     } catch {
-      // concurrent reclaim — fall through to exclusive open
+      // concurrent reclaim or already gone
     }
-    try {
-      fd = tryOpenExclusive();
-    } catch (retryError) {
-      if ((retryError as NodeJS.ErrnoException).code === "EEXIST") {
-        const retryPid = readLockPid(lockPath);
-        throw new HomeLockError(
-          `AGENTOS_HOME already in use${retryPid !== null ? ` by agentosd pid ${retryPid}` : ""} (lock: ${lockPath})`,
-          home,
-          lockPath,
-          retryPid,
-        );
-      }
-      throw retryError;
+    fd = acquireOrNull();
+    if (fd === null) {
+      const retryPid = readLockPid(lockPath);
+      throw new HomeLockError(
+        `AGENTOS_HOME already in use${retryPid !== null ? ` by agentosd pid ${retryPid}` : ""} (lock: ${lockPath})`,
+        home,
+        lockPath,
+        retryPid,
+      );
     }
   }
 
-  writeSync(fd, `${process.pid}\n`);
   try {
     chmodSync(lockPath, 0o600);
   } catch {
