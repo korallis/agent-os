@@ -3,7 +3,7 @@
 import { useState, useRef } from "react";
 import { motion, useInView, AnimatePresence } from "framer-motion";
 import { cn } from "@agent-os/ui";
-import MagneticButton from "./MagneticButton";
+import { MagneticButton } from "@agent-os/ui";
 
 interface ContactFormProps {
   className?: string;

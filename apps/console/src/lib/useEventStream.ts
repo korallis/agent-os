@@ -1,0 +1,68 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { eventEnvelopeSchema, type EventEnvelope } from "@agent-os/protocol";
+
+/** Every Phase 1 event type — SSE frames are named by event type. */
+const EVENT_TYPES = [
+  "daemon.started",
+  "daemon.stopping",
+  "config.installed",
+  "config.changed",
+  "config.rejected",
+  "policy.changed",
+] as const;
+
+export type StreamState = "connecting" | "live" | "down";
+
+export interface EventStream {
+  state: StreamState;
+  /** Newest first, capped. */
+  events: EventEnvelope[];
+  /** Total envelopes received this session (incl. replay). */
+  received: number;
+}
+
+/**
+ * Subscribes to the daemon SSE stream through the BFF (`/api/agentos/events`).
+ * EventSource reconnects automatically; replay-on-reconnect comes from the
+ * daemon's Last-Event-ID handling.
+ */
+export function useEventStream(cap = 100): EventStream {
+  const [state, setState] = useState<StreamState>("connecting");
+  const [events, setEvents] = useState<EventEnvelope[]>([]);
+  const receivedRef = useRef(0);
+  const [received, setReceived] = useState(0);
+
+  useEffect(() => {
+    const source = new EventSource("/api/agentos/events");
+    source.onopen = () => setState("live");
+    source.onerror = () => setState("down");
+
+    const onFrame = (frame: MessageEvent<string>): void => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(frame.data);
+      } catch {
+        return;
+      }
+      const envelope = eventEnvelopeSchema.safeParse(parsed);
+      if (!envelope.success) return;
+      receivedRef.current += 1;
+      setReceived(receivedRef.current);
+      setEvents((current) => {
+        if (current.some((e) => e.id === envelope.data.id)) return current;
+        return [envelope.data, ...current].slice(0, cap);
+      });
+    };
+
+    for (const type of EVENT_TYPES) {
+      source.addEventListener(type, onFrame);
+    }
+    return () => {
+      source.close();
+    };
+  }, [cap]);
+
+  return { state, events, received };
+}

@@ -22,6 +22,22 @@
   --color-surface-warm: #eeeee8;
   --color-ink: #0a0a0a;
 
+  /* Console dashboard tokens (Figma: AgentOS — AI Agent Orchestration Dashboard) */
+  --color-shell: #0a0a0a;
+  --color-panel: #141414;
+  --color-panel-2: #1a1a1a;
+  --color-line-1: #222222;
+  --color-line-2: #333333;
+  --color-fg-1: #f5f5f5;
+  --color-fg-2: #999999;
+  --color-fg-3: #666666;
+  --color-fg-4: #4a4a4a;
+  --color-teal-brand: #2dd4bf;
+  --color-ok: #4ade80;
+  --color-warn: #fbbf24;
+  --color-danger: #f87171;
+  --color-job-id: #a5f3fc;
+
   --font-sans: var(--font-geist-sans), system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), monospace;
 

@@ -9,8 +9,8 @@ import {
   staggerContainerSlow,
 } from "@agent-os/ui";
 import AnimatedHeadline from "@/components/ui/AnimatedHeadline";
-import MagneticButton from "@/components/ui/MagneticButton";
-import GlassCard from "@/components/ui/GlassCard";
+import { MagneticButton } from "@agent-os/ui";
+import { GlassCard } from "@agent-os/ui";
 import PageHero from "@/components/sections/PageHero";
 import { CountUp } from "@/components/sections/FeatureVisuals";
 import { cn } from "@agent-os/ui";

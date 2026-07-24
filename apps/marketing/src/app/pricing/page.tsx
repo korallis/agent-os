@@ -4,7 +4,7 @@ import { useRef } from "react";
 import { motion, useInView } from "framer-motion";
 import dynamic from "next/dynamic";
 import { fadeUp, staggerContainer } from "@agent-os/ui";
-import MagneticButton from "@/components/ui/MagneticButton";
+import { MagneticButton } from "@agent-os/ui";
 import PageHero from "@/components/sections/PageHero";
 import PricingCard from "@/components/ui/PricingCard";
 const FAQAccordion = dynamic(() => import("@/components/ui/FAQAccordion"));
@@ -32,7 +32,7 @@ export default function PricingPage() {
             animate={pricingInView ? "visible" : "hidden"}
             className="grid grid-cols-1 md:grid-cols-3 gap-6 lg:gap-8"
           >
-            {pricingPlans.map((plan, i) => (
+            {pricingPlans.map((plan) => (
               <motion.div key={plan.name} variants={fadeUp}>
                 <PricingCard plan={plan} />
               </motion.div>

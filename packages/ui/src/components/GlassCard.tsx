@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react";
 import { motion, useMotionValue, useSpring } from "framer-motion";
-import { cn } from "@agent-os/ui";
+import { cn } from "../lib/cn";
 
 interface GlassCardProps {
   children: React.ReactNode;
@@ -11,7 +11,11 @@ interface GlassCardProps {
   glow?: string;
 }
 
-export default function GlassCard({
+/**
+ * The white glass tilt-on-hover card used across the marketing site —
+ * shared so every Agent OS surface renders the same card language.
+ */
+export function GlassCard({
   children,
   className,
   hover = true,

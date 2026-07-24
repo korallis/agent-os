@@ -3,9 +3,9 @@
 import { useRef } from "react";
 import { motion, useInView } from "framer-motion";
 import { fadeUp, staggerContainer, staggerContainerSlow } from "@agent-os/ui";
-import MagneticButton from "@/components/ui/MagneticButton";
+import { MagneticButton } from "@agent-os/ui";
 import PageHero from "@/components/sections/PageHero";
-import GlassCard from "@/components/ui/GlassCard";
+import { GlassCard } from "@agent-os/ui";
 import { customerStories } from "@/lib/data/customers";
 
 const metrics = [
@@ -68,7 +68,7 @@ function StoriesSection() {
           animate={inView ? "visible" : "hidden"}
           className="space-y-8"
         >
-          {customerStories.map((story, i) => (
+          {customerStories.map((story) => (
             <motion.div key={story.company} variants={fadeUp}>
               <GlassCard className="p-8 md:p-10">
                 <div className="flex flex-col md:flex-row gap-8">

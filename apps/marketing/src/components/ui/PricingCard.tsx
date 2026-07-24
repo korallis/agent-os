@@ -4,7 +4,7 @@ import { useRef } from "react";
 import { motion, useInView } from "framer-motion";
 import { cn } from "@agent-os/ui";
 import { CountUp } from "@/components/sections/FeatureVisuals";
-import MagneticButton from "./MagneticButton";
+import { MagneticButton } from "@agent-os/ui";
 
 interface PricingPlan {
   name: string;

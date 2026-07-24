@@ -73,9 +73,9 @@ apps/marketing/
       layout.tsx            # Root layout
       globals.css           # Global styles (Tailwind v4 + design tokens)
     components/
-      layout/               # Header, Footer, LenisProvider, PageTransition
+      layout/               # Header (thin wrapper over @agent-os/ui SiteHeader), Footer, LenisProvider, PageTransition
       sections/             # Shared section components
-      ui/                   # Marketing-local UI components
+      ui/                   # Marketing-local only (PricingCard, ContactForm, FAQ, etc.)
     lib/
       data/                 # Static data (agents, pricing, integrations, etc.)
   public/                   # Static assets (images, videos)
@@ -83,7 +83,7 @@ apps/marketing/
   package.json
 ```
 
-Shared design system (fonts, theme CSS, motion variants, shared UI) lives in `packages/ui` and is imported as `@agent-os/ui`.
+Shared design system lives in `packages/ui` and is imported as `@agent-os/ui` — fonts, theme CSS (incl. console Figma tokens), motion variants, and promoted components (`SiteHeader`, `GlassCard`, `MagneticButton`, …). Do not reintroduce lookalikes under `components/ui/`.
 
 ## Tech Stack
 
