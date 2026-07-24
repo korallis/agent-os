@@ -1,0 +1,141 @@
+/*
+  All custom styles MUST be inside @layer base so Tailwind utility classes
+  (which live in @layer utilities) can override them. Unlayered styles in
+  CSS Cascade Layers always beat layered styles, breaking Tailwind utilities.
+*/
+@layer base {
+  html {
+    scroll-behavior: auto;
+  }
+
+  body {
+    background: #ffffff;
+    color: #0a0a0a;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background: rgba(59, 130, 246, 0.2);
+    color: #0a0a0a;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+}
+
+@layer components {
+  .glass {
+    background: rgba(0, 0, 0, 0.02);
+    --_glass-blur: blur(20px);
+    -webkit-backdrop-filter: var(--_glass-blur);
+    backdrop-filter: var(--_glass-blur);
+    border: 1px solid rgba(0, 0, 0, 0.06);
+  }
+
+  .glass-strong {
+    background: rgba(0, 0, 0, 0.04);
+    --_glass-blur: blur(40px);
+    -webkit-backdrop-filter: var(--_glass-blur);
+    backdrop-filter: var(--_glass-blur);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+  }
+
+  .gradient-text {
+    background: linear-gradient(135deg, #2563eb 0%, #3b82f6 30%, #64748b 70%, #0a0a0a 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .gradient-text-violet {
+    background: linear-gradient(135deg, #7c3aed 0%, #8b5cf6 30%, #64748b 70%, #0a0a0a 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .glow-blue {
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.15), 0 0 60px rgba(59, 130, 246, 0.05);
+  }
+
+  .glow-cyan {
+    box-shadow: 0 0 20px rgba(34, 211, 238, 0.15), 0 0 60px rgba(34, 211, 238, 0.05);
+  }
+
+  .glow-violet {
+    box-shadow: 0 0 20px rgba(139, 92, 246, 0.15), 0 0 60px rgba(139, 92, 246, 0.05);
+  }
+
+  .section-padding {
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
+  }
+  @media (min-width: 768px) {
+    .section-padding {
+      padding-left: 3rem;
+      padding-right: 3rem;
+    }
+  }
+  @media (min-width: 1024px) {
+    .section-padding {
+      padding-left: 5rem;
+      padding-right: 5rem;
+    }
+  }
+  @media (min-width: 1280px) {
+    .section-padding {
+      padding-left: 8rem;
+      padding-right: 8rem;
+    }
+  }
+
+  .max-container {
+    max-width: 1440px;
+    margin-left: auto;
+    margin-right: auto;
+    width: 100%;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .border-rule {
+    border-color: #e5e5e0;
+  }
+
+  .border-rule-dark {
+    border-color: rgba(0, 0, 0, 0.06);
+  }
+}
+
+/* Marquee scroll animation (used in integrations page) */
+@keyframes marquee-scroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.animate-marquee-scroll {
+  animation: marquee-scroll 40s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @layer base {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

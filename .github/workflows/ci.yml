@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        # Version comes from the root package.json "packageManager" field.
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Lint (workspaces — no-explicit-any enforced)
+        run: pnpm run lint
+
+      - name: Lint (root scripts)
+        run: pnpm exec eslint scripts
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Zero-deprecated gate
+        run: node scripts/verify-no-deprecated.mjs

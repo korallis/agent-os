@@ -1,0 +1,13 @@
+/*
+  Agent OS design system — tokens (@theme) + base/component layers.
+  Import AFTER `@import "tailwindcss";` in the consuming app:
+
+    @import "tailwindcss";
+    @import "@agent-os/ui/styles.css";
+*/
+@import "./theme.css";
+@import "./base.css";
+
+/* Scan the design-system source so utilities used by shared
+   primitives (e.g. TextAnimations) are always generated. */
+@source "../";

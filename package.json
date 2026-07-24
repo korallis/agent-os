@@ -1,0 +1,23 @@
+{
+  "name": "agent-os",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "verify:no-deprecated": "node scripts/verify-no-deprecated.mjs"
+  },
+  "devDependencies": {
+    "eslint": "9.39.4",
+    "turbo": "2.10.6",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.65.0"
+  }
+}
