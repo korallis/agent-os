@@ -58,6 +58,11 @@ export const PROBE_ALLOWLIST: readonly ProbeEndpoint[] = [
   },
 ] as const;
 
+/** True when the code-baked allowlist has at least one endpoint for this provider key. */
+export function hasProbeEndpoints(provider: string): boolean {
+  return PROBE_ALLOWLIST.some((e) => e.provider === provider);
+}
+
 const ALLOWED_URLS = new Set(PROBE_ALLOWLIST.map((e) => e.url));
 
 /** Returns true only if the URL is on the code-baked allowlist. */

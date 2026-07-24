@@ -24,7 +24,6 @@ const PROVIDER_CHECKLIST: PiProviderId[] = [
   "openai",
   "xai",
   "openrouter",
-  "github-copilot",
   "kimi-coding",
   "vercel-ai-gateway",
 ];

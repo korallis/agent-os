@@ -5,6 +5,7 @@ import type { ConfigService } from "../config/service.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
 import { resolveAuthJsonPathWithFallback } from "../security/auth-store.js";
+import { hasProbeEndpoints } from "./allowlist.js";
 import { isLimitReached, isProbeEnabled, probeConnection } from "./probes.js";
 
 export interface QuotaProbeSchedulerDeps {
@@ -88,6 +89,9 @@ export class QuotaProbeScheduler {
 
     for (const connection of this.deps.connections.list()) {
       if (!isProbeEnabled(connection.provider, quota)) continue;
+      const allowlistKey =
+        connection.provider === "claude-agent-sdk" ? "anthropic" : connection.provider;
+      if (!hasProbeEndpoints(allowlistKey)) continue;
 
       const allowedAt = this.nextAllowedAt.get(connection.id) ?? 0;
       if (now < allowedAt) continue;

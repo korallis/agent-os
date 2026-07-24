@@ -27,7 +27,7 @@ export function quotaKeysForProvider(
     case "kimi-coding":
       return ["kimi-coding"];
     case "vercel-ai-gateway":
-      return ["vercel-ai-gateway"];
+      return [];
     default:
       return [];
   }

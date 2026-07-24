@@ -756,13 +756,15 @@ function buildOAuthAttachCommand(options: {
 }): string {
   const configDirEnv = options.pi?.configDirEnv ?? "PI_CONFIG_DIR";
   const managedHome = options.pi?.managedHome ?? `${options.home}/pi`;
+  const binary = options.pi?.binary ?? "pi";
+  const quotedBinary = shellSingleQuote(binary);
   const useManaged =
     options.pi === undefined ||
     options.pi.isolationMode === "managed" ||
     options.pi.configDirEnv !== null;
   const login = useManaged
-    ? `env ${configDirEnv}=${shellSingleQuote(managedHome)} pi /login ${options.provider}`
-    : `pi /login ${options.provider}`;
+    ? `env ${configDirEnv}=${shellSingleQuote(managedHome)} ${quotedBinary} /login ${options.provider}`
+    : `${quotedBinary} /login ${options.provider}`;
   return `tmux -L agentos new-session -A -s ${options.session} \\; new-window -n ${options.window} -- ${login}`;
 }
 

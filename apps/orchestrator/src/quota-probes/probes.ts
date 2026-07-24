@@ -107,6 +107,8 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
 
       const response = await fetchImpl(endpoint.url, {
         method: "GET",
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
         headers: {
           authorization: `Bearer ${token.token}`,
           ...token.headers,
