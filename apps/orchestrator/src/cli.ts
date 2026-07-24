@@ -7,7 +7,7 @@ import { formatDoctorReport, runDoctor } from "./doctor.js";
 import { readToken, resolveHome } from "./home.js";
 import { DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";
 
-/** The `agentos` CLI skeleton (master plan piece #4): start · status · doctor. */
+/** The `agentos` CLI (master plan piece #4): start · status · doctor. */
 
 export async function runStart(): Promise<void> {
   const daemon = await startDaemon({ stdout: true });
@@ -72,7 +72,7 @@ export function runDoctorCommand(): void {
   console.log(formatDoctorReport(runDoctor()));
 }
 
-const USAGE = `agentos — Agent OS CLI (Phase 1 skeleton)
+const USAGE = `agentos — Agent OS CLI
 
 usage:
   agentos start    run the agentosd daemon in the foreground

@@ -28,18 +28,14 @@ const LOGO: Record<string, { letter: string; className: string }> = {
   "vercel-ai-gateway": { letter: "V", className: "bg-black text-white" },
 };
 
-/** Providers that support Pi subscription /login OAuth via the daemon. */
-const OAUTH_PROVIDERS = ["openai", "anthropic", "xai"] as const;
-/** Providers that accept API-key connect (keychain/file custody). */
-const API_KEY_PROVIDERS = [
-  "openai",
-  "anthropic",
-  "openrouter",
-  "kimi-coding",
-  "vercel-ai-gateway",
-] as const;
-
-type ConnectProvider = (typeof OAUTH_PROVIDERS)[number] | (typeof API_KEY_PROVIDERS)[number];
+/** Provider ids exposed in the connect rows (oauth and/or api-key). */
+type ConnectProvider =
+  | "openai"
+  | "anthropic"
+  | "openrouter"
+  | "xai"
+  | "kimi-coding"
+  | "vercel-ai-gateway";
 
 const CONNECT_ROWS: readonly {
   provider: ConnectProvider;

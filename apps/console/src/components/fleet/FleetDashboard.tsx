@@ -5,7 +5,7 @@ import { Icon } from "@/components/shell/Icon";
 import { useEventStream } from "@/lib/useEventStream";
 
 /* Static roster/table data — pixel-faithful renderings of the Figma design.
-   The task engine that feeds these lands in Phase 2 (master plan §11). */
+   The task engine that feeds these lands in Phase 3 (master plan §11). */
 
 const TOP_AGENTS = [
   {
@@ -361,7 +361,7 @@ function RecentTasksTable() {
  * Fleet (§7.1) — the Figma "Home Dashboard" screen. The Swarm Activity
  * "last updated" line is wired live to the newest daemon event; roster,
  * token, and task figures are pixel-faithful placeholders until the task
- * engine (Phase 2) and brain (Phase 3) feed them.
+ * engine and Brain (Phase 3) feed them.
  */
 export function FleetDashboard() {
   const { events } = useEventStream();
