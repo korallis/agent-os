@@ -15,6 +15,7 @@ import {
 } from "@agent-os/protocol";
 import { DEFAULT_ISOLATION } from "@agentos/claude-agent-sdk-pi";
 import { detectPi, installHintForPi, listDetectedProviders, managedPiHome } from "../pi/manager.js";
+import { readApiKeyFile } from "../pi/connections.js";
 import { assertNoAmbientAnthropicKey, EnvHygieneError } from "../security/env-scrub.js";
 import { spawnSync } from "node:child_process";
 
@@ -163,7 +164,7 @@ export class OnboardingService {
           provider,
           selected: selected.has(provider),
           detected: detected.has(provider),
-          authVerified: detected.has(provider) || isSubscriptionSdkVerified(existing),
+          authVerified: isAuthVerified(this.home, provider, detected, existing),
           claudeBillingMode: existing?.claudeBillingMode ?? null,
           claudeSdk: existing?.claudeSdk ?? null,
         };
@@ -180,7 +181,11 @@ export class OnboardingService {
       ...this.state,
       providers: this.state.providers.map((p) =>
         p.provider === provider
-          ? { ...p, authVerified: detected.has(provider), detected: detected.has(provider) }
+          ? {
+              ...p,
+              authVerified: isAuthVerified(this.home, provider, detected, p),
+              detected: detected.has(provider),
+            }
           : p,
       ),
     };
@@ -350,6 +355,24 @@ function seedProviderChecklist(home: string): OnboardingProviderChoice[] {
   }));
 }
 
+/**
+ * Auth is verified when any credential path succeeds: auth-store presence,
+ * complete subscription-sdk checklist, readable API-key secret, or a healthy
+ * pi-api-key connection for the provider.
+ */
+function isAuthVerified(
+  home: string,
+  provider: PiProviderId,
+  detected: Set<PiProviderId>,
+  choice: OnboardingProviderChoice | undefined,
+): boolean {
+  return (
+    detected.has(provider) ||
+    isSubscriptionSdkVerified(choice) ||
+    isApiKeyVerified(home, provider)
+  );
+}
+
 /** True when anthropic subscription-sdk path has every verification flag set. */
 function isSubscriptionSdkVerified(
   choice: OnboardingProviderChoice | undefined,
@@ -365,6 +388,33 @@ function isSubscriptionSdkVerified(
     sdk.isolationDefaults &&
     sdk.catalogHealthcheck
   );
+}
+
+/** Readable secrets file or healthy pi-api-key connection for API-key providers. */
+function isApiKeyVerified(home: string, provider: PiProviderId): boolean {
+  const key = readApiKeyFile(home, provider);
+  if (key !== null && key.length > 0) return true;
+  return hasHealthyApiKeyConnection(home, provider);
+}
+
+function hasHealthyApiKeyConnection(home: string, provider: PiProviderId): boolean {
+  const path = join(home, "connections.json");
+  if (!existsSync(path)) return false;
+  try {
+    const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!Array.isArray(raw)) return false;
+    return raw.some((item) => {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+      const record = item as Record<string, unknown>;
+      return (
+        record["provider"] === provider &&
+        record["kind"] === "pi-api-key" &&
+        record["health"] === "healthy"
+      );
+    });
+  } catch {
+    return false;
+  }
 }
 
 function hasClaudeCodeCredential(): boolean {

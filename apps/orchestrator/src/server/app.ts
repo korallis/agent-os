@@ -726,7 +726,9 @@ function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): bo
     );
   }
 
-  // Fallback only when the checklist is empty (R5.1 detection-driven).
+  // Presence fallback only when the checklist is empty (never seeded).
+  if (state.providers.length > 0) return false;
+
   const presence = listDetectedProviders(deps.home).filter((p) => p.present);
   if (presence.length === 0) return false;
   return enableQuotaProviders(
