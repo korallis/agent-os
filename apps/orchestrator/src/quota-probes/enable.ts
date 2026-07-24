@@ -63,23 +63,17 @@ export function enableQuotaProviders(
       : {};
 
   const effective = config.config.quota.providers;
-  const nextProviders: Record<string, { enabled: boolean; bestEffortAllowed: boolean }> = {
-    ...Object.fromEntries(
-      Object.entries(effective).map(([key, value]) => [
-        key,
-        { enabled: value.enabled, bestEffortAllowed: value.bestEffortAllowed },
-      ]),
-    ),
-  };
-
+  // Partial global overlay: only write keys that actually flip so deep-merge
+  // keeps shipped defaults for untouched providers.
+  const flipped: Record<string, { enabled: boolean; bestEffortAllowed: boolean }> = {};
   let changed = false;
   for (const key of keys) {
-    const current = nextProviders[key] ?? effective[key];
+    const current = effective[key];
     const bestEffortAllowed = key === "xai" ? true : current.bestEffortAllowed;
     if (current.enabled === true && current.bestEffortAllowed === bestEffortAllowed) {
       continue;
     }
-    nextProviders[key] = { enabled: true, bestEffortAllowed };
+    flipped[key] = { enabled: true, bestEffortAllowed };
     changed = true;
   }
   if (!changed) return;
@@ -91,7 +85,7 @@ export function enableQuotaProviders(
         ...base,
         providers: {
           ...existingProviders,
-          ...nextProviders,
+          ...flipped,
         },
       },
       null,

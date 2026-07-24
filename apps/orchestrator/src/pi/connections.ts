@@ -110,7 +110,10 @@ export class ConnectionRegistry {
     const presentProviders = new Set(presence.map((p) => p.provider));
 
     for (const p of presence) {
-      const existing = [...this.connections.values()].find((c) => c.provider === p.provider);
+      // Auth-store presence only drives pi-oauth cards; never attach to pi-api-key.
+      const existing = [...this.connections.values()].find(
+        (c) => c.provider === p.provider && c.kind === "pi-oauth",
+      );
       if (existing !== undefined) {
         const nextHealth = p.present ? "healthy" : "unknown";
         if (
@@ -155,7 +158,7 @@ export class ConnectionRegistry {
     for (const existing of this.connections.values()) {
       if (presentProviders.has(existing.provider)) continue;
       // API-key connections are not driven by auth-store presence.
-      if (existing.kind === "pi-api-key" && existing.authStorePresence === null) continue;
+      if (existing.kind === "pi-api-key") continue;
       if (existing.authStorePresence === null && existing.health === "unknown") continue;
       const cleared: ProviderConnection = {
         ...existing,

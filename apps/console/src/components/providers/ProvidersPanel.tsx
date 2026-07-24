@@ -51,6 +51,22 @@ function tierBadge(tier: string): string {
   return "≈ ESTIMATE";
 }
 
+/** Prefer healthy, then api-key, then oauth when multiple cards share a provider. */
+function pickDisplayConnection(
+  connections: ProviderConnection[],
+  provider: string,
+): ProviderConnection | undefined {
+  const matches = connections.filter((c) => c.provider === provider);
+  if (matches.length === 0) return undefined;
+  const healthy = matches.find((c) => c.health === "healthy");
+  if (healthy !== undefined) return healthy;
+  const apiKey = matches.find((c) => c.kind === "pi-api-key");
+  if (apiKey !== undefined) return apiKey;
+  const oauth = matches.find((c) => c.kind === "pi-oauth");
+  if (oauth !== undefined) return oauth;
+  return matches[0];
+}
+
 /**
  * Live Providers panel — quota cards + connection rows (master plan §7.3).
  * Falls back to Figma-faithful empty/static treatment when the daemon is down.
@@ -272,7 +288,7 @@ export function ProvidersPanel() {
       {/* Connection management rows — Figma Settings · API Providers structure */}
       <div className="flex flex-col gap-3">
         {CONNECT_ROWS.map(({ provider, oauth, apiKey }) => {
-          const existing = connections.find((c) => c.provider === provider);
+          const existing = pickDisplayConnection(connections, provider);
           const logo = LOGO[provider] ?? { letter: "?", className: "bg-fg-3" };
           return (
             <div key={provider} className="flex flex-col gap-2 border-t border-line-2 pt-3 first:border-t-0 first:pt-0">

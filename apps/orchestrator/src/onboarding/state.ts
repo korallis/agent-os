@@ -28,8 +28,25 @@ const PROVIDER_CHECKLIST: PiProviderId[] = [
   "vercel-ai-gateway",
 ];
 
+const STEP_ORDER: readonly OnboardingStep[] = [
+  "doctor",
+  "providers",
+  "auth",
+  "claude-billing",
+  "probes",
+  "complete",
+];
+
 const CLAUDE_AGENT_SDK_PACKAGE = "@agentos/claude-agent-sdk-pi";
 const ISOLATION_DEFAULTS_FILE = "claude-agent-sdk-isolation.json5";
+
+/** Advance to target only when still on/before it; never rewind later progress. */
+function stepAtOrAdvance(current: OnboardingStep, target: OnboardingStep): OnboardingStep {
+  const currentIdx = STEP_ORDER.indexOf(current);
+  const targetIdx = STEP_ORDER.indexOf(target);
+  if (currentIdx === -1 || targetIdx === -1) return current;
+  return currentIdx <= targetIdx ? target : current;
+}
 
 /**
  * Resumable onboarding wizard state (master plan §4.10).
@@ -139,7 +156,7 @@ export class OnboardingService {
     const selected = new Set(providers);
     this.state = {
       ...this.state,
-      step: "providers",
+      step: stepAtOrAdvance(this.state.step, "auth"),
       providers: PROVIDER_CHECKLIST.map((provider) => {
         const existing = this.state.providers.find((p) => p.provider === provider);
         return {
@@ -152,7 +169,6 @@ export class OnboardingService {
         };
       }),
     };
-    this.state = { ...this.state, step: "auth" };
     this.save(previous);
     return this.state;
   }
@@ -183,7 +199,7 @@ export class OnboardingService {
    */
   enableProbes(): OnboardingState {
     const previous = this.state.step;
-    this.state = { ...this.state, step: "probes" };
+    this.state = { ...this.state, step: stepAtOrAdvance(this.state.step, "probes") };
     this.save(previous);
     return this.state;
   }
@@ -192,7 +208,7 @@ export class OnboardingService {
     const previous = this.state.step;
     this.state = {
       ...this.state,
-      step: "claude-billing",
+      step: stepAtOrAdvance(this.state.step, "claude-billing"),
       providers: this.state.providers.map((p) =>
         p.provider === "anthropic"
           ? {
