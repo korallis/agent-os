@@ -4,7 +4,7 @@ import { useRef } from "react";
 import { motion, useInView } from "framer-motion";
 import dynamic from "next/dynamic";
 import { fadeUp, staggerContainer } from "@agent-os/ui";
-import MagneticButton from "@/components/ui/MagneticButton";
+import { MagneticButton } from "@agent-os/ui";
 import PageHero from "@/components/sections/PageHero";
 import PricingCard from "@/components/ui/PricingCard";
 const FAQAccordion = dynamic(() => import("@/components/ui/FAQAccordion"));

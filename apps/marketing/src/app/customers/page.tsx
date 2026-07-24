@@ -3,9 +3,9 @@
 import { useRef } from "react";
 import { motion, useInView } from "framer-motion";
 import { fadeUp, staggerContainer, staggerContainerSlow } from "@agent-os/ui";
-import MagneticButton from "@/components/ui/MagneticButton";
+import { MagneticButton } from "@agent-os/ui";
 import PageHero from "@/components/sections/PageHero";
-import GlassCard from "@/components/ui/GlassCard";
+import { GlassCard } from "@agent-os/ui";
 import { customerStories } from "@/lib/data/customers";
 
 const metrics = [

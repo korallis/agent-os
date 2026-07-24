@@ -3,7 +3,7 @@
 > **Provenance:** FUSED MASTER PLAN produced by the FUSION agent from two independent plans:
 > **[A]** = PLAN A (`plan-a-fable.md`, architect: Claude Fable 5, thinking high) · **[B]** = PLAN B (`plan-b-sol.md`, architect: GPT-5.6 Sol, medium).
 > **[CONSENSUS]** marks positions both plans reached independently. **[R2]** marks the Pi single-harness revision; **[R3]** marks the LLM-Brain + full-configurability revision; **[R4]** marks the Captain's decisions revision; **[R5]**/**[R5.1]** mark the live quota & balance metering revision and its detection-driven amendment; **[R6]** marks the guided onboarding wizard + Claude Agent SDK subscription-billing revision (all Captain's directives). Divergences are resolved inline with attribution and a one-to-two-sentence rationale; materially contested losers are preserved as "Rejected alternative" notes. A mandatory **Consensus & Divergence** ledger closes the document.
-> **Status:** Revision 6 — Guided onboarding wizard + Claude Agent SDK subscription billing, 2026-07-24.
+> **Status:** Revision 6.3 — Figma canonical UI spec, 2026-07-24.
 
 ---
 
@@ -92,7 +92,7 @@ v1 is shipped when all of the following are true (each restated as an executable
 
 **[A] chosen over [B].** Preserved **verbatim as `apps/marketing`**, a separate Next.js app sharing `packages/ui`; deploys publicly; never imports orchestrator code. *Rationale:* a localhost-only console must never share a deployable with a public site. *Adopted from [B]:* the honesty pass. *Rejected alternative [B]:* `/site` fold-in with redirects.
 
-**[R5] Design-system mandate (Captain's directive):** the Console **must** use the marketing site's design language — the two surfaces stay visually one product, since the marketing page will be made use of at a later stage. The system is extracted into `packages/ui` in **Phase 0** as tokens + primitives: ink-on-white palette with dark `bg-ink` panels, hairline `border-rule` grid dividers, **Geist Sans display numerals** (big bold `text-display-*`), **Geist Mono uppercase micro-labels** with wide tracking (`text-xs font-mono uppercase tracking-[0.2em]`), the section-grid layout idiom from `apps/marketing/src/app/page.tsx`, and Framer Motion reveals. Every Console surface — most visibly the quota meters of §7.3 — renders in this idiom; ad-hoc styling in `apps/console` is a review defect.
+**[R5→R6.2→R6.3] Design-system mandate (Captain's directives, current form):** **[R6.3]** the UI's single source of truth for the **product app** is the Captain's Figma file — *"AgentOS — AI Agent Orchestration Dashboard"* (`Ria7UpyEPRd9jNlF9B6xgF`); every product screen must **exactly replicate** its corresponding Figma frame (§7). `packages/ui` remains the shared token/component home, now sourced from **both** origins: the marketing site's promoted components (header/nav, GlassCard, MagneticButton, AnimatedCard, TextReveal, gradients, marquee — marketing keeps rendering identically; that parity gate stands) **and** the Figma file's tokens/components (dark charcoal surfaces, slim icon rail, top bar, stat cards with delta chips, teal→green charts, status pills) for the product app. **Where the two conflict on product screens, Figma wins.** The R6.2 rule against bespoke lookalikes stands: components come from `packages/ui`, built once against the Figma spec. Ad-hoc styling in `apps/console` is a review defect.
 
 ---
 
@@ -473,7 +473,9 @@ agent-os/
 │   └── cli/                          # agentos CLI (+ `agentos config` subcommands [R3])
 ├── packages/
 │   ├── protocol/                     # zod: REST, SSE, socket frames, TOOL SURFACE, CONFIG schemas
-│   ├── ui/
+│   ├── ui/                           # [R6.2] PROMOTED marketing components (header/nav, GlassCard,
+│   │                                 #   MagneticButton, AnimatedCard, TextReveal, gradients, marquee)
+│   │                                 #   + tokens — console composes these, never bespoke lookalikes
 │   ├── pi-extension/                 # [R2] the agent-os Pi extension
 │   │   └── src/{index,telemetry,guard,control,tools,brain-bridge}.ts   # brain-bridge [R3]
 │   ├── pi-ext-claude-agent-sdk/      # [R6.1] vendored fork of claude-agent-sdk-pi (Claude subscription-billing bridge; upstream tracked via diff review)
@@ -811,45 +813,80 @@ Unchanged from Rev 2 (directory, write-once phases, SHA-256, redaction), with `s
 
 ## 7. Console UI Spec
 
-General **[CONSENSUS + R2; design language re-based R5]**: the Console renders in the **marketing site's design system** (mandated, §1.5): ink-on-white with dark `bg-ink` panels, hairline `border-rule` dividers on the section-grid layout idiom, **Geist Sans display numerals** (`text-display-*`) for the big numbers, **Geist Mono uppercase micro-labels** (`text-xs font-mono uppercase tracking-[0.2em]`) for metadata rows, Framer Motion reveals — all from `packages/ui`, no ad-hoc styling. Left-rail nav (Fleet, Projects, Tasks, Runs, Providers, Analytics, **Policies** [R3], Settings); ⌘K **Brain chat** drawer on every page [R3]; one SSE stream; on-demand ticketed terminal; red reserved for security/auth/hard failures (including the `LIMIT REACHED` pill [R5]); unknown quota renders `?`. Live columns are extension-fed **[R2]**. **[R3]:** any active safety-policy override renders a persistent amber badge linking to the Policies page. **[R5]:** every quota metric renders its honesty tier (● LIVE / ◌ BEST-EFFORT / ≈ ESTIMATE), source label, and synced-at timestamp — the screenshots' info hierarchy (huge numeral, thin bar, right-aligned mono "RESETS IN ND", currency balances, per-window sub-rows, refresh + synced row) maps 1:1 onto this language.
+**[R6.3 — the governing frame, Captain's directive: "the UI exactly replicates the Figma file."]** The UI's single source of truth is the Captain's Figma file: **"AgentOS — AI Agent Orchestration Dashboard"** — `https://www.figma.com/design/Ria7UpyEPRd9jNlF9B6xgF/…?node-id=4-2081` (fileKey `Ria7UpyEPRd9jNlF9B6xgF`, canvas `4:2081` "⚙️ ・ Workspace"). Every product screen must **exactly replicate** its corresponding Figma frame. Inspected 2026-07-24: the design is a **dark dashboard** — charcoal/black surfaces, a **slim icon-only left rail**, a top bar (page title · search · notifications · date · profile), rounded stat cards with hairline borders and big semibold numerals with green/red delta chips, teal→green gradient charts, donut charts, dark tables with status pills (Done/Failed/Queued), amber warning banners — plus a light marketing landing frame in the same file.
 
-### 7.1 Fleet Dashboard (`/fleet`)
+**Supersession, stated honestly:** R6.2's "no admin shell / marketing-idiom editorial pages" reading is **overridden wherever the Figma file shows dashboard chrome — the Figma file wins** (and it does show an icon rail and top bar throughout the Workspace frames). What survives of R6.2: components live in `packages/ui`, no bespoke lookalikes, marketing renders identically. The §7.x ASCII wireframes below (and R6.2's editorial-section descriptions) **demote to information-architecture references** — content and data requirements remain normative; **visual truth lives in Figma**.
 
-Rev-2 wireframe retained with two [R3] deltas — the NEEDS-YOU card is Brain-mediated, and a Brain status chip appears in the header:
+**Process requirement [R6.3]:** implementers MUST pull per-screen design context from the Figma MCP (`get_design_context`, with the `figma-design-to-code` skill loaded first) rather than eyeballing screenshots; every UI evidence pack includes **Figma-frame-vs-implementation side-by-sides per screen** (this extends the R6.2 brand-parity gate — §11 Phases 1/6).
+
+**Screen inventory** (from `get_metadata` on canvas `4:2081`; frame → route → phase live):
+
+| Figma section / frame | Node id | Route | Live in |
+|---|---|---|---|
+| Landing Page · "Orchestrate AI Agents At Scale" | `8:11470` | `apps/marketing` home | Phase 0 (visual refresh at Captain's option) |
+| Dashboard · Home Dashboard | `10:11978` | `/fleet` | UI Phase 1 (placeholder) → live Phase 3 |
+| Dashboard · All Agents | `17:4` | `/tasks` (board) | Phase 3 |
+| Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | Phase 3 → fusion columns Phases 4–5 |
+| Dashboard · Swarm Activity | `37:2871` | `/fleet` activity + `/runs` overview | Phase 3–4 |
+| Dashboard · Notifications | `17:940` | `/notifications` (wake queue / needs-you) | Phase 3 |
+| Dashboard · Token Usage | `37:2265` | `/analytics` (usage, cost, budgets) + quota surfaces | probes Phase 2 → full Phase 6/8 |
+| Dashboard · Onboarding Guide | `37:1300` | `/onboarding` (§4.10 wizard) | Phase 2 |
+| Dashboard · User Profile | `37:1553` | `/settings` (profile section) | Phase 6 |
+| Agent Detail · Agent Detail / Agent Logs / Create New Agent / Edit Agent | `41:2` / `41:456` / `41:1226` / `41:1605` | crewmate/session detail · terminal log view · new-task dispatch · task/config edit | Phase 3 |
+| Inference Jobs · Inference Jobs / Pipeline Runs | `41:2412` / `41:5136` | `/runs` (fusion runs + history) | Phases 4–5 |
+| Inference Jobs · Live Log Stream | `41:3973` | terminal/stream view | Phase 3 |
+| Inference Jobs · Model Performance | `41:4355` | `/analytics` (per-model) | Phase 8 |
+| Inference Jobs · Recent Alerts | `41:5674` | wake queue / `quota.threshold` surfaces | Phase 3 |
+| Inference Jobs · Cluster Nodes / GPU Cluster Detail | `41:730` / `41:1892` | secondmate fleet topology | Phase 7 |
+| Workflows · Workflow List / Run History | `41:6896` / `41:7213` | `/policies` fusion profiles + `/runs` history | Phases 4–6 |
+| Workflows · Network I/O Detail | `41:4815` | `/analytics` detail | Phase 8 |
+| Settings · API Providers | `41:6186` | `/providers` (§7.3) | Phase 2 |
+| Settings · Billing | `41:6309` | budgets (Policies ▸ Budgets + quota) | Phases 2/6 |
+| Settings · Workspace | `41:6672` | `/settings` | Phase 6 |
+| Empty State · Not Found / Server Error / No Data / No Results | `37:3731` / `37:3760` / `37:3792` / `37:3812` | shared empty/error treatments | Phase 1 onward |
+| Other · Delete Agent / KB Upload / Test Agent modals | `41:1519` / `41:3790` / `41:6787` | modals on their owning screens | with owners |
+| **SKIPPED (R6.3-Q1 — Captain: "skip"):** Login (Sign In/Up/Forgot, `37:3447/37:3607/37:3689`); Pricing & Upgrade/Checkout/Payment Success (`37:3849/37:4074/37:4230`); Settings · Team Members (`37:4297/41:6442`); Knowledge Base (`41:2767/41:3226/41:3505`) — **not implemented**; only frames mapping to the local single-user product are built. Retained here as future/marketing candidates | | not built | — |
+
+**Future-phase screens [R6.3]:** frames whose data arrives later (providers/quota, fleet, tasks, onboarding) are implemented **pixel-faithful with placeholder data at UI-build time** and wired live in their phase — never left as empty panes.
+
+Carried forward unchanged: nav destinations (now the Figma icon rail + top bar); ⌘K **Brain chat** drawer [R3]; one SSE stream; on-demand ticketed terminal; red for security/auth/hard failures incl. the `LIMIT REACHED` pill [R5]; unknown quota renders `?`; extension-fed live columns [R2]; safety-override amber badge [R3]; per-metric honesty tier + source + synced-at [R5].
+
+### 7.1 Fleet (`/fleet`) — the live front page
+
+**[R6.2]** A marketing-style page of stacked full-bleed sections under the promoted **top nav** — a hero whose display numerals are live, then editorial sections divided by hairlines. Same information architecture as before (fleet stats, usage strip, active tasks, wake feed, needs-you, secondmates); no rails, no panes:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ AGENT OS ▸ Fleet          ⌘K Brain   ● agentosd ✓   ● brain ✓ (claude-fable-5)│
-├────────────┬─────────────────────────────────────────────────────────────────┤
-│ ▸ Fleet    │  FLEET   ACTIVE 4   QUEUED 2   NEEDS YOU 1 ⚠   today $19.31 est │
-│   Projects │  USAGE STRIP (live probes · click → /providers)  [R5]           │
-│   Tasks    │ ┌──────────────────────────────────────────────────────────────┐│
-│   Runs     │ │ CLAUDE·MAX   ▰▰▱▱▱▱▱▱ 24% wk · 76% LEFT · x-usage £1,001 ●   ││
-│   Providers│ │ OPENAI·CODEX ▰▰▰▰▰▰▰▰ ⟨LIMIT REACHED⟩ · US$433.12 credits ●  ││
-│   Analytics│ │ GROK·WEEKLY  ▱▱▱▱▱▱▱▱ 0% · 100% LEFT · US$44.19 ◌  KIMI $400 ●││
-│            │ └──────────────────────────────────────────────────────────────┘│
-│   Policies │  ACTIVE TASKS                     WAKE QUEUE → brain             │
-│   Settings │ ┌───────────────────────────────┐ 12:47 gate.failed T-9F2 ▸brain│
-│            │ │ T-9F2 SHIP VALIDATING 3/6     │ 12:46 turn.settled T-9F4 ✓abs │
-│            │ │ builder:openai ↔ gate:anthropic│ 12:44 credential.refreshed   │
-│            │ │ settled 14s · ctx 41%  [view] │                               │
-│            │ │ T-9F4 SCOUT BUILDING 2m       │  NEEDS YOU (1)                │
-│            │ │ T-9F7 SHIP → sm:infra         │ ⚑ T-9E1 brain asks: "OK to    │
-│            │ │ T-9F9 WAITING_WORKTREE ⚠      │   bump zod 4.1→4.2?"          │
-│            │ └───────────────────────────────┘ [answer] [approve] [take over]│
-│            │  SECONDMATES  infra ● 2 active   docs ● idle    [+ provision]   │
-└────────────┴─────────────────────────────────────────────────────────────────┘
+│ AGENT OS   Fleet Projects Tasks Runs Providers Analytics Policies ⚙   ⌘K ▊  │  ← marketing header/nav
+╞══════════════════════════════════════════════════════════════════════════════╡
+│  FLEET — LIVE                                    ● agentosd ✓ · ● brain ✓    │  ← eyebrow (mono, tracked)
+│                                                                              │
+│  4 ACTIVE      2 QUEUED      1 NEEDS YOU ⚠      $19.31 TODAY EST             │  ← hero: display numerals,
+│                                                                              │     values live over SSE
+├─ USAGE ──────────────────────────────────────────────────── border-rule ────┤
+│  CLAUDE·MAX  ▰▰▱▱▱▱ 24% WK · 76% LEFT · £1,001 ●    OPENAI ⟨LIMIT REACHED⟩  │  ← full-bleed strip section
+│  GROK ▱▱▱▱▱▱ 100% LEFT ◌      KIMI $400.38 ●        US$433.12 CREDITS ●     │
+├─ UNDERWAY ───────────────────────────────────────────────────────────────────┤
+│  T-9F2  SHIP · VALIDATING 3/6      builder openai ↔ gate anthropic           │  ← each task an editorial
+│         settled 14s · ctx 41%                                    [view →]    │     row (AnimatedCard),
+│  T-9F4  SCOUT · BUILDING 2m        T-9F7 SHIP → sm:infra                     │     not a table
+├─ THE BRAIN HEARD ────────────────────────────────────────────────────────────┤
+│  12:47  gate.failed T-9F2 → brain      12:46  turn.settled T-9F4 ✓ absorbed  │  ← wake feed as a designed
+│  ⚑ NEEDS YOU — brain asks: "OK to bump zod 4.1→4.2?"   [answer] [approve]    │     section, not a log panel
+├─ SECONDMATES ────────────────────────────────────────────────────────────────┤
+│  infra ● 2 active        docs ● idle                        [+ provision]    │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-If the Brain is down: the header chip goes red, and a banner shows `BRAIN DOWN — 7 wakes queued · sessions alive · [switch model] [restart brain]` **[R3]**.
+If the Brain is down: the header chip goes red and a full-width banner section shows `BRAIN DOWN — 7 wakes queued · sessions alive · [switch model] [restart brain]` **[R3]**.
 
 ### 7.2 Task Detail with live fusion columns (`/tasks/[id]`)
 
-Rev-2 wireframe retained (three extension-fed columns with per-column cost/context meters, phase stepper, auto-validate evidence panel, read-only terminal with take-over). [R3] delta: the header shows the **effective config chips** for the task (`profile: default-cross-family · maxVal 6 · pool app-web/4 · overrides: none`) — clicking opens the Policies page scoped to this task's resolved config; a timeline lane shows **Brain decisions** (each tool call with its one-line rationale extracted from the Brain's message, timestamped and linkable to the transcript).
+Content unchanged (three extension-fed live columns with per-column cost/context meters, phase progression, auto-validate evidence, read-only terminal with take-over). [R3] delta: the header shows the **effective config chips** for the task — clicking opens the Policies page scoped to this task's resolved config; a **Brain decisions** lane shows each tool call with its one-line rationale. **[R6.2] framing:** the page is a stacked editorial article about the task — a hero (intent + phase progression as display typography), the three plan columns as a full-bleed section-grid, the validation evidence as its own hairline-divided section, the terminal as a designed section that expands in place — not tabs-and-panes chrome.
 
 ### 7.3 Provider Connections & Usage (`/providers`) **[R5 — quota cards added]**
 
-The Rev-2 connection management content is retained (Pi harness version header; `/login`-driven `pi-oauth` connect flows with the **EXTRA USAGE — PER-TOKEN** warning + daily budget on Claude; `pi-api-key` keychain custody + precedence warnings; ToS footer; wizard contract). **[R5]** The page leads with a **quota card grid** — the screenshots' menu-bar-tool information hierarchy re-set in the Agent OS design language: `bg-ink` cards on the hairline section grid, `text-display-*` Geist Sans numerals for the headline percentage/balance, Geist Mono uppercase tracking-wide micro-labels for windows/sources, thin 1px-track progress bars, right-aligned `RESETS IN ND` labels, red `LIMIT REACHED` pill, per-card refresh + synced row:
+The Rev-2 connection management content is retained (Pi harness version header; `/login`-driven `pi-oauth` connect flows with the **EXTRA USAGE — PER-TOKEN** warning + daily budget on Claude; `pi-api-key` keychain custody + precedence warnings; ToS footer; wizard contract). **[R5]** The page leads with a **quota card grid**. **[R6.3] Visual form now follows the Figma file** — *Settings · API Providers* (`41:6186`) for connection management and *Token Usage* (`37:2265`) for the usage/budget surfaces (dark stat cards, delta chips, teal charts, budget bars with amber limit warnings); the wireframe below and its idiom notes are an information-architecture reference only. **All §4.9 content requirements stand:** per-metric honesty tier (● LIVE / ◌ BEST-EFFORT / ≈ ESTIMATE), source label, synced-at, refresh affordance, per-window sub-rows, currency-verbatim balances, red `LIMIT REACHED` exclusion pill:
 
 ```
 ┌ PROVIDERS · USAGE & QUOTA ──────────────── polled 5m · [REFRESH ALL ⟳] ─────┐
@@ -919,7 +956,7 @@ Rev-2 wireframe retained: attributed spans (click → source), consensus/diverge
 └──────────────┴───────────────────────────────────────────────────────────────┘
 ```
 
-Behaviors: layer tabs switch scope; every value shows its full override chain with diff-from-default highlighting (◆); safety section is visually distinct with stamped-override warnings; prompt templates get the three-way diff upgrade flow (§2.6); project overrides show trust/acknowledgment state; raw-file editing is always available (files are the truth — the UI is a client of them).
+Behaviors: layer tabs switch scope; every value shows its full override chain with diff-from-default highlighting (◆); safety section is visually distinct with stamped-override warnings; prompt templates get the three-way diff upgrade flow (§2.6); project overrides show trust/acknowledgment state; raw-file editing is always available (files are the truth — the UI is a client of them). **[R6.2] framing:** the domain list renders as an in-page section index (typeset, marketing-style) and each domain is a hairline-divided section of a typeset config chain — the override table is a designed section-grid, not a settings form; no admin chrome.
 
 ### 7.6 Settings (`/settings`)
 
@@ -946,7 +983,7 @@ Also specified (not wireframed) **[CONSENSUS]**: Projects, Task Board, Analytics
 
 ### 7.7 Onboarding Wizard (`/onboarding`) **[R6]**
 
-Full-screen guided flow per §4.10, in the mandated design language: step rail in Geist Mono uppercase micro-labels, copy-paste command blocks on `bg-ink` panels, live-verification ticks that flip only when the re-probe passes, persisted/resumable state, ⟨DETECTED⟩ badges from R5.1 detection. The two signature steps:
+Full-screen guided flow per §4.10. **[R6.3] Visual form follows the Figma *Onboarding Guide* frame (`37:1300`)**; the wireframe below is the information-architecture reference. All §4.10 content requirements stand: step rail, copy-paste command blocks, live-verification ticks that flip only when the re-probe passes, persisted/resumable state, ⟨DETECTED⟩ badges, and the mandatory Claude-SDK branch blocking. The two signature steps:
 
 ```
 ┌ AGENT OS · ONBOARDING ─── step 2a of 4 ─── resumable ✓ ─────────────────────┐
@@ -1118,16 +1155,17 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 **[CONSENSUS on gate philosophy]** — executable gates authored before each phase, RED at phase start. **[R3] re-sequencing:** the config layering system lands in Phase 1 (everything after it consumes it), and the **substrate tool surface + Brain land in Phase 3** — the Brain is the orchestrator from the first end-to-end task onward; there is no interim rule-engine orchestrator to build and then discard.
 
 **Phase 0 — Monorepo scaffold & migration (1 wk)** — unchanged:
-- [ ] pnpm+Turborepo; marketing verbatim; console shell + daemon boot; CLI skeleton.
+- [ ] pnpm+Turborepo; marketing verbatim; console pages in the marketing idiom (top nav, no admin shell) + daemon boot; CLI skeleton. [R6.2]
 - [ ] Strict TS + `no-explicit-any` + zero-`any` scanner. [B]
 - [ ] Deprecation gates clean. **[CONSENSUS]**
 - [ ] Marketing pixel-identical smoke (diff < 0.1%) [A]; honesty pass [B].
-- [ ] **Design-system extraction gate [R5]:** the marketing design system (palette incl. `bg-ink`, `border-rule` hairlines, `text-display-*` numerals, Geist Mono micro-label styles, section-grid primitives, motion variants) lives in `packages/ui`; the console shell renders these tokens; a visual-parity check confirms typography/palette primitives match the marketing site (Playwright style assertions on shared primitives).
+- [ ] **Design-system extraction gate [R5, strengthened R6.2]:** the marketing **components themselves** (header/nav, GlassCard, MagneticButton, AnimatedCard, TextReveal, gradients, marquee) + tokens (palette incl. `bg-ink`, `border-rule` hairlines, `text-display-*` numerals, Geist Mono micro-label styles, section-grid primitives, motion variants) are promoted to `packages/ui`; the console composes the real components (import-path assertion: no bespoke lookalikes); **marketing renders identically after promotion** (Playwright visual parity on marketing routes) and console typography/palette primitives match marketing's.
 
-**Phase 1 — Daemon substrate, persistence, events, config layering, live console shell (2.5 wk)** [B]+[R3]:
+**Phase 1 — Daemon substrate, persistence, events, config layering, live product pages (2.5 wk)** [B]+[R3]+[R6.2]:
 - [ ] Loopback-only enforced; 401s; BFF never leaks the token. [B]
 - [ ] Kill/restart after 100 events → exactly-once projection + SSE resume; corrupt tail quarantined. [B]
 - [ ] Fleet page reflects a state change over SSE within 500 ms. [B]
+- [ ] **Figma-source gate [R6.3]:** Phase-1 screens (Fleet, empty states) are built from `get_design_context` on their inventory frames (`10:11978`, `37:3731`–`37:3812`), pixel-faithful with placeholder data where the phase's data doesn't exist yet; the evidence pack carries Figma-vs-implementation side-by-sides.
 - [ ] **Config gates [R3]:** shipped defaults install; global file edit hot-reloads a supervision value (observed); **project override beats global; task override beats project** (resolution test matrix); `/v1/config/effective` reports per-key source layer; **invalid config rejected with a typed, path-precise error** and nothing partially applied; safety-policy write requires confirmation and emits `policy.changed`; project `.agentos/` has no effect before trust-ack and re-prompts on hash change.
 - [ ] launchd template (macOS-only v1 [R4]); `doctor` verifies tmux/git/gh/node/pi/**uv** [R4]. [B]+[R2]
 
@@ -1185,6 +1223,7 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [ ] **Policies page gates [R3]:** layered chain view shows correct per-key source; diff-from-default marks (◆) accurate; safety-policy toggle requires confirmation, stamps overrides, and raises the persistent badge; prompt three-way diff renders for a customized template with a shipped update.
 - [ ] **Usage & quota UI gates [R5]:** the Fleet usage strip renders per-connection name · window bar · % left · balance from seeded `quota_samples` and updates on `quota.updated` within 1 s; the quota card grid renders all four card archetypes (weekly-window, limit-reached, best-effort, balance-split) with tier badges, source rows, synced timestamps, and working per-card refresh; the `LIMIT REACHED` pill renders red and links to the exclusion reason (Playwright).
 - [ ] Terminal reconnect resumes the same tmux window. [B]
+- [ ] **Figma-fidelity gate [R6.3, replaces R6.2's brand-parity gate]:** every shipped screen has a **Figma-frame-vs-implementation side-by-side** in the evidence pack (per breakpoint where the frame specifies); implementation was built from `get_design_context` per screen (figma-design-to-code skill), not eyeballed screenshots; visual diffs reviewed against the canonical frames in the §7 inventory. **Kept from R6.2:** marketing renders identically after component promotion (no-regression parity on marketing routes).
 
 **Phase 7 — Secondmates & fleet operations (v1.x, 3 wk)** — Rev-2 gates plus:
 - [ ] Isolated homes; no shared inodes; double-start blocked; **no auth material under secondmate homes** (fs scan). [A]+[B]+[R2]
@@ -1276,8 +1315,9 @@ Carried forward where live; **[R3-Q]** marks new questions:
 18. ~~**[R5-Q1] Grok best-effort probing: default-ON or opt-in?**~~ — **RESOLVED [R5.1], Captain's decision:** neither — **detection-driven**. The first-run onboarding flow detects which providers the user's Pi agent has authenticated (auth-store presence metadata) and enables tracking accordingly: Grok's best-effort probe is ON when a Grok subscription credential is detected, absent otherwise; individually toggleable afterward (§4.9, config #14).
 19. ~~**[R6-Q1] Vendor/fork `claude-agent-sdk-pi`?**~~ — **RESOLVED [R6.1], Captain's decision: fork/vendor.** The bridge lives in the monorepo as `packages/pi-ext-claude-agent-sdk` (published `@agentos/claude-agent-sdk-pi`), under our CI; upstream changes land only via reviewed diffs. Removes the single-author npm-publish trust boundary; the maintenance cost of tracking upstream is accepted.
 20. **[R6-Q2] Does the Claude usage probe expose the Agent SDK monthly credit pool?** `api/oauth/usage` verifiably reports session/weekly windows and extra-usage spend; whether the 2026-06-15 SDK credit pool is queryable via the Claude Code OAuth credential is a **Phase 2 verification** — if not, SDK-pool remaining shows as `estimate` (SDK-reported usage deltas) with a visible reason.
+21. ~~**[R6.3-Q1] Out-of-scope Figma frames — Captain to rule**~~ — **RESOLVED [R6.3.1], Captain's decision: "skip."** The unmapped frames — Login (`37:3447`/`37:3607`/`37:3689`), Pricing & Upgrade/Checkout/Payment Success, Settings · Team Members, Knowledge Base — are **not implemented**; only frames mapping to the local single-user product are built. They stay in the §7 inventory marked `SKIPPED (R6.3-Q1)` as future/marketing candidates.
 
-*Dissolved:* Rev-1's Grok CLI + Claude-ToS questions (by R2); Rev-2's Q7 liaison-persistence and Q8 liaison-brain-default (merged into R3-Q1 by the Brain architecture). *Resolved by R4:* R3-Q1, gate default (#12), fusion-spend family count (#15), Linux (#16). *Resolved by R5.1:* Grok probe default (#18) — detection-driven onboarding. *Resolved by R6.1:* SDK-bridge vendoring (#19) — fork into the monorepo.
+*Dissolved:* Rev-1's Grok CLI + Claude-ToS questions (by R2); Rev-2's Q7 liaison-persistence and Q8 liaison-brain-default (merged into R3-Q1 by the Brain architecture). *Resolved by R4:* R3-Q1, gate default (#12), fusion-spend family count (#15), Linux (#16). *Resolved by R5.1:* Grok probe default (#18) — detection-driven onboarding. *Resolved by R6.1:* vendor/fork (#19). *Resolved by R6.3.1:* out-of-scope Figma frames (#21) — skipped. *Resolved by R6.1:* SDK-bridge vendoring (#19) — fork into the monorepo.
 
 ### 13.3 Explicit assumptions
 
@@ -1398,6 +1438,22 @@ Consolidated in §13.2. **Still open after R4:** Brain wake-batching/token budge
 
 **The vendor-CLI tension, addressed:** Rev 2 rejected vendor CLIs **as worker harnesses**. Claude Code returns here in a categorically different role — a one-time **auth substrate** for the official Agent SDK (conditional dependency, subscription path only). It executes no tools, runs no sessions, supervises nothing: `claude-agent-sdk-pi` routes LLM calls through the SDK while **Pi executes every tool natively** (tool execution denied on the Claude Code side; Pi built-ins and our `agent-os` extension tools exposed via in-process MCP). The single-harness architecture — one tool-executing harness, one telemetry channel, one spawn spec — survives intact.
 
+### Revision 6.2 (Captain's design directive) — marketing-idiom live pages, not a console shell **[R6.2]**
+
+**Directive:** *"Not a console shell. It shouldn't be a console shell — the frontend should look like the marketing pages do, where everything is custom designed and live."* Plus the earlier correction: *"You were supposed to reuse all elements from the marketing app to ensure consistent branding."*
+
+**What changed:** §7 re-framed — every product page is a custom-designed page in the marketing site's exact idiom: marketing top header/nav (no left admin rail), full-bleed editorial sections on `border-rule` hairlines with `section-padding`/`max-container` rhythm, display-scale typography whose big numerals are **live values over SSE**, mono uppercase eyebrows, glass surfaces, motion reveals — "a page that could sit on the marketing site, except it moves and updates." Live data presented as marketing presents static content (wake feeds as designed sections, config chains as typeset section-grids); unbuilt pages are designed "coming in Phase N" treatments. §1.5/§3 strengthened: `packages/ui` holds the **promoted marketing components themselves** (header/nav, GlassCard, MagneticButton, AnimatedCard, TextReveal, gradients, marquee); the console composes real components, never lookalikes; marketing must render identically post-promotion. §7.1 wireframe redrawn (top nav + stacked sections); §7.2/7.3/7.5 re-framed in prose. Gates: Phase 0 extraction gate now covers component promotion + marketing render-parity + import-path assertions; Phase 6 gains the **brand-parity gate** (side-by-side marketing-vs-console screenshots; automated no-admin-chrome sweep).
+
+**What it supersedes:** the R5/R6 "console" framing's dashboard connotations — left-rail nav, panes, shell chrome. The **information architecture and all content requirements survive unchanged**; only the chrome dies. *(Itself superseded on visuals by R6.3 below.)*
+
+### Revision 6.3 (Captain's directive) — the Figma file is the canonical UI specification **[R6.3]**
+
+**Directive:** *"Stop and update the plan to ensure the UI exactly replicates [the Figma file] — I built a Figma file instead so you have something to follow."* File: **"AgentOS — AI Agent Orchestration Dashboard"**, `Ria7UpyEPRd9jNlF9B6xgF`, canvas `4:2081` "⚙️ ・ Workspace".
+
+**What changed:** the UI's single source of truth is the Captain's Figma file; every product screen **exactly replicates** its frame. The file was inspected via the Figma MCP (2026-07-24): 10 sections, ~40 frames — a **dark dashboard** design (charcoal surfaces, slim icon-only left rail, top bar, stat cards with delta chips, teal→green charts, status-pill tables, amber warnings) plus a light marketing landing frame. §7 gained the full **screen inventory table** (frame + node id → route → live-in phase). §1.5/§3: `packages/ui` is now dual-sourced — promoted marketing components (marketing keeps rendering identically) + Figma tokens/components for the product app; **Figma wins on product screens where they conflict**. Process: implementers must build each screen from Figma MCC design context (`get_design_context` + figma-design-to-code skill), never eyeballed screenshots; evidence packs carry per-screen **Figma-vs-implementation side-by-sides** (Phase 1 Figma-source gate; Phase 6 Figma-fidelity gate replacing R6.2's brand-parity gate, with the marketing no-regression parity kept). Future-phase frames are built pixel-faithful with placeholder data and wired live in their phase (§7.3 quota + §7.7 wizard visual forms now follow frames `37:2265`/`41:6186` and `37:1300`; all §4.9/§4.10 content requirements stand).
+
+**What it supersedes:** R6.2's "no admin shell / marketing-idiom editorial pages" reading is **overridden wherever the Figma file shows dashboard chrome — the Figma file wins** (and its Workspace frames do show an icon rail and top bar). What survives of R6.2: components in `packages/ui`, no bespoke lookalikes, marketing render-parity. All §7 ASCII wireframes demote to information-architecture references — visual truth lives in Figma. **R6.3.1 (Captain's answer to R6.3-Q1): "skip"** — the out-of-scope frames (Login, Pricing/Checkout, Team Members, Knowledge Base) are not implemented; only frames mapping to the local single-user product are built; they remain in the inventory as `SKIPPED` future/marketing candidates. No open R6.3 questions remain.
+
 ---
 
-*End of FUSED MASTER PLAN — Revision 6.*
+*End of FUSED MASTER PLAN — Revision 6.3.*

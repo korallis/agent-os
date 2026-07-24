@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import { motion } from "framer-motion";
 import Link from "next/link";
-import { cn } from "@agent-os/ui";
+import { cn } from "../lib/cn";
 
 interface MagneticButtonProps {
   children: React.ReactNode;
@@ -20,7 +20,11 @@ const sizeClasses = {
   lg: "px-8 py-4 text-lg",
 };
 
-export default function MagneticButton({
+/**
+ * The magnetic pill CTA used across the marketing site — shared so every
+ * Agent OS surface renders the same button language.
+ */
+export function MagneticButton({
   children,
   href,
   variant = "primary",
