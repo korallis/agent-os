@@ -25,12 +25,19 @@ const LOGO: Record<string, { letter: string; className: string }> = {
   openrouter: { letter: "O", className: "bg-[#6366f1]" },
   xai: { letter: "X", className: "bg-fg-1 text-black" },
   "kimi-coding": { letter: "K", className: "bg-teal-brand" },
+  "vercel-ai-gateway": { letter: "V", className: "bg-black text-white" },
 };
 
 /** Providers that support Pi subscription /login OAuth via the daemon. */
 const OAUTH_PROVIDERS = ["openai", "anthropic", "xai"] as const;
 /** Providers that accept API-key connect (keychain/file custody). */
-const API_KEY_PROVIDERS = ["openai", "anthropic", "openrouter"] as const;
+const API_KEY_PROVIDERS = [
+  "openai",
+  "anthropic",
+  "openrouter",
+  "kimi-coding",
+  "vercel-ai-gateway",
+] as const;
 
 type ConnectProvider = (typeof OAUTH_PROVIDERS)[number] | (typeof API_KEY_PROVIDERS)[number];
 
@@ -43,6 +50,8 @@ const CONNECT_ROWS: readonly {
   { provider: "anthropic", oauth: true, apiKey: true },
   { provider: "openrouter", oauth: false, apiKey: true },
   { provider: "xai", oauth: true, apiKey: false },
+  { provider: "kimi-coding", oauth: false, apiKey: true },
+  { provider: "vercel-ai-gateway", oauth: false, apiKey: true },
 ];
 
 function tierBadge(tier: string): string {

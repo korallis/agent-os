@@ -192,8 +192,11 @@ export class OnboardingService {
     const claude = this.state.providers.find((p) => p.provider === "anthropic" && p.selected);
     if (claude?.selected === true) {
       this.state = { ...this.state, step: stepAtOrAdvance(this.state.step, "claude-billing") };
-    } else if (this.state.providers.filter((p) => p.selected).every((p) => p.authVerified)) {
-      this.state = { ...this.state, step: stepAtOrAdvance(this.state.step, "probes") };
+    } else {
+      const selected = this.state.providers.filter((p) => p.selected);
+      if (selected.length > 0 && selected.every((p) => p.authVerified)) {
+        this.state = { ...this.state, step: stepAtOrAdvance(this.state.step, "probes") };
+      }
     }
     this.save(previous);
     return this.state;
@@ -366,6 +369,9 @@ function isAuthVerified(
   detected: Set<PiProviderId>,
   choice: OnboardingProviderChoice | undefined,
 ): boolean {
+  if (choice?.claudeBillingMode === "subscription-sdk") {
+    return isSubscriptionSdkVerified(choice);
+  }
   return (
     detected.has(provider) ||
     isSubscriptionSdkVerified(choice) ||

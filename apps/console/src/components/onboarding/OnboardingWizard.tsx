@@ -6,7 +6,13 @@ import type { OnboardingState, PiProviderId } from "@agent-os/protocol";
 import { Topbar } from "@/components/shell/Topbar";
 
 const OAUTH_PROVIDERS = new Set(["openai", "anthropic", "xai"]);
-const API_KEY_PROVIDERS = new Set(["openai", "anthropic", "openrouter"]);
+const API_KEY_PROVIDERS = new Set([
+  "openai",
+  "anthropic",
+  "openrouter",
+  "kimi-coding",
+  "vercel-ai-gateway",
+]);
 
 /**
  * Guided, resumable onboarding wizard (§4.10).

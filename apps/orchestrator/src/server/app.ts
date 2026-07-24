@@ -374,10 +374,16 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
             deps.connections.syncFromAuthStore();
           }
           const enabled = enableProbesForOnboarding(deps, svc);
-          if (enabled) {
-            return { state: svc.enableProbes() };
+          if (!enabled) {
+            sendError(
+              reply,
+              400,
+              "BAD_REQUEST",
+              "no providers available to enable probes — select and verify at least one provider",
+            );
+            return;
           }
-          return { state: svc.getState() };
+          return { state: svc.enableProbes() };
         }
         case "complete":
           return { state: svc.complete() };
