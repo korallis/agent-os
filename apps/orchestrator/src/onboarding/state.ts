@@ -163,7 +163,7 @@ export class OnboardingService {
           provider,
           selected: selected.has(provider),
           detected: detected.has(provider),
-          authVerified: detected.has(provider),
+          authVerified: detected.has(provider) || isSubscriptionSdkVerified(existing),
           claudeBillingMode: existing?.claudeBillingMode ?? null,
           claudeSdk: existing?.claudeSdk ?? null,
         };
@@ -348,6 +348,23 @@ function seedProviderChecklist(home: string): OnboardingProviderChoice[] {
     claudeBillingMode: null,
     claudeSdk: null,
   }));
+}
+
+/** True when anthropic subscription-sdk path has every verification flag set. */
+function isSubscriptionSdkVerified(
+  choice: OnboardingProviderChoice | undefined,
+): boolean {
+  if (choice === undefined) return false;
+  if (choice.claudeBillingMode !== "subscription-sdk") return false;
+  const sdk = choice.claudeSdk;
+  if (sdk === null) return false;
+  return (
+    sdk.claudeCodeLogin &&
+    sdk.sdkInstalled &&
+    sdk.noAmbientApiKey &&
+    sdk.isolationDefaults &&
+    sdk.catalogHealthcheck
+  );
 }
 
 function hasClaudeCodeCredential(): boolean {

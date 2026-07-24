@@ -2,8 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
-import type { OnboardingState } from "@agent-os/protocol";
+import type { OnboardingState, PiProviderId } from "@agent-os/protocol";
 import { Topbar } from "@/components/shell/Topbar";
+
+const OAUTH_PROVIDERS = new Set(["openai", "anthropic", "xai"]);
+const API_KEY_PROVIDERS = new Set(["openai", "anthropic", "openrouter"]);
 
 /**
  * Guided, resumable onboarding wizard (§4.10).
@@ -14,6 +17,10 @@ export function OnboardingWizard() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
+  const [oauthAttach, setOauthAttach] = useState<{
+    provider: string;
+    attachCommand: string;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -61,6 +68,73 @@ export function OnboardingWizard() {
       setBusy(false);
     }
   };
+
+  const connectApiKey = async (provider: string) => {
+    const apiKey = window.prompt(`API key for ${provider}`);
+    if (apiKey === null || apiKey.trim().length === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/agentos/connections/api-key", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider, apiKey: apiKey.trim() }),
+      });
+      if (!res.ok) {
+        setError(`api-key connect ${res.status}`);
+        return;
+      }
+      await act({ action: "verify-auth", provider });
+    } catch {
+      setError("api-key connect failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startOAuth = async (provider: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/agentos/connections/oauth/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          provider,
+          ...(provider === "anthropic" ? { billingMode: "extra-usage-oauth" } : {}),
+        }),
+      });
+      if (!res.ok) {
+        setError(`oauth/start ${res.status}`);
+        return;
+      }
+      const body = (await res.json()) as {
+        connectionId: string;
+        attachCommand: string;
+      };
+      setOauthAttach({ provider, attachCommand: body.attachCommand });
+    } catch {
+      setError("oauth/start failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const verifySelectedAuth = async () => {
+    if (state === null) return;
+    const selected = state.providers.filter((p) => p.selected);
+    if (selected.length === 0) {
+      setError("select at least one provider before verifying auth");
+      return;
+    }
+    for (const row of selected) {
+      await act({ action: "verify-auth", provider: row.provider });
+    }
+  };
+
+  const selectedProviders =
+    state?.providers.filter((p) => p.selected) ??
+    ([] as OnboardingState["providers"]);
 
   return (
     <div className="flex min-h-full flex-col">
@@ -173,6 +247,97 @@ export function OnboardingWizard() {
                   );
                 })}
               </div>
+            </section>
+
+            <section className="rounded-[12px] border border-line-2 bg-panel-1 p-5">
+              <h2 className="text-[16px] font-semibold text-fg-1">
+                Step 2 · Auth verification
+              </h2>
+              <p className="mt-1 text-[13px] text-fg-3">
+                Connect OAuth or paste an API key, then re-check presence in the auth store.
+              </p>
+              {selectedProviders.length === 0 ? (
+                <p className="mt-3 text-[13px] text-fg-3">
+                  Select providers above, then verify auth here.
+                </p>
+              ) : (
+                <ul className="mt-4 flex flex-col gap-2">
+                  {selectedProviders.map((row) => (
+                    <li
+                      key={row.provider}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line-2 bg-shell px-3 py-2"
+                    >
+                      <div>
+                        <p className="text-[13px] font-semibold text-fg-1">
+                          {row.authVerified ? "✓" : "○"} {row.provider}
+                          {row.detected ? " ⟨DETECTED⟩" : ""}
+                        </p>
+                        <p className="text-[12px] text-fg-3">
+                          {row.authVerified
+                            ? "credential present / verified"
+                            : "not verified — connect or re-check"}
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {OAUTH_PROVIDERS.has(row.provider) && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void startOAuth(row.provider)}
+                            className="rounded-lg border border-line-2 bg-panel-2 px-2.5 py-1.5 text-[11px] font-medium text-fg-2"
+                          >
+                            OAuth /login
+                          </button>
+                        )}
+                        {API_KEY_PROVIDERS.has(row.provider) && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void connectApiKey(row.provider)}
+                            className="rounded-lg border border-line-2 bg-panel-2 px-2.5 py-1.5 text-[11px] font-medium text-fg-2"
+                          >
+                            API key
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            void act({
+                              action: "verify-auth",
+                              provider: row.provider as PiProviderId,
+                            })
+                          }
+                          className="rounded-lg border border-teal-brand/40 bg-teal-brand/15 px-2.5 py-1.5 text-[11px] font-semibold text-teal-brand"
+                        >
+                          Verify
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {oauthAttach !== null && (
+                <div className="mt-3 rounded-lg border border-teal-brand/30 bg-teal-brand/10 px-3 py-2">
+                  <p className="mb-1 text-[12px] font-semibold text-fg-1">
+                    OAuth login ready for {oauthAttach.provider}
+                  </p>
+                  <code className="block break-all text-[11px] text-teal-brand">
+                    {oauthAttach.attachCommand}
+                  </code>
+                  <p className="mt-1 text-[11px] text-fg-3">
+                    Run the command, finish login, then Verify.
+                  </p>
+                </div>
+              )}
+              <button
+                type="button"
+                disabled={busy || selectedProviders.length === 0}
+                onClick={() => void verifySelectedAuth()}
+                className="mt-4 rounded-lg bg-teal-brand px-4 py-2 text-[13px] font-semibold text-black disabled:opacity-50"
+              >
+                Verify all selected
+              </button>
             </section>
 
             <section className="rounded-[12px] border border-line-2 bg-panel-1 p-5">

@@ -37,18 +37,20 @@ export function quotaKeysForProvider(
  * Flip quota.json5 providers.*.enabled=true for the given providers (R5.1).
  * xAI always gets bestEffortAllowed=true when enabled. Idempotent and
  * individually toggleable afterward via Policies / writeGlobal.
+ * @returns true when at least one requested provider is enabled after the call
+ *   (either newly flipped or already enabled).
  */
 export function enableQuotaProviders(
   config: ConfigService,
   providers: Iterable<{ provider: PiProviderId | string; billingMode?: ClaudeBillingMode | null }>,
-): void {
+): boolean {
   const keys = new Set<QuotaProviderKey>();
   for (const entry of providers) {
     for (const key of quotaKeysForProvider(entry.provider, entry.billingMode ?? null)) {
       keys.add(key);
     }
   }
-  if (keys.size === 0) return;
+  if (keys.size === 0) return false;
 
   const existingRaw = config.layerValue("global", "quota");
   const base =
@@ -67,16 +69,19 @@ export function enableQuotaProviders(
   // keeps shipped defaults for untouched providers.
   const flipped: Record<string, { enabled: boolean; bestEffortAllowed: boolean }> = {};
   let changed = false;
+  let anyEnabled = false;
   for (const key of keys) {
     const current = effective[key];
     const bestEffortAllowed = key === "xai" ? true : current.bestEffortAllowed;
     if (current.enabled === true && current.bestEffortAllowed === bestEffortAllowed) {
+      anyEnabled = true;
       continue;
     }
     flipped[key] = { enabled: true, bestEffortAllowed };
     changed = true;
+    anyEnabled = true;
   }
-  if (!changed) return;
+  if (!changed) return anyEnabled;
 
   config.writeGlobal(
     "quota",
@@ -92,4 +97,5 @@ export function enableQuotaProviders(
       2,
     ),
   );
+  return anyEnabled;
 }

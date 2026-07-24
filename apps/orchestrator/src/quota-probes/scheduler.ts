@@ -78,6 +78,8 @@ export class QuotaProbeScheduler {
   }
 
   private async probeAll(): Promise<void> {
+    this.deps.connections.syncFromAuthStore();
+
     const quota = this.deps.config.config.quota;
     const authJsonPath = resolveAuthJsonPathWithFallback(
       this.deps.pi.isolationMode === "managed" ? this.deps.pi.managedHome : null,

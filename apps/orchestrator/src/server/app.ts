@@ -373,8 +373,11 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
           if (deps.connections !== undefined) {
             deps.connections.syncFromAuthStore();
           }
-          enableProbesForOnboarding(deps, svc);
-          return { state: svc.enableProbes() };
+          const enabled = enableProbesForOnboarding(deps, svc);
+          if (enabled) {
+            return { state: svc.enableProbes() };
+          }
+          return { state: svc.getState() };
         }
         case "complete":
           return { state: svc.complete() };
@@ -705,28 +708,28 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
  * R5.1: flip quota.json5 providers.enabled for onboarding providers.
  * Presence fallback only when the selection checklist is empty; if any
  * providers are selected, enable only selected+verified (or selected).
+ * @returns true when at least one provider probe was enabled (or already was).
  */
-function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): void {
+function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): boolean {
   const state = svc.getState();
   const selected = state.providers.filter((p) => p.selected);
 
   if (selected.length > 0) {
     const selectedVerified = selected.filter((p) => p.authVerified);
     const toEnable = selectedVerified.length > 0 ? selectedVerified : selected;
-    enableQuotaProviders(
+    return enableQuotaProviders(
       deps.config,
       toEnable.map((p) => ({
         provider: p.provider,
         billingMode: p.claudeBillingMode,
       })),
     );
-    return;
   }
 
   // Fallback only when the checklist is empty (R5.1 detection-driven).
   const presence = listDetectedProviders(deps.home).filter((p) => p.present);
-  if (presence.length === 0) return;
-  enableQuotaProviders(
+  if (presence.length === 0) return false;
+  return enableQuotaProviders(
     deps.config,
     presence.map((p) => ({ provider: p.provider, billingMode: null })),
   );
