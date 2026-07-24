@@ -24,6 +24,19 @@ export function resolvePiAuthPaths(managedHome: string | null): AuthStorePaths {
   };
 }
 
+/**
+ * Prefer managed auth.json when it has presence; otherwise fall back to shared ~/.pi.
+ * Mirrors listDetectedProviders so OAuth probes and detection agree on the store.
+ */
+export function resolveAuthJsonPathWithFallback(managedHome: string | null): string {
+  const managed = resolvePiAuthPaths(managedHome);
+  if (readAuthStorePresence(managed.authJsonPath).length > 0) {
+    return managed.authJsonPath;
+  }
+  const shared = resolvePiAuthPaths(null);
+  return shared.authJsonPath;
+}
+
 /** Shape we accept from Pi's auth.json without claiming full fidelity. */
 interface AuthJsonShape {
   [provider: string]: unknown;

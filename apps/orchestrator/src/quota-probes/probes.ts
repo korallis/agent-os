@@ -260,6 +260,13 @@ function mapProviderConfigKey(
   }
 }
 
+/** Whether quota.json5 enables live probes for this provider. */
+export function isProbeEnabled(provider: PiProviderId, config: QuotaConfig): boolean {
+  const key = mapProviderConfigKey(provider);
+  if (key === null) return false;
+  return config.providers[key].enabled;
+}
+
 function parseProbeBody(
   provider: PiProviderId,
   tier: HonestyTier,

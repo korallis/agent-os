@@ -7,7 +7,10 @@ import {
   PI_PINNED_VERSION,
   type PiSpawnSpec,
 } from "@agent-os/protocol";
-import { resolvePiAuthPaths, readAuthStorePresence } from "../security/auth-store.js";
+import {
+  resolveAuthJsonPathWithFallback,
+  readAuthStorePresence,
+} from "../security/auth-store.js";
 import { scrubEnv, type ProviderKeyEnvName } from "../security/env-scrub.js";
 
 /**
@@ -158,17 +161,9 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
 
 export function listDetectedProviders(agentosHome: string): ReturnType<typeof readAuthStorePresence> {
   const detection = detectPi(agentosHome);
-  const paths = resolvePiAuthPaths(
-    detection.isolationMode === "managed" ? detection.managedHome : null,
-  );
-  // Also scan shared ~/.pi when managed store is empty (first-run detection).
-  const managed = readAuthStorePresence(paths.authJsonPath);
-  if (managed.length > 0) return managed;
-  const shared = resolvePiAuthPaths(null);
-  if (shared.authJsonPath !== paths.authJsonPath) {
-    return readAuthStorePresence(shared.authJsonPath);
-  }
-  return managed;
+  const managedHome = detection.isolationMode === "managed" ? detection.managedHome : null;
+  const authJsonPath = resolveAuthJsonPathWithFallback(managedHome);
+  return readAuthStorePresence(authJsonPath);
 }
 
 export function installHintForPi(): string {

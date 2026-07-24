@@ -35,7 +35,7 @@ import type { PiDetection } from "../pi/manager.js";
 import type { OnboardingService } from "../onboarding/state.js";
 import { OnboardingBlockedError } from "../onboarding/state.js";
 import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
-import { resolvePiAuthPaths } from "../security/auth-store.js";
+import { resolveAuthJsonPathWithFallback } from "../security/auth-store.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -300,13 +300,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         sendError(reply, 404, "NOT_FOUND", "connection not found");
         return;
       }
-      const paths = resolvePiAuthPaths(
+      const authJsonPath = resolveAuthJsonPathWithFallback(
         deps.pi.isolationMode === "managed" ? deps.pi.managedHome : null,
       );
       const { sample, events } = await probeConnection({
         connection,
         config: deps.config.config.quota,
-        authJsonPath: paths.authJsonPath,
+        authJsonPath,
         agentosHome: deps.home,
       });
       deps.quotaSamples.set(connection.id, sample);

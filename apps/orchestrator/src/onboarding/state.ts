@@ -304,20 +304,27 @@ export class OnboardingBlockedError extends Error {
 
 function whichCheck(id: DoctorCheck["id"], bin: string, required: string | null): DoctorCheck {
   const result = spawnSync("which", [bin], { encoding: "utf8" });
-  const ok = result.status === 0;
   let version: string | null = null;
-  if (ok) {
+  if (result.status === 0) {
     const v = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 3000 });
     const text = `${v.stdout} ${v.stderr}`.trim();
     const match = text.match(/(\d+\.\d+(\.\d+)?)/);
     version = match?.[1] ?? null;
   }
+  const present = result.status === 0;
+  const ok =
+    present &&
+    (required === null || (version !== null && satisfiesVersionConstraint(version, required)));
   return {
     id,
     ok,
     version,
     required,
-    detail: ok ? "found" : `${bin} not found`,
+    detail: !present
+      ? `${bin} not found`
+      : ok
+        ? "found"
+        : `need ${required}, found ${version ?? "unknown"}`,
     installHint: ok
       ? null
       : bin === "uv"
@@ -345,22 +352,57 @@ function checkTool(
   };
 }
 
-/** Parse major from "24.1.0" / "v24.1.0" and evaluate constraints like ">=24". */
+/**
+ * Evaluate version constraints: ">=24", ">24", "3.3+", "2.40+", or major-only exact.
+ */
 function satisfiesVersionConstraint(version: string, required: string): boolean {
   const cleaned = version.replace(/^v/i, "").trim();
-  const major = Number.parseInt(cleaned.split(".")[0] ?? "", 10);
-  if (!Number.isFinite(major)) return false;
-  const ge = required.match(/^>=\s*(\d+)/);
+  const versionParts = parseVersionParts(cleaned);
+  if (versionParts === null) return false;
+
+  const plus = required.match(/^(\d+(?:\.\d+)*)\+$/);
+  if (plus !== null) {
+    const minParts = parseVersionParts(plus[1] ?? "");
+    if (minParts === null) return false;
+    return compareVersionParts(versionParts, minParts) >= 0;
+  }
+
+  const ge = required.match(/^>=\s*(\d+(?:\.\d+)*)/);
   if (ge !== null) {
-    return major >= Number.parseInt(ge[1] ?? "", 10);
+    const minParts = parseVersionParts(ge[1] ?? "");
+    if (minParts === null) return false;
+    return compareVersionParts(versionParts, minParts) >= 0;
   }
-  const gt = required.match(/^>\s*(\d+)/);
+  const gt = required.match(/^>\s*(\d+(?:\.\d+)*)/);
   if (gt !== null) {
-    return major > Number.parseInt(gt[1] ?? "", 10);
+    const minParts = parseVersionParts(gt[1] ?? "");
+    if (minParts === null) return false;
+    return compareVersionParts(versionParts, minParts) > 0;
   }
-  const exact = required.match(/^(\d+)/);
+  const exact = required.match(/^(\d+(?:\.\d+)*)$/);
   if (exact !== null) {
-    return major === Number.parseInt(exact[1] ?? "", 10);
+    const want = parseVersionParts(exact[1] ?? "");
+    if (want === null) return false;
+    return compareVersionParts(versionParts, want) === 0;
   }
   return true;
+}
+
+function parseVersionParts(version: string): number[] | null {
+  const parts = version
+    .split(".")
+    .map((p) => Number.parseInt(p, 10))
+    .filter((n) => Number.isFinite(n));
+  return parts.length > 0 ? parts : null;
+}
+
+function compareVersionParts(a: number[], b: number[]): number {
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    if (av < bv) return -1;
+    if (av > bv) return 1;
+  }
+  return 0;
 }

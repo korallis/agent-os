@@ -179,6 +179,9 @@ export class ConnectionRegistry {
   setLimitReached(id: string, reached: boolean, reason: string | null): void {
     const existing = this.connections.get(id);
     if (existing === undefined) return;
+    if (existing.limitReached === reached && existing.limitReachedReason === reason) {
+      return;
+    }
     const updated: ProviderConnection = {
       ...existing,
       limitReached: reached,

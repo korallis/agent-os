@@ -166,9 +166,10 @@ export class SqliteProjection {
   latestQuotaByConnection(): Map<string, unknown> {
     const rows = this.sqlite
       .prepare(
-        `SELECT connection_id, payload FROM quota_samples
-         WHERE sampled_at IN (
-           SELECT MAX(sampled_at) FROM quota_samples GROUP BY connection_id
+        `SELECT connection_id, payload FROM quota_samples qs
+         WHERE sampled_at = (
+           SELECT MAX(sampled_at) FROM quota_samples
+           WHERE connection_id = qs.connection_id
          )`,
       )
       .all() as { connection_id: string; payload: string }[];

@@ -4,8 +4,8 @@ import { quotaSampleSchema, type QuotaSample } from "@agent-os/protocol";
 import type { ConfigService } from "../config/service.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
-import { resolvePiAuthPaths } from "../security/auth-store.js";
-import { isLimitReached, probeConnection } from "./probes.js";
+import { resolveAuthJsonPathWithFallback } from "../security/auth-store.js";
+import { isLimitReached, isProbeEnabled, probeConnection } from "./probes.js";
 
 export interface QuotaProbeSchedulerDeps {
   home: string;
@@ -79,12 +79,14 @@ export class QuotaProbeScheduler {
 
   private async probeAll(): Promise<void> {
     const quota = this.deps.config.config.quota;
-    const paths = resolvePiAuthPaths(
+    const authJsonPath = resolveAuthJsonPathWithFallback(
       this.deps.pi.isolationMode === "managed" ? this.deps.pi.managedHome : null,
     );
     const now = Date.now();
 
     for (const connection of this.deps.connections.list()) {
+      if (!isProbeEnabled(connection.provider, quota)) continue;
+
       const allowedAt = this.nextAllowedAt.get(connection.id) ?? 0;
       if (now < allowedAt) continue;
 
@@ -92,7 +94,7 @@ export class QuotaProbeScheduler {
         const { sample, events } = await probeConnection({
           connection,
           config: quota,
-          authJsonPath: paths.authJsonPath,
+          authJsonPath,
           agentosHome: this.deps.home,
         });
         this.deps.quotaSamples.set(connection.id, sample);
