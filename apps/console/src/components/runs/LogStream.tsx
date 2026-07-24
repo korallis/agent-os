@@ -16,11 +16,13 @@ function levelOf(envelope: EventEnvelope): Level {
     case "provider.billing_mismatch":
     case "session.lost":
     case "brain.down":
+    case "scout.write_violation":
       return "ERROR";
     case "daemon.stopping":
     case "quota.threshold":
     case "captain.escalation":
     case "wake.classified":
+    case "crew.question":
       return "WARN";
     case "policy.changed":
       return envelope.event.payload.safetyOverride ? "WARN" : "INFO";
@@ -49,6 +51,8 @@ function levelOf(envelope: EventEnvelope): Level {
     case "tool.invoked":
     case "gate.result":
     case "fusion.dispatched":
+    case "crew.answered":
+    case "bridge.tool_call":
       return "INFO";
     default: {
       const exhaustive: never = envelope.event;
@@ -94,6 +98,13 @@ function sourceOf(envelope: EventEnvelope): string {
     case "session.stopped":
     case "session.lost":
       return "sessions";
+    case "crew.question":
+    case "crew.answered":
+      return "crew";
+    case "scout.write_violation":
+      return "scout";
+    case "bridge.tool_call":
+      return "bridge";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -193,6 +204,18 @@ function messageOf(envelope: EventEnvelope): string {
       return `Gate ${event.payload.target} → ${event.payload.outcome}`;
     case "fusion.dispatched":
       return `Fusion ${event.payload.kind} dispatched`;
+    case "crew.question":
+      return `Crewmate asked — ${event.payload.question}`;
+    case "crew.answered":
+      return event.payload.delivered
+        ? `Answer delivered to session ${event.payload.sessionId.slice(0, 8)}`
+        : `Answer UNDELIVERED — session ${event.payload.sessionId.slice(0, 8)} has no live channel`;
+    case "scout.write_violation":
+      return `SCOUT WRITE VIOLATION — ${event.payload.changedPaths.length} path(s) in ${event.payload.worktreePath}${event.payload.quarantined ? " (worktree quarantined)" : ""}`;
+    case "bridge.tool_call":
+      return event.payload.accepted
+        ? `Bridge ${event.payload.tool} accepted from ${event.payload.sessionId.slice(0, 8)}`
+        : `Bridge ${event.payload.tool} refused — ${event.payload.reason ?? "unknown"}`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {

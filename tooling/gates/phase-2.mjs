@@ -9,7 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,9 +22,6 @@ const results = [];
 function gate(id, name, ok, detail) {
   results.push({ id, name, ok, detail });
   console.log(`${ok ? "PASS" : "FAIL"}  ${id}  ${name}${detail ? ` — ${detail}` : ""}`);
-}
-function assert(condition, message) {
-  if (!condition) throw new Error(message);
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

@@ -232,6 +232,12 @@ export const toolCallRequestSchema = z.strictObject({
   tool: brainToolNameSchema,
   input: z.record(z.string(), z.unknown()),
   idempotencyKey: z.string().min(1).max(200).optional(),
+  /**
+   * Impersonate a session's bridge authorization. The Captain (holding the
+   * daemon token) is unrestricted; supplying a sessionId applies that session's
+   * narrower rights instead, which is how the bridge boundary is testable.
+   */
+  sessionId: ulidSchema.optional(),
 });
 export type ToolCallRequest = z.infer<typeof toolCallRequestSchema>;
 

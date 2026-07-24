@@ -12,12 +12,25 @@ import type { PiDetection } from "../pi/manager.js";
 import { buildPiSpawnSpec } from "../pi/manager.js";
 import { familyFromModel } from "../substrate/family.js";
 import type { TmuxController } from "./tmux.js";
-import type { ToolSurface } from "./tool-surface.js";
+import type { SessionChannel, ToolSurface } from "./tool-surface.js";
 import type { WakeWatcher } from "./watcher.js";
 
 export type BrainEventSink = (event: OrchestratorEvent) => void;
 
 const nextUlid = monotonicFactory();
+
+/**
+ * The Brain is an LLM, not a rule engine — but it acts only through the typed
+ * tool surface, and the substrate rejects illegal moves regardless of what it
+ * decides here.
+ */
+const BRAIN_SYSTEM_PROMPT = [
+  "You are the Agent OS Orchestrator Brain.",
+  "Your first tool call MUST be read_fleet_state, so you reconcile against reality before deciding anything.",
+  "Make every judgment call through the typed agent-os tool surface: intake, cast resolution, spawning, gate authoring, escalation, delivery.",
+  "Never edit code, never run shell commands, never touch a worktree — crewmates do the work.",
+  "Illegal state transitions and policy violations come back as typed tool errors; read them and choose a legal next move.",
+].join(" ");
 
 export interface BrainManagerDeps {
   home: string;
@@ -27,6 +40,7 @@ export interface BrainManagerDeps {
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
+  sockets?: SessionChannel;
   config: BrainConfig;
   /** Scripted brain for tests — deterministic tool sequences. */
   fakeBrain?: boolean;
@@ -45,10 +59,9 @@ export class BrainManager {
 
   constructor(private readonly deps: BrainManagerDeps) {
     this.config = deps.config;
-    this.fake =
-      deps.fakeBrain === true ||
-      process.env.AGENTOS_FAKE_BRAIN === "1" ||
-      deps.pi?.binary == null;
+    // Explicit seam only. A missing Pi means the Brain cannot run, which is
+    // BRAIN_DOWN — not a window that echoes a string and reports "running".
+    this.fake = deps.fakeBrain === true || process.env.AGENTOS_FAKE_BRAIN === "1";
     this.snapshot = {
       status: "down",
       sessionId: null,
@@ -114,31 +127,40 @@ export class BrainManager {
     if (this.fake) {
       this.deps.tmux.newWindow({
         windowName,
-        command: `echo fake-brain ${sessionId}`,
+        argv: ["echo", "fake-brain", sessionId],
       });
-    } else if (this.deps.pi !== undefined && this.deps.extensionPath !== undefined) {
-      const prompt =
-        "You are the Agent OS Orchestrator Brain. Your first tool call MUST be read_fleet_state. Make all judgment calls via the typed tool surface. Never edit code directly.";
+    } else {
+      if (this.deps.pi?.binary == null || this.deps.extensionPath === undefined) {
+        this.enterDown(
+          this.deps.pi?.binary == null
+            ? "Pi is not installed — run onboarding to install the pinned Pi"
+            : "agent-os Pi extension unavailable",
+        );
+        return this.getSnapshot();
+      }
+      const socketPath =
+        this.deps.sockets?.sessionSocketPath(sessionId) ??
+        join(this.deps.home, "sockets", `${sessionId}.sock`);
+      void this.deps.sockets?.openSession(sessionId).catch(() => undefined);
+      this.deps.tools.setBrainSessionId(sessionId);
+
       const spec = buildPiSpawnSpec({
         agentosHome: this.deps.home,
         detection: this.deps.pi,
-        args: ["--mode", "json", "-p", prompt, "--model", model],
+        args: ["--mode", "json", "-p", BRAIN_SYSTEM_PROMPT, "--model", model],
         cwd: this.deps.home,
         sessionId,
-        socketPath: join(this.deps.home, "sockets", `${sessionId}.sock`),
+        role: "brain",
+        socketPath,
         extensionPath: this.deps.extensionPath,
         cleanRoom: false,
       });
-      const cmd = [spec.binary, ...spec.args]
-        .map((s) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`))
-        .join(" ");
-      const win = this.deps.tmux.newWindow({ windowName, command: cmd });
-      this.snapshot = { ...this.snapshot, tmuxWindow: win.target };
-    } else {
-      this.deps.tmux.newWindow({
+      const win = this.deps.tmux.newWindow({
         windowName,
-        command: `echo brain-no-pi ${sessionId}`,
+        argv: [spec.binary, ...spec.args],
+        env: spec.env,
       });
+      this.snapshot = { ...this.snapshot, tmuxWindow: win.target };
     }
 
     // Reconcile: first act is always read_fleet_state
@@ -211,15 +233,24 @@ export class BrainManager {
       // Otherwise no automatic action — scripted tests drive tools explicitly.
       return;
     }
-    // Real brain: inject wake digest via tmux/control channel (Phase 3: best-effort send-keys).
-    if (this.snapshot.tmuxWindow !== null) {
+    // Real brain: deliver the digest over its control socket; fall back to the
+    // tmux pane if the extension channel has not (re)connected yet.
+    const message = `[wake] ${digest.class}: ${digest.summary}`;
+    const sessionId = this.snapshot.sessionId;
+    const sent =
+      sessionId !== null &&
+      (this.deps.sockets?.sendControl(sessionId, {
+        type: "ctl.injectMessage",
+        sessionId,
+        message,
+        ts: new Date().toISOString(),
+      }) ??
+        false);
+    if (!sent && this.snapshot.tmuxWindow !== null) {
       try {
-        this.deps.tmux.sendKeys(
-          this.snapshot.tmuxWindow,
-          `[wake] ${digest.class}: ${digest.summary}`,
-        );
+        this.deps.tmux.sendKeys(this.snapshot.tmuxWindow, message);
       } catch {
-        // control path best-effort
+        // The pane may have died; the watcher's liveness sweep handles it.
       }
     }
   }

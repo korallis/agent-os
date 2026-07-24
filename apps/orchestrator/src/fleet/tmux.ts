@@ -28,13 +28,35 @@ export class TmuxError extends Error {
   }
 }
 
+/** Quote a single argv token for the `sh -c` line tmux runs. */
+export function shellQuote(token: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(token)) return token;
+  return `'${token.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Build a command line that starts from an *empty* environment and sets only
+ * the allowlisted pairs. `tmux new-window` inherits the daemon's environment
+ * otherwise, which would silently defeat `scrubEnv` and leak provider keys into
+ * every crewmate.
+ */
+export function envPrefixedCommand(argv: string[], env?: Record<string, string>): string {
+  const command = argv.map(shellQuote).join(" ");
+  if (env === undefined) return command;
+  const assignments = Object.entries(env)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  return ["env", "-i", ...assignments, command].join(" ");
+}
+
 export class TmuxController {
   private readonly socketName: string;
   private readonly fake: boolean;
   private readonly fakeWindows = new Map<string, { session: string; window: string; cmd: string }>();
 
   constructor(options: TmuxOptions = {}) {
-    this.socketName = options.socketName ?? "agentos";
+    this.socketName =
+      options.socketName ?? process.env.AGENTOS_TMUX_SOCKET ?? "agentos";
     this.fake = options.fake === true || process.env.AGENTOS_FAKE_TMUX === "1";
   }
 
@@ -72,23 +94,26 @@ export class TmuxController {
   }
 
   /**
-   * Create a new window running `command` (shell-less via `sh -c` only for the
-   * single command string assembled by the fleet spawner).
+   * Create a new window running `argv`. When `env` is supplied the process
+   * starts from an empty environment holding exactly those pairs — this is how
+   * the scrubbed spawn env actually reaches Pi.
    */
   newWindow(input: {
     session?: string;
     windowName: string;
-    command: string;
+    argv: string[];
+    env?: Record<string, string>;
     cwd?: string;
   }): TmuxWindow {
     const session = input.session ?? "agentos";
+    const command = envPrefixedCommand(input.argv, input.env);
     this.ensureSession(session);
     if (this.fake) {
       const key = `${session}:${input.windowName}`;
       this.fakeWindows.set(key, {
         session,
         window: input.windowName,
-        cmd: input.command,
+        cmd: command,
       });
       return { session, window: input.windowName, target: key };
     }
@@ -104,7 +129,7 @@ export class TmuxController {
     if (input.cwd !== undefined) {
       extra.push("-c", input.cwd);
     }
-    extra.push(input.command);
+    extra.push(command);
     const result = this.run(extra);
     if (result.status !== 0) {
       throw new TmuxError(`failed to create window ${input.windowName}`, result.stderr);
@@ -133,6 +158,11 @@ export class TmuxController {
       .split("\n")
       .map((l) => l.trim())
       .includes(target);
+  }
+
+  /** Test/gate accessor: the exact command line a virtual window was given. */
+  fakeWindowCommand(target: string): string | null {
+    return this.fakeWindows.get(target)?.cmd ?? null;
   }
 
   listWindows(session = "agentos"): string[] {

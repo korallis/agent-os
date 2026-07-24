@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
+  ExtensionToDaemonFrame,
   FleetSummary,
   OrchestratorEvent,
   TaskListItem,
@@ -14,7 +15,7 @@ import { WorktreePool } from "./worktree-pool.js";
 import { TmuxController } from "./tmux.js";
 import { WakeWatcher } from "./watcher.js";
 import { GateRunner } from "./gate-runner.js";
-import { ToolSurface } from "./tool-surface.js";
+import { ToolSurface, type SessionChannel } from "./tool-surface.js";
 import { BrainManager } from "./brain.js";
 
 export type FleetEventSink = (event: OrchestratorEvent) => void;
@@ -25,6 +26,7 @@ export interface FleetServiceOptions {
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
+  sockets?: SessionChannel;
   fakeTmux?: boolean;
   fakePi?: boolean;
   fakeBrain?: boolean;
@@ -63,6 +65,7 @@ export class FleetService {
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
+      ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
       ...(options.fakePi !== undefined ? { fakePi: options.fakePi } : {}),
     });
     this.brain = new BrainManager({
@@ -74,6 +77,7 @@ export class FleetService {
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
+      ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
       ...(options.fakeBrain !== undefined ? { fakeBrain: options.fakeBrain } : {}),
     });
 
@@ -95,6 +99,121 @@ export class FleetService {
   /** Boot: start brain (or enter BRAIN_DOWN if blocked). */
   start(): void {
     this.brain.start("daemon-boot");
+  }
+
+  /**
+   * Single entry point for everything a session's Pi extension reports.
+   * Lifecycle drives the zero-token watcher, usage drives context pressure,
+   * and `ext.tool_call` is the Brain's only way to act on the fleet.
+   */
+  handleExtensionFrame(frame: ExtensionToDaemonFrame): void {
+    switch (frame.type) {
+      case "ext.hello":
+        break;
+      case "ext.lifecycle":
+        this.onLifecycle(frame);
+        break;
+      case "ext.usage":
+        if (frame.contextUsedPct !== null) {
+          this.watcher.classify({
+            class: "CONTEXT_PRESSURE",
+            sessionId: frame.sessionId,
+            summary: `context ${frame.contextUsedPct}% used on ${frame.model}`,
+            contextUsedPct: frame.contextUsedPct,
+          });
+        }
+        break;
+      case "ext.tool_blocked":
+        this.watcher.classify({
+          class: "SECURITY",
+          sessionId: frame.sessionId,
+          summary: `tool ${frame.toolName} blocked: ${frame.reason}`,
+        });
+        break;
+      case "ext.question":
+        this.tools.recordQuestion({
+          questionId: frame.questionId,
+          sessionId: frame.sessionId,
+          question: frame.question,
+        });
+        break;
+      case "ext.tool_call":
+        this.onToolCall(frame);
+        break;
+      default: {
+        const _exhaustive: never = frame;
+        void _exhaustive;
+      }
+    }
+  }
+
+  private onLifecycle(
+    frame: Extract<ExtensionToDaemonFrame, { type: "ext.lifecycle" }>,
+  ): void {
+    switch (frame.phase) {
+      case "turn_start":
+      case "tool_call":
+      case "tool_result":
+        this.watcher.classify({
+          class: "PROGRESS",
+          sessionId: frame.sessionId,
+          summary: frame.detail ?? frame.phase,
+        });
+        break;
+      case "turn_end":
+        this.watcher.classify({
+          class: "TURN_SETTLED",
+          sessionId: frame.sessionId,
+          summary: frame.detail ?? "turn end",
+        });
+        break;
+      case "agent_settled":
+        this.tools.markSessionStatus(frame.sessionId, "settled");
+        this.watcher.classify({
+          class: "AGENT_SETTLED",
+          sessionId: frame.sessionId,
+          summary: frame.detail ?? "agent settled",
+        });
+        break;
+      case "session_end":
+        this.tools.markSessionStatus(frame.sessionId, "settled");
+        void this.options.sockets?.closeSession(frame.sessionId).catch(() => undefined);
+        break;
+      case "session_start":
+        this.tools.markSessionStatus(frame.sessionId, "running");
+        break;
+      default: {
+        const _exhaustive: never = frame.phase;
+        void _exhaustive;
+      }
+    }
+  }
+
+  private onToolCall(
+    frame: Extract<ExtensionToDaemonFrame, { type: "ext.tool_call" }>,
+  ): void {
+    const result = this.tools.invokeFromSession(frame.sessionId, frame.tool, frame.input);
+    this.sink({
+      type: "bridge.tool_call",
+      payload: {
+        sessionId: frame.sessionId,
+        invocationId: frame.invocationId,
+        tool: frame.tool,
+        accepted: result.ok,
+        reason: result.ok ? null : (result.error?.message ?? null),
+      },
+    });
+    this.options.sockets?.sendControl(frame.sessionId, {
+      type: "ctl.tool_result",
+      sessionId: frame.sessionId,
+      invocationId: frame.invocationId,
+      ok: result.ok,
+      ...(result.ok ? { data: result.data } : {}),
+      ...(result.error !== undefined
+        ? { error: { code: result.error.code, message: result.error.message } }
+        : {}),
+      ts: new Date().toISOString(),
+    });
   }
 
   stop(): void {

@@ -322,13 +322,20 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 400, "BAD_REQUEST", "unknown tool");
       return;
     }
-    const result = deps.fleet.tools.invoke(
-      toolParsed.data,
-      body.data.input,
-      body.data.idempotencyKey !== undefined
-        ? { idempotencyKey: body.data.idempotencyKey }
-        : {},
-    );
+    const result =
+      body.data.sessionId !== undefined
+        ? deps.fleet.tools.invokeFromSession(
+            body.data.sessionId,
+            toolParsed.data,
+            body.data.input,
+          )
+        : deps.fleet.tools.invoke(
+            toolParsed.data,
+            body.data.input,
+            body.data.idempotencyKey !== undefined
+              ? { idempotencyKey: body.data.idempotencyKey }
+              : {},
+          );
     return {
       invocationId: result.invocationId,
       ok: result.ok,

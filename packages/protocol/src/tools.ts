@@ -28,6 +28,8 @@ export const toolErrorCodeSchema = z.enum([
   "BRAIN_DOWN",
   "VALIDATION_ERROR",
   "SPAWN_FAILED",
+  "PI_UNAVAILABLE",
+  "UNAUTHORIZED_TOOL",
   "GATE_ERROR",
   "FUSION_CONTRACT",
   "INTERNAL",

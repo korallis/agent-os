@@ -1,13 +1,30 @@
 #!/usr/bin/env node
 /**
  * Phase 3 executable gates (master plan §11 Phase 3).
- * Tool surface, scripted local SHIP, cross-family policy, BRAIN_DOWN, absorb.
+ *
+ * Runs against REAL tmux and REAL git — the durability substrate and the
+ * worktree pool are exercised, not simulated. The only simulated component is
+ * the model itself (`AGENTOS_FAKE_PI` / `AGENTOS_FAKE_BRAIN`), because a gate
+ * must not spend a subscription; the spawn *path* is asserted separately in
+ * G11 by inspecting the exact command line the harness would run.
+ *
+ *   G1  fleet summary + brain running
+ *   G2  register project + create_task
+ *   G3  run_gate before GATE_AUTHORING → ILLEGAL_TRANSITION
+ *   G4  same-family builder/validator → POLICY_VIOLATION
+ *   G5  scripted local-only SHIP → DONE on a real git worktree
+ *   G6  fleet state readable after the run
+ *   G7  BRAIN_DOWN blocks orchestration
+ *   G8  kill -9 mid-task → restart rehydrates tasks and the Brain reconciles
+ *   G9  SCOUT write violation is audited by git and quarantines the worktree
+ *   G10 a non-Brain session cannot orchestrate over the extension bridge
+ *   G11 the spawn command line starts from `env -i` and carries no stray key
  *
  * Usage: node tooling/gates/phase-3.mjs
  * Exit 0 = all gates green.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   readFileSync,
@@ -29,23 +46,26 @@ function gate(id, name, ok, detail) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Isolated tmux server so a gate run never touches the captain's sessions. */
+const TMUX_SOCKET = `agentos-gate-${process.pid}`;
+
 function startDaemon(home, port) {
   return spawn(process.execPath, [DAEMON_BIN], {
     env: {
       ...process.env,
       AGENTOS_HOME: home,
       AGENTOS_PORT: String(port),
-      AGENTOS_FAKE_TMUX: "1",
+      AGENTOS_TMUX_SOCKET: TMUX_SOCKET,
+      // Real tmux, real git, real gate runner. Only the model is simulated.
       AGENTOS_FAKE_PI: "1",
       AGENTOS_FAKE_BRAIN: "1",
-      AGENTOS_FAKE_GIT: "1",
       AGENTOS_FAKE_GATE: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
 
-async function waitForHealth(home, port, timeoutMs = 15000) {
+async function waitForHealth(home, port, timeoutMs = 20000) {
   const base = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -72,10 +92,52 @@ async function api(base, path, token, init = {}) {
   return fetch(`${base}${path}`, { ...init, headers });
 }
 
+async function callTool(base, token, tool, input) {
+  const res = await api(base, "/v1/tools/call", token, {
+    method: "POST",
+    body: JSON.stringify({ tool, input }),
+  });
+  return res.json();
+}
+
+/** A real git repository with one commit — worktrees need a HEAD. */
 function fixtureRepo() {
   const dir = mkdtempSync(join(tmpdir(), "agentos-gate-repo-"));
+  const git = (...args) =>
+    spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", timeout: 30_000 });
+  spawnSync("git", ["init", "-q", "-b", "main", dir], { encoding: "utf8" });
+  git("config", "user.email", "gate@agent-os.local");
+  git("config", "user.name", "Agent OS Gate");
   writeFileSync(join(dir, "README.md"), "# gate fixture\n");
+  git("add", "-A");
+  git("commit", "-qm", "seed");
   return dir;
+}
+
+async function registerProject(base, token, name, repo) {
+  const res = await api(base, "/v1/projects", token, {
+    method: "POST",
+    body: JSON.stringify({ name, path: repo, mode: "local-only", trusted: true }),
+  });
+  return (await res.json()).project?.id;
+}
+
+async function createTask(base, token, projectId, spec = {}) {
+  const res = await api(base, "/v1/tasks", token, {
+    method: "POST",
+    body: JSON.stringify({
+      spec: {
+        shape: "SHIP",
+        title: "Gate ship",
+        intent: "local only",
+        projectId,
+        mode: "local-only",
+        yolo: true,
+        ...spec,
+      },
+    }),
+  });
+  return (await res.json()).task?.id;
 }
 
 let home;
@@ -85,6 +147,10 @@ const PORT = 4700 + Math.floor(Math.random() * 1000) + 200;
 const BASE = `http://127.0.0.1:${PORT}`;
 
 try {
+  if (spawnSync("tmux", ["-V"], { encoding: "utf8" }).status !== 0) {
+    throw new Error("tmux is required for the Phase 3 gates");
+  }
+
   home = mkdtempSync(join(tmpdir(), "agentos-p3-gate-"));
   cleanups.push(home);
   child = startDaemon(home, PORT);
@@ -98,47 +164,16 @@ try {
     gate("G1", "fleet summary + brain running", ok, `brain=${body.summary?.brain?.status}`);
   }
 
-  // G2 — project + create_task
+  // G2 — project + create_task on a real git repo
   const repo = fixtureRepo();
   cleanups.push(repo);
-  let projectId;
-  let taskId;
-  {
-    const pr = await api(BASE, "/v1/projects", token, {
-      method: "POST",
-      body: JSON.stringify({ name: "gate", path: repo, mode: "local-only", trusted: true }),
-    });
-    const pb = await pr.json();
-    projectId = pb.project?.id;
-    const tr = await api(BASE, "/v1/tasks", token, {
-      method: "POST",
-      body: JSON.stringify({
-        spec: {
-          shape: "SHIP",
-          title: "Gate ship",
-          intent: "local only",
-          projectId,
-          mode: "local-only",
-          yolo: true,
-        },
-        idempotencyKey: "p3-g2",
-      }),
-    });
-    const tb = await tr.json();
-    taskId = tb.task?.id;
-    gate("G2", "register project + create_task", pr.ok && tr.ok && !!taskId, taskId);
-  }
+  const projectId = await registerProject(BASE, token, "gate", repo);
+  const taskId = await createTask(BASE, token, projectId);
+  gate("G2", "register project + create_task", !!projectId && !!taskId, taskId);
 
   // G3 — illegal transition run_gate
   {
-    const res = await api(BASE, "/v1/tools/call", token, {
-      method: "POST",
-      body: JSON.stringify({
-        tool: "run_gate",
-        input: { taskId, target: "baseline" },
-      }),
-    });
-    const body = await res.json();
+    const body = await callTool(BASE, token, "run_gate", { taskId, target: "baseline" });
     gate(
       "G3",
       "run_gate before GATE_AUTHORING → ILLEGAL_TRANSITION",
@@ -149,31 +184,14 @@ try {
 
   // G4 — cross-family policy (claude-agent-sdk vs anthropic)
   {
-    const res = await api(BASE, "/v1/tools/call", token, {
-      method: "POST",
-      body: JSON.stringify({
-        tool: "resolve_cast",
-        input: {
-          taskId,
-          roles: [
-            {
-              role: "builder",
-              model: "claude-agent-sdk/claude-sonnet-4-5",
-              thinking: "medium",
-              cleanRoom: true,
-            },
-            {
-              role: "validator",
-              model: "anthropic/claude-sonnet-4-5",
-              thinking: "medium",
-              cleanRoom: true,
-            },
-          ],
-          familyCheckOverride: false,
-        },
-      }),
+    const body = await callTool(BASE, token, "resolve_cast", {
+      taskId,
+      roles: [
+        { role: "builder", model: "claude-agent-sdk/claude-sonnet-4-5", thinking: "medium", cleanRoom: true },
+        { role: "validator", model: "anthropic/claude-sonnet-4-5", thinking: "medium", cleanRoom: true },
+      ],
+      familyCheckOverride: false,
     });
-    const body = await res.json();
     gate(
       "G4",
       "same-family builder/validator → POLICY_VIOLATION",
@@ -182,44 +200,36 @@ try {
     );
   }
 
-  // G5 — scripted local SHIP end-to-end
+  // G5 — scripted local SHIP end-to-end on a real worktree
   {
-    await api(BASE, "/v1/tools/call", token, {
-      method: "POST",
-      body: JSON.stringify({
-        tool: "resolve_cast",
-        input: {
-          taskId,
-          roles: [
-            { role: "builder", model: "openai/gpt-4.1", thinking: "medium", cleanRoom: true },
-          ],
-          familyCheckOverride: false,
-        },
-      }),
+    await callTool(BASE, token, "resolve_cast", {
+      taskId,
+      roles: [{ role: "builder", model: "openai/gpt-4.1", thinking: "medium", cleanRoom: true }],
+      familyCheckOverride: false,
     });
-    await api(BASE, "/v1/tools/call", token, {
-      method: "POST",
-      body: JSON.stringify({
-        tool: "spawn_crewmate",
-        input: {
-          taskId,
-          role: "builder",
-          model: "openai/gpt-4.1",
-          thinking: "medium",
-          vars: {},
-        },
-      }),
+    const spawned = await callTool(BASE, token, "spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "medium",
+      vars: {},
     });
-    const deliver = await api(BASE, "/v1/tools/call", token, {
-      method: "POST",
-      body: JSON.stringify({ tool: "deliver_task", input: { taskId } }),
-    });
-    const body = await deliver.json();
+    const worktreePath = spawned.data?.session?.worktreePath ?? null;
+    const isRealWorktree =
+      worktreePath !== null &&
+      spawnSync("git", ["-C", worktreePath, "rev-parse", "--is-inside-work-tree"], {
+        encoding: "utf8",
+      }).stdout.trim() === "true";
+
+    const body = await callTool(BASE, token, "deliver_task", { taskId });
     gate(
       "G5",
-      "scripted local-only SHIP → DONE with ao/* branch",
-      body.ok === true && body.data?.phase === "DONE" && String(body.data?.branch ?? "").startsWith("ao/"),
-      `phase=${body.data?.phase} branch=${body.data?.branch}`,
+      "scripted local-only SHIP → DONE on a real git worktree",
+      body.ok === true &&
+        body.data?.phase === "DONE" &&
+        String(body.data?.branch ?? "").startsWith("ao/") &&
+        isRealWorktree,
+      `phase=${body.data?.phase} branch=${body.data?.branch} realWorktree=${isRealWorktree}`,
     );
   }
 
@@ -229,6 +239,122 @@ try {
     const sb = await state.json();
     const ok = state.ok && Array.isArray(sb.state?.tasks);
     gate("G6", "fleet state readable after run", ok, `tasks=${sb.state?.tasks?.length}`);
+  }
+
+  // G9 — SCOUT write violation quarantines the worktree
+  {
+    const scoutTask = await createTask(BASE, token, projectId, {
+      shape: "SCOUT",
+      title: "Gate scout",
+      intent: "read only",
+      yolo: undefined,
+    });
+    await callTool(BASE, token, "resolve_cast", {
+      taskId: scoutTask,
+      roles: [{ role: "scout", model: "openai/gpt-4.1", thinking: "low", cleanRoom: true }],
+      familyCheckOverride: false,
+    });
+    const spawned = await callTool(BASE, token, "spawn_crewmate", {
+      taskId: scoutTask,
+      role: "scout",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    const sessionId = spawned.data?.session?.sessionId;
+    const worktreePath = spawned.data?.session?.worktreePath;
+    let quarantined = false;
+    let changed = 0;
+    if (typeof worktreePath === "string") {
+      writeFileSync(join(worktreePath, "scout-wrote-this.txt"), "violation\n");
+      const stopped = await callTool(BASE, token, "stop_crewmate", {
+        sessionId,
+        reason: "gate scout audit",
+      });
+      void stopped;
+      const state = await (await api(BASE, "/v1/fleet/state", token)).json();
+      const lease = (state.state?.worktrees ?? []).find((l) => l.path === worktreePath);
+      quarantined = lease?.state === "quarantined";
+      const { events } = await (await api(BASE, "/v1/events/replay", token)).json();
+      changed =
+        events.filter((e) => e.event.type === "scout.write_violation").length;
+    }
+    gate(
+      "G9",
+      "SCOUT write violation audited by git → worktree quarantined",
+      quarantined && changed >= 1,
+      `quarantined=${quarantined} violations=${changed}`,
+    );
+  }
+
+  // G10 — a crew session cannot orchestrate over the bridge
+  {
+    const body = await callTool(BASE, token, "read_fleet_state", {});
+    const sessions = body.data?.sessions ?? [];
+    const crew = sessions.find((s) => s.role !== "brain");
+    const res = await api(BASE, "/v1/tools/call", token, {
+      method: "POST",
+      body: JSON.stringify({
+        tool: "deliver_task",
+        input: { taskId },
+        sessionId: crew?.sessionId,
+      }),
+    });
+    const denied = await res.json();
+    gate(
+      "G10",
+      "non-Brain session cannot orchestrate over the extension bridge",
+      denied.ok === false && denied.error?.code === "UNAUTHORIZED_TOOL",
+      `err=${denied.error?.code}`,
+    );
+  }
+
+  // G8 — kill -9 mid-task → rehydrate + Brain reconcile
+  {
+    const liveTask = await createTask(BASE, token, projectId, { title: "Survives kill -9" });
+    child.kill("SIGKILL");
+    await sleep(400);
+    child = startDaemon(home, PORT);
+    const token2 = await waitForHealth(home, PORT);
+
+    const rehydrated = await (await api(BASE, `/v1/tasks/${liveTask}`, token2)).json();
+    const brain = await (await api(BASE, "/v1/brain", token2)).json();
+    gate(
+      "G8",
+      "kill -9 → tasks rehydrate and the Brain reconciles on restart",
+      rehydrated.task?.id === liveTask &&
+        brain.brain?.status === "running" &&
+        brain.brain?.lastReconcileAt !== null,
+      `task=${rehydrated.task?.phase} brain=${brain.brain?.status} reconciledAt=${brain.brain?.lastReconcileAt !== null}`,
+    );
+  }
+
+  // G11 — the spawn command line is env-scrubbed and starts from `env -i`
+  {
+    const evalJs = `
+      import { envPrefixedCommand } from '${join(ROOT, "apps/orchestrator/dist/fleet/tmux.js")}';
+      import { scrubEnv } from '${join(ROOT, "apps/orchestrator/dist/security/env-scrub.js")}';
+      const scrubbed = scrubEnv(
+        { PATH: '/usr/bin', HOME: '/h', OPENAI_API_KEY: 'leaked', SECRET_THING: 'leaked' },
+        { grantProviderKey: { name: 'ANTHROPIC_API_KEY', value: 'granted' },
+          extraAllow: { AGENTOS_SOCKET: '/tmp/s.sock', AGENTOS_ROLE: 'builder' } },
+      );
+      const cmd = envPrefixedCommand(['/usr/local/bin/pi', '--mode', 'json'], scrubbed.env);
+      if (!cmd.startsWith('env -i ')) process.exit(2);
+      if (cmd.includes('leaked')) process.exit(3);
+      if (!cmd.includes('AGENTOS_SOCKET=/tmp/s.sock')) process.exit(4);
+      if (!cmd.includes('ANTHROPIC_API_KEY=granted')) process.exit(5);
+      process.stdout.write('ok');
+    `;
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", evalJs], {
+      encoding: "utf8",
+    });
+    gate(
+      "G11",
+      "spawn command line starts from `env -i` and carries only scrubbed pairs",
+      run.status === 0 && run.stdout.trim() === "ok",
+      `exit=${run.status}`,
+    );
   }
 
   // G7 — BRAIN_DOWN blocks orchestration
@@ -246,37 +372,18 @@ try {
     const base2 = `http://127.0.0.1:${port2}`;
     child = startDaemon(home2, port2);
     const token2 = await waitForHealth(home2, port2);
-    const brain = await api(base2, "/v1/brain", token2);
-    const bb = await brain.json();
+    const bb = await (await api(base2, "/v1/brain", token2)).json();
     const repo2 = fixtureRepo();
     cleanups.push(repo2);
-    const pr = await api(base2, "/v1/projects", token2, {
-      method: "POST",
-      body: JSON.stringify({ name: "bd", path: repo2, mode: "local-only" }),
+    const pid = await registerProject(base2, token2, "bd", repo2);
+    const tid = await createTask(base2, token2, pid, { title: "bd", yolo: false });
+    const sb = await callTool(base2, token2, "spawn_crewmate", {
+      taskId: tid,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
     });
-    const pid = (await pr.json()).project?.id;
-    const tr = await api(base2, "/v1/tasks", token2, {
-      method: "POST",
-      body: JSON.stringify({
-        spec: {
-          shape: "SHIP",
-          title: "bd",
-          intent: "i",
-          projectId: pid,
-          mode: "local-only",
-          yolo: false,
-        },
-      }),
-    });
-    const tid = (await tr.json()).task?.id;
-    const spawn = await api(base2, "/v1/tools/call", token2, {
-      method: "POST",
-      body: JSON.stringify({
-        tool: "spawn_crewmate",
-        input: { taskId: tid, role: "builder", model: "openai/gpt-4.1", thinking: "low", vars: {} },
-      }),
-    });
-    const sb = await spawn.json();
     gate(
       "G7",
       "BRAIN_DOWN blocks spawn_crewmate",
@@ -297,6 +404,7 @@ try {
   } catch {
     // ignore
   }
+  spawnSync("tmux", ["-L", TMUX_SOCKET, "kill-server"], { encoding: "utf8" });
   for (const p of cleanups) {
     try {
       rmSync(p, { recursive: true, force: true });

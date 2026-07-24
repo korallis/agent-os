@@ -37,8 +37,8 @@ jobs:
       - name: Lint (workspaces — no-explicit-any enforced)
         run: pnpm run lint
 
-      - name: Lint (root scripts)
-        run: pnpm exec eslint scripts
+      - name: Lint (root scripts + gates)
+        run: pnpm exec eslint scripts tooling
 
       - name: Build
         run: pnpm run build

@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { monotonicFactory } from "ulid";
+import { ZodError } from "zod";
+import { spawnSync } from "node:child_process";
+import { readdirSync } from "node:fs";
 import {
+  answerCrewmateInputSchema,
   authorGateInputSchema,
   cancelTaskInputSchema,
   createTaskInputSchema,
@@ -21,9 +25,11 @@ import {
   stopCrewmateInputSchema,
   updateTaskInputSchema,
   advancePhaseInputSchema,
+  brainToolNameSchema,
   type AgentOsConfig,
   type BrainSnapshot,
   type BrainToolName,
+  type DaemonControlFrame,
   type FleetSession,
   type FleetStateSnapshot,
   type OrchestratorEvent,
@@ -57,6 +63,38 @@ export type ToolEventSink = (event: OrchestratorEvent) => void;
 
 const nextUlid = monotonicFactory();
 
+/**
+ * The per-session control channel the tool surface needs. `SocketHub`
+ * satisfies it; kept narrow so the fleet does not depend on the Pi layer.
+ */
+export interface SessionChannel {
+  sessionSocketPath(sessionId: string): string;
+  openSession(sessionId: string): Promise<string>;
+  closeSession(sessionId: string): Promise<void>;
+  sendControl(sessionId: string, frame: DaemonControlFrame): boolean;
+}
+
+/**
+ * Tools a non-Brain session may call over its own socket. Read-only plus the
+ * two report-upward calls; everything that moves the fleet is Brain-only.
+ */
+const CREW_ALLOWED_TOOLS = new Set<BrainToolName>([
+  "read_task",
+  "read_policy",
+  "read_run_artifacts",
+  "notify_captain",
+  "stow_knowledge",
+]);
+
+/** A crewmate question awaiting an answer from the Brain or Captain. */
+export interface PendingQuestion {
+  questionId: string;
+  sessionId: string;
+  taskId: string | null;
+  question: string;
+  askedAt: string;
+}
+
 export interface ToolCallResult {
   invocationId: string;
   ok: boolean;
@@ -76,7 +114,13 @@ export interface ToolSurfaceDeps {
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
-  /** When true (tests / no Pi), crewmates are simulated. */
+  /** Per-session control channel used by the tool bridge. */
+  sockets?: SessionChannel;
+  /**
+   * Explicit test seam: simulate crewmates instead of spawning Pi. Never
+   * inferred — a missing Pi is a typed `PI_UNAVAILABLE` error, not a silent
+   * downgrade to a window that echoes a string.
+   */
   fakePi?: boolean;
 }
 
@@ -94,6 +138,8 @@ export class ToolSurface {
   private brain: BrainSnapshot;
   private brainDown = false;
   private readonly failLines = new Map<string, string[]>();
+  private readonly questions = new Map<string, PendingQuestion>();
+  private brainSessionId: string | null = null;
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -119,6 +165,49 @@ export class ToolSurface {
     this.brain = brain;
     this.brainDown = brain.status === "down";
     this.deps.watcher.setBrainDown(this.brainDown);
+  }
+
+  /** The session id whose extension channel is allowed to orchestrate. */
+  setBrainSessionId(sessionId: string | null): void {
+    this.brainSessionId = sessionId;
+  }
+
+  /**
+   * Route a tool call that arrived over a session's extension socket.
+   *
+   * Authorization is by session, not by claim: only the live Brain session may
+   * orchestrate. Crewmates get a small self-service subset — they can read the
+   * task they are working on, ask for policy, and report — so a compromised or
+   * confused crewmate cannot spawn fleets or deliver work.
+   */
+  invokeFromSession(
+    sessionId: string,
+    tool: string,
+    input: Record<string, unknown>,
+  ): ToolCallResult {
+    const parsed = brainToolNameSchema.safeParse(tool);
+    if (!parsed.success) {
+      return {
+        invocationId: nextUlid(),
+        ok: false,
+        error: err("VALIDATION_ERROR", `unknown tool: ${tool}`),
+        durationMs: 0,
+      };
+    }
+    const name = parsed.data;
+    const isBrain = this.brainSessionId !== null && sessionId === this.brainSessionId;
+    if (!isBrain && !CREW_ALLOWED_TOOLS.has(name)) {
+      return {
+        invocationId: nextUlid(),
+        ok: false,
+        error: err(
+          "UNAUTHORIZED_TOOL",
+          `session ${sessionId} is not the Brain — ${name} is not available to crewmates`,
+        ),
+        durationMs: 0,
+      };
+    }
+    return this.invoke(name, input);
   }
 
   isBrainDown(): boolean {
@@ -218,6 +307,19 @@ export class ToolSurface {
           error: err(error.code, error.message, error.details),
         });
       }
+      // Bad tool input is the caller's error, not an internal fault — the Brain
+      // needs a path-precise VALIDATION_ERROR it can act on.
+      if (error instanceof ZodError) {
+        return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+          ok: false,
+          error: err("VALIDATION_ERROR", `invalid input for ${tool}`, {
+            issues: error.issues.map((i) => ({
+              path: i.path.join("."),
+              message: i.message,
+            })),
+          }),
+        });
+      }
       const message = error instanceof Error ? error.message : String(error);
       return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
         ok: false,
@@ -282,7 +384,7 @@ export class ToolSurface {
       case "send_to_crew":
         return this.sendToCrew(raw);
       case "answer_crewmate":
-        return { answered: true };
+        return this.answerCrewmate(raw);
       case "deliver_task":
         return this.deliverTask(raw);
       case "escalate_to_captain":
@@ -403,10 +505,14 @@ export class ToolSurface {
     return this.requireTask(input.taskId);
   }
 
-  private readRunArtifacts(raw: Record<string, unknown>): { taskId: string; path: string; files: string[] } {
+  private readRunArtifacts(raw: Record<string, unknown>): {
+    taskId: string;
+    path: string;
+    files: string[];
+  } {
     const input = readTaskInputSchema.parse(raw);
     const dir = join(this.deps.home, "runs", input.taskId);
-    return { taskId: input.taskId, path: dir, files: existsSync(dir) ? ["task.json"] : [] };
+    return { taskId: input.taskId, path: dir, files: listFilesRecursive(dir) };
   }
 
   private resolveCast(raw: Record<string, unknown>): { taskId: string; cast: RoleCast[] } {
@@ -561,19 +667,35 @@ export class ToolSurface {
     }
 
     const cwd = worktreePath ?? project.path;
-    const fake =
-      this.deps.fakePi === true ||
-      process.env.AGENTOS_FAKE_PI === "1" ||
-      this.deps.pi?.binary == null;
+    const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
 
     let tmuxWindow = `agentos:${windowName}`;
     if (fake) {
       this.deps.tmux.newWindow({
         windowName,
-        command: `echo fake-pi ${input.role} ${sessionId}`,
+        argv: ["echo", "fake-pi", input.role, sessionId],
         cwd,
       });
-    } else if (this.deps.pi !== undefined && this.deps.extensionPath !== undefined) {
+    } else {
+      if (this.deps.pi?.binary == null) {
+        throw new ToolSurfaceError(
+          "PI_UNAVAILABLE",
+          "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
+        );
+      }
+      if (this.deps.extensionPath === undefined) {
+        throw new ToolSurfaceError(
+          "PI_UNAVAILABLE",
+          "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
+        );
+      }
+      const socketPath =
+        this.deps.sockets?.sessionSocketPath(sessionId) ??
+        join(this.deps.home, "sockets", `${sessionId}.sock`);
+      // Listener first, then spawn: the extension retries, but opening early
+      // keeps the common case race-free.
+      void this.deps.sockets?.openSession(sessionId).catch(() => undefined);
+
       const prompt =
         input.prompt ??
         `Agent OS role=${input.role}. Task: ${task.title}\n\n${task.intent}`;
@@ -583,19 +705,18 @@ export class ToolSurface {
         args: ["--mode", "json", "-p", prompt, "--model", input.model],
         cwd,
         sessionId,
-        socketPath: join(this.deps.home, "sockets", `${sessionId}.sock`),
+        role: input.role,
+        socketPath,
         extensionPath: this.deps.extensionPath,
         cleanRoom: input.cleanRoom,
       });
-      const cmd = [spec.binary, ...spec.args].map(shellQuote).join(" ");
-      const win = this.deps.tmux.newWindow({ windowName, command: cmd, cwd });
-      tmuxWindow = win.target;
-    } else {
-      this.deps.tmux.newWindow({
+      const win = this.deps.tmux.newWindow({
         windowName,
-        command: `echo missing-pi ${input.role}`,
+        argv: [spec.binary, ...spec.args],
+        env: spec.env,
         cwd,
       });
+      tmuxWindow = win.target;
     }
 
     const now = new Date().toISOString();
@@ -677,7 +798,11 @@ export class ToolSurface {
     if (session === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
     }
+    if (session.role === "scout") {
+      this.auditScoutSession(input.sessionId);
+    }
     this.deps.tmux.killWindow(session.tmuxWindow);
+    void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
     this.sessions.set(input.sessionId, { ...session, status: "stopped" });
     this.sink({
       type: "session.stopped",
@@ -885,6 +1010,155 @@ export class ToolSurface {
     return { sent: true };
   }
 
+  /** Record a blocking question a crewmate asked over its extension socket. */
+  recordQuestion(input: {
+    questionId: string;
+    sessionId: string;
+    question: string;
+  }): PendingQuestion {
+    const session = this.sessions.get(input.sessionId);
+    const pending: PendingQuestion = {
+      questionId: input.questionId,
+      sessionId: input.sessionId,
+      taskId: session?.taskId ?? null,
+      question: input.question,
+      askedAt: new Date().toISOString(),
+    };
+    this.questions.set(input.questionId, pending);
+    this.sink({
+      type: "crew.question",
+      payload: {
+        questionId: pending.questionId,
+        sessionId: pending.sessionId,
+        taskId: pending.taskId,
+        question: pending.question,
+      },
+    });
+    this.deps.watcher.classify({
+      class: "NEEDS_INPUT",
+      taskId: pending.taskId,
+      sessionId: pending.sessionId,
+      summary: pending.question.slice(0, 500),
+    });
+    return pending;
+  }
+
+  listQuestions(): PendingQuestion[] {
+    return [...this.questions.values()];
+  }
+
+  /**
+   * Route an answer back to the exact session that asked. Delivered over the
+   * session's control socket; falls back to `send-keys` for a human-attached
+   * pane whose extension channel has dropped.
+   */
+  private answerCrewmate(raw: Record<string, unknown>): {
+    questionId: string;
+    sessionId: string;
+    delivered: boolean;
+  } {
+    const input = answerCrewmateInputSchema.parse(raw);
+    const pending = this.questions.get(input.questionId);
+    if (pending === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", `question not found: ${input.questionId}`);
+    }
+    const session = this.sessions.get(pending.sessionId);
+    if (session === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", `session not found: ${pending.sessionId}`);
+    }
+
+    let delivered =
+      this.deps.sockets?.sendControl(pending.sessionId, {
+        type: "ctl.injectMessage",
+        sessionId: pending.sessionId,
+        message: input.answer,
+        ts: new Date().toISOString(),
+      }) ?? false;
+    if (!delivered) {
+      try {
+        this.deps.tmux.sendKeys(session.tmuxWindow, input.answer);
+        delivered = true;
+      } catch {
+        delivered = false;
+      }
+    }
+
+    this.questions.delete(input.questionId);
+    this.sink({
+      type: "crew.answered",
+      payload: {
+        questionId: input.questionId,
+        sessionId: pending.sessionId,
+        delivered,
+      },
+    });
+    if (!delivered) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `no live channel to session ${pending.sessionId} — answer not delivered`,
+      );
+    }
+    return { questionId: input.questionId, sessionId: pending.sessionId, delivered };
+  }
+
+  /**
+   * SCOUT sessions are read-only by policy. Enforcement is an audit of the real
+   * worktree: any tracked modification or untracked file quarantines the lease
+   * and escalates. Called when a scout session settles or is stopped.
+   */
+  auditScoutSession(sessionId: string): { clean: boolean; changedPaths: string[] } {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined || session.role !== "scout") {
+      return { clean: true, changedPaths: [] };
+    }
+    if (!this.cfg().policies.scoutReadOnly) {
+      return { clean: true, changedPaths: [] };
+    }
+    const path = session.worktreePath;
+    if (path === null || !existsSync(join(path, ".git"))) {
+      return { clean: true, changedPaths: [] };
+    }
+
+    const status = spawnSync("git", ["-C", path, "status", "--porcelain"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    const changedPaths =
+      status.status === 0
+        ? status.stdout
+            .split("\n")
+            .map((l) => l.trim())
+            .filter((l) => l.length > 0)
+        : [];
+    if (changedPaths.length === 0) {
+      return { clean: true, changedPaths: [] };
+    }
+
+    let quarantined = false;
+    for (const lease of this.deps.worktrees.list().filter((l) => l.sessionId === sessionId)) {
+      this.deps.worktrees.release(lease.id, { forceQuarantine: true });
+      quarantined = true;
+    }
+    this.sink({
+      type: "scout.write_violation",
+      payload: {
+        sessionId,
+        taskId: session.taskId ?? sessionId,
+        worktreePath: path,
+        changedPaths,
+        quarantined,
+      },
+    });
+    if (session.taskId !== null) {
+      this.invoke("escalate_to_captain", {
+        taskId: session.taskId,
+        summary: `SCOUT ${sessionId} wrote ${changedPaths.length} path(s) in a read-only worktree`,
+        severity: "critical",
+      });
+    }
+    return { clean: false, changedPaths };
+  }
+
   private deliverTask(raw: Record<string, unknown>): TaskSnapshot {
     const input = deliverTaskInputSchema.parse(raw);
     let task = this.requireTask(input.taskId);
@@ -1047,11 +1321,34 @@ export class ToolSurface {
     });
   }
 
+  /** Record a session status reported by its extension (running → settled). */
+  markSessionStatus(sessionId: string, status: FleetSession["status"]): void {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) return;
+    this.sessions.set(sessionId, { ...session, status });
+    const task = session.taskId !== null ? this.tasks.get(session.taskId) : undefined;
+    if (task !== undefined) {
+      this.saveTask({
+        ...task,
+        sessions: task.sessions.map((s) =>
+          s.sessionId === sessionId
+            ? { ...s, status, lastEventAt: new Date().toISOString() }
+            : s,
+        ),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    if (status === "settled" && session.role === "scout") {
+      this.auditScoutSession(sessionId);
+    }
+  }
+
   /** Mark a session lost (pane-died / reconcile). */
   markSessionLost(sessionId: string, reason: string): void {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
     this.sessions.set(sessionId, { ...session, status: "lost" });
+    void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
     this.sink({
       type: "session.lost",
       payload: { sessionId, taskId: session.taskId, reason },
@@ -1093,7 +1390,17 @@ function hashConfig(config: AgentOsConfig): string {
   return createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 16);
 }
 
-function shellQuote(s: string): string {
-  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(s)) return s;
-  return `'${s.replace(/'/g, `'\\''`)}'`;
+/** Repo-relative listing of everything durable under a run directory. */
+function listFilesRecursive(dir: string, prefix = ""): string[] {
+  if (!existsSync(dir)) return [];
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      out.push(...listFilesRecursive(join(dir, entry.name), rel));
+    } else {
+      out.push(rel);
+    }
+  }
+  return out.sort();
 }

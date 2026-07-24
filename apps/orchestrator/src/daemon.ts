@@ -170,12 +170,21 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       connections,
       pi,
       extensionPath,
+      sockets: socketHub,
       fakeTmux: process.env.AGENTOS_FAKE_TMUX === "1",
       fakePi: process.env.AGENTOS_FAKE_PI === "1",
       fakeBrain: process.env.AGENTOS_FAKE_BRAIN === "1",
     });
     fleet.onEvent((event) => {
       eventStore.append(event);
+    });
+    // Live visibility + the Brain's tool bridge both ride the extension socket.
+    socketHub.onExtensionFrame((frame) => {
+      try {
+        fleet.handleExtensionFrame(frame);
+      } catch (error) {
+        logger.warn({ err: error, frame: frame.type }, "extension frame handling failed");
+      }
     });
 
     const deps = {

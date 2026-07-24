@@ -375,6 +375,53 @@ export const fusionDispatchedEventSchema = z.strictObject({
   }),
 });
 
+/** A crewmate asked a blocking question; routed to the Brain/Captain. */
+export const crewQuestionEventSchema = z.strictObject({
+  type: z.literal("crew.question"),
+  payload: z.strictObject({
+    questionId: ulidSchema,
+    sessionId: ulidSchema,
+    taskId: ulidSchema.nullable(),
+    question: z.string(),
+  }),
+});
+
+export const crewAnsweredEventSchema = z.strictObject({
+  type: z.literal("crew.answered"),
+  payload: z.strictObject({
+    questionId: ulidSchema,
+    sessionId: ulidSchema,
+    delivered: z.boolean(),
+  }),
+});
+
+/**
+ * A SCOUT session mutated its worktree. Scouts are read-only by policy
+ * (`policies.scoutReadOnly`); the audit is a real `git status` diff, not trust.
+ */
+export const scoutWriteViolationEventSchema = z.strictObject({
+  type: z.literal("scout.write_violation"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    taskId: ulidSchema,
+    worktreePath: z.string(),
+    changedPaths: z.array(z.string()),
+    quarantined: z.boolean(),
+  }),
+});
+
+/** A session's Pi extension called the daemon tool surface over its socket. */
+export const bridgeToolCallEventSchema = z.strictObject({
+  type: z.literal("bridge.tool_call"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    invocationId: ulidSchema,
+    tool: z.string(),
+    accepted: z.boolean(),
+    reason: z.string().nullable(),
+  }),
+});
+
 export const captainEscalationEventSchema = z.strictObject({
   type: z.literal("captain.escalation"),
   payload: z.strictObject({
@@ -418,6 +465,10 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   toolInvokedEventSchema,
   gateResultEventSchema,
   fusionDispatchedEventSchema,
+  crewQuestionEventSchema,
+  crewAnsweredEventSchema,
+  scoutWriteViolationEventSchema,
+  bridgeToolCallEventSchema,
   captainEscalationEventSchema,
 ]);
 export type OrchestratorEvent = z.infer<typeof orchestratorEventSchema>;

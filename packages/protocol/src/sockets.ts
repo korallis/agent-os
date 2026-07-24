@@ -69,6 +69,20 @@ export const extensionToolCallFrameSchema = z.strictObject({
 });
 export type ExtensionToolCallFrame = z.infer<typeof extensionToolCallFrameSchema>;
 
+/**
+ * A crewmate asking the Captain/Brain a blocking question. The daemon keys the
+ * question by id so `answer_crewmate` can route the answer back to the exact
+ * session that asked it.
+ */
+export const extensionQuestionFrameSchema = z.strictObject({
+  type: z.literal("ext.question"),
+  sessionId: ulidSchema,
+  questionId: ulidSchema,
+  question: z.string().min(1).max(20_000),
+  ts: isoTimestampSchema,
+});
+export type ExtensionQuestionFrame = z.infer<typeof extensionQuestionFrameSchema>;
+
 /** Frames the extension may send to the daemon. */
 export const extensionToDaemonFrameSchema = z.discriminatedUnion("type", [
   extensionHelloFrameSchema,
@@ -76,6 +90,7 @@ export const extensionToDaemonFrameSchema = z.discriminatedUnion("type", [
   extensionUsageFrameSchema,
   extensionToolBlockedFrameSchema,
   extensionToolCallFrameSchema,
+  extensionQuestionFrameSchema,
 ]);
 export type ExtensionToDaemonFrame = z.infer<typeof extensionToDaemonFrameSchema>;
 
