@@ -373,13 +373,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
           if (deps.connections !== undefined) {
             deps.connections.syncFromAuthStore();
           }
-          const enabled = enableProbesForOnboarding(deps, svc);
-          if (!enabled) {
+          const result = enableProbesForOnboarding(deps, svc);
+          if (result === "empty-selection") {
             sendError(
               reply,
               400,
               "BAD_REQUEST",
-              "no providers available to enable probes — select and verify at least one provider",
+              "select and verify at least one provider before enabling probes",
             );
             return;
           }
@@ -714,33 +714,38 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
  * R5.1: flip quota.json5 providers.enabled for onboarding providers.
  * Presence fallback only when the selection checklist is empty; if any
  * providers are selected, enable only selected+verified (or selected).
- * @returns true when at least one provider probe was enabled (or already was).
+ * Unprobeable-only selections (e.g. vercel-ai-gateway) return ok as a no-op.
  */
-function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): boolean {
+function enableProbesForOnboarding(
+  deps: ServerDeps,
+  svc: OnboardingService,
+): "ok" | "empty-selection" {
   const state = svc.getState();
   const selected = state.providers.filter((p) => p.selected);
 
   if (selected.length > 0) {
     const selectedVerified = selected.filter((p) => p.authVerified);
     const toEnable = selectedVerified.length > 0 ? selectedVerified : selected;
-    return enableQuotaProviders(
+    enableQuotaProviders(
       deps.config,
       toEnable.map((p) => ({
         provider: p.provider,
         billingMode: p.claudeBillingMode,
       })),
     );
+    return "ok";
   }
 
   // Presence fallback only when the checklist is empty (never seeded).
-  if (state.providers.length > 0) return false;
+  if (state.providers.length > 0) return "empty-selection";
 
   const presence = listDetectedProviders(deps.home).filter((p) => p.present);
-  if (presence.length === 0) return false;
-  return enableQuotaProviders(
+  if (presence.length === 0) return "empty-selection";
+  enableQuotaProviders(
     deps.config,
     presence.map((p) => ({ provider: p.provider, billingMode: null })),
   );
+  return "ok";
 }
 
 /**
