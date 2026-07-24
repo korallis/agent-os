@@ -1,0 +1,50 @@
+{
+  "capturedAt": "2026-07-24T23:11:01.084Z",
+  "pages": [
+    {
+      "path": "/fleet",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/01-fleet-dashboard.png"
+    },
+    {
+      "path": "/tasks",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/02-tasks-board.png"
+    },
+    {
+      "path": "/projects",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/03-projects.png"
+    },
+    {
+      "path": "/providers",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/04-providers-quota.png"
+    },
+    {
+      "path": "/runs",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/05-runs-live-log.png"
+    },
+    {
+      "path": "/analytics",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/06-analytics.png"
+    },
+    {
+      "path": "/policies",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/07-policies.png"
+    },
+    {
+      "path": "/settings",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/08-settings.png"
+    },
+    {
+      "path": "/onboarding",
+      "status": 200,
+      "file": "/Users/leebarry/Downloads/OS Agents/docs/screenshots/09-onboarding-wizard.png"
+    }
+  ]
+}
