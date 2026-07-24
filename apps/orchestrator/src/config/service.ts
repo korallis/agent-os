@@ -154,9 +154,14 @@ export class ConfigService {
   /**
    * Re-resolves all domains from disk, falling back to the last-good global
    * layer for any domain whose on-disk content is currently invalid so that
-   * retained overrides survive later reloads of other domains.
+   * retained overrides survive later reloads of other domains. Emits
+   * `config.changed` for every domain whose effective value actually changed
+   * (including fallback-to-shipped when a global file is missing).
    */
   private reload(): void {
+    const previousByDomain = new Map(
+      CONFIG_DOMAINS.map((domain) => [domain, JSON.stringify(this.resolved.config[domain])]),
+    );
     const globalOverrides: Partial<Record<ConfigDomain, unknown>> = {};
     const retainedRejections: LayerRejection[] = [];
 
@@ -177,6 +182,7 @@ export class ConfigService {
           }
         } else {
           this.rememberLastGood(domain, file);
+          this.appliedHashes.set(domain, file.contentHash);
         }
       } catch (error) {
         retainedRejections.push({
@@ -203,6 +209,18 @@ export class ConfigService {
       ...retainedRejections,
       ...result.rejections.filter((r) => !(r.layer === "global" && retainedDomains.has(r.domain))),
     ];
+
+    for (const domain of CONFIG_DOMAINS) {
+      if (JSON.stringify(this.resolved.config[domain]) === previousByDomain.get(domain)) continue;
+      const contentHash =
+        this.lastGoodGlobal.get(domain)?.contentHash ??
+        this.appliedHashes.get(domain) ??
+        sha256("");
+      this.sink({
+        type: "config.changed",
+        payload: { domain, layer: "global", hotReloaded: true, contentHash },
+      });
+    }
   }
 
   /**
@@ -236,10 +254,6 @@ export class ConfigService {
     this.appliedHashes.set(domain, contentHash);
     this.rememberLastGood(domain, { value, contentHash, raw: json5Text });
     this.reload();
-    this.sink({
-      type: "config.changed",
-      payload: { domain, layer: "global", hotReloaded: true, contentHash },
-    });
     return { contentHash };
   }
 
@@ -295,27 +309,7 @@ export class ConfigService {
       );
     });
     if (deletedDomains.length > 0) {
-      const previousByDomain = new Map(
-        CONFIG_DOMAINS.map((domain) => [domain, JSON.stringify(this.resolved.config[domain])]),
-      );
-      for (const domain of deletedDomains) {
-        this.lastGoodGlobal.delete(domain);
-        this.appliedHashes.delete(domain);
-      }
       this.reload();
-      for (const domain of deletedDomains) {
-        if (JSON.stringify(this.resolved.config[domain]) !== previousByDomain.get(domain)) {
-          this.sink({
-            type: "config.changed",
-            payload: {
-              domain,
-              layer: "global",
-              hotReloaded: true,
-              contentHash: sha256(""),
-            },
-          });
-        }
-      }
     }
 
     for (const domain of CONFIG_DOMAINS) {
@@ -357,10 +351,6 @@ export class ConfigService {
       }
       this.rememberLastGood(domain, file);
       this.reload();
-      this.sink({
-        type: "config.changed",
-        payload: { domain, layer: "global", hotReloaded: true, contentHash: file.contentHash },
-      });
     }
   }
 
