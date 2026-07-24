@@ -272,34 +272,39 @@ export class ConfigService {
   }
 
   private handleExternalChange(): void {
+    type DomainProbe =
+      | { kind: "missing" }
+      | { kind: "unparseable"; error: Error }
+      | { kind: "present"; file: LayerFile };
+
+    const probes = new Map<ConfigDomain, DomainProbe>();
     for (const domain of CONFIG_DOMAINS) {
-      let file: ReturnType<typeof loadLayerFile>;
       try {
-        file = loadLayerFile(this.globalDir, domain);
+        const file = loadLayerFile(this.globalDir, domain);
+        probes.set(domain, file === null ? { kind: "missing" } : { kind: "present", file });
       } catch (error) {
-        // Unparseable JSON5 — reject, keep previous values.
-        if (this.appliedHashes.get(domain) !== "unparseable") {
-          this.appliedHashes.set(domain, "unparseable");
-          this.sink({
-            type: "config.rejected",
-            payload: {
-              domain,
-              layer: "global",
-              issues: [{ path: "", message: `JSON5 parse error: ${(error as Error).message}` }],
-            },
-          });
-        }
-        continue;
+        probes.set(domain, { kind: "unparseable", error: error as Error });
       }
-      if (file === null) {
-        if (!this.lastGoodGlobal.has(domain) && !this.appliedHashes.has(domain)) {
-          continue;
-        }
-        const previous = JSON.stringify(this.resolved.config[domain]);
+    }
+
+    const deletedDomains = CONFIG_DOMAINS.filter((domain) => {
+      const probe = probes.get(domain);
+      return (
+        probe?.kind === "missing" &&
+        (this.lastGoodGlobal.has(domain) || this.appliedHashes.has(domain))
+      );
+    });
+    if (deletedDomains.length > 0) {
+      const previousByDomain = new Map(
+        CONFIG_DOMAINS.map((domain) => [domain, JSON.stringify(this.resolved.config[domain])]),
+      );
+      for (const domain of deletedDomains) {
         this.lastGoodGlobal.delete(domain);
         this.appliedHashes.delete(domain);
-        this.reload();
-        if (JSON.stringify(this.resolved.config[domain]) !== previous) {
+      }
+      this.reload();
+      for (const domain of deletedDomains) {
+        if (JSON.stringify(this.resolved.config[domain]) !== previousByDomain.get(domain)) {
           this.sink({
             type: "config.changed",
             payload: {
@@ -310,8 +315,35 @@ export class ConfigService {
             },
           });
         }
+      }
+    }
+
+    for (const domain of CONFIG_DOMAINS) {
+      const probe = probes.get(domain);
+      if (probe === undefined || probe.kind === "missing") continue;
+
+      if (probe.kind === "unparseable") {
+        // Unparseable JSON5 — reject, keep previous values.
+        if (this.appliedHashes.get(domain) !== "unparseable") {
+          this.appliedHashes.set(domain, "unparseable");
+          this.sink({
+            type: "config.rejected",
+            payload: {
+              domain,
+              layer: "global",
+              issues: [
+                {
+                  path: "",
+                  message: `JSON5 parse error: ${probe.error.message}`,
+                },
+              ],
+            },
+          });
+        }
         continue;
       }
+
+      const { file } = probe;
       if (this.appliedHashes.get(domain) === file.contentHash) continue;
 
       const issues = this.validateGlobal(domain, file.value);
