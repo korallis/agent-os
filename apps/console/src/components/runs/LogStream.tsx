@@ -13,14 +13,23 @@ type Filter = "All" | "Info" | "Warn" | "Error";
 function levelOf(envelope: EventEnvelope): Level {
   switch (envelope.event.type) {
     case "config.rejected":
+    case "provider.billing_mismatch":
       return "ERROR";
     case "daemon.stopping":
+    case "quota.threshold":
       return "WARN";
     case "policy.changed":
       return envelope.event.payload.safetyOverride ? "WARN" : "INFO";
     case "daemon.started":
     case "config.installed":
     case "config.changed":
+    case "provider.connection_updated":
+    case "provider.credential_refreshed":
+    case "quota.updated":
+    case "ext.hello":
+    case "ext.usage":
+    case "onboarding.step":
+    case "onboarding.completed":
       return "INFO";
     default: {
       const exhaustive: never = envelope.event;
@@ -41,6 +50,19 @@ function sourceOf(envelope: EventEnvelope): string {
       return envelope.event.payload.domain;
     case "policy.changed":
       return "policies";
+    case "provider.connection_updated":
+    case "provider.credential_refreshed":
+    case "provider.billing_mismatch":
+      return "providers";
+    case "quota.updated":
+    case "quota.threshold":
+      return "quota";
+    case "ext.hello":
+    case "ext.usage":
+      return "extension";
+    case "onboarding.step":
+    case "onboarding.completed":
+      return "onboarding";
     default: {
       const exhaustive: never = envelope.event;
       return exhaustive;
@@ -69,6 +91,24 @@ function messageOf(envelope: EventEnvelope): string {
       return event.payload.safetyOverride
         ? "Safety policy override ACTIVE — confirmation was supplied"
         : "Policy change applied — all safety policies ON";
+    case "provider.connection_updated":
+      return `Connection ${event.payload.provider} · ${event.payload.health}${event.payload.limitReached ? " · LIMIT REACHED" : ""}`;
+    case "provider.credential_refreshed":
+      return `Credential presence refreshed — ${event.payload.provider}`;
+    case "provider.billing_mismatch":
+      return `BILLING_MISMATCH — expected ${event.payload.expectedPath}, observed ${event.payload.observedPath}`;
+    case "quota.updated":
+      return `Quota sample — ${event.payload.provider} (${event.payload.metrics.length} metrics)`;
+    case "quota.threshold":
+      return `Quota ${event.payload.level} — ${event.payload.provider}: ${event.payload.reason}`;
+    case "ext.hello":
+      return `Extension hello — session ${event.payload.sessionId.slice(0, 8)}… role ${event.payload.role}`;
+    case "ext.usage":
+      return `Usage — ${event.payload.provider}/${event.payload.model} in=${event.payload.inputTokens ?? "?"} out=${event.payload.outputTokens ?? "?"}`;
+    case "onboarding.step":
+      return `Onboarding step → ${event.payload.step}`;
+    case "onboarding.completed":
+      return `Onboarding completed at ${event.payload.at}`;
     default: {
       const exhaustive: never = event;
       return exhaustive;

@@ -2,9 +2,10 @@ import { execFileSync } from "node:child_process";
 
 /**
  * `agentos doctor` — environment preflight (master plan §11 Phase 1 gate:
- * "doctor verifies tmux/git/gh/node/pi/uv"). Missing tools are WARNINGS in
- * Phase 1: nothing here is exercised until Pi integration (Phase 2) and the
- * fleet (Phase 3); the wizard's guided installs land with §4.10.
+ * "doctor verifies tmux/git/gh/node/pi/uv"; §4.10 wizard reuses the same
+ * probes). Missing tools remain non-fatal warnings here; the onboarding
+ * wizard (§4.10) drives guided installs and hard blocks for Pi / Claude SDK
+ * paths. Fleet-hard deps (tmux) still land with Phase 3.
  */
 
 export interface DoctorCheck {
@@ -25,7 +26,7 @@ const TOOLS: readonly ToolSpec[] = [
   { tool: "tmux", args: ["-V"], note: "session backend — hard dependency from Phase 3" },
   { tool: "git", args: ["--version"], note: "worktrees + delivery" },
   { tool: "gh", args: ["--version"], note: "PR delivery modes" },
-  { tool: "pi", args: ["--version"], note: "the one worker harness (Phase 2)" },
+  { tool: "pi", args: ["--version"], note: "the one worker harness (pinned @earendil-works/pi-coding-agent)" },
   { tool: "uv", args: ["--version"], note: "gate runtime — hard v1 dependency (Phase 5)" },
 ];
 
@@ -60,9 +61,9 @@ export function formatDoctorReport(checks: DoctorCheck[]): string {
   lines.push(
     missing.length === 0
       ? "all tools present."
-      : `${missing.length} tool(s) missing — warnings only in Phase 1 (${missing
+      : `${missing.length} tool(s) missing — reported as warnings (${missing
           .map((c) => c.tool)
-          .join(", ")}).`,
+          .join(", ")}); use the Console onboarding wizard for guided install.`,
   );
   return lines.join("\n");
 }

@@ -1,0 +1,31 @@
+{
+  "name": "@agentos/claude-agent-sdk-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vendored Claude Agent SDK bridge for Pi (master plan §4.10 R6.1). Published name @agentos/claude-agent-sdk-pi; models address as claude-agent-sdk/* and classify as family anthropic.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agent-os/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "eslint": "9.39.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

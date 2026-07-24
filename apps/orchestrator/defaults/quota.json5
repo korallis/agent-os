@@ -1,0 +1,26 @@
+// quota.json5 — Policy Pack surface #14 (master plan §4.9 / §2.6).
+// Probe endpoint URLs are CONFIG-LOCKED (baked into code) and deliberately
+// absent — a config-supplied URL receiving a bearer token is an exfiltration
+// vector. Probes auto-enable from detection at onboarding; each stays
+// individually toggleable here and on the Policies page.
+{
+  pollIntervalSeconds: 300,
+  minIntervalSeconds: 60,
+  jitterSeconds: 15,
+  backoffBaseSeconds: 30,
+  backoffMaxSeconds: 900,
+  thresholds: {
+    windowPctWarn: 80,
+    windowPctCritical: 95,
+    lowBalanceUsd: 5,
+  },
+  providers: {
+    anthropic: { enabled: false, bestEffortAllowed: false },
+    openai: { enabled: false, bestEffortAllowed: false },
+    xai: { enabled: false, bestEffortAllowed: true },
+    openrouter: { enabled: false, bestEffortAllowed: false },
+    "kimi-coding": { enabled: false, bestEffortAllowed: false },
+    "vercel-ai-gateway": { enabled: false, bestEffortAllowed: false },
+    "claude-agent-sdk": { enabled: false, bestEffortAllowed: false },
+  },
+}

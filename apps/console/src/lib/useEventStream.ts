@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { eventEnvelopeSchema, type EventEnvelope } from "@agent-os/protocol";
 
-/** Every Phase 1 event type — SSE frames are named by event type. */
+/** Named SSE event types (Phase 1 + Phase 2). Named events do not fire onmessage. */
 const EVENT_TYPES = [
   "daemon.started",
   "daemon.stopping",
@@ -11,6 +11,15 @@ const EVENT_TYPES = [
   "config.changed",
   "config.rejected",
   "policy.changed",
+  "provider.connection_updated",
+  "provider.credential_refreshed",
+  "provider.billing_mismatch",
+  "quota.updated",
+  "quota.threshold",
+  "ext.hello",
+  "ext.usage",
+  "onboarding.step",
+  "onboarding.completed",
 ] as const;
 
 export type StreamState = "connecting" | "live" | "down";

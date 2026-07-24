@@ -1,0 +1,35 @@
+{
+  "name": "@agent-os/pi-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "agent-os Pi extension — lifecycle telemetry + control over Unix sockets (master plan §1.1, §4)",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./extension": {
+      "types": "./dist/extension.d.ts",
+      "import": "./dist/extension.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agent-os/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "eslint": "9.39.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

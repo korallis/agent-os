@@ -8,7 +8,7 @@ export const metadata: Metadata = { title: "Inference Jobs — AgentOS" };
 type JobStatus = "Done" | "Running" | "Failed" | "Queued";
 
 /* Pixel-faithful placeholder rows from the Figma design — the task engine
-   that feeds this table lands in Phase 2 (master plan §11). */
+   that feeds this table lands in Phase 3 (master plan §11). */
 const JOBS: {
   id: string;
   model: string;
@@ -44,7 +44,7 @@ const STATUS_TEXT: Record<JobStatus, string> = {
 
 /**
  * Tasks (§7.3) — the Figma "Inference Jobs" screen. Static placeholder
- * data until the Phase 2 task engine streams real jobs over SSE.
+ * data until the Phase 3 task engine streams real jobs over SSE.
  */
 export default function TasksPage() {
   return (

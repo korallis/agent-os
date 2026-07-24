@@ -27,10 +27,13 @@
   },
   "dependencies": {
     "@agent-os/event-store": "workspace:*",
+    "@agent-os/pi-extension": "workspace:*",
     "@agent-os/protocol": "workspace:*",
+    "@agentos/claude-agent-sdk-pi": "workspace:*",
     "fastify": "5.10.0",
     "json5": "2.2.3",
     "pino": "10.3.1",
+    "ulid": "3.0.2",
     "zod": "4.4.3"
   },
   "devDependencies": {

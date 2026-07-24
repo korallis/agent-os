@@ -12,6 +12,16 @@ import {
 import { ConfigService } from "./config/service.js";
 import { buildServer, type AgentosdServer } from "./server/app.js";
 import { AGENTOSD_VERSION, DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";
+import { ConnectionRegistry } from "./pi/connections.js";
+import { detectPi } from "./pi/manager.js";
+import { SocketHub } from "./pi/socket-hub.js";
+import { OnboardingService } from "./onboarding/state.js";
+import {
+  hydrateQuotaSamples,
+  QuotaProbeScheduler,
+} from "./quota-probes/scheduler.js";
+import { enableQuotaProviders } from "./quota-probes/enable.js";
+import type { QuotaSample } from "@agent-os/protocol";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
@@ -112,7 +122,47 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
 
     const startedAt = new Date().toISOString();
 
-    const deps = { store, config, token, home, port, startedAt, logger };
+    const pi = detectPi(home);
+    const connections = new ConnectionRegistry(home);
+    connections.onEvent((event) => {
+      eventStore.append(event);
+    });
+    // R5.1: new / detected connections auto-enable matching quota probes.
+    const configService = config;
+    connections.onProbeAutoEnable(({ provider, billingMode }) => {
+      enableQuotaProviders(configService, [{ provider, billingMode }]);
+    });
+    connections.syncFromAuthStore();
+
+    const onboarding = new OnboardingService(home);
+    onboarding.onEvent((event) => {
+      eventStore.append(event);
+    });
+
+    const quotaSamples: Map<string, QuotaSample> = hydrateQuotaSamples(store);
+    const socketHub = new SocketHub(join(home, "sockets"));
+    socketHub.onEvent((event) => {
+      eventStore.append(event);
+    });
+    try {
+      await socketHub.listen();
+    } catch (error) {
+      logger.warn({ err: error }, "socket hub failed to listen — extension channel unavailable");
+    }
+
+    const deps = {
+      store,
+      config,
+      token,
+      home,
+      port,
+      startedAt,
+      logger,
+      connections,
+      onboarding,
+      pi,
+      quotaSamples,
+    };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });
     const address = server.server.address();
@@ -121,11 +171,32 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     // With port 0 (tests) the real port is only known after listen.
     deps.port = boundPort;
 
+    const quotaScheduler = new QuotaProbeScheduler({
+      home,
+      store,
+      config,
+      connections,
+      pi,
+      quotaSamples,
+      logger,
+    });
+    quotaScheduler.start();
+
     store.append({
       type: "daemon.started",
       payload: { version: AGENTOSD_VERSION, pid: process.pid, home, port: boundPort },
     });
-    logger.info({ home, port: boundPort, version: AGENTOSD_VERSION }, "agentosd started");
+    logger.info(
+      {
+        home,
+        port: boundPort,
+        version: AGENTOSD_VERSION,
+        piVersion: pi.version,
+        piPinned: pi.pinnedVersion,
+        hydratedQuotaSamples: quotaSamples.size,
+      },
+      "agentosd started",
+    );
 
     const runningStore = store;
     const runningConfig = config;
@@ -145,11 +216,13 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         if (closed) return;
         closed = true;
         try {
+          quotaScheduler.stop();
           runningStore.append({
             type: "daemon.stopping",
             payload: { reason, signal: signal ?? null },
           });
           runningConfig.stop();
+          await socketHub.close();
           const closePromise = runningServer.close();
           await new Promise<void>((resolve) => setTimeout(resolve, SSE_SHUTDOWN_GRACE_MS));
           runningServer.destroySseStreams();

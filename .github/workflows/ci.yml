@@ -34,5 +34,11 @@ jobs:
       - name: Build
         run: pnpm run build
 
+      - name: Test
+        run: pnpm run test
+
       - name: Zero-deprecated gate
         run: node scripts/verify-no-deprecated.mjs
+
+      - name: Phase 2 gates
+        run: node tooling/gates/phase-2.mjs
