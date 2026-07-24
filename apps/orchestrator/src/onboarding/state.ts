@@ -130,7 +130,7 @@ export class OnboardingService {
         const existing = this.state.providers.find((p) => p.provider === provider);
         return {
           provider,
-          selected: selected.has(provider) || detected.has(provider),
+          selected: selected.has(provider),
           detected: detected.has(provider),
           authVerified: existing?.authVerified ?? detected.has(provider),
           claudeBillingMode: existing?.claudeBillingMode ?? null,
@@ -155,14 +155,21 @@ export class OnboardingService {
       ),
     };
     const claude = this.state.providers.find((p) => p.provider === "anthropic" && p.selected);
-    if (claude !== undefined && !claude.authVerified === false) {
-      // keep
-    }
     if (claude?.selected === true) {
       this.state = { ...this.state, step: "claude-billing" };
     } else if (this.state.providers.filter((p) => p.selected).every((p) => p.authVerified)) {
       this.state = { ...this.state, step: "probes" };
     }
+    this.save(previous);
+    return this.state;
+  }
+
+  /**
+   * Advance to probes step after auto-enabling selected+verified providers (R5.1).
+   */
+  enableProbes(): OnboardingState {
+    const previous = this.state.step;
+    this.state = { ...this.state, step: "probes" };
     this.save(previous);
     return this.state;
   }
@@ -327,12 +334,33 @@ function checkTool(
   required: string,
   installHint: string | null,
 ): DoctorCheck {
+  const ok = satisfiesVersionConstraint(version, required);
   return {
     id,
-    ok: true,
+    ok,
     version,
     required,
-    detail: "runtime",
-    installHint,
+    detail: ok ? "runtime" : `need ${required}, found ${version}`,
+    installHint: ok ? installHint : (installHint ?? `install ${id} ${required}`),
   };
+}
+
+/** Parse major from "24.1.0" / "v24.1.0" and evaluate constraints like ">=24". */
+function satisfiesVersionConstraint(version: string, required: string): boolean {
+  const cleaned = version.replace(/^v/i, "").trim();
+  const major = Number.parseInt(cleaned.split(".")[0] ?? "", 10);
+  if (!Number.isFinite(major)) return false;
+  const ge = required.match(/^>=\s*(\d+)/);
+  if (ge !== null) {
+    return major >= Number.parseInt(ge[1] ?? "", 10);
+  }
+  const gt = required.match(/^>\s*(\d+)/);
+  if (gt !== null) {
+    return major > Number.parseInt(gt[1] ?? "", 10);
+  }
+  const exact = required.match(/^(\d+)/);
+  if (exact !== null) {
+    return major === Number.parseInt(exact[1] ?? "", 10);
+  }
+  return true;
 }

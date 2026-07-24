@@ -307,6 +307,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         connection,
         config: deps.config.config.quota,
         authJsonPath: paths.authJsonPath,
+        agentosHome: deps.home,
       });
       deps.quotaSamples.set(connection.id, sample);
       for (const event of events) {
@@ -362,7 +363,8 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
           if (deps.connections !== undefined) {
             deps.connections.syncFromAuthStore();
           }
-          return { state: svc.getState() };
+          enableProbesForOnboarding(deps, svc);
+          return { state: svc.enableProbes() };
         }
         case "complete":
           return { state: svc.complete() };
@@ -687,4 +689,65 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
   });
 
   return Object.assign(app, { destroySseStreams });
+}
+
+/**
+ * R5.1: flip quota.json5 providers.enabled for selected+verified onboarding
+ * providers (Grok best-effort when xAI is enabled).
+ */
+function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): void {
+  const state = svc.getState();
+  const toEnable = state.providers.filter((p) => p.selected && p.authVerified);
+  if (toEnable.length === 0) return;
+
+  const existingRaw = deps.config.layerValue("global", "quota");
+  const base =
+    typeof existingRaw === "object" && existingRaw !== null && !Array.isArray(existingRaw)
+      ? { ...(existingRaw as Record<string, unknown>) }
+      : {};
+  const existingProviders =
+    typeof base["providers"] === "object" &&
+    base["providers"] !== null &&
+    !Array.isArray(base["providers"])
+      ? { ...(base["providers"] as Record<string, unknown>) }
+      : {};
+
+  const effective = deps.config.config.quota.providers;
+  const providers: Record<string, { enabled: boolean; bestEffortAllowed: boolean }> = {
+    ...Object.fromEntries(
+      Object.entries(effective).map(([key, value]) => [
+        key,
+        { enabled: value.enabled, bestEffortAllowed: value.bestEffortAllowed },
+      ]),
+    ),
+  };
+
+  for (const entry of toEnable) {
+    const keys: (keyof typeof effective)[] = [];
+    if (entry.provider === "anthropic") {
+      keys.push("anthropic");
+      if (entry.claudeBillingMode === "subscription-sdk") keys.push("claude-agent-sdk");
+    } else if (entry.provider === "openai") keys.push("openai");
+    else if (entry.provider === "xai") keys.push("xai");
+    else if (entry.provider === "openrouter") keys.push("openrouter");
+    else if (entry.provider === "kimi-coding") keys.push("kimi-coding");
+    else if (entry.provider === "vercel-ai-gateway") keys.push("vercel-ai-gateway");
+
+    for (const key of keys) {
+      const current = providers[key] ?? effective[key];
+      providers[key] = {
+        enabled: true,
+        bestEffortAllowed: key === "xai" ? true : current.bestEffortAllowed,
+      };
+    }
+  }
+
+  const next = {
+    ...base,
+    providers: {
+      ...existingProviders,
+      ...providers,
+    },
+  };
+  deps.config.writeGlobal("quota", JSON.stringify(next, null, 2));
 }

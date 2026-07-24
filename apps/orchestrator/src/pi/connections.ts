@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { monotonicFactory } from "ulid";
 import {
   providerConnectionSchema,
+  type AuthStorePresence,
   type BillingSurface,
   type ClaudeBillingMode,
   type ModelFamily,
@@ -80,24 +81,32 @@ export class ConnectionRegistry {
 
   /**
    * Sync connections from Pi auth-store presence (detection-driven, §4.9 R5.1).
+   * Only persists / emits when presence hash, health, or membership actually changes.
    */
   syncFromAuthStore(): ProviderConnection[] {
     const presence = listDetectedProviders(this.home);
     const now = new Date().toISOString();
-    const seen = new Set<string>();
+    let dirty = false;
 
     for (const p of presence) {
-      seen.add(p.provider);
       const existing = [...this.connections.values()].find((c) => c.provider === p.provider);
       if (existing !== undefined) {
+        const nextHealth = p.present ? "healthy" : "unknown";
+        if (
+          presenceUnchanged(existing.authStorePresence, p) &&
+          existing.health === nextHealth
+        ) {
+          continue;
+        }
         const updated: ProviderConnection = {
           ...existing,
           authStorePresence: p,
-          health: p.present ? "healthy" : "unknown",
+          health: nextHealth,
           updatedAt: now,
         };
         this.connections.set(updated.id, updated);
         this.emitUpdated(updated);
+        dirty = true;
       } else {
         const created = this.createConnection({
           provider: p.provider,
@@ -112,9 +121,10 @@ export class ConnectionRegistry {
         };
         this.connections.set(withPresence.id, withPresence);
         this.emitUpdated(withPresence);
+        dirty = true;
       }
     }
-    this.persist();
+    if (dirty) this.persist();
     return this.list();
   }
 
@@ -193,6 +203,20 @@ export class ConnectionRegistry {
       },
     });
   }
+}
+
+function presenceUnchanged(
+  existing: AuthStorePresence | null,
+  next: AuthStorePresence,
+): boolean {
+  if (existing === null) return false;
+  return (
+    existing.provider === next.provider &&
+    existing.present === next.present &&
+    existing.presenceHash === next.presenceHash &&
+    existing.mtime === next.mtime &&
+    existing.expiresAt === next.expiresAt
+  );
 }
 
 /** API keys are stored under AGENTOS_HOME/secrets/<provider> as 0600 files for Phase 2 (keychain later). */

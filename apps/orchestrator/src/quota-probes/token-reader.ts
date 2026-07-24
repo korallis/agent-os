@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import type { ConnectionKind } from "@agent-os/protocol";
+import { readApiKeyFile } from "../pi/connections.js";
 import { assertTokenUrlAllowed } from "./allowlist.js";
 
 /**
@@ -45,6 +47,12 @@ export function readProbeToken(options: {
   /** Test-only fixture token (never used in production paths). */
   fixtureToken?: string;
   billingMode?: string | null;
+  /** Connection kind — api-key custody uses AGENTOS_HOME/secrets. */
+  connectionKind?: ConnectionKind;
+  /** AGENTOS_HOME for secrets/<provider>.key reads. */
+  agentosHome?: string;
+  /** Provider id used for secrets path (connection.provider, not allowlist alias). */
+  secretsProvider?: string;
 }): ProbeToken | null {
   assertTokenUrlAllowed(options.url);
 
@@ -59,6 +67,19 @@ export function readProbeToken(options: {
   ) {
     const claudeCred = readClaudeCodeCredential();
     if (claudeCred !== null) return claudeCred;
+  }
+
+  // API-key connections: secrets written by writeApiKeyFile (env-keychain custody).
+  if (
+    options.connectionKind === "pi-api-key" &&
+    options.agentosHome !== undefined &&
+    options.agentosHome.length > 0
+  ) {
+    const secretsProvider = options.secretsProvider ?? options.provider;
+    const apiKey = readApiKeyFile(options.agentosHome, secretsProvider);
+    if (apiKey !== null && apiKey.length > 0) {
+      return { token: apiKey, source: "keychain", headers: {} };
+    }
   }
 
   if (!existsSync(options.authJsonPath)) return null;

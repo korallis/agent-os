@@ -16,6 +16,10 @@ import { ConnectionRegistry } from "./pi/connections.js";
 import { detectPi } from "./pi/manager.js";
 import { SocketHub } from "./pi/socket-hub.js";
 import { OnboardingService } from "./onboarding/state.js";
+import {
+  hydrateQuotaSamples,
+  QuotaProbeScheduler,
+} from "./quota-probes/scheduler.js";
 import type { QuotaSample } from "@agent-os/protocol";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -129,7 +133,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       eventStore.append(event);
     });
 
-    const quotaSamples = new Map<string, QuotaSample>();
+    const quotaSamples: Map<string, QuotaSample> = hydrateQuotaSamples(store);
     const socketHub = new SocketHub(join(home, "sockets"));
     socketHub.onEvent((event) => {
       eventStore.append(event);
@@ -161,6 +165,17 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     // With port 0 (tests) the real port is only known after listen.
     deps.port = boundPort;
 
+    const quotaScheduler = new QuotaProbeScheduler({
+      home,
+      store,
+      config,
+      connections,
+      pi,
+      quotaSamples,
+      logger,
+    });
+    quotaScheduler.start();
+
     store.append({
       type: "daemon.started",
       payload: { version: AGENTOSD_VERSION, pid: process.pid, home, port: boundPort },
@@ -172,6 +187,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         version: AGENTOSD_VERSION,
         piVersion: pi.version,
         piPinned: pi.pinnedVersion,
+        hydratedQuotaSamples: quotaSamples.size,
       },
       "agentosd started",
     );
@@ -194,6 +210,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         if (closed) return;
         closed = true;
         try {
+          quotaScheduler.stop();
           runningStore.append({
             type: "daemon.stopping",
             payload: { reason, signal: signal ?? null },

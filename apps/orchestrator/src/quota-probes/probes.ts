@@ -17,6 +17,8 @@ export interface ProbeContext {
   connection: ProviderConnection;
   config: QuotaConfig;
   authJsonPath: string;
+  /** AGENTOS_HOME — used to read secrets/<provider>.key for pi-api-key probes. */
+  agentosHome?: string;
   /** Injectable clock for fake-clock countdown tests. */
   now?: () => Date;
   /** Injectable fetch for tests. */
@@ -88,6 +90,9 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
         authJsonPath: ctx.authJsonPath,
         url: endpoint.url,
         billingMode: ctx.connection.billingMode,
+        connectionKind: ctx.connection.kind,
+        secretsProvider: provider,
+        ...(ctx.agentosHome !== undefined ? { agentosHome: ctx.agentosHome } : {}),
         ...(ctx.fixtureToken !== undefined ? { fixtureToken: ctx.fixtureToken } : {}),
       });
       if (token === null) {
@@ -322,11 +327,24 @@ function parseProbeBody(
     }
   }
 
-  // OpenRouter credits
+  // OpenRouter credits — API wraps fields under top-level `data`.
   if (provider === "openrouter") {
-    const totalCredits = num(b["total_credits"] ?? b["totalCredits"]);
-    const totalUsage = num(b["total_usage"] ?? b["totalUsage"]);
-    const limitRemaining = num(b["limit_remaining"] ?? b["limitRemaining"]);
+    const data =
+      typeof b["data"] === "object" && b["data"] !== null && !Array.isArray(b["data"])
+        ? (b["data"] as Record<string, unknown>)
+        : b;
+    const totalCredits = num(
+      data["total_credits"] ?? data["totalCredits"] ?? b["total_credits"] ?? b["totalCredits"],
+    );
+    const totalUsage = num(
+      data["total_usage"] ?? data["totalUsage"] ?? b["total_usage"] ?? b["totalUsage"],
+    );
+    const limitRemaining = num(
+      data["limit_remaining"] ??
+        data["limitRemaining"] ??
+        b["limit_remaining"] ??
+        b["limitRemaining"],
+    );
     if (totalCredits !== null && totalUsage !== null) {
       metrics.push(
         metric("account-credits", totalCredits - totalUsage, "credits", tier, `${sourceLabel} · SYNCED`, syncedAt, {
@@ -338,7 +356,9 @@ function parseProbeBody(
       metrics.push(
         metric("key-limit-remaining", limitRemaining, "credits", tier, `${sourceLabel} · SYNCED`, syncedAt, {
           limitReached: limitRemaining <= 0,
-          resetsAt: str(b["limit_reset"] ?? b["limitReset"]),
+          resetsAt: str(
+            data["limit_reset"] ?? data["limitReset"] ?? b["limit_reset"] ?? b["limitReset"],
+          ),
         }),
       );
     }
