@@ -183,35 +183,77 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
-    raw.write(`retry: 2000\n\n`);
+
+    let closed = false;
+    let unsubscribe: (() => void) | null = null;
+    let heartbeatTimer: NodeJS.Timeout | null = null;
+
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      if (unsubscribe !== null) {
+        unsubscribe();
+        unsubscribe = null;
+      }
+      if (heartbeatTimer !== null) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      try {
+        raw.end();
+      } catch {
+        try {
+          raw.destroy();
+        } catch {
+          // already gone
+        }
+      }
+    };
+
+    const safeWrite = (chunk: string): boolean => {
+      if (closed) return false;
+      try {
+        raw.write(chunk);
+        return true;
+      } catch {
+        cleanup();
+        return false;
+      }
+    };
+
+    if (!safeWrite(`retry: 2000\n\n`)) {
+      return;
+    }
 
     const writeFrame = (envelope: { id: string; event: { type: string } }): void => {
-      raw.write(`id: ${envelope.id}\nevent: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`);
+      safeWrite(
+        `id: ${envelope.id}\nevent: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
+      );
     };
 
     // Replay everything after the cursor, then go live.
     const { events } = deps.store.eventsAfterId(cursor, 10_000);
-    for (const envelope of events) writeFrame(envelope);
+    for (const envelope of events) {
+      if (closed) break;
+      writeFrame(envelope);
+    }
+    if (closed) return;
 
-    const unsubscribe = deps.store.subscribe((envelope) => writeFrame(envelope));
+    unsubscribe = deps.store.subscribe((envelope) => writeFrame(envelope));
 
     // Heartbeat: cadence follows supervision.heartbeatSeconds live, so a
     // hot-reloaded value is observable on the wire (§11 config gate).
-    let heartbeatTimer: NodeJS.Timeout | null = null;
     const scheduleHeartbeat = (): void => {
+      if (closed) return;
       const seconds = deps.config.config.supervision.heartbeatSeconds;
       heartbeatTimer = setTimeout(() => {
-        raw.write(`: heartbeat ${seconds}s\n\n`);
+        if (!safeWrite(`: heartbeat ${seconds}s\n\n`)) return;
         scheduleHeartbeat();
       }, seconds * 1000);
     };
     scheduleHeartbeat();
 
-    request.raw.on("close", () => {
-      unsubscribe();
-      if (heartbeatTimer !== null) clearTimeout(heartbeatTimer);
-      raw.end();
-    });
+    request.raw.on("close", cleanup);
   });
 
   app.get("/v1/config/effective", () => {

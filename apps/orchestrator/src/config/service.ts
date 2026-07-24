@@ -163,7 +163,11 @@ export class ConfigService {
     for (const domain of CONFIG_DOMAINS) {
       try {
         const file = loadLayerFile(this.globalDir, domain);
-        if (file === null) continue;
+        if (file === null) {
+          this.lastGoodGlobal.delete(domain);
+          this.appliedHashes.delete(domain);
+          continue;
+        }
         const issues = this.validateGlobal(domain, file.value);
         if (issues.length > 0) {
           retainedRejections.push({ domain, layer: "global", issues });
@@ -287,7 +291,27 @@ export class ConfigService {
         }
         continue;
       }
-      if (file === null) continue;
+      if (file === null) {
+        if (!this.lastGoodGlobal.has(domain) && !this.appliedHashes.has(domain)) {
+          continue;
+        }
+        const previous = JSON.stringify(this.resolved.config[domain]);
+        this.lastGoodGlobal.delete(domain);
+        this.appliedHashes.delete(domain);
+        this.reload();
+        if (JSON.stringify(this.resolved.config[domain]) !== previous) {
+          this.sink({
+            type: "config.changed",
+            payload: {
+              domain,
+              layer: "global",
+              hotReloaded: true,
+              contentHash: sha256(""),
+            },
+          });
+        }
+        continue;
+      }
       if (this.appliedHashes.get(domain) === file.contentHash) continue;
 
       const issues = this.validateGlobal(domain, file.value);
