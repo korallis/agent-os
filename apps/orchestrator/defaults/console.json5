@@ -1,0 +1,7 @@
+// console.json5 — console layout preferences (Policy Pack surface #10, §2.6).
+// Hot-reloadable.
+{
+  defaultPage: "fleet",
+  columnDensity: "comfortable",
+  wakeQueueVisible: true,
+}

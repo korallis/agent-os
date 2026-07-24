@@ -1,0 +1,259 @@
+import { existsSync, readFileSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { join } from "node:path";
+import JSON5 from "json5";
+import {
+  CONFIG_DOMAINS,
+  configDomainSchemas,
+  type AgentOsConfig,
+  type ConfigDomain,
+  type ConfigLayer,
+  type ConfigValidationIssue,
+  type OrchestratorEvent,
+} from "@agent-os/protocol";
+import {
+  issuesFromZodError,
+  loadLayerFile,
+  resolveAll,
+  resolveDomain,
+  sha256,
+  type LayerRejection,
+} from "./resolver.js";
+
+export type ConfigEventSink = (event: OrchestratorEvent) => void;
+
+export class ConfigWriteError extends Error {
+  constructor(
+    readonly domain: ConfigDomain,
+    readonly layer: ConfigLayer,
+    readonly issues: ConfigValidationIssue[],
+  ) {
+    super(`invalid ${layer} config for domain "${domain}"`);
+  }
+}
+
+/**
+ * Holds the resolved effective config; installs shipped-default templates;
+ * hot-reloads the global layer on file change (§2.6 "hot-reload where safe").
+ * Invalid edits are rejected wholesale (config.rejected event, previous
+ * values retained) — never partially applied.
+ */
+export class ConfigService {
+  private resolved: { config: AgentOsConfig; sources: Record<string, ConfigLayer> };
+  private rejections: LayerRejection[] = [];
+  private readonly appliedHashes = new Map<ConfigDomain, string>();
+  private watcher: FSWatcher | null = null;
+  private reloadTimer: NodeJS.Timeout | null = null;
+  private sink: ConfigEventSink = () => undefined;
+
+  constructor(
+    private readonly shippedDir: string,
+    private readonly globalDir: string,
+  ) {
+    const result = resolveAll({ shippedDir, globalDir });
+    this.resolved = { config: result.config, sources: result.sources };
+    this.rejections = result.rejections;
+    this.recordAppliedHashes();
+  }
+
+  /** Wires the event sink (the daemon's event store) after construction. */
+  onEvent(sink: ConfigEventSink): void {
+    this.sink = sink;
+  }
+
+  private recordAppliedHashes(): void {
+    for (const domain of CONFIG_DOMAINS) {
+      const file = safeLoad(this.globalDir, domain);
+      if (file !== null) this.appliedHashes.set(domain, file.contentHash);
+    }
+  }
+
+  /**
+   * Installs shipped defaults into the global config dir as commented
+   * templates (§2.6: "shipped defaults … installed to ~/.agentos/config/
+   * templates on init"). A template parses as `{}` so every key still
+   * resolves from the shipped layer until deliberately overridden.
+   */
+  installDefaults(): ConfigDomain[] {
+    const installed: ConfigDomain[] = [];
+    for (const domain of CONFIG_DOMAINS) {
+      const target = join(this.globalDir, `${domain}.json5`);
+      if (existsSync(target)) continue;
+      const shippedRaw = readFileSync(join(this.shippedDir, `${domain}.json5`), "utf8");
+      const commented = shippedRaw
+        .split("\n")
+        .map((line) => (line.trim().length > 0 ? `// ${line}` : line))
+        .join("\n");
+      const template = [
+        `// ${domain}.json5 — GLOBAL layer (Policy Packs, master plan §2.6).`,
+        "// Shipped defaults are reproduced below for reference; add overrides",
+        "// to the object at the bottom. Only keys you set here override the",
+        "// shipped layer — everything else keeps its shipped default.",
+        "//",
+        commented,
+        "{",
+        "}",
+        "",
+      ].join("\n");
+      writeFileSync(target, template, { mode: 0o600 });
+      this.appliedHashes.set(domain, sha256(template));
+      installed.push(domain);
+    }
+    if (installed.length > 0) {
+      this.reload();
+    }
+    return installed;
+  }
+
+  get config(): AgentOsConfig {
+    return this.resolved.config;
+  }
+
+  effective(): { config: AgentOsConfig; sources: Record<string, ConfigLayer> } {
+    return this.resolved;
+  }
+
+  lastRejections(): LayerRejection[] {
+    return this.rejections;
+  }
+
+  /** Raw parsed value of one layer file (Console layer view). */
+  layerValue(layer: ConfigLayer, domain: ConfigDomain): unknown {
+    const dir = layer === "shipped" ? this.shippedDir : layer === "global" ? this.globalDir : null;
+    if (dir === null) return null;
+    try {
+      return loadLayerFile(dir, domain)?.value ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private reload(): void {
+    const result = resolveAll({ shippedDir: this.shippedDir, globalDir: this.globalDir });
+    this.resolved = { config: result.config, sources: result.sources };
+    this.rejections = result.rejections;
+  }
+
+  /**
+   * Validated global-layer write (§8.2 PUT /v1/config/:layer/:domain).
+   * Parses JSON5, applies the layer transactionally against shipped
+   * defaults, writes atomically, reloads, emits `config.changed`.
+   * @throws ConfigWriteError with path-precise issues; nothing is written.
+   */
+  writeGlobal(domain: ConfigDomain, json5Text: string): { contentHash: string } {
+    let value: unknown;
+    try {
+      value = JSON5.parse(json5Text);
+    } catch (error) {
+      throw new ConfigWriteError(domain, "global", [
+        { path: "", message: `JSON5 parse error: ${(error as Error).message}` },
+      ]);
+    }
+    const shipped = loadLayerFile(this.shippedDir, domain);
+    if (shipped === null) throw new Error(`missing shipped default for "${domain}"`);
+    const resolved = resolveDomain(domain, { shipped: shipped.value, global: value });
+    const rejection = resolved.rejections.find((r) => r.layer === "global");
+    if (rejection !== undefined) {
+      throw new ConfigWriteError(domain, "global", rejection.issues);
+    }
+
+    const target = join(this.globalDir, `${domain}.json5`);
+    const tmp = `${target}.tmp-${process.pid}`;
+    writeFileSync(tmp, json5Text, { mode: 0o600 });
+    renameSync(tmp, target);
+    const contentHash = sha256(json5Text);
+    this.appliedHashes.set(domain, contentHash);
+    this.reload();
+    this.sink({
+      type: "config.changed",
+      payload: { domain, layer: "global", hotReloaded: true, contentHash },
+    });
+    return { contentHash };
+  }
+
+  /** Validates a candidate global-layer body without writing (dry run). */
+  validateGlobal(domain: ConfigDomain, value: unknown): ConfigValidationIssue[] {
+    const schema = configDomainSchemas[domain];
+    const shipped = loadLayerFile(this.shippedDir, domain);
+    if (shipped === null) throw new Error(`missing shipped default for "${domain}"`);
+    const resolved = resolveDomain(domain, { shipped: shipped.value, global: value });
+    const rejection = resolved.rejections.find((r) => r.layer === "global");
+    if (rejection !== undefined) return rejection.issues;
+    const full = schema.safeParse(resolved.value);
+    return full.success ? [] : issuesFromZodError(full.error);
+  }
+
+  /**
+   * Watches the global config dir; external edits hot-reload valid files
+   * (config.changed) and reject invalid ones (config.rejected), keeping
+   * previous values (§11 Phase 1 config gates).
+   */
+  startWatching(): void {
+    if (this.watcher !== null) return;
+    this.watcher = watch(this.globalDir, () => {
+      if (this.reloadTimer !== null) clearTimeout(this.reloadTimer);
+      this.reloadTimer = setTimeout(() => {
+        this.reloadTimer = null;
+        this.handleExternalChange();
+      }, 60);
+    });
+  }
+
+  private handleExternalChange(): void {
+    for (const domain of CONFIG_DOMAINS) {
+      let file: ReturnType<typeof loadLayerFile>;
+      try {
+        file = loadLayerFile(this.globalDir, domain);
+      } catch (error) {
+        // Unparseable JSON5 — reject, keep previous values.
+        if (this.appliedHashes.get(domain) !== "unparseable") {
+          this.appliedHashes.set(domain, "unparseable");
+          this.sink({
+            type: "config.rejected",
+            payload: {
+              domain,
+              layer: "global",
+              issues: [{ path: "", message: `JSON5 parse error: ${(error as Error).message}` }],
+            },
+          });
+        }
+        continue;
+      }
+      if (file === null) continue;
+      if (this.appliedHashes.get(domain) === file.contentHash) continue;
+
+      const issues = this.validateGlobal(domain, file.value);
+      this.appliedHashes.set(domain, file.contentHash);
+      if (issues.length > 0) {
+        this.sink({
+          type: "config.rejected",
+          payload: { domain, layer: "global", issues },
+        });
+        continue;
+      }
+      this.reload();
+      this.sink({
+        type: "config.changed",
+        payload: { domain, layer: "global", hotReloaded: true, contentHash: file.contentHash },
+      });
+    }
+  }
+
+  stop(): void {
+    if (this.reloadTimer !== null) {
+      clearTimeout(this.reloadTimer);
+      this.reloadTimer = null;
+    }
+    if (this.watcher !== null) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+  }
+}
+
+function safeLoad(dir: string, domain: ConfigDomain): ReturnType<typeof loadLayerFile> {
+  try {
+    return loadLayerFile(dir, domain);
+  } catch {
+    return null;
+  }
+}

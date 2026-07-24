@@ -1,0 +1,14 @@
+// policies.json5 — safety policies (Policy Pack surface #12, master plan §2.6).
+// Default ON. Captain-only changes; every write requires explicit
+// confirmation and emits `policy.changed`; weakening overrides are
+// evidence-stamped. Loopback-only bind and secret redaction are
+// CONFIG-LOCKED (surface #13) and deliberately absent from this file.
+{
+  crossFamilyBuilderValidator: true,
+  distinctPlannerFamilies: true,
+  redBaselineGateRequired: true,
+  scoutReadOnly: true,
+  verbatimFailDelivery: true,
+  haltCapNotYoloOverridable: true,
+  destructiveGitDenial: true,
+}

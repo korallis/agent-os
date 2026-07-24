@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for agentosd (master plan §2.5, §11 Phase 1 — macOS-only v1).
+  Install:  cp com.agentos.agentosd.plist ~/Library/LaunchAgents/
+            launchctl load ~/Library/LaunchAgents/com.agentos.agentosd.plist
+  Replace __NODE_PATH__ and __AGENTOSD_PATH__ with the output of
+  `which node` and the absolute path to dist/bin/agentosd.js.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentos.agentosd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_PATH__</string>
+    <string>__AGENTOSD_PATH__</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/agentosd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/agentosd.stderr.log</string>
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+// supervision.json5 — shipped defaults (Policy Pack surface #5, master plan §2.6).
+// Hot-reloadable: heartbeat cadence, per-role stale thresholds, escalation
+// ladder depth, respawn cap, and the watcher absorb rules.
+{
+  heartbeatSeconds: 30,
+  staleMinutes: {
+    api: 5,
+    build: 12,
+  },
+  escalationLadderSteps: 3,
+  respawnPerStage: 1,
+  // Wake classes the watcher absorbs in code — zero LLM tokens (§5.6).
+  absorb: ["PROGRESS", "TURN_SETTLED_MID_STAGE", "CONTEXT_PRESSURE_LT_70"],
+}

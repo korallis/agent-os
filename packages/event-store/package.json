@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os/protocol",
+  "name": "@agent-os/event-store",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -15,13 +15,21 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@agent-os/protocol": "workspace:*",
+    "better-sqlite3": "13.0.1",
+    "drizzle-orm": "0.45.2",
+    "ulid": "3.0.2",
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "26.1.1",
     "eslint": "9.39.4",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
   }
 }
