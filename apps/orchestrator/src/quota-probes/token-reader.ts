@@ -1,8 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import type { ConnectionKind } from "@agent-os/protocol";
 import { readApiKeyFile } from "../pi/connections.js";
+import { readClaudeCodeCredential as readClaudeCodeCredentialFile } from "../security/claude-code-credentials.js";
 import { assertTokenUrlAllowed } from "./allowlist.js";
 
 /**
@@ -68,8 +67,10 @@ export function readProbeToken(options: {
     options.provider === "claude-agent-sdk" ||
     (options.provider === "anthropic" && options.billingMode === "subscription-sdk")
   ) {
-    const claudeCred = readClaudeCodeCredential();
-    if (claudeCred !== null) return claudeCred;
+    const claudeCred = readClaudeCodeCredentialFile();
+    if (claudeCred !== null) {
+      return { token: claudeCred.token, source: "claude-code-credentials", headers: {} };
+    }
   }
 
   // API-key connections: secrets written by writeApiKeyFile (env-keychain custody).
@@ -133,26 +134,4 @@ function readTokenFromAuthJson(authJsonPath: string, provider: string): ProbeTok
   return null;
 }
 
-function readClaudeCodeCredential(): ProbeToken | null {
-  const candidates = [
-    join(homedir(), ".claude", ".credentials.json"),
-    join(homedir(), ".claude", "credentials.json"),
-  ];
-  for (const path of candidates) {
-    if (!existsSync(path)) continue;
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-      const token = extractBearer(parsed);
-      if (token !== null) {
-        return { token, source: "claude-code-credentials", headers: {} };
-      }
-      if (isRecord(parsed) && isRecord(parsed["claudeAiOauth"])) {
-        const t = extractBearer(parsed["claudeAiOauth"]);
-        if (t !== null) return { token: t, source: "claude-code-credentials", headers: {} };
-      }
-    } catch {
-      // continue
-    }
-  }
-  return null;
-}
+

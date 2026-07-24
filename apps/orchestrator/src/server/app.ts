@@ -761,6 +761,8 @@ function enableProbesForOnboarding(
 /**
  * Keep anthropic ProviderConnection.billingMode/billingSurface aligned with the
  * wizard so probes/readProbeToken take the subscription-sdk Claude Code path.
+ * Upserts only the mode-matching kind (api-key → pi-api-key, else pi-oauth)
+ * so oauth and api-key cards are never cross-stamped.
  */
 function syncAnthropicBillingFromWizard(deps: ServerDeps, state: OnboardingState): void {
   if (deps.connections === undefined) return;
@@ -770,24 +772,11 @@ function syncAnthropicBillingFromWizard(deps: ServerDeps, state: OnboardingState
   if (claude === undefined || claude.claudeBillingMode === null) return;
   const mode = claude.claudeBillingMode;
   const kind = mode === "api-key" ? "pi-api-key" : "pi-oauth";
-  const existing = deps.connections
-    .list()
-    .filter((c) => c.provider === "anthropic");
-  if (existing.length === 0) {
-    deps.connections.upsertConnection({
-      provider: "anthropic",
-      kind,
-      billingMode: mode,
-    });
-    return;
-  }
-  for (const connection of existing) {
-    deps.connections.upsertConnection({
-      provider: "anthropic",
-      kind: connection.kind,
-      billingMode: mode,
-    });
-  }
+  deps.connections.upsertConnection({
+    provider: "anthropic",
+    kind,
+    billingMode: mode,
+  });
 }
 
 /**

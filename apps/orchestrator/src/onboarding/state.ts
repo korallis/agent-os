@@ -1,5 +1,4 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import JSON5 from "json5";
 import {
@@ -16,6 +15,7 @@ import {
 import { DEFAULT_ISOLATION } from "@agentos/claude-agent-sdk-pi";
 import { detectPi, installHintForPi, listDetectedProviders, managedPiHome } from "../pi/manager.js";
 import { readApiKeyFile } from "../pi/connections.js";
+import { hasReadableClaudeCodeCredential } from "../security/claude-code-credentials.js";
 import { assertNoAmbientAnthropicKey, EnvHygieneError } from "../security/env-scrub.js";
 import { spawnSync } from "node:child_process";
 
@@ -427,12 +427,7 @@ function hasHealthyApiKeyConnection(home: string, provider: PiProviderId): boole
 }
 
 function hasClaudeCodeCredential(): boolean {
-  const home = process.env.HOME ?? homedir();
-  const candidates = [
-    join(home, ".claude", ".credentials.json"),
-    join(home, ".claude", "credentials.json"),
-  ];
-  return candidates.some((path) => existsSync(path));
+  return hasReadableClaudeCodeCredential();
 }
 
 /**

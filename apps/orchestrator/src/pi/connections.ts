@@ -6,12 +6,14 @@ import {
   type AuthStorePresence,
   type BillingSurface,
   type ClaudeBillingMode,
+  type EffectiveCredentialPath,
   type ModelFamily,
   type OrchestratorEvent,
   type PiProviderId,
   type ProviderConnection,
   type ConnectionKind,
 } from "@agent-os/protocol";
+import { hasReadableClaudeCodeCredential } from "../security/claude-code-credentials.js";
 import { listDetectedProviders } from "./manager.js";
 
 const nextUlid = monotonicFactory();
@@ -102,12 +104,15 @@ export class ConnectionRegistry {
   /**
    * Sync connections from Pi auth-store presence (detection-driven, §4.9 R5.1).
    * Only persists / emits when presence hash, health, or membership actually changes.
+   * subscription-sdk cards use Claude Code credential extractability for health,
+   * not Pi auth.json presence.
    */
   syncFromAuthStore(): ProviderConnection[] {
     const presence = listDetectedProviders(this.home);
     const now = new Date().toISOString();
     let dirty = false;
     const presentProviders = new Set(presence.map((p) => p.provider));
+    const claudeCodeOk = hasReadableClaudeCodeCredential();
 
     for (const p of presence) {
       // Auth-store presence only drives pi-oauth cards; never attach to pi-api-key.
@@ -115,10 +120,19 @@ export class ConnectionRegistry {
         (c) => c.provider === p.provider && c.kind === "pi-oauth",
       );
       if (existing !== undefined) {
-        const nextHealth = p.present ? "healthy" : "unknown";
+        const subscriptionSdk = existing.billingMode === "subscription-sdk";
+        const nextHealth = subscriptionSdk
+          ? claudeCodeOk
+            ? "healthy"
+            : "setup"
+          : p.present
+            ? "healthy"
+            : "unknown";
+        const nextPath = resolveCredentialPath(existing.kind, existing.billingMode);
         if (
           presenceUnchanged(existing.authStorePresence, p) &&
-          existing.health === nextHealth
+          existing.health === nextHealth &&
+          existing.effectiveCredentialPath === nextPath
         ) {
           continue;
         }
@@ -126,6 +140,7 @@ export class ConnectionRegistry {
           ...existing,
           authStorePresence: p,
           health: nextHealth,
+          effectiveCredentialPath: nextPath,
           updatedAt: now,
         };
         this.connections.set(updated.id, updated);
@@ -154,11 +169,32 @@ export class ConnectionRegistry {
       }
     }
 
+    // subscription-sdk cards not covered above (e.g. no Pi auth entry): refresh health/path.
+    for (const existing of this.connections.values()) {
+      if (existing.billingMode !== "subscription-sdk") continue;
+      const nextHealth = claudeCodeOk ? "healthy" : "setup";
+      const nextPath = resolveCredentialPath(existing.kind, existing.billingMode);
+      if (existing.health === nextHealth && existing.effectiveCredentialPath === nextPath) {
+        continue;
+      }
+      const updated: ProviderConnection = {
+        ...existing,
+        health: nextHealth,
+        effectiveCredentialPath: nextPath,
+        updatedAt: now,
+      };
+      this.connections.set(updated.id, updated);
+      this.emitUpdated(updated);
+      dirty = true;
+    }
+
     // Reflect logout / credential removal: providers no longer in the auth store.
     for (const existing of this.connections.values()) {
       if (presentProviders.has(existing.provider)) continue;
       // API-key connections are not driven by auth-store presence.
       if (existing.kind === "pi-api-key") continue;
+      // subscription-sdk health is driven by Claude Code credentials above.
+      if (existing.billingMode === "subscription-sdk") continue;
       if (
         existing.authStorePresence === null &&
         (existing.health === "unknown" || existing.health === "setup")
@@ -223,12 +259,19 @@ export class ConnectionRegistry {
     if (billingMode === "extra-usage-oauth") billingSurface = "extra-usage-per-token";
     if (billingMode === "api-key") billingSurface = "api-metered";
 
+    const nextPath = resolveCredentialPath(input.kind, billingMode);
+    let nextHealth = existing.health;
+    if (billingMode === "subscription-sdk") {
+      nextHealth = hasReadableClaudeCodeCredential() ? "healthy" : "setup";
+    }
+
     const updated: ProviderConnection = {
       ...existing,
       label: input.label ?? existing.label,
       billingSurface,
       billingMode,
-      effectiveCredentialPath: input.kind === "pi-api-key" ? "env-keychain" : existing.effectiveCredentialPath,
+      health: nextHealth,
+      effectiveCredentialPath: nextPath,
       updatedAt: new Date().toISOString(),
     };
     this.update(updated);
@@ -272,7 +315,14 @@ export class ConnectionRegistry {
     if (input.billingMode === "extra-usage-oauth") billingSurface = "extra-usage-per-token";
     if (input.billingMode === "api-key") billingSurface = "api-metered";
 
+    const billingMode = input.billingMode ?? null;
     const now = new Date().toISOString();
+    const health =
+      billingMode === "subscription-sdk"
+        ? hasReadableClaudeCodeCredential()
+          ? "healthy"
+          : "setup"
+        : "setup";
     return {
       id: nextUlid(),
       kind: input.kind,
@@ -280,11 +330,11 @@ export class ConnectionRegistry {
       label: input.label ?? meta.label,
       family: meta.family,
       billingSurface,
-      billingMode: input.billingMode ?? null,
-      health: "setup",
+      billingMode,
+      health,
       healthReason: null,
       authStorePresence: null,
-      effectiveCredentialPath: input.kind === "pi-api-key" ? "env-keychain" : "auth-json",
+      effectiveCredentialPath: resolveCredentialPath(input.kind, billingMode),
       personalUseOnly: true,
       supportedRoles: ["brain", "planner", "builder", "validator", "fusion", "scout", "healthcheck"],
       limitReached: false,
@@ -323,6 +373,15 @@ function presenceUnchanged(
     existing.mtime === next.mtime &&
     existing.expiresAt === next.expiresAt
   );
+}
+
+function resolveCredentialPath(
+  kind: ConnectionKind,
+  billingMode: ClaudeBillingMode | null | undefined,
+): EffectiveCredentialPath {
+  if (billingMode === "subscription-sdk") return "claude-code-oauth";
+  if (kind === "pi-api-key") return "env-keychain";
+  return "auth-json";
 }
 
 /** API keys are stored under AGENTOS_HOME/secrets/<provider> as 0600 files for Phase 2 (keychain later). */
