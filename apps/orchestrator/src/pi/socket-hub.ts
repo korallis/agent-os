@@ -1,5 +1,5 @@
 import { createServer, type Server, type Socket } from "node:net";
-import { mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   extensionToDaemonFrameSchema,
@@ -14,6 +14,8 @@ import {
  */
 
 export type ExtensionFrameHandler = (frame: ExtensionToDaemonFrame) => void;
+
+const HUB_SOCK_MODE = 0o600;
 
 export class SocketHub {
   private server: Server | null = null;
@@ -46,7 +48,13 @@ export class SocketHub {
     return new Promise((resolve, reject) => {
       const server = createServer((socket) => this.handleConnection(socket));
       server.on("error", reject);
-      server.listen(path, () => {
+      // Owner-only socket: restrict group/other access on multi-user hosts.
+      server.listen({ path, readableAll: false, writableAll: false }, () => {
+        try {
+          chmodSync(path, HUB_SOCK_MODE);
+        } catch {
+          // Best-effort; parent dir is already 0o700.
+        }
         this.server = server;
         resolve(path);
       });

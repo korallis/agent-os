@@ -27,6 +27,24 @@ const LOGO: Record<string, { letter: string; className: string }> = {
   "kimi-coding": { letter: "K", className: "bg-teal-brand" },
 };
 
+/** Providers that support Pi subscription /login OAuth via the daemon. */
+const OAUTH_PROVIDERS = ["openai", "anthropic", "xai"] as const;
+/** Providers that accept API-key connect (keychain/file custody). */
+const API_KEY_PROVIDERS = ["openai", "anthropic", "openrouter"] as const;
+
+type ConnectProvider = (typeof OAUTH_PROVIDERS)[number] | (typeof API_KEY_PROVIDERS)[number];
+
+const CONNECT_ROWS: readonly {
+  provider: ConnectProvider;
+  oauth: boolean;
+  apiKey: boolean;
+}[] = [
+  { provider: "openai", oauth: true, apiKey: true },
+  { provider: "anthropic", oauth: true, apiKey: true },
+  { provider: "openrouter", oauth: false, apiKey: true },
+  { provider: "xai", oauth: true, apiKey: false },
+];
+
 function tierBadge(tier: string): string {
   if (tier === "live") return "● LIVE";
   if (tier === "best-effort") return "◌ BEST-EFFORT";
@@ -44,6 +62,10 @@ export function ProvidersPanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
+  const [oauthAttach, setOauthAttach] = useState<{
+    provider: string;
+    attachCommand: string;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,6 +116,32 @@ export function ProvidersPanel() {
     }
   };
 
+  const startOAuth = async (provider: string) => {
+    setBusy(true);
+    try {
+      const res = await fetch("/api/agentos/connections/oauth/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          provider,
+          ...(provider === "anthropic" ? { billingMode: "extra-usage-oauth" } : {}),
+        }),
+      });
+      if (!res.ok) {
+        setError(`oauth/start ${res.status}`);
+        return;
+      }
+      const body = (await res.json()) as {
+        connectionId: string;
+        attachCommand: string;
+      };
+      setOauthAttach({ provider, attachCommand: body.attachCommand });
+      setTick((t) => t + 1);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const refreshQuota = async (id: string) => {
     setBusy(true);
     try {
@@ -127,6 +175,27 @@ export function ProvidersPanel() {
         <p className="rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-[13px] text-warn">
           {error} — showing last known / empty state
         </p>
+      )}
+
+      {oauthAttach !== null && (
+        <div className="rounded-lg border border-teal-brand/30 bg-teal-brand/10 px-3 py-2">
+          <p className="mb-1 text-[12px] font-semibold text-fg-1">
+            OAuth login ready for {oauthAttach.provider}
+          </p>
+          <p className="mb-2 text-[12px] text-fg-3">
+            Run this attach command in a terminal (uses managed PI_CONFIG_DIR):
+          </p>
+          <code className="block break-all rounded-md bg-shell px-2 py-1.5 text-[11px] text-fg-2">
+            {oauthAttach.attachCommand}
+          </code>
+          <button
+            type="button"
+            className="mt-2 text-[12px] font-medium text-teal-brand"
+            onClick={() => setOauthAttach(null)}
+          >
+            Dismiss
+          </button>
+        </div>
       )}
 
       {/* Quota card grid */}
@@ -202,7 +271,7 @@ export function ProvidersPanel() {
 
       {/* Connection management rows — Figma Settings · API Providers structure */}
       <div className="flex flex-col gap-3">
-        {(["openai", "anthropic", "openrouter"] as const).map((provider) => {
+        {CONNECT_ROWS.map(({ provider, oauth, apiKey }) => {
           const existing = connections.find((c) => c.provider === provider);
           const logo = LOGO[provider] ?? { letter: "?", className: "bg-fg-3" };
           return (
@@ -214,9 +283,14 @@ export function ProvidersPanel() {
                     {existing?.label ?? provider}
                   </span>
                 </span>
-                {existing !== undefined ? (
+                {existing !== undefined &&
+                (existing.health === "healthy" || existing.kind === "pi-api-key") ? (
                   <span className="flex items-center gap-1.5 rounded-[20px] bg-ok/[0.08] px-2.5 py-1 text-[11px] font-semibold text-ok">
                     <span className="size-1.5 rounded-[3px] bg-ok" /> Connected
+                  </span>
+                ) : existing !== undefined && existing.kind === "pi-oauth" ? (
+                  <span className="flex items-center gap-1.5 rounded-[20px] bg-warn/10 px-2.5 py-1 text-[11px] font-medium text-warn">
+                    <span className="size-1.5 rounded-[3px] bg-warn" /> OAuth pending
                   </span>
                 ) : (
                   <span className="flex items-center gap-1.5 rounded-[20px] bg-panel-2 px-2.5 py-1 text-[11px] font-medium text-fg-3">
@@ -224,37 +298,51 @@ export function ProvidersPanel() {
                   </span>
                 )}
               </div>
-              {existing?.kind === "pi-api-key" ? (
+              {existing?.kind === "pi-api-key" && existing.health === "healthy" ? (
                 <div className="flex h-[42px] items-center justify-between rounded-[10px] bg-shell border border-line-2 px-[15px]">
                   <span className="text-[13px] text-fg-3">•••••••••••••••• (keychain)</span>
                   <Icon src="ap-eye.svg" className="size-3.5" />
                 </div>
               ) : (
-                <form
-                  className="flex flex-col gap-2"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    const fd = new FormData(e.currentTarget);
-                    const key = String(fd.get("key") ?? "");
-                    if (key.length > 0) void connectApiKey(provider, key);
-                    e.currentTarget.reset();
-                  }}
-                >
-                  <input
-                    name="key"
-                    type="password"
-                    placeholder={`Enter ${provider} API key…`}
-                    className="h-[42px] rounded-[10px] border border-line-2 bg-shell px-[15px] text-[13px] text-fg-1 outline-none"
-                    autoComplete="off"
-                  />
-                  <button
-                    type="submit"
-                    disabled={busy}
-                    className="self-start flex h-[33px] items-center rounded-lg border border-line-2 bg-panel-2 px-4 text-[13px] font-medium text-fg-2"
-                  >
-                    Connect
-                  </button>
-                </form>
+                <div className="flex flex-col gap-2">
+                  {oauth && (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void startOAuth(provider)}
+                      className="self-start flex h-[33px] items-center rounded-lg border border-line-2 bg-panel-2 px-4 text-[13px] font-medium text-fg-2"
+                    >
+                      Connect with OAuth
+                    </button>
+                  )}
+                  {apiKey && (
+                    <form
+                      className="flex flex-col gap-2"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const fd = new FormData(e.currentTarget);
+                        const key = String(fd.get("key") ?? "");
+                        if (key.length > 0) void connectApiKey(provider, key);
+                        e.currentTarget.reset();
+                      }}
+                    >
+                      <input
+                        name="key"
+                        type="password"
+                        placeholder={`Enter ${provider} API key…`}
+                        className="h-[42px] rounded-[10px] border border-line-2 bg-shell px-[15px] text-[13px] text-fg-1 outline-none"
+                        autoComplete="off"
+                      />
+                      <button
+                        type="submit"
+                        disabled={busy}
+                        className="self-start flex h-[33px] items-center rounded-lg border border-line-2 bg-panel-2 px-4 text-[13px] font-medium text-fg-2"
+                      >
+                        Connect API key
+                      </button>
+                    </form>
+                  )}
+                </div>
               )}
             </div>
           );

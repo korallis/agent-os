@@ -218,7 +218,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 400, "BAD_REQUEST", "invalid oauth start body");
       return;
     }
-    const connection = deps.connections.createConnection({
+    const connection = deps.connections.upsertConnection({
       provider: body.data.provider,
       kind: "pi-oauth",
       billingMode: body.data.billingMode ?? null,
@@ -254,7 +254,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     }
     // Never log the key. Write to 0600 file under AGENTOS_HOME/secrets.
     writeApiKeyFile(deps.home, body.data.provider, body.data.apiKey);
-    const connection = deps.connections.createConnection({
+    const connection = deps.connections.upsertConnection({
       provider: body.data.provider,
       kind: "pi-api-key",
       billingMode: body.data.provider === "anthropic" ? "api-key" : null,
@@ -702,19 +702,20 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
 }
 
 /**
- * R5.1: flip quota.json5 providers.enabled for selected+verified onboarding
- * providers (Grok best-effort when xAI is enabled). When the checklist is
- * empty or misaligned with auth-store presence, enable from current presence
- * instead of advancing a silent no-op.
+ * R5.1: flip quota.json5 providers.enabled for onboarding providers.
+ * Presence fallback only when the selection checklist is empty; if any
+ * providers are selected, enable only selected+verified (or selected).
  */
 function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): void {
   const state = svc.getState();
-  const selectedVerified = state.providers.filter((p) => p.selected && p.authVerified);
+  const selected = state.providers.filter((p) => p.selected);
 
-  if (selectedVerified.length > 0) {
+  if (selected.length > 0) {
+    const selectedVerified = selected.filter((p) => p.authVerified);
+    const toEnable = selectedVerified.length > 0 ? selectedVerified : selected;
     enableQuotaProviders(
       deps.config,
-      selectedVerified.map((p) => ({
+      toEnable.map((p) => ({
         provider: p.provider,
         billingMode: p.claudeBillingMode,
       })),
@@ -722,7 +723,7 @@ function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): vo
     return;
   }
 
-  // Fallback: auth-store presence (R5.1 detection-driven enablement).
+  // Fallback only when the checklist is empty (R5.1 detection-driven).
   const presence = listDetectedProviders(deps.home).filter((p) => p.present);
   if (presence.length === 0) return;
   enableQuotaProviders(

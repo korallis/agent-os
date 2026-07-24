@@ -93,6 +93,12 @@ export class ConnectionRegistry {
     return this.connections.get(id) ?? null;
   }
 
+  findByProviderKind(provider: PiProviderId, kind: ConnectionKind): ProviderConnection | null {
+    return (
+      [...this.connections.values()].find((c) => c.provider === provider && c.kind === kind) ?? null
+    );
+  }
+
   /**
    * Sync connections from Pi auth-store presence (detection-driven, §4.9 R5.1).
    * Only persists / emits when presence hash, health, or membership actually changes.
@@ -101,6 +107,7 @@ export class ConnectionRegistry {
     const presence = listDetectedProviders(this.home);
     const now = new Date().toISOString();
     let dirty = false;
+    const presentProviders = new Set(presence.map((p) => p.provider));
 
     for (const p of presence) {
       const existing = [...this.connections.values()].find((c) => c.provider === p.provider);
@@ -122,7 +129,8 @@ export class ConnectionRegistry {
         this.emitUpdated(updated);
         dirty = true;
       } else {
-        const created = this.createConnection({
+        // Build once with presence/health so first detection does not double-emit.
+        const created = this.buildConnection({
           provider: p.provider,
           kind: "pi-oauth",
           billingMode: p.provider === "anthropic" ? "extra-usage-oauth" : null,
@@ -135,9 +143,31 @@ export class ConnectionRegistry {
         };
         this.connections.set(withPresence.id, withPresence);
         this.emitUpdated(withPresence);
+        this.probeAutoEnable?.({
+          provider: withPresence.provider,
+          billingMode: withPresence.billingMode,
+        });
         dirty = true;
       }
     }
+
+    // Reflect logout / credential removal: providers no longer in the auth store.
+    for (const existing of this.connections.values()) {
+      if (presentProviders.has(existing.provider)) continue;
+      // API-key connections are not driven by auth-store presence.
+      if (existing.kind === "pi-api-key" && existing.authStorePresence === null) continue;
+      if (existing.authStorePresence === null && existing.health === "unknown") continue;
+      const cleared: ProviderConnection = {
+        ...existing,
+        authStorePresence: null,
+        health: "unknown",
+        updatedAt: now,
+      };
+      this.connections.set(cleared.id, cleared);
+      this.emitUpdated(cleared);
+      dirty = true;
+    }
+
     if (dirty) this.persist();
     return this.list();
   }
@@ -148,36 +178,7 @@ export class ConnectionRegistry {
     billingMode?: ClaudeBillingMode | null;
     label?: string;
   }): ProviderConnection {
-    const meta = PROVIDER_META[input.provider] ?? {
-      label: input.provider,
-      family: "other" as const,
-      defaultBilling: "api-metered" as const,
-    };
-    let billingSurface = meta.defaultBilling;
-    if (input.billingMode === "subscription-sdk") billingSurface = "sdk-credit-pool";
-    if (input.billingMode === "extra-usage-oauth") billingSurface = "extra-usage-per-token";
-    if (input.billingMode === "api-key") billingSurface = "api-metered";
-
-    const now = new Date().toISOString();
-    const connection: ProviderConnection = {
-      id: nextUlid(),
-      kind: input.kind,
-      provider: input.provider,
-      label: input.label ?? meta.label,
-      family: meta.family,
-      billingSurface,
-      billingMode: input.billingMode ?? null,
-      health: "setup",
-      healthReason: null,
-      authStorePresence: null,
-      effectiveCredentialPath: input.kind === "pi-api-key" ? "env-keychain" : "auth-json",
-      personalUseOnly: true,
-      supportedRoles: ["brain", "planner", "builder", "validator", "fusion", "scout", "healthcheck"],
-      limitReached: false,
-      limitReachedReason: null,
-      createdAt: now,
-      updatedAt: now,
-    };
+    const connection = this.buildConnection(input);
     this.connections.set(connection.id, connection);
     this.persist();
     this.emitUpdated(connection);
@@ -186,6 +187,44 @@ export class ConnectionRegistry {
       billingMode: connection.billingMode,
     });
     return connection;
+  }
+
+  /**
+   * Update-or-create by provider+kind so repeated Connect/login does not
+   * accumulate duplicate connection cards.
+   */
+  upsertConnection(input: {
+    provider: PiProviderId;
+    kind: ConnectionKind;
+    billingMode?: ClaudeBillingMode | null;
+    label?: string;
+  }): ProviderConnection {
+    const existing = this.findByProviderKind(input.provider, input.kind);
+    if (existing === null) {
+      return this.createConnection(input);
+    }
+
+    const meta = PROVIDER_META[input.provider] ?? {
+      label: input.provider,
+      family: "other" as const,
+      defaultBilling: "api-metered" as const,
+    };
+    let billingSurface = meta.defaultBilling;
+    const billingMode = input.billingMode ?? existing.billingMode;
+    if (billingMode === "subscription-sdk") billingSurface = "sdk-credit-pool";
+    if (billingMode === "extra-usage-oauth") billingSurface = "extra-usage-per-token";
+    if (billingMode === "api-key") billingSurface = "api-metered";
+
+    const updated: ProviderConnection = {
+      ...existing,
+      label: input.label ?? existing.label,
+      billingSurface,
+      billingMode,
+      effectiveCredentialPath: input.kind === "pi-api-key" ? "env-keychain" : existing.effectiveCredentialPath,
+      updatedAt: new Date().toISOString(),
+    };
+    this.update(updated);
+    return updated;
   }
 
   update(connection: ProviderConnection): void {
@@ -207,6 +246,44 @@ export class ConnectionRegistry {
       updatedAt: new Date().toISOString(),
     };
     this.update(updated);
+  }
+
+  private buildConnection(input: {
+    provider: PiProviderId;
+    kind: ConnectionKind;
+    billingMode?: ClaudeBillingMode | null;
+    label?: string;
+  }): ProviderConnection {
+    const meta = PROVIDER_META[input.provider] ?? {
+      label: input.provider,
+      family: "other" as const,
+      defaultBilling: "api-metered" as const,
+    };
+    let billingSurface = meta.defaultBilling;
+    if (input.billingMode === "subscription-sdk") billingSurface = "sdk-credit-pool";
+    if (input.billingMode === "extra-usage-oauth") billingSurface = "extra-usage-per-token";
+    if (input.billingMode === "api-key") billingSurface = "api-metered";
+
+    const now = new Date().toISOString();
+    return {
+      id: nextUlid(),
+      kind: input.kind,
+      provider: input.provider,
+      label: input.label ?? meta.label,
+      family: meta.family,
+      billingSurface,
+      billingMode: input.billingMode ?? null,
+      health: "setup",
+      healthReason: null,
+      authStorePresence: null,
+      effectiveCredentialPath: input.kind === "pi-api-key" ? "env-keychain" : "auth-json",
+      personalUseOnly: true,
+      supportedRoles: ["brain", "planner", "builder", "validator", "fusion", "scout", "healthcheck"],
+      limitReached: false,
+      limitReachedReason: null,
+      createdAt: now,
+      updatedAt: now,
+    };
   }
 
   private emitUpdated(connection: ProviderConnection): void {
