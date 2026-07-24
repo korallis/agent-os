@@ -371,11 +371,22 @@ function parseProbeBody(
     }
   }
 
-  // Moonshot balance
+  // Moonshot / Kimi balance — API wraps fields under top-level `data`.
   if (provider === "kimi-coding") {
-    const balance = num(b["balance"] ?? b["available_balance"]);
-    const voucher = num(b["voucher"] ?? b["voucher_balance"]);
-    const cash = num(b["cash"] ?? b["cash_balance"]);
+    const data =
+      typeof b["data"] === "object" && b["data"] !== null && !Array.isArray(b["data"])
+        ? (b["data"] as Record<string, unknown>)
+        : b;
+    const balance = num(
+      data["balance"] ??
+        data["available_balance"] ??
+        b["balance"] ??
+        b["available_balance"],
+    );
+    const voucher = num(
+      data["voucher"] ?? data["voucher_balance"] ?? b["voucher"] ?? b["voucher_balance"],
+    );
+    const cash = num(data["cash"] ?? data["cash_balance"] ?? b["cash"] ?? b["cash_balance"]);
     if (balance !== null) {
       metrics.push(
         metric("balance", balance, "usd", tier, `${sourceLabel} · SYNCED`, syncedAt, {

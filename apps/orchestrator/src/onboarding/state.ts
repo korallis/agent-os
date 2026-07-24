@@ -117,7 +117,12 @@ export class OnboardingService {
     ];
     // Advance when all required pass (gh is optional warning).
     const requiredOk = doctor.filter((d) => d.id !== "gh").every((d) => d.ok);
-    let step: OnboardingStep = requiredOk ? "providers" : "doctor";
+    let step: OnboardingStep = this.state.step;
+    if (!requiredOk) {
+      step = "doctor";
+    } else if (step === "doctor") {
+      step = "providers";
+    }
     let providers = this.state.providers;
     // Seed ⟨DETECTED⟩ checklist once when first entering providers (R5.1).
     if (requiredOk && providers.length === 0) {
