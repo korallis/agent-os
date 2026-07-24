@@ -21,3 +21,9 @@ dist/
 
 # Logs
 *.log
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Local editor config
+.cursor/

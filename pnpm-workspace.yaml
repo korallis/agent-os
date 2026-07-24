@@ -1,0 +1,9 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm 10 blocks lifecycle scripts by default; these are the only
+# dependencies allowed to run their (native-binary) install scripts.
+onlyBuiltDependencies:
+  - sharp
+  - unrs-resolver

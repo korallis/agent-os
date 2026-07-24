@@ -1,0 +1,63 @@
+@theme {
+  --color-navy-950: #030712;
+  --color-navy-900: #0a0f1e;
+  --color-navy-800: #111827;
+  --color-navy-700: #1a2332;
+
+  --color-electric: #3b82f6;
+  --color-electric-light: #60a5fa;
+  --color-electric-dark: #2563eb;
+
+  --color-cyan-soft: #67e8f9;
+  --color-cyan: #22d3ee;
+
+  --color-violet-accent: #8b5cf6;
+  --color-violet-soft: #a78bfa;
+  --color-violet-deep: #7c3aed;
+
+  --color-silver: #94a3b8;
+  --color-silver-light: #cbd5e1;
+
+  --color-surface: #f5f5f0;
+  --color-surface-warm: #eeeee8;
+  --color-ink: #0a0a0a;
+
+  --font-sans: var(--font-geist-sans), system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), monospace;
+
+  --text-display-xl: clamp(3.5rem, 8vw, 9rem);
+  --text-display-xl--line-height: 0.9;
+  --text-display-xl--letter-spacing: -0.04em;
+
+  --text-display-lg: clamp(2.5rem, 5.5vw, 5.5rem);
+  --text-display-lg--line-height: 0.95;
+  --text-display-lg--letter-spacing: -0.03em;
+
+  --text-display-md: clamp(1.75rem, 3.5vw, 3.25rem);
+  --text-display-md--line-height: 1.1;
+  --text-display-md--letter-spacing: -0.02em;
+
+  --text-display-sm: clamp(1.25rem, 2.5vw, 2rem);
+  --text-display-sm--line-height: 1.2;
+  --text-display-sm--letter-spacing: -0.01em;
+
+  --animate-glow-pulse: glow-pulse 4s ease-in-out infinite;
+  --animate-float: float 6s ease-in-out infinite;
+  --animate-gradient-shift: gradient-shift 8s ease infinite;
+
+  @keyframes glow-pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 0.8; }
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-20px); }
+  }
+  @keyframes gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+  @keyframes shimmer {
+    100% { transform: translateX(100%); }
+  }
+}

@@ -92,7 +92,7 @@ v1 is shipped when all of the following are true (each restated as an executable
 
 **[A] chosen over [B].** Preserved **verbatim as `apps/marketing`**, a separate Next.js app sharing `packages/ui`; deploys publicly; never imports orchestrator code. *Rationale:* a localhost-only console must never share a deployable with a public site. *Adopted from [B]:* the honesty pass. *Rejected alternative [B]:* `/site` fold-in with redirects.
 
-**[R5] Design-system mandate (Captain's directive):** the Console **must** use the marketing site's design language — the two surfaces stay visually one product, since the marketing page will be made use of at a later stage. The system is extracted into `packages/ui` in **Phase 0** as tokens + primitives: ink-on-white palette with dark `bg-ink` panels, hairline `border-rule` grid dividers, **Geist Sans display numerals** (big bold `text-display-*`), **Geist Mono uppercase micro-labels** with wide tracking (`text-xs font-mono uppercase tracking-[0.2em]`), the section-grid layout idiom from `src/app/page.tsx`, and Framer Motion reveals. Every Console surface — most visibly the quota meters of §7.3 — renders in this idiom; ad-hoc styling in `apps/console` is a review defect.
+**[R5] Design-system mandate (Captain's directive):** the Console **must** use the marketing site's design language — the two surfaces stay visually one product, since the marketing page will be made use of at a later stage. The system is extracted into `packages/ui` in **Phase 0** as tokens + primitives: ink-on-white palette with dark `bg-ink` panels, hairline `border-rule` grid dividers, **Geist Sans display numerals** (big bold `text-display-*`), **Geist Mono uppercase micro-labels** with wide tracking (`text-xs font-mono uppercase tracking-[0.2em]`), the section-grid layout idiom from `apps/marketing/src/app/page.tsx`, and Framer Motion reveals. Every Console surface — most visibly the quota meters of §7.3 — renders in this idiom; ad-hoc styling in `apps/console` is a review defect.
 
 ---
 
@@ -421,7 +421,7 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 
 ## 3. Monorepo Layout
 
-pnpm workspaces + Turborepo (§2.1). Migration: current `src/` → `apps/marketing/src/` unchanged; shared primitives → `packages/ui`. [A]
+pnpm workspaces + Turborepo (§2.1). Marketing lives at `apps/marketing` (verbatim migration from the former root `src/`); shared design-system primitives live in `packages/ui`. [A]
 
 ```
 agent-os/
