@@ -31,9 +31,15 @@ const PROVIDER_META: Record<
   google: { label: "Google", family: "google", defaultBilling: "api-metered" },
 };
 
+export type ProbeAutoEnableHandler = (input: {
+  provider: PiProviderId;
+  billingMode: ClaudeBillingMode | null;
+}) => void;
+
 export class ConnectionRegistry {
   private connections = new Map<string, ProviderConnection>();
   private sink: (event: OrchestratorEvent) => void = () => undefined;
+  private probeAutoEnable: ProbeAutoEnableHandler | null = null;
 
   constructor(private readonly home: string) {
     this.load();
@@ -41,6 +47,14 @@ export class ConnectionRegistry {
 
   onEvent(sink: (event: OrchestratorEvent) => void): void {
     this.sink = sink;
+  }
+
+  /**
+   * R5.1: when a connection is created or newly detected, flip matching
+   * quota probes on (still individually toggleable afterward).
+   */
+  onProbeAutoEnable(handler: ProbeAutoEnableHandler): void {
+    this.probeAutoEnable = handler;
   }
 
   private storePath(): string {
@@ -167,6 +181,10 @@ export class ConnectionRegistry {
     this.connections.set(connection.id, connection);
     this.persist();
     this.emitUpdated(connection);
+    this.probeAutoEnable?.({
+      provider: connection.provider,
+      billingMode: connection.billingMode,
+    });
     return connection;
   }
 

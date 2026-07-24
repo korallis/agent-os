@@ -1,19 +1,35 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import JSON5 from "json5";
 import {
   onboardingStateSchema,
   PI_PINNED_VERSION,
   type DoctorCheck,
+  type OnboardingProviderChoice,
   type OnboardingState,
   type OnboardingStep,
   type OrchestratorEvent,
   type PiProviderId,
   type ClaudeBillingMode,
 } from "@agent-os/protocol";
-import { detectPi, installHintForPi, listDetectedProviders } from "../pi/manager.js";
+import { DEFAULT_ISOLATION } from "@agentos/claude-agent-sdk-pi";
+import { detectPi, installHintForPi, listDetectedProviders, managedPiHome } from "../pi/manager.js";
 import { assertNoAmbientAnthropicKey, EnvHygieneError } from "../security/env-scrub.js";
 import { spawnSync } from "node:child_process";
+
+const PROVIDER_CHECKLIST: PiProviderId[] = [
+  "anthropic",
+  "openai",
+  "xai",
+  "openrouter",
+  "github-copilot",
+  "kimi-coding",
+  "vercel-ai-gateway",
+];
+
+const CLAUDE_AGENT_SDK_PACKAGE = "@agentos/claude-agent-sdk-pi";
+const ISOLATION_DEFAULTS_FILE = "claude-agent-sdk-isolation.json5";
 
 /**
  * Resumable onboarding wizard state (master plan §4.10).
@@ -99,13 +115,15 @@ export class OnboardingService {
       whichCheck("uv", "uv", null),
       whichCheck("gh", "gh", null),
     ];
-    this.state = { ...this.state, doctor, step: "doctor" };
     // Advance when all required pass (gh is optional warning).
     const requiredOk = doctor.filter((d) => d.id !== "gh").every((d) => d.ok);
-    if (requiredOk) {
-      this.state = { ...this.state, step: this.state.providers.some((p) => p.selected) ? this.state.step : "providers" };
-      if (this.state.step === "doctor") this.state = { ...this.state, step: "providers" };
+    let step: OnboardingStep = requiredOk ? "providers" : "doctor";
+    let providers = this.state.providers;
+    // Seed ⟨DETECTED⟩ checklist once when first entering providers (R5.1).
+    if (requiredOk && providers.length === 0) {
+      providers = seedProviderChecklist(this.home);
     }
+    this.state = { ...this.state, doctor, step, providers };
     this.save(previous);
     return this.state;
   }
@@ -113,20 +131,11 @@ export class OnboardingService {
   setProviders(providers: PiProviderId[]): OnboardingState {
     const previous = this.state.step;
     const detected = new Set(listDetectedProviders(this.home).map((p) => p.provider));
-    const all: PiProviderId[] = [
-      "anthropic",
-      "openai",
-      "xai",
-      "openrouter",
-      "github-copilot",
-      "kimi-coding",
-      "vercel-ai-gateway",
-    ];
     const selected = new Set(providers);
     this.state = {
       ...this.state,
       step: "providers",
-      providers: all.map((provider) => {
+      providers: PROVIDER_CHECKLIST.map((provider) => {
         const existing = this.state.providers.find((p) => p.provider === provider);
         return {
           provider,
@@ -204,11 +213,14 @@ export class OnboardingService {
 
   /**
    * Verify Claude SDK subscription path. Blocks completion until all sub-steps pass.
+   * Best-effort detection of package install, Claude Code credentials, ambient key
+   * absence, isolation defaults file, and catalog surface. Fixtures override for tests.
    */
   verifyClaudeSdk(fixture?: {
     claudeCodeLogin?: boolean;
     sdkInstalled?: boolean;
     catalogHealthcheck?: boolean;
+    isolationDefaults?: boolean;
   }): OnboardingState {
     const previous = this.state.step;
     let noAmbientApiKey = true;
@@ -218,11 +230,13 @@ export class OnboardingService {
       if (error instanceof EnvHygieneError) noAmbientApiKey = false;
     }
 
-    // In CI/fixtures, allow injecting verification results.
-    const claudeCodeLogin = fixture?.claudeCodeLogin ?? existsSync(join(process.env.HOME ?? "", ".claude"));
-    const sdkInstalled = fixture?.sdkInstalled ?? false;
-    const catalogHealthcheck = fixture?.catalogHealthcheck ?? sdkInstalled;
-    const isolationDefaults = true;
+    const detectedSdk = detectClaudeAgentSdkInstalled(this.home);
+    const claudeCodeLogin = fixture?.claudeCodeLogin ?? hasClaudeCodeCredential();
+    const sdkInstalled = fixture?.sdkInstalled ?? detectedSdk;
+    const isolationDefaults =
+      fixture?.isolationDefaults ?? ensureIsolationDefaults(this.home);
+    const catalogHealthcheck =
+      fixture?.catalogHealthcheck ?? (sdkInstalled && isolationDefaults);
 
     this.state = {
       ...this.state,
@@ -299,6 +313,71 @@ export class OnboardingBlockedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "OnboardingBlockedError";
+  }
+}
+
+/** First-entry providers checklist: detected auth-store presence is pre-selected (R5.1). */
+function seedProviderChecklist(home: string): OnboardingProviderChoice[] {
+  const detected = new Set(listDetectedProviders(home).map((p) => p.provider));
+  return PROVIDER_CHECKLIST.map((provider) => ({
+    provider,
+    selected: detected.has(provider),
+    detected: detected.has(provider),
+    authVerified: detected.has(provider),
+    claudeBillingMode: null,
+    claudeSdk: null,
+  }));
+}
+
+function hasClaudeCodeCredential(): boolean {
+  const home = process.env.HOME ?? homedir();
+  const candidates = [
+    join(home, ".claude", ".credentials.json"),
+    join(home, ".claude", "credentials.json"),
+  ];
+  return candidates.some((path) => existsSync(path));
+}
+
+/**
+ * Best-effort: package present under managed Pi home (node_modules or extensions).
+ */
+function detectClaudeAgentSdkInstalled(agentosHome: string): boolean {
+  const managed = managedPiHome(agentosHome);
+  const pkgSegments = CLAUDE_AGENT_SDK_PACKAGE.split("/");
+  const candidates = [
+    join(managed, "node_modules", ...pkgSegments),
+    join(managed, "extensions", ...pkgSegments),
+    join(managed, "extensions", "claude-agent-sdk-pi"),
+    join(managed, "agent", "extensions", ...pkgSegments),
+    join(managed, "agent", "extensions", "claude-agent-sdk-pi"),
+    join(managed, "agent", "node_modules", ...pkgSegments),
+  ];
+  return candidates.some((path) => existsSync(path));
+}
+
+/**
+ * Write isolation defaults if missing; return true when file matches required defaults.
+ */
+function ensureIsolationDefaults(agentosHome: string): boolean {
+  const managed = managedPiHome(agentosHome);
+  const dir = join(managed, "agent");
+  const path = join(dir, ISOLATION_DEFAULTS_FILE);
+  try {
+    if (!existsSync(path)) {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeFileSync(path, JSON5.stringify(DEFAULT_ISOLATION, null, 2), { mode: 0o600 });
+    }
+    const raw: unknown = JSON5.parse(readFileSync(path, "utf8"));
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
+    const record = raw as Record<string, unknown>;
+    const sources = record["settingSources"];
+    const strict = record["strictMcpConfig"];
+    const sourcesOk =
+      Array.isArray(sources) &&
+      (sources.length === 0 || (sources.length === 1 && sources[0] === "user"));
+    return sourcesOk && strict === true;
+  } catch {
+    return false;
   }
 }
 

@@ -32,8 +32,10 @@ import { AGENTOSD_VERSION } from "../version.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import { writeApiKeyFile } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
+import { listDetectedProviders } from "../pi/manager.js";
 import type { OnboardingService } from "../onboarding/state.js";
 import { OnboardingBlockedError } from "../onboarding/state.js";
+import { enableQuotaProviders } from "../quota-probes/enable.js";
 import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
 import { resolveAuthJsonPathWithFallback } from "../security/auth-store.js";
 
@@ -222,13 +224,21 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       billingMode: body.data.billingMode ?? null,
     });
     // Visible tmux login is driven by the host; we record the attach contract.
+    // Inject PI_CONFIG_DIR (managed isolation) so login lands in the same store spawns use.
     const session = "agentos";
     const window = `login-${body.data.provider}`;
+    const attachCommand = buildOAuthAttachCommand({
+      session,
+      window,
+      provider: body.data.provider,
+      pi: deps.pi,
+      home: deps.home,
+    });
     return {
       connectionId: connection.id,
       tmuxSession: session,
       tmuxWindow: window,
-      attachCommand: `tmux -L agentos new-session -A -s ${session} \\; new-window -n ${window} -- pi /login ${body.data.provider}`,
+      attachCommand,
     };
   });
 
@@ -693,61 +703,57 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
 
 /**
  * R5.1: flip quota.json5 providers.enabled for selected+verified onboarding
- * providers (Grok best-effort when xAI is enabled).
+ * providers (Grok best-effort when xAI is enabled). When the checklist is
+ * empty or misaligned with auth-store presence, enable from current presence
+ * instead of advancing a silent no-op.
  */
 function enableProbesForOnboarding(deps: ServerDeps, svc: OnboardingService): void {
   const state = svc.getState();
-  const toEnable = state.providers.filter((p) => p.selected && p.authVerified);
-  if (toEnable.length === 0) return;
+  const selectedVerified = state.providers.filter((p) => p.selected && p.authVerified);
 
-  const existingRaw = deps.config.layerValue("global", "quota");
-  const base =
-    typeof existingRaw === "object" && existingRaw !== null && !Array.isArray(existingRaw)
-      ? { ...(existingRaw as Record<string, unknown>) }
-      : {};
-  const existingProviders =
-    typeof base["providers"] === "object" &&
-    base["providers"] !== null &&
-    !Array.isArray(base["providers"])
-      ? { ...(base["providers"] as Record<string, unknown>) }
-      : {};
-
-  const effective = deps.config.config.quota.providers;
-  const providers: Record<string, { enabled: boolean; bestEffortAllowed: boolean }> = {
-    ...Object.fromEntries(
-      Object.entries(effective).map(([key, value]) => [
-        key,
-        { enabled: value.enabled, bestEffortAllowed: value.bestEffortAllowed },
-      ]),
-    ),
-  };
-
-  for (const entry of toEnable) {
-    const keys: (keyof typeof effective)[] = [];
-    if (entry.provider === "anthropic") {
-      keys.push("anthropic");
-      if (entry.claudeBillingMode === "subscription-sdk") keys.push("claude-agent-sdk");
-    } else if (entry.provider === "openai") keys.push("openai");
-    else if (entry.provider === "xai") keys.push("xai");
-    else if (entry.provider === "openrouter") keys.push("openrouter");
-    else if (entry.provider === "kimi-coding") keys.push("kimi-coding");
-    else if (entry.provider === "vercel-ai-gateway") keys.push("vercel-ai-gateway");
-
-    for (const key of keys) {
-      const current = providers[key] ?? effective[key];
-      providers[key] = {
-        enabled: true,
-        bestEffortAllowed: key === "xai" ? true : current.bestEffortAllowed,
-      };
-    }
+  if (selectedVerified.length > 0) {
+    enableQuotaProviders(
+      deps.config,
+      selectedVerified.map((p) => ({
+        provider: p.provider,
+        billingMode: p.claudeBillingMode,
+      })),
+    );
+    return;
   }
 
-  const next = {
-    ...base,
-    providers: {
-      ...existingProviders,
-      ...providers,
-    },
-  };
-  deps.config.writeGlobal("quota", JSON.stringify(next, null, 2));
+  // Fallback: auth-store presence (R5.1 detection-driven enablement).
+  const presence = listDetectedProviders(deps.home).filter((p) => p.present);
+  if (presence.length === 0) return;
+  enableQuotaProviders(
+    deps.config,
+    presence.map((p) => ({ provider: p.provider, billingMode: null })),
+  );
+}
+
+/**
+ * OAuth login attach command — inject managed PI_CONFIG_DIR so credentials
+ * land in the same store buildPiSpawnSpec uses for casts.
+ */
+function buildOAuthAttachCommand(options: {
+  session: string;
+  window: string;
+  provider: string;
+  pi: PiDetection | undefined;
+  home: string;
+}): string {
+  const configDirEnv = options.pi?.configDirEnv ?? "PI_CONFIG_DIR";
+  const managedHome = options.pi?.managedHome ?? `${options.home}/pi`;
+  const useManaged =
+    options.pi === undefined ||
+    options.pi.isolationMode === "managed" ||
+    options.pi.configDirEnv !== null;
+  const login = useManaged
+    ? `env ${configDirEnv}=${shellSingleQuote(managedHome)} pi /login ${options.provider}`
+    : `pi /login ${options.provider}`;
+  return `tmux -L agentos new-session -A -s ${options.session} \\; new-window -n ${options.window} -- ${login}`;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

@@ -20,6 +20,7 @@ import {
   hydrateQuotaSamples,
   QuotaProbeScheduler,
 } from "./quota-probes/scheduler.js";
+import { enableQuotaProviders } from "./quota-probes/enable.js";
 import type { QuotaSample } from "@agent-os/protocol";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -125,6 +126,11 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const connections = new ConnectionRegistry(home);
     connections.onEvent((event) => {
       eventStore.append(event);
+    });
+    // R5.1: new / detected connections auto-enable matching quota probes.
+    const configService = config;
+    connections.onProbeAutoEnable(({ provider, billingMode }) => {
+      enableQuotaProviders(configService, [{ provider, billingMode }]);
     });
     connections.syncFromAuthStore();
 
