@@ -118,6 +118,9 @@ importers:
       '@agent-os/event-store':
         specifier: workspace:*
         version: link:../../packages/event-store
+      '@agent-os/fusion-core':
+        specifier: workspace:*
+        version: link:../../packages/fusion-core
       '@agent-os/pi-extension':
         specifier: workspace:*
         version: link:../../packages/pi-extension
@@ -177,6 +180,25 @@ importers:
       '@types/better-sqlite3':
         specifier: 7.6.13
         version: 7.6.13
+      '@types/node':
+        specifier: 26.1.1
+        version: 26.1.1
+      eslint:
+        specifier: 9.39.4
+        version: 9.39.4(jiti@2.7.0)
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: 4.1.10
+        version: 4.1.10(@types/node@26.1.1)(vite@8.1.5(@types/node@26.1.1)(jiti@2.7.0))
+
+  packages/fusion-core:
+    dependencies:
+      '@agent-os/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+    devDependencies:
       '@types/node':
         specifier: 26.1.1
         version: 26.1.1

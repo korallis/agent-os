@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pino, { type Logger } from "pino";
@@ -22,10 +23,22 @@ import {
 } from "./quota-probes/scheduler.js";
 import { enableQuotaProviders } from "./quota-probes/enable.js";
 import type { QuotaSample } from "@agent-os/protocol";
+import { FleetService } from "./fleet/service.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
 export const SHIPPED_DEFAULTS_DIR = join(here, "..", "defaults");
+
+function resolveExtensionPath(): string {
+  const candidates = [
+    join(here, "..", "..", "..", "packages", "pi-extension", "dist", "extension.js"),
+    join(here, "..", "node_modules", "@agent-os", "pi-extension", "dist", "extension.js"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return candidates[0] ?? "agent-os-extension.js";
+}
 
 /** Grace period before force-destroying hijacked SSE sockets on shutdown. */
 const SSE_SHUTDOWN_GRACE_MS = 150;
@@ -150,6 +163,21 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       logger.warn({ err: error }, "socket hub failed to listen — extension channel unavailable");
     }
 
+    const extensionPath = resolveExtensionPath();
+    const fleet = new FleetService({
+      home,
+      config,
+      connections,
+      pi,
+      extensionPath,
+      fakeTmux: process.env.AGENTOS_FAKE_TMUX === "1",
+      fakePi: process.env.AGENTOS_FAKE_PI === "1",
+      fakeBrain: process.env.AGENTOS_FAKE_BRAIN === "1",
+    });
+    fleet.onEvent((event) => {
+      eventStore.append(event);
+    });
+
     const deps = {
       store,
       config,
@@ -162,6 +190,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       onboarding,
       pi,
       quotaSamples,
+      fleet,
     };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });
@@ -182,6 +211,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     });
     quotaScheduler.start();
 
+    // Start Brain after listen so REST is available during reconcile.
+    try {
+      fleet.start();
+    } catch (error) {
+      logger.warn({ err: error }, "brain start failed — entering degraded mode");
+      fleet.brain.enterDown(error instanceof Error ? error.message : "brain start failed");
+    }
+
     store.append({
       type: "daemon.started",
       payload: { version: AGENTOSD_VERSION, pid: process.pid, home, port: boundPort },
@@ -194,6 +231,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         piVersion: pi.version,
         piPinned: pi.pinnedVersion,
         hydratedQuotaSamples: quotaSamples.size,
+        brain: fleet.brain.getSnapshot().status,
       },
       "agentosd started",
     );
@@ -201,6 +239,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const runningStore = store;
     const runningConfig = config;
     const runningServer = server;
+    const runningFleet = fleet;
     let closed = false;
     lockOwned = false;
     return {
@@ -216,6 +255,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         if (closed) return;
         closed = true;
         try {
+          runningFleet.stop();
           quotaScheduler.stop();
           runningStore.append({
             type: "daemon.stopping",

@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
 import { Icon } from "@/components/shell/Icon";
 import { useEventStream } from "@/lib/useEventStream";
@@ -358,13 +359,54 @@ function RecentTasksTable() {
 }
 
 /**
- * Fleet (§7.1) — the Figma "Home Dashboard" screen. The Swarm Activity
- * "last updated" line is wired live to the newest daemon event; roster,
- * token, and task figures are pixel-faithful placeholders until the task
- * engine and Brain (Phase 3) feed them.
+ * Fleet (§7.1) — the Figma "Home Dashboard" screen.
+ * Live: swarm "last updated", fleet summary chips (active/queued/needs-you/brain).
+ * Roster cards remain design placeholders where analytics still use fixtures.
  */
 export function FleetDashboard() {
-  const { events } = useEventStream();
+  const { events, lastEvent } = useEventStream();
+  const refreshKey = lastEvent?.id ?? "init";
+  const [summary, setSummary] = useState<{
+    active: number;
+    queued: number;
+    needsCaptain: number;
+    doneToday: number;
+    brainDown: boolean;
+    brainStatus: string;
+  } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/agentos/fleet", { cache: "no-store" })
+      .then(async (res) => {
+        if (cancelled || !res.ok) return;
+        const body = (await res.json()) as {
+          summary: {
+            active: number;
+            queued: number;
+            needsCaptain: number;
+            doneToday: number;
+            brainDown: boolean;
+            brain: { status: string };
+          };
+        };
+        setSummary({
+          active: body.summary.active,
+          queued: body.summary.queued,
+          needsCaptain: body.summary.needsCaptain,
+          doneToday: body.summary.doneToday,
+          brainDown: body.summary.brainDown,
+          brainStatus: body.summary.brain.status,
+        });
+      })
+      .catch(() => {
+        // daemon down — leave previous
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshKey]);
+
   const latest = events[0];
   const lastEventAt =
     latest !== undefined
@@ -376,6 +418,40 @@ export function FleetDashboard() {
 
   return (
     <div className="flex flex-col gap-5 p-8 pt-6">
+      {summary !== null && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          {[
+            { label: "Active", value: summary.active },
+            { label: "Queued", value: summary.queued },
+            { label: "Needs you", value: summary.needsCaptain },
+            { label: "Done today", value: summary.doneToday },
+            {
+              label: "Brain",
+              value: summary.brainDown ? "DOWN" : summary.brainStatus,
+            },
+          ].map((chip) => (
+            <div
+              key={chip.label}
+              className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1"
+            >
+              <span className="text-[11px] uppercase tracking-wide text-fg-3">{chip.label}</span>
+              <span
+                className={cn(
+                  "text-2xl font-semibold",
+                  chip.label === "Brain" && summary.brainDown ? "text-danger" : "text-fg-1",
+                )}
+              >
+                {chip.value}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {summary?.brainDown === true && (
+        <div className="rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-[13px] text-danger">
+          BRAIN DOWN — sessions alive · wakes queued · no orchestration until restart
+        </div>
+      )}
       <div className="grid grid-cols-1 xl:grid-cols-[1fr_1fr_260px] gap-4">
         <SwarmActivityCard lastEventAt={lastEventAt} />
         <TokenConsumptionCard />

@@ -11,8 +11,17 @@ import {
 import { quotaSampleSchema } from "./quota.js";
 import { onboardingStateSchema } from "./onboarding.js";
 import { PI_PINNED_VERSION } from "./pi.js";
+import {
+  fleetStateSnapshotSchema,
+  fleetSummarySchema,
+  projectRecordSchema,
+  taskListItemSchema,
+  wakeDigestSchema,
+} from "./fleet.js";
+import { projectModeSchema, taskSnapshotSchema, taskSpecSchema } from "./tasks.js";
+import { brainToolNameSchema } from "./tools.js";
 
-/** REST DTOs for `/v1/*` (master plan §8.2). Phase 1 + Phase 2 surfaces. */
+/** REST DTOs for `/v1/*` (master plan §8.2). Phase 1–3 surfaces. */
 
 export const healthResponseSchema = z.strictObject({
   ok: z.literal(true),
@@ -66,6 +75,10 @@ export const apiErrorCodeSchema = z.enum([
   "ONBOARDING_BLOCKED",
   "PROBE_FAILED",
   "CONFLICT",
+  "ILLEGAL_TRANSITION",
+  "POLICY_VIOLATION",
+  "BRAIN_DOWN",
+  "LIMIT_REACHED",
 ]);
 export type ApiErrorCode = z.infer<typeof apiErrorCodeSchema>;
 
@@ -161,3 +174,77 @@ export const onboardingAdvanceRequestSchema = z.strictObject({
   kind: connectionKindSchema.optional(),
 });
 export type OnboardingAdvanceRequest = z.infer<typeof onboardingAdvanceRequestSchema>;
+
+// ── Phase 3 REST: projects / tasks / fleet / brain tools ───────────────────
+
+export const projectsListResponseSchema = z.strictObject({
+  projects: z.array(projectRecordSchema),
+});
+export type ProjectsListResponse = z.infer<typeof projectsListResponseSchema>;
+
+export const projectRegisterRequestSchema = z.strictObject({
+  name: z.string().min(1).max(100),
+  path: z.string().min(1),
+  mode: projectModeSchema.optional(),
+  trusted: z.boolean().optional(),
+  yolo: z.boolean().optional(),
+});
+export type ProjectRegisterRequest = z.infer<typeof projectRegisterRequestSchema>;
+
+export const projectResponseSchema = z.strictObject({
+  project: projectRecordSchema,
+});
+export type ProjectResponse = z.infer<typeof projectResponseSchema>;
+
+export const tasksListResponseSchema = z.strictObject({
+  tasks: z.array(taskListItemSchema),
+});
+export type TasksListResponse = z.infer<typeof tasksListResponseSchema>;
+
+export const taskCreateRequestSchema = z.strictObject({
+  spec: taskSpecSchema,
+  idempotencyKey: z.string().min(1).max(200).optional(),
+});
+export type TaskCreateRequest = z.infer<typeof taskCreateRequestSchema>;
+
+export const taskResponseSchema = z.strictObject({
+  task: taskSnapshotSchema,
+});
+export type TaskResponse = z.infer<typeof taskResponseSchema>;
+
+export const fleetStateResponseSchema = z.strictObject({
+  state: fleetStateSnapshotSchema,
+});
+export type FleetStateResponse = z.infer<typeof fleetStateResponseSchema>;
+
+export const fleetSummaryResponseSchema = z.strictObject({
+  summary: fleetSummarySchema,
+});
+export type FleetSummaryResponse = z.infer<typeof fleetSummaryResponseSchema>;
+
+export const wakesListResponseSchema = z.strictObject({
+  wakes: z.array(wakeDigestSchema),
+});
+export type WakesListResponse = z.infer<typeof wakesListResponseSchema>;
+
+/** Captain / scripted-brain tool call over REST (also available via socket bridge). */
+export const toolCallRequestSchema = z.strictObject({
+  tool: brainToolNameSchema,
+  input: z.record(z.string(), z.unknown()),
+  idempotencyKey: z.string().min(1).max(200).optional(),
+});
+export type ToolCallRequest = z.infer<typeof toolCallRequestSchema>;
+
+export const toolCallResponseSchema = z.strictObject({
+  invocationId: ulidSchema,
+  ok: z.boolean(),
+  data: z.unknown().optional(),
+  error: z
+    .strictObject({
+      code: z.string(),
+      message: z.string(),
+      details: z.record(z.string(), z.unknown()).optional(),
+    })
+    .optional(),
+});
+export type ToolCallResponse = z.infer<typeof toolCallResponseSchema>;

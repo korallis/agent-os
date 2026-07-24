@@ -1,0 +1,6 @@
+// worktrees.json5 — worktree pool policy (master plan §5.4, surface #7).
+{
+  poolSize: 4,
+  reclaimPolicy: "verified-reset",
+  networkPolicy: "fetch-allowed",
+}

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { eventEnvelopeSchema, type EventEnvelope } from "@agent-os/protocol";
 
-/** Named SSE event types (Phase 1 + Phase 2). Named events do not fire onmessage. */
+/** Named SSE event types (Phase 1–3). Named events do not fire onmessage. */
 const EVENT_TYPES = [
   "daemon.started",
   "daemon.stopping",
@@ -20,6 +20,25 @@ const EVENT_TYPES = [
   "ext.usage",
   "onboarding.step",
   "onboarding.completed",
+  "project.registered",
+  "project.updated",
+  "task.created",
+  "task.phase_changed",
+  "task.updated",
+  "task.cast_resolved",
+  "session.spawned",
+  "session.stopped",
+  "session.lost",
+  "worktree.leased",
+  "worktree.released",
+  "wake.classified",
+  "brain.status",
+  "brain.handoff",
+  "brain.down",
+  "tool.invoked",
+  "gate.result",
+  "fusion.dispatched",
+  "captain.escalation",
 ] as const;
 
 export type StreamState = "connecting" | "live" | "down";
@@ -28,6 +47,8 @@ export interface EventStream {
   state: StreamState;
   /** Newest first, capped. */
   events: EventEnvelope[];
+  /** Newest single envelope (or null before first). */
+  lastEvent: EventEnvelope | null;
   /** Total envelopes received this session (incl. replay). */
   received: number;
 }
@@ -73,5 +94,5 @@ export function useEventStream(cap = 100): EventStream {
     };
   }, [cap]);
 
-  return { state, events, received };
+  return { state, events, lastEvent: events[0] ?? null, received };
 }

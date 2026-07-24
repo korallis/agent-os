@@ -58,12 +58,24 @@ export const extensionToolBlockedFrameSchema = z.strictObject({
 });
 export type ExtensionToolBlockedFrame = z.infer<typeof extensionToolBlockedFrameSchema>;
 
+/** Brain tool-call frame (Phase 3 tool bridge). */
+export const extensionToolCallFrameSchema = z.strictObject({
+  type: z.literal("ext.tool_call"),
+  sessionId: ulidSchema,
+  invocationId: ulidSchema,
+  tool: z.string(),
+  input: z.record(z.string(), z.unknown()),
+  ts: isoTimestampSchema,
+});
+export type ExtensionToolCallFrame = z.infer<typeof extensionToolCallFrameSchema>;
+
 /** Frames the extension may send to the daemon. */
 export const extensionToDaemonFrameSchema = z.discriminatedUnion("type", [
   extensionHelloFrameSchema,
   extensionLifecycleFrameSchema,
   extensionUsageFrameSchema,
   extensionToolBlockedFrameSchema,
+  extensionToolCallFrameSchema,
 ]);
 export type ExtensionToDaemonFrame = z.infer<typeof extensionToDaemonFrameSchema>;
 
@@ -83,6 +95,20 @@ export const daemonControlFrameSchema = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("ctl.shutdown"),
     reason: z.string(),
+    ts: isoTimestampSchema,
+  }),
+  z.strictObject({
+    type: z.literal("ctl.tool_result"),
+    sessionId: ulidSchema,
+    invocationId: ulidSchema,
+    ok: z.boolean(),
+    data: z.unknown().optional(),
+    error: z
+      .strictObject({
+        code: z.string(),
+        message: z.string(),
+      })
+      .optional(),
     ts: isoTimestampSchema,
   }),
 ]);

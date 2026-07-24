@@ -1,0 +1,9 @@
+// dispatch.json5 — natural-language dispatch hints for the Brain (surface #4).
+{
+  rules: [
+    {
+      when: "default",
+      hint: { fusionProfile: "default-cross-family" },
+    },
+  ],
+}

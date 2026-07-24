@@ -1,0 +1,7 @@
+// validation.json5 — gate runner budgets (master plan §6.4, surface #6).
+{
+  maxValidations: 6,
+  triageAt: 3,
+  gateLanguage: "py",
+  gateTimeoutSeconds: 300,
+}

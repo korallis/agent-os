@@ -1,0 +1,28 @@
+{
+  "name": "@agent-os/fusion-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agent-os/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "eslint": "9.39.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

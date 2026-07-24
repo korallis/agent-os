@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@agent-os/event-store": "workspace:*",
+    "@agent-os/fusion-core": "workspace:*",
     "@agent-os/pi-extension": "workspace:*",
     "@agent-os/protocol": "workspace:*",
     "@agentos/claude-agent-sdk-pi": "workspace:*",

@@ -12,13 +12,17 @@ import type { Logger } from "pino";
 import { z } from "zod";
 import {
   apiKeyConnectRequestSchema,
+  brainToolNameSchema,
   configDomainSchema,
   configLayerSchema,
   oauthStartRequestSchema,
   onboardingAdvanceRequestSchema,
   PI_PINNED_VERSION,
+  projectRegisterRequestSchema,
   SAFETY_CONFIRM_HEADER,
   safetyPoliciesConfigSchema,
+  taskCreateRequestSchema,
+  toolCallRequestSchema,
   type ApiErrorCode,
   type ConfigValidationIssue,
   type EventsReplayResponse,
@@ -39,6 +43,7 @@ import { OnboardingBlockedError } from "../onboarding/state.js";
 import { enableQuotaProviders } from "../quota-probes/enable.js";
 import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
 import { resolveAuthJsonPathsWithFallback } from "../security/auth-store.js";
+import type { FleetService } from "../fleet/service.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -59,6 +64,8 @@ export interface ServerDeps {
   pi?: PiDetection;
   /** In-memory latest quota samples (connectionId → sample). */
   quotaSamples?: Map<string, QuotaSample>;
+  /** Phase 3 fleet substrate. */
+  fleet?: FleetService;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -193,6 +200,158 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         configDirEnv: deps.pi?.configDirEnv ?? null,
       },
     };
+  });
+
+  // ── Phase 3: fleet / projects / tasks / tools ──────────────────────────
+
+  app.get("/v1/fleet", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { summary: deps.fleet.summary() };
+  });
+
+  app.get("/v1/fleet/state", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { state: deps.fleet.tools.readFleetState() };
+  });
+
+  app.get("/v1/wakes", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { wakes: deps.fleet.watcher.getHistory(200) };
+  });
+
+  app.get("/v1/projects", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { projects: deps.fleet.projects.list() };
+  });
+
+  app.post("/v1/projects", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const body = projectRegisterRequestSchema.safeParse(request.body);
+    if (!body.success) {
+      sendError(reply, 400, "BAD_REQUEST", "invalid project body");
+      return;
+    }
+    try {
+      const project = deps.fleet.projects.register({
+        name: body.data.name,
+        path: body.data.path,
+        ...(body.data.mode !== undefined ? { mode: body.data.mode } : {}),
+        ...(body.data.trusted !== undefined ? { trusted: body.data.trusted } : {}),
+        ...(body.data.yolo !== undefined ? { yolo: body.data.yolo } : {}),
+      });
+      return { project };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendError(reply, 400, "BAD_REQUEST", message);
+      return;
+    }
+  });
+
+  app.get("/v1/tasks", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { tasks: deps.fleet.listTaskItems() };
+  });
+
+  app.post("/v1/tasks", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const body = taskCreateRequestSchema.safeParse(request.body);
+    if (!body.success) {
+      sendError(reply, 400, "BAD_REQUEST", "invalid task body");
+      return;
+    }
+    const result = deps.fleet.tools.invoke("create_task", {
+      spec: body.data.spec,
+      ...(body.data.idempotencyKey !== undefined
+        ? { idempotencyKey: body.data.idempotencyKey }
+        : {}),
+    });
+    if (!result.ok) {
+      const code = mapToolError(result.error?.code);
+      sendError(reply, code === "NOT_FOUND" ? 404 : 400, code, result.error?.message ?? "create failed");
+      return;
+    }
+    return { task: result.data };
+  });
+
+  app.get<{ Params: { id: string } }>("/v1/tasks/:id", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const task = deps.fleet.tools.getTask(request.params.id);
+    if (task === null) {
+      sendError(reply, 404, "NOT_FOUND", "task not found");
+      return;
+    }
+    return { task };
+  });
+
+  app.post("/v1/tools/call", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const body = toolCallRequestSchema.safeParse(request.body);
+    if (!body.success) {
+      sendError(reply, 400, "BAD_REQUEST", "invalid tool call body");
+      return;
+    }
+    const toolParsed = brainToolNameSchema.safeParse(body.data.tool);
+    if (!toolParsed.success) {
+      sendError(reply, 400, "BAD_REQUEST", "unknown tool");
+      return;
+    }
+    const result = deps.fleet.tools.invoke(
+      toolParsed.data,
+      body.data.input,
+      body.data.idempotencyKey !== undefined
+        ? { idempotencyKey: body.data.idempotencyKey }
+        : {},
+    );
+    return {
+      invocationId: result.invocationId,
+      ok: result.ok,
+      ...(result.data !== undefined ? { data: result.data } : {}),
+      ...(result.error !== undefined ? { error: result.error } : {}),
+    };
+  });
+
+  app.post("/v1/brain/start", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const brain = deps.fleet.brain.start("api");
+    return { brain };
+  });
+
+  app.get("/v1/brain", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { brain: deps.fleet.brain.getSnapshot() };
   });
 
   // ── Phase 2: connections / quota / onboarding ──────────────────────────
@@ -806,4 +965,23 @@ function buildOAuthAttachCommand(options: {
 
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function mapToolError(code: string | undefined): ApiErrorCode {
+  switch (code) {
+    case "ILLEGAL_TRANSITION":
+      return "ILLEGAL_TRANSITION";
+    case "POLICY_VIOLATION":
+      return "POLICY_VIOLATION";
+    case "BRAIN_DOWN":
+      return "BRAIN_DOWN";
+    case "LIMIT_REACHED":
+      return "LIMIT_REACHED";
+    case "NOT_FOUND":
+      return "NOT_FOUND";
+    case "CONFLICT":
+      return "CONFLICT";
+    default:
+      return "BAD_REQUEST";
+  }
 }

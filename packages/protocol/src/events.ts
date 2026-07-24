@@ -6,6 +6,7 @@ import {
   configValidationIssueSchema,
 } from "./config.js";
 import {
+  agentRoleSchema,
   authStorePresenceSchema,
   billingSurfaceSchema,
   claudeBillingModeSchema,
@@ -16,10 +17,18 @@ import {
 } from "./providers.js";
 import { honestyTierSchema, quotaMetricSchema } from "./quota.js";
 import { onboardingStepSchema } from "./onboarding.js";
+import {
+  taskFailureCauseSchema,
+  taskPhaseSchema,
+  taskShapeSchema,
+} from "./tasks.js";
+import { brainStatusSchema, wakeClassSchema } from "./fleet.js";
+import { brainToolNameSchema, toolErrorCodeSchema } from "./tools.js";
 
 /**
  * Orchestrator event union (master plan §8.2, §9).
  * Phase 1: daemon + config. Phase 2: provider, quota, extension, onboarding.
+ * Phase 3: tasks, fleet, brain, tools, wakes.
  */
 
 export const daemonStartedEventSchema = z.strictObject({
@@ -169,6 +178,212 @@ export const onboardingCompletedEventSchema = z.strictObject({
   }),
 });
 
+// ── Phase 3: tasks / fleet / brain / tools ─────────────────────────────────
+
+export const projectRegisteredEventSchema = z.strictObject({
+  type: z.literal("project.registered"),
+  payload: z.strictObject({
+    projectId: ulidSchema,
+    name: z.string(),
+    path: z.string(),
+    mode: z.string(),
+    trusted: z.boolean(),
+  }),
+});
+
+export const projectUpdatedEventSchema = z.strictObject({
+  type: z.literal("project.updated"),
+  payload: z.strictObject({
+    projectId: ulidSchema,
+    name: z.string().optional(),
+    mode: z.string().optional(),
+    trusted: z.boolean().optional(),
+  }),
+});
+
+export const taskCreatedEventSchema = z.strictObject({
+  type: z.literal("task.created"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    shape: taskShapeSchema,
+    projectId: ulidSchema,
+    title: z.string(),
+    mode: z.string(),
+    phase: taskPhaseSchema,
+    idempotencyKey: z.string().nullable(),
+  }),
+});
+
+export const taskPhaseChangedEventSchema = z.strictObject({
+  type: z.literal("task.phase_changed"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    from: taskPhaseSchema,
+    to: taskPhaseSchema,
+    reason: z.string().nullable(),
+  }),
+});
+
+export const taskUpdatedEventSchema = z.strictObject({
+  type: z.literal("task.updated"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    title: z.string().optional(),
+    phase: taskPhaseSchema.optional(),
+    failureCause: taskFailureCauseSchema.nullable().optional(),
+  }),
+});
+
+export const taskCastResolvedEventSchema = z.strictObject({
+  type: z.literal("task.cast_resolved"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    roles: z.array(
+      z.strictObject({
+        role: agentRoleSchema,
+        model: z.string(),
+        thinking: z.string(),
+        family: modelFamilySchema,
+      }),
+    ),
+    familyCheckOverridden: z.boolean(),
+  }),
+});
+
+export const sessionSpawnedEventSchema = z.strictObject({
+  type: z.literal("session.spawned"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    taskId: ulidSchema,
+    role: agentRoleSchema,
+    model: z.string(),
+    family: modelFamilySchema,
+    tmuxWindow: z.string(),
+    worktreePath: z.string().nullable(),
+  }),
+});
+
+export const sessionStoppedEventSchema = z.strictObject({
+  type: z.literal("session.stopped"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    taskId: ulidSchema.nullable(),
+    reason: z.string(),
+  }),
+});
+
+export const sessionLostEventSchema = z.strictObject({
+  type: z.literal("session.lost"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    taskId: ulidSchema.nullable(),
+    reason: z.string(),
+  }),
+});
+
+export const worktreeLeasedEventSchema = z.strictObject({
+  type: z.literal("worktree.leased"),
+  payload: z.strictObject({
+    leaseId: ulidSchema,
+    projectId: ulidSchema,
+    taskId: ulidSchema,
+    path: z.string(),
+    branch: z.string().nullable(),
+  }),
+});
+
+export const worktreeReleasedEventSchema = z.strictObject({
+  type: z.literal("worktree.released"),
+  payload: z.strictObject({
+    leaseId: ulidSchema,
+    projectId: ulidSchema,
+    path: z.string(),
+    quarantined: z.boolean(),
+  }),
+});
+
+export const wakeClassifiedEventSchema = z.strictObject({
+  type: z.literal("wake.classified"),
+  payload: z.strictObject({
+    wakeId: ulidSchema,
+    class: wakeClassSchema,
+    taskId: ulidSchema.nullable(),
+    sessionId: ulidSchema.nullable(),
+    absorbed: z.boolean(),
+    deliveredToBrain: z.boolean(),
+    summary: z.string(),
+  }),
+});
+
+export const brainStatusEventSchema = z.strictObject({
+  type: z.literal("brain.status"),
+  payload: z.strictObject({
+    status: brainStatusSchema,
+    sessionId: ulidSchema.nullable(),
+    model: z.string().nullable(),
+    reason: z.string().nullable(),
+  }),
+});
+
+export const brainHandoffEventSchema = z.strictObject({
+  type: z.literal("brain.handoff"),
+  payload: z.strictObject({
+    fromModel: z.string(),
+    toModel: z.string(),
+    triggerMetric: z.string(),
+    reason: z.string(),
+  }),
+});
+
+export const brainDownEventSchema = z.strictObject({
+  type: z.literal("brain.down"),
+  payload: z.strictObject({
+    wakeQueueDepth: z.number().int().min(0),
+    reason: z.string(),
+  }),
+});
+
+export const toolInvokedEventSchema = z.strictObject({
+  type: z.literal("tool.invoked"),
+  payload: z.strictObject({
+    invocationId: ulidSchema,
+    tool: brainToolNameSchema,
+    taskId: ulidSchema.nullable(),
+    ok: z.boolean(),
+    errorCode: toolErrorCodeSchema.nullable(),
+    durationMs: z.number().int().min(0),
+  }),
+});
+
+export const gateResultEventSchema = z.strictObject({
+  type: z.literal("gate.result"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    target: z.enum(["baseline", "candidate"]),
+    outcome: z.enum(["PASS", "FAIL", "GATE_ERROR", "EXPECTED_RED"]),
+    attempt: z.number().int().min(0),
+    outputHash: z.string().nullable(),
+  }),
+});
+
+export const fusionDispatchedEventSchema = z.strictObject({
+  type: z.literal("fusion.dispatched"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    kind: z.enum(["opinion", "fusion", "plan-fusion"]),
+    runId: ulidSchema,
+  }),
+});
+
+export const captainEscalationEventSchema = z.strictObject({
+  type: z.literal("captain.escalation"),
+  payload: z.strictObject({
+    taskId: ulidSchema.nullable(),
+    summary: z.string(),
+    severity: z.enum(["info", "warn", "critical"]),
+  }),
+});
+
 export const orchestratorEventSchema = z.discriminatedUnion("type", [
   daemonStartedEventSchema,
   daemonStoppingEventSchema,
@@ -185,6 +400,25 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   extensionUsageEventSchema,
   onboardingStepEventSchema,
   onboardingCompletedEventSchema,
+  projectRegisteredEventSchema,
+  projectUpdatedEventSchema,
+  taskCreatedEventSchema,
+  taskPhaseChangedEventSchema,
+  taskUpdatedEventSchema,
+  taskCastResolvedEventSchema,
+  sessionSpawnedEventSchema,
+  sessionStoppedEventSchema,
+  sessionLostEventSchema,
+  worktreeLeasedEventSchema,
+  worktreeReleasedEventSchema,
+  wakeClassifiedEventSchema,
+  brainStatusEventSchema,
+  brainHandoffEventSchema,
+  brainDownEventSchema,
+  toolInvokedEventSchema,
+  gateResultEventSchema,
+  fusionDispatchedEventSchema,
+  captainEscalationEventSchema,
 ]);
 export type OrchestratorEvent = z.infer<typeof orchestratorEventSchema>;
 
