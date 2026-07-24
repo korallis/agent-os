@@ -15,6 +15,7 @@ export {
 } from "./config/resolver.js";
 export {
   acquireHomeLock,
+  ensureDaemonToken,
   ensureHome,
   homePaths,
   readToken,

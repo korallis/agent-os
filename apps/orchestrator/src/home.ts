@@ -257,29 +257,65 @@ export function acquireHomeLock(home: string): HomeLock {
   };
 }
 
-function writeToken(tokenPath: string): void {
-  writeFileSync(tokenPath, randomBytes(32).toString("hex"), { mode: 0o600 });
-  chmodSync(tokenPath, 0o600);
-}
-
-/** Creates the home tree (0700) and the daemon bearer token (0600) if missing. */
+/** Creates the home directory tree (0700). Token creation is separate (`ensureDaemonToken`). */
 export function ensureHome(home: string): HomePaths {
   const paths = homePaths(home);
   for (const dir of [paths.home, paths.configDir, paths.eventsDir, paths.logsDir]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     chmodSync(dir, 0o700);
   }
-  if (!existsSync(paths.tokenPath)) {
-    writeToken(paths.tokenPath);
-  } else {
-    const existing = readFileSync(paths.tokenPath, "utf8").trim();
-    if (existing.length === 0) {
-      writeToken(paths.tokenPath);
-    } else {
-      chmodSync(paths.tokenPath, 0o600);
+  return paths;
+}
+
+/**
+ * Create or read `daemon.token` (0600). Must run while holding `acquireHomeLock`
+ * for this home. Missing files use exclusive create (`wx`); empty files are rewritten.
+ */
+export function ensureDaemonToken(home: string): string {
+  const { tokenPath } = homePaths(home);
+
+  if (!existsSync(tokenPath)) {
+    const token = randomBytes(32).toString("hex");
+    try {
+      const fd = openSync(tokenPath, "wx", 0o600);
+      try {
+        writeSync(fd, token);
+        try {
+          fsyncSync(fd);
+        } catch {
+          // some platforms/tmpfs ignore fsync
+        }
+      } finally {
+        closeSync(fd);
+      }
+      try {
+        chmodSync(tokenPath, 0o600);
+      } catch {
+        // best-effort on platforms that ignore mode
+      }
+      return token;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
   }
-  return paths;
+
+  const existing = readFileSync(tokenPath, "utf8").trim();
+  if (existing.length === 0) {
+    const token = randomBytes(32).toString("hex");
+    writeFileSync(tokenPath, token, { mode: 0o600 });
+    try {
+      chmodSync(tokenPath, 0o600);
+    } catch {
+      // best-effort
+    }
+    return token;
+  }
+  try {
+    chmodSync(tokenPath, 0o600);
+  } catch {
+    // best-effort
+  }
+  return existing;
 }
 
 export function readToken(home: string): string {

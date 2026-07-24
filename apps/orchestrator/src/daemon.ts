@@ -2,7 +2,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pino, { type Logger } from "pino";
 import { EventStore } from "@agent-os/event-store";
-import { acquireHomeLock, ensureHome, readToken, resolveHome, type HomeLock } from "./home.js";
+import {
+  acquireHomeLock,
+  ensureDaemonToken,
+  ensureHome,
+  resolveHome,
+  type HomeLock,
+} from "./home.js";
 import { ConfigService } from "./config/service.js";
 import { buildServer, type AgentosdServer } from "./server/app.js";
 import { AGENTOSD_VERSION, DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";
@@ -46,15 +52,16 @@ function resolvePort(explicit: number | undefined): number {
 }
 
 /**
- * Boots agentosd (master plan §2.5): home init → exclusive home lock →
- * shipped-defaults install → event-store open (log replay + corrupt-tail
- * quarantine) → config layering + watcher → Fastify on 127.0.0.1
- * (loopback config-locked) → daemon.started.
+ * Boots agentosd (master plan §2.5): home dirs → exclusive home lock →
+ * daemon.token (under lock) → shipped-defaults install → event-store open
+ * (log replay + corrupt-tail quarantine) → config layering + watcher →
+ * Fastify on 127.0.0.1 (loopback config-locked) → daemon.started.
  */
 export async function startDaemon(options: DaemonOptions = {}): Promise<RunningDaemon> {
   const home = options.home ?? resolveHome();
   const paths = ensureHome(home);
   const lock: HomeLock = acquireHomeLock(home);
+  const token = ensureDaemonToken(home);
   const port = resolvePort(options.port);
 
   const fileDestination = pino.destination({ dest: paths.logFile, mkdir: true, sync: false });
@@ -100,7 +107,6 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     }
     config.startWatching();
 
-    const token = readToken(home);
     const startedAt = new Date().toISOString();
 
     const deps = { store, config, token, home, port, startedAt, logger };
