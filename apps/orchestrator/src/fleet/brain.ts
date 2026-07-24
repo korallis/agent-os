@@ -152,23 +152,31 @@ export class BrainManager {
       }
       this.deps.tools.setBrainSessionId(sessionId);
 
-      const spec = buildPiSpawnSpec({
-        agentosHome: this.deps.home,
-        detection: this.deps.pi,
-        args: ["--mode", "json", "-p", BRAIN_SYSTEM_PROMPT, "--model", model],
-        cwd: this.deps.home,
-        sessionId,
-        role: "brain",
-        socketPath,
-        extensionPath: this.deps.extensionPath,
-        cleanRoom: false,
-      });
-      const win = this.deps.tmux.newWindow({
-        windowName,
-        argv: [spec.binary, ...spec.args],
-        env: spec.env,
-      });
-      this.snapshot = { ...this.snapshot, tmuxWindow: win.target };
+      try {
+        const spec = buildPiSpawnSpec({
+          agentosHome: this.deps.home,
+          detection: this.deps.pi,
+          args: ["--mode", "json", "-p", BRAIN_SYSTEM_PROMPT, "--model", model],
+          cwd: this.deps.home,
+          sessionId,
+          role: "brain",
+          socketPath,
+          extensionPath: this.deps.extensionPath,
+          cleanRoom: false,
+        });
+        const win = this.deps.tmux.newWindow({
+          windowName,
+          argv: [spec.binary, ...spec.args],
+          env: spec.env,
+        });
+        this.snapshot = { ...this.snapshot, tmuxWindow: win.target };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.deps.tools.setBrainSessionId(null);
+        void this.deps.sockets?.closeSession(sessionId);
+        this.enterDown(`brain spawn failed: ${message}`);
+        return this.getSnapshot();
+      }
     }
 
     // Reconcile: first act is always read_fleet_state

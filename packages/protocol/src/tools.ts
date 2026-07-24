@@ -198,6 +198,14 @@ export const stowKnowledgeInputSchema = z.strictObject({
     .min(1)
     .max(200)
     .regex(/^docs\/notes\/[A-Za-z0-9._/-]+$/, "must write under docs/notes/")
+    .refine(
+      (p) =>
+        p
+          .slice("docs/notes/".length)
+          .split("/")
+          .every((seg) => seg.length > 0 && seg !== "." && seg !== ".."),
+      { message: "path segments must not be . or .." },
+    )
     .optional(),
 });
 export type StowKnowledgeInput = z.infer<typeof stowKnowledgeInputSchema>;

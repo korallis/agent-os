@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { PI_PINNED_VERSION } from "@agent-os/protocol";
 import { ConfigService } from "../src/config/service.js";
 import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
 import { FleetService } from "../src/fleet/service.js";
@@ -274,6 +275,17 @@ describe("tool bridge authorization", () => {
     expect(refused.ok).toBe(false);
     expect(refused.error?.code).toBe("UNAUTHORIZED_TOOL");
 
+    const stow = service.tools.invokeFromSession(
+      "01JCREW0000000000000000000",
+      "stow_knowledge",
+      {
+        projectId: "01JPROJ0000000000000000000",
+        notes: "crew must not write notes",
+      },
+    );
+    expect(stow.ok).toBe(false);
+    expect(stow.error?.code).toBe("UNAUTHORIZED_TOOL");
+
     // Read-only self-service is allowed — it fails on NOT_FOUND, not on authz.
     const allowed = service.tools.invokeFromSession(
       "01JCREW0000000000000000000",
@@ -490,6 +502,137 @@ describe("crewmate questions", () => {
       answer: "hello",
     });
     expect(unknown.error?.code).toBe("NOT_FOUND");
+  });
+
+  it("keeps a pending question retryable when delivery fails", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId } = seedTask(service, { name: "retry-ask", shape: "SHIP", role: "builder" });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+
+    const questionId = "01JQ5T0000000000000000000B";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Need a decision before continuing.",
+      ts: new Date().toISOString(),
+    });
+    expect(service.tools.listQuestions()).toHaveLength(1);
+
+    const original = service.tmux.sendKeys.bind(service.tmux);
+    service.tmux.sendKeys = (): void => {
+      throw new Error("tmux channel dead");
+    };
+    try {
+      const failed = service.tools.invoke("answer_crewmate", {
+        questionId,
+        answer: "Ship the migration as-is.",
+      });
+      expect(failed.ok).toBe(false);
+      expect(failed.error?.code).toBe("CONFLICT");
+      expect(service.tools.listQuestions()).toHaveLength(1);
+      expect(service.tools.listQuestions()[0]?.questionId).toBe(questionId);
+    } finally {
+      service.tmux.sendKeys = original;
+    }
+
+    const retried = service.tools.invoke("answer_crewmate", {
+      questionId,
+      answer: "Ship the migration as-is.",
+    });
+    expect(retried.ok).toBe(true);
+    expect(service.tools.listQuestions()).toHaveLength(0);
+  });
+});
+
+describe("stow_knowledge path jail", () => {
+  it("rejects path traversal and keeps notes under docs/notes", () => {
+    const service = fleet({ fakePi: true });
+    const project = service.projects.register({
+      name: "stow-jail",
+      path: gitRepo(),
+      mode: "local-only",
+      trusted: true,
+    });
+
+    const traversal = service.tools.invoke("stow_knowledge", {
+      projectId: project.id,
+      notes: "should never land outside the jail",
+      relativePath: "docs/notes/../../secrets.env",
+    });
+    expect(traversal.ok).toBe(false);
+    expect(["VALIDATION_ERROR", "POLICY_VIOLATION"]).toContain(traversal.error?.code);
+
+    const ok = service.tools.invoke("stow_knowledge", {
+      projectId: project.id,
+      notes: "safe note",
+      relativePath: "docs/notes/safe-note.md",
+    });
+    expect(ok.ok).toBe(true);
+    const written = (ok.data as { path: string }).path;
+    expect(written.startsWith(join(project.path, "docs", "notes"))).toBe(true);
+  });
+});
+
+describe("brain spawn failure", () => {
+  it("enters BRAIN_DOWN and clears authorized session when Pi spawn fails", () => {
+    const home = temp("agentos-brain-spawn-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+
+    let closedSessionId: string | null = null;
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: false,
+      pi: {
+        binary: "/usr/bin/true",
+        version: PI_PINNED_VERSION,
+        pinnedVersion: PI_PINNED_VERSION,
+        versionMatchesPin: true,
+        managedHome: join(home, "pi"),
+        configDirEnv: "PI_CONFIG_DIR",
+        isolationMode: "managed",
+      },
+      extensionPath: join(home, "extension.js"),
+      sockets: {
+        sessionSocketPath: (sessionId) => join(home, "sockets", `${sessionId}.sock`),
+        openSession: (sessionId) => join(home, "sockets", `${sessionId}.sock`),
+        closeSession: async (sessionId) => {
+          closedSessionId = sessionId;
+        },
+        sendControl: () => false,
+      },
+    });
+
+    service.tmux.newWindow = (): never => {
+      throw new Error("tmux refused window");
+    };
+
+    const snap = service.brain.start("api");
+    expect(snap.status).toBe("down");
+    expect(service.tools.isBrainDown()).toBe(true);
+    expect(snap.sessionId).not.toBeNull();
+    expect(closedSessionId).toBe(snap.sessionId);
+
+    const forged = service.tools.invokeFromSession(snap.sessionId as string, "spawn_crewmate", {
+      taskId: "01JTASK0000000000000000000",
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(forged.ok).toBe(false);
+    expect(forged.error?.code).toBe("UNAUTHORIZED_TOOL");
   });
 });
 

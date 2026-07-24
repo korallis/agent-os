@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { monotonicFactory } from "ulid";
 import { ZodError } from "zod";
 import { spawnSync } from "node:child_process";
@@ -77,15 +77,15 @@ export interface SessionChannel {
 }
 
 /**
- * Tools a non-Brain session may call over its own socket. Read-only plus the
- * two report-upward calls; everything that moves the fleet is Brain-only.
+ * Tools a non-Brain session may call over its own socket. Strictly read-only
+ * plus report-upward (`notify_captain`); everything that writes or moves the
+ * fleet is Brain-only (or Captain REST).
  */
 const CREW_ALLOWED_TOOLS = new Set<BrainToolName>([
   "read_task",
   "read_policy",
   "read_run_artifacts",
   "notify_captain",
-  "stow_knowledge",
 ]);
 
 /** A crewmate question awaiting an answer from the Brain or Captain. */
@@ -1159,6 +1159,12 @@ export class ToolSurface {
         delivered = false;
       }
     }
+    if (!delivered) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `no live channel to session ${pending.sessionId} — answer not delivered`,
+      );
+    }
 
     this.questions.delete(input.questionId);
     this.sink({
@@ -1166,16 +1172,10 @@ export class ToolSurface {
       payload: {
         questionId: input.questionId,
         sessionId: pending.sessionId,
-        delivered,
+        delivered: true,
       },
     });
-    if (!delivered) {
-      throw new ToolSurfaceError(
-        "CONFLICT",
-        `no live channel to session ${pending.sessionId} — answer not delivered`,
-      );
-    }
-    return { questionId: input.questionId, sessionId: pending.sessionId, delivered };
+    return { questionId: input.questionId, sessionId: pending.sessionId, delivered: true };
   }
 
   /**
@@ -1388,11 +1388,13 @@ export class ToolSurface {
       throw new ToolSurfaceError("NOT_FOUND", `project not found: ${input.projectId}`);
     }
     const rel = input.relativePath ?? `docs/notes/stow-${Date.now()}.md`;
-    if (!rel.startsWith("docs/notes/")) {
+    const notesRoot = resolve(project.path, "docs", "notes");
+    const full = resolve(project.path, rel);
+    const notesPrefix = notesRoot.endsWith(sep) ? notesRoot : `${notesRoot}${sep}`;
+    if (!full.startsWith(notesPrefix)) {
       throw new ToolSurfaceError("POLICY_VIOLATION", "stow_knowledge path must be under docs/notes/");
     }
-    const full = join(project.path, rel);
-    mkdirSync(join(project.path, "docs", "notes"), { recursive: true });
+    mkdirSync(notesRoot, { recursive: true });
     writeFileSync(full, input.notes, { mode: 0o600 });
     return { path: full };
   }
