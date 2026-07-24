@@ -19,6 +19,15 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Runtime deps for fleet gates (real tmux + git)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux
+          tmux -V
+          git config --global user.email "ci@agent-os.local"
+          git config --global user.name "Agent OS CI"
+          git config --global init.defaultBranch main
+
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
@@ -40,5 +49,11 @@ jobs:
       - name: Zero-deprecated gate
         run: node scripts/verify-no-deprecated.mjs
 
+      - name: Phase 1 gates
+        run: node tooling/gates/phase-1.mjs
+
       - name: Phase 2 gates
         run: node tooling/gates/phase-2.mjs
+
+      - name: Phase 3 gates
+        run: node tooling/gates/phase-3.mjs
