@@ -123,7 +123,7 @@ export class ConfigService {
       installed.push(domain);
     }
     if (installed.length > 0) {
-      this.reload();
+      this.reload(false);
     }
     return installed;
   }
@@ -157,8 +157,11 @@ export class ConfigService {
    * retained overrides survive later reloads of other domains. Emits
    * `config.changed` for every domain whose effective value actually changed
    * (including fallback-to-shipped when a global file is missing).
+   *
+   * @param hotReloaded true for external file-watch reloads; false for API
+   *   `writeGlobal` and boot-time install paths.
    */
-  private reload(): void {
+  private reload(hotReloaded: boolean): void {
     const previousByDomain = new Map(
       CONFIG_DOMAINS.map((domain) => [domain, JSON.stringify(this.resolved.config[domain])]),
     );
@@ -218,7 +221,7 @@ export class ConfigService {
         sha256("");
       this.sink({
         type: "config.changed",
-        payload: { domain, layer: "global", hotReloaded: true, contentHash },
+        payload: { domain, layer: "global", hotReloaded, contentHash },
       });
     }
   }
@@ -253,7 +256,7 @@ export class ConfigService {
     const contentHash = sha256(json5Text);
     this.appliedHashes.set(domain, contentHash);
     this.rememberLastGood(domain, { value, contentHash, raw: json5Text });
-    this.reload();
+    this.reload(false);
     return { contentHash };
   }
 
@@ -309,7 +312,7 @@ export class ConfigService {
       );
     });
     if (deletedDomains.length > 0) {
-      this.reload();
+      this.reload(true);
     }
 
     for (const domain of CONFIG_DOMAINS) {
@@ -350,7 +353,7 @@ export class ConfigService {
         continue;
       }
       this.rememberLastGood(domain, file);
-      this.reload();
+      this.reload(true);
     }
   }
 

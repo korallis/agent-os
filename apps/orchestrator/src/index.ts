@@ -13,6 +13,15 @@ export {
   type ResolvedDomain,
   type LayerRejection,
 } from "./config/resolver.js";
-export { ensureHome, homePaths, readToken, resolveHome, type HomePaths } from "./home.js";
+export {
+  acquireHomeLock,
+  ensureHome,
+  homePaths,
+  readToken,
+  resolveHome,
+  HomeLockError,
+  type HomeLock,
+  type HomePaths,
+} from "./home.js";
 export { runDoctor, formatDoctorReport, type DoctorCheck } from "./doctor.js";
 export { AGENTOSD_VERSION, DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";

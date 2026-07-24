@@ -2,7 +2,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pino, { type Logger } from "pino";
 import { EventStore } from "@agent-os/event-store";
-import { ensureHome, readToken, resolveHome } from "./home.js";
+import { acquireHomeLock, ensureHome, readToken, resolveHome, type HomeLock } from "./home.js";
 import { ConfigService } from "./config/service.js";
 import { buildServer, type AgentosdServer } from "./server/app.js";
 import { AGENTOSD_VERSION, DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";
@@ -10,6 +10,9 @@ import { AGENTOSD_VERSION, DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
 export const SHIPPED_DEFAULTS_DIR = join(here, "..", "defaults");
+
+/** Grace period before force-destroying hijacked SSE sockets on shutdown. */
+const SSE_SHUTDOWN_GRACE_MS = 150;
 
 export interface DaemonOptions {
   /** State home; defaults to AGENTOS_HOME or ~/.agentos. */
@@ -43,13 +46,15 @@ function resolvePort(explicit: number | undefined): number {
 }
 
 /**
- * Boots agentosd (master plan §2.5): home init → shipped-defaults install →
- * event-store open (log replay + corrupt-tail quarantine) → config layering
- * + watcher → Fastify on 127.0.0.1 (loopback config-locked) → daemon.started.
+ * Boots agentosd (master plan §2.5): home init → exclusive home lock →
+ * shipped-defaults install → event-store open (log replay + corrupt-tail
+ * quarantine) → config layering + watcher → Fastify on 127.0.0.1
+ * (loopback config-locked) → daemon.started.
  */
 export async function startDaemon(options: DaemonOptions = {}): Promise<RunningDaemon> {
   const home = options.home ?? resolveHome();
   const paths = ensureHome(home);
+  const lock: HomeLock = acquireHomeLock(home);
   const port = resolvePort(options.port);
 
   const fileDestination = pino.destination({ dest: paths.logFile, mkdir: true, sync: false });
@@ -70,66 +75,98 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     pino.multistream(streams),
   );
 
-  const opened = EventStore.open(home);
-  const { store } = opened;
-  if (opened.quarantinedTail !== null) {
-    logger.warn({ quarantinedTail: opened.quarantinedTail }, "corrupt event-log tail quarantined");
-  }
-  if (opened.replayed > 0) {
-    logger.info({ replayed: opened.replayed }, "projection replayed from event log");
-  }
+  let store: EventStore | undefined;
+  let config: ConfigService | undefined;
+  let server: AgentosdServer | undefined;
 
-  const config = new ConfigService(SHIPPED_DEFAULTS_DIR, paths.configDir);
-  const installed = config.installDefaults();
-  config.onEvent((event) => {
-    store.append(event);
-  });
-  if (installed.length > 0) {
-    store.append({ type: "config.installed", payload: { domains: installed } });
-  }
-  config.startWatching();
+  try {
+    const opened = EventStore.open(home);
+    store = opened.store;
+    if (opened.quarantinedTail !== null) {
+      logger.warn({ quarantinedTail: opened.quarantinedTail }, "corrupt event-log tail quarantined");
+    }
+    if (opened.replayed > 0) {
+      logger.info({ replayed: opened.replayed }, "projection replayed from event log");
+    }
 
-  const token = readToken(home);
-  const startedAt = new Date().toISOString();
+    config = new ConfigService(SHIPPED_DEFAULTS_DIR, paths.configDir);
+    const installed = config.installDefaults();
+    const eventStore = store;
+    config.onEvent((event) => {
+      eventStore.append(event);
+    });
+    if (installed.length > 0) {
+      store.append({ type: "config.installed", payload: { domains: installed } });
+    }
+    config.startWatching();
 
-  const deps = { store, config, token, home, port, startedAt, logger };
-  const server = buildServer(deps);
-  await server.listen({ host: LOOPBACK_HOST, port });
-  const boundPort = (() => {
+    const token = readToken(home);
+    const startedAt = new Date().toISOString();
+
+    const deps = { store, config, token, home, port, startedAt, logger };
+    server = buildServer(deps);
+    await server.listen({ host: LOOPBACK_HOST, port });
     const address = server.server.address();
-    return typeof address === "object" && address !== null ? address.port : port;
-  })();
-  // With port 0 (tests) the real port is only known after listen.
-  deps.port = boundPort;
+    const boundPort =
+      typeof address === "object" && address !== null ? address.port : port;
+    // With port 0 (tests) the real port is only known after listen.
+    deps.port = boundPort;
 
-  store.append({
-    type: "daemon.started",
-    payload: { version: AGENTOSD_VERSION, pid: process.pid, home, port: boundPort },
-  });
-  logger.info({ home, port: boundPort, version: AGENTOSD_VERSION }, "agentosd started");
+    store.append({
+      type: "daemon.started",
+      payload: { version: AGENTOSD_VERSION, pid: process.pid, home, port: boundPort },
+    });
+    logger.info({ home, port: boundPort, version: AGENTOSD_VERSION }, "agentosd started");
 
-  let closed = false;
-  return {
-    home,
-    port: boundPort,
-    token,
-    startedAt,
-    store,
-    config,
-    server,
-    logger,
-    async close(reason = "shutdown", signal?: string) {
-      if (closed) return;
-      closed = true;
-      store.append({
-        type: "daemon.stopping",
-        payload: { reason, signal: signal ?? null },
-      });
-      config.stop();
-      await server.close();
-      store.close();
-      logger.info({ reason }, "agentosd stopped");
-      fileDestination.flushSync();
-    },
-  };
+    const runningStore = store;
+    const runningConfig = config;
+    const runningServer = server;
+    let closed = false;
+    return {
+      home,
+      port: boundPort,
+      token,
+      startedAt,
+      store: runningStore,
+      config: runningConfig,
+      server: runningServer,
+      logger,
+      async close(reason = "shutdown", signal?: string) {
+        if (closed) return;
+        closed = true;
+        runningStore.append({
+          type: "daemon.stopping",
+          payload: { reason, signal: signal ?? null },
+        });
+        runningConfig.stop();
+        const closePromise = runningServer.close();
+        await new Promise<void>((resolve) => setTimeout(resolve, SSE_SHUTDOWN_GRACE_MS));
+        runningServer.destroySseStreams();
+        runningServer.server.closeAllConnections();
+        await closePromise;
+        runningStore.close();
+        lock.release();
+        logger.info({ reason }, "agentosd stopped");
+        fileDestination.flushSync();
+      },
+    };
+  } catch (error) {
+    try {
+      config?.stop();
+    } catch {
+      // best-effort
+    }
+    try {
+      if (server !== undefined) await server.close();
+    } catch {
+      // best-effort
+    }
+    try {
+      store?.close();
+    } catch {
+      // best-effort
+    }
+    lock.release();
+    throw error;
+  }
 }

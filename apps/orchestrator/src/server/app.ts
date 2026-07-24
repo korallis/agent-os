@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import type { ServerResponse } from "node:http";
 import Fastify, {
   LogController,
   type FastifyInstance,
@@ -24,6 +25,11 @@ import type { EventStore } from "@agent-os/event-store";
 import { ConfigService, ConfigWriteError } from "../config/service.js";
 import { AGENTOSD_VERSION } from "../version.js";
 
+/** Drop an SSE client if its write buffer stays stalled this long. */
+const SSE_STALL_MS = 30_000;
+/** Page size for Last-Event-ID history replay (loop until !truncated). */
+const SSE_REPLAY_PAGE = 10_000;
+
 export interface ServerDeps {
   store: EventStore;
   config: ConfigService;
@@ -33,6 +39,16 @@ export interface ServerDeps {
   startedAt: string;
   logger: Logger;
 }
+
+export type AgentosdServer = FastifyInstance<
+  RawServerDefault,
+  RawRequestDefaultExpression<RawServerDefault>,
+  RawReplyDefaultExpression<RawServerDefault>,
+  Logger
+> & {
+  /** Force-close hijacked SSE responses so graceful shutdown cannot hang. */
+  destroySseStreams(): void;
+};
 
 const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 const ALLOWED_ORIGIN_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -55,13 +71,6 @@ function tokenMatches(provided: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-export type AgentosdServer = FastifyInstance<
-  RawServerDefault,
-  RawRequestDefaultExpression<RawServerDefault>,
-  RawReplyDefaultExpression<RawServerDefault>,
-  Logger
->;
-
 /**
  * The agentosd Fastify app (master plan §8). Loopback-only (config-locked),
  * bearer-authenticated except `/v1/health`, exact-origin checked, typed
@@ -73,6 +82,19 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     // Per-request logging off: SSE/health polling would flood the file log.
     logController: new LogController({ disableRequestLogging: true }),
   });
+
+  /** Hijacked SSE `reply.raw` responses — destroyed on daemon shutdown. */
+  const sseStreams = new Set<ServerResponse>();
+  const destroySseStreams = (): void => {
+    for (const raw of sseStreams) {
+      try {
+        raw.destroy();
+      } catch {
+        // already gone
+      }
+    }
+    sseStreams.clear();
+  };
 
   // JSON5 config writes arrive as text (§8.2 "JSON5 body").
   app.addContentTypeParser(
@@ -177,14 +199,20 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
 
     reply.hijack();
     const raw = reply.raw;
+    sseStreams.add(raw);
 
     let closed = false;
     let unsubscribe: (() => void) | null = null;
     let heartbeatTimer: NodeJS.Timeout | null = null;
+    let stallTimer: NodeJS.Timeout | null = null;
+    let drainWaiter: ((ok: boolean) => void) | null = null;
+    /** Serialize writes so live fan-out cannot interleave with drain waits. */
+    let writeChain: Promise<void> = Promise.resolve();
 
     const cleanup = (): void => {
       if (closed) return;
       closed = true;
+      sseStreams.delete(raw);
       if (unsubscribe !== null) {
         unsubscribe();
         unsubscribe = null;
@@ -192,6 +220,15 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       if (heartbeatTimer !== null) {
         clearTimeout(heartbeatTimer);
         heartbeatTimer = null;
+      }
+      if (stallTimer !== null) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+      if (drainWaiter !== null) {
+        const waiter = drainWaiter;
+        drainWaiter = null;
+        waiter(false);
       }
       try {
         raw.end();
@@ -219,48 +256,98 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       "x-accel-buffering": "no",
     });
 
-    const safeWrite = (chunk: string): boolean => {
+    const waitForDrain = (): Promise<boolean> =>
+      new Promise((resolve) => {
+        if (closed) {
+          resolve(false);
+          return;
+        }
+        const finish = (ok: boolean): void => {
+          if (stallTimer !== null) {
+            clearTimeout(stallTimer);
+            stallTimer = null;
+          }
+          drainWaiter = null;
+          raw.off("drain", onDrain);
+          resolve(ok && !closed);
+        };
+        const onDrain = (): void => finish(true);
+        drainWaiter = finish;
+        stallTimer = setTimeout(() => {
+          cleanup();
+        }, SSE_STALL_MS);
+        raw.once("drain", onDrain);
+      });
+
+    /**
+     * Write a chunk; on backpressure wait for `drain` (or drop the subscriber
+     * if the client stays stalled).
+     */
+    const safeWrite = async (chunk: string): Promise<boolean> => {
       if (closed) return false;
       try {
-        raw.write(chunk);
-        return true;
+        const ok = raw.write(chunk);
+        if (ok) return true;
+        return waitForDrain();
       } catch {
         cleanup();
         return false;
       }
     };
 
-    if (!safeWrite(`retry: 2000\n\n`)) {
-      return;
-    }
+    const enqueueWrite = (chunk: string): Promise<boolean> => {
+      const result = writeChain.then(
+        () => safeWrite(chunk),
+        () => safeWrite(chunk),
+      );
+      writeChain = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    };
 
-    const writeFrame = (envelope: { id: string; event: { type: string } }): void => {
-      safeWrite(
+    const writeFrame = (envelope: { id: string; event: { type: string } }): Promise<boolean> =>
+      enqueueWrite(
         `id: ${envelope.id}\nevent: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
       );
-    };
 
-    // Replay everything after the cursor, then go live.
-    const { events } = deps.store.eventsAfterId(cursor, 10_000);
-    for (const envelope of events) {
-      if (closed) break;
-      writeFrame(envelope);
-    }
-    if (closed) return;
+    void (async () => {
+      if (!(await enqueueWrite(`retry: 2000\n\n`))) return;
 
-    unsubscribe = deps.store.subscribe((envelope) => writeFrame(envelope));
-
-    // Heartbeat: cadence follows supervision.heartbeatSeconds live, so a
-    // hot-reloaded value is observable on the wire (§11 config gate).
-    const scheduleHeartbeat = (): void => {
+      // Replay every page after the cursor (truncated pages are continued)
+      // before switching to live subscribe so Last-Event-ID clients never skip.
+      let afterId: string | null = cursor;
+      for (;;) {
+        const page = deps.store.eventsAfterId(afterId, SSE_REPLAY_PAGE);
+        for (const envelope of page.events) {
+          if (closed) return;
+          if (!(await writeFrame(envelope))) return;
+        }
+        if (!page.truncated || page.events.length === 0) break;
+        const last = page.events[page.events.length - 1];
+        if (last === undefined) break;
+        afterId = last.id;
+      }
       if (closed) return;
-      const seconds = deps.config.config.supervision.heartbeatSeconds;
-      heartbeatTimer = setTimeout(() => {
-        if (!safeWrite(`: heartbeat ${seconds}s\n\n`)) return;
-        scheduleHeartbeat();
-      }, seconds * 1000);
-    };
-    scheduleHeartbeat();
+
+      unsubscribe = deps.store.subscribe((envelope) => {
+        void writeFrame(envelope);
+      });
+
+      // Heartbeat: cadence follows supervision.heartbeatSeconds live, so a
+      // hot-reloaded value is observable on the wire (§11 config gate).
+      const scheduleHeartbeat = (): void => {
+        if (closed) return;
+        const seconds = deps.config.config.supervision.heartbeatSeconds;
+        heartbeatTimer = setTimeout(() => {
+          void enqueueWrite(`: heartbeat ${seconds}s\n\n`).then((ok) => {
+            if (ok) scheduleHeartbeat();
+          });
+        }, seconds * 1000);
+      };
+      scheduleHeartbeat();
+    })();
   });
 
   app.get("/v1/config/effective", () => {
@@ -354,5 +441,5 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     }
   });
 
-  return app;
+  return Object.assign(app, { destroySseStreams });
 }
