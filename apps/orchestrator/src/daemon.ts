@@ -61,32 +61,35 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
   const home = options.home ?? resolveHome();
   const paths = ensureHome(home);
   const lock: HomeLock = acquireHomeLock(home);
-  const token = ensureDaemonToken(home);
-  const port = resolvePort(options.port);
-
-  const fileDestination = pino.destination({ dest: paths.logFile, mkdir: true, sync: false });
-  const streams: pino.StreamEntry[] = [{ level: "info", stream: fileDestination }];
-  if (options.stdout === true) {
-    streams.push({ level: "info", stream: process.stdout });
-  }
-  const logger = pino(
-    {
-      level: "info",
-      // No secrets in logs: bearer material is redacted, and the token value
-      // itself is never passed to the logger anywhere in this codebase.
-      redact: {
-        paths: ["req.headers.authorization", "headers.authorization"],
-        censor: "[REDACTED]",
-      },
-    },
-    pino.multistream(streams),
-  );
+  /** True until ownership is transferred to a returned RunningDaemon.close. */
+  let lockOwned = true;
 
   let store: EventStore | undefined;
   let config: ConfigService | undefined;
   let server: AgentosdServer | undefined;
 
   try {
+    const token = ensureDaemonToken(home);
+    const port = resolvePort(options.port);
+
+    const fileDestination = pino.destination({ dest: paths.logFile, mkdir: true, sync: false });
+    const streams: pino.StreamEntry[] = [{ level: "info", stream: fileDestination }];
+    if (options.stdout === true) {
+      streams.push({ level: "info", stream: process.stdout });
+    }
+    const logger = pino(
+      {
+        level: "info",
+        // No secrets in logs: bearer material is redacted, and the token value
+        // itself is never passed to the logger anywhere in this codebase.
+        redact: {
+          paths: ["req.headers.authorization", "headers.authorization"],
+          censor: "[REDACTED]",
+        },
+      },
+      pino.multistream(streams),
+    );
+
     const opened = EventStore.open(home);
     store = opened.store;
     if (opened.quarantinedTail !== null) {
@@ -128,6 +131,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const runningConfig = config;
     const runningServer = server;
     let closed = false;
+    lockOwned = false;
     return {
       home,
       port: boundPort,
@@ -140,20 +144,31 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       async close(reason = "shutdown", signal?: string) {
         if (closed) return;
         closed = true;
-        runningStore.append({
-          type: "daemon.stopping",
-          payload: { reason, signal: signal ?? null },
-        });
-        runningConfig.stop();
-        const closePromise = runningServer.close();
-        await new Promise<void>((resolve) => setTimeout(resolve, SSE_SHUTDOWN_GRACE_MS));
-        runningServer.destroySseStreams();
-        runningServer.server.closeAllConnections();
-        await closePromise;
-        runningStore.close();
-        lock.release();
-        logger.info({ reason }, "agentosd stopped");
-        fileDestination.flushSync();
+        try {
+          runningStore.append({
+            type: "daemon.stopping",
+            payload: { reason, signal: signal ?? null },
+          });
+          runningConfig.stop();
+          const closePromise = runningServer.close();
+          await new Promise<void>((resolve) => setTimeout(resolve, SSE_SHUTDOWN_GRACE_MS));
+          runningServer.destroySseStreams();
+          runningServer.server.closeAllConnections();
+          await closePromise;
+          logger.info({ reason }, "agentosd stopped");
+          fileDestination.flushSync();
+        } finally {
+          try {
+            runningStore.close();
+          } catch {
+            // best-effort
+          }
+          try {
+            lock.release();
+          } catch {
+            // best-effort
+          }
+        }
       },
     };
   } catch (error) {
@@ -172,7 +187,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     } catch {
       // best-effort
     }
-    lock.release();
     throw error;
+  } finally {
+    if (lockOwned) {
+      lock.release();
+    }
   }
 }
