@@ -16,6 +16,7 @@ import {
   resolveAll,
   resolveDomain,
   sha256,
+  type LayerFile,
   type LayerRejection,
 } from "./resolver.js";
 
@@ -41,6 +42,8 @@ export class ConfigService {
   private resolved: { config: AgentOsConfig; sources: Record<string, ConfigLayer> };
   private rejections: LayerRejection[] = [];
   private readonly appliedHashes = new Map<ConfigDomain, string>();
+  /** Last successfully applied global-layer raw/hash/value per domain. */
+  private readonly lastGoodGlobal = new Map<ConfigDomain, LayerFile>();
   private watcher: FSWatcher | null = null;
   private reloadTimer: NodeJS.Timeout | null = null;
   private sink: ConfigEventSink = () => undefined;
@@ -53,6 +56,7 @@ export class ConfigService {
     this.resolved = { config: result.config, sources: result.sources };
     this.rejections = result.rejections;
     this.recordAppliedHashes();
+    this.captureLastGoodFromDisk();
   }
 
   /** Wires the event sink (the daemon's event store) after construction. */
@@ -65,6 +69,24 @@ export class ConfigService {
       const file = safeLoad(this.globalDir, domain);
       if (file !== null) this.appliedHashes.set(domain, file.contentHash);
     }
+  }
+
+  private captureLastGoodFromDisk(): void {
+    for (const domain of CONFIG_DOMAINS) {
+      try {
+        const file = loadLayerFile(this.globalDir, domain);
+        if (file === null) continue;
+        if (this.validateGlobal(domain, file.value).length === 0) {
+          this.lastGoodGlobal.set(domain, file);
+        }
+      } catch {
+        // Invalid on disk — leave last-good empty until a valid write lands.
+      }
+    }
+  }
+
+  private rememberLastGood(domain: ConfigDomain, file: LayerFile): void {
+    this.lastGoodGlobal.set(domain, file);
   }
 
   /**
@@ -95,7 +117,9 @@ export class ConfigService {
         "",
       ].join("\n");
       writeFileSync(target, template, { mode: 0o600 });
-      this.appliedHashes.set(domain, sha256(template));
+      const contentHash = sha256(template);
+      this.appliedHashes.set(domain, contentHash);
+      this.rememberLastGood(domain, { value: {}, contentHash, raw: template });
       installed.push(domain);
     }
     if (installed.length > 0) {
@@ -127,10 +151,54 @@ export class ConfigService {
     }
   }
 
+  /**
+   * Re-resolves all domains from disk, falling back to the last-good global
+   * layer for any domain whose on-disk content is currently invalid so that
+   * retained overrides survive later reloads of other domains.
+   */
   private reload(): void {
-    const result = resolveAll({ shippedDir: this.shippedDir, globalDir: this.globalDir });
+    const globalOverrides: Partial<Record<ConfigDomain, unknown>> = {};
+    const retainedRejections: LayerRejection[] = [];
+
+    for (const domain of CONFIG_DOMAINS) {
+      try {
+        const file = loadLayerFile(this.globalDir, domain);
+        if (file === null) continue;
+        const issues = this.validateGlobal(domain, file.value);
+        if (issues.length > 0) {
+          retainedRejections.push({ domain, layer: "global", issues });
+          const lastGood = this.lastGoodGlobal.get(domain);
+          if (lastGood !== undefined) {
+            globalOverrides[domain] = lastGood.value;
+          }
+        } else {
+          this.rememberLastGood(domain, file);
+        }
+      } catch (error) {
+        retainedRejections.push({
+          domain,
+          layer: "global",
+          issues: [{ path: "", message: `JSON5 parse error: ${(error as Error).message}` }],
+        });
+        const lastGood = this.lastGoodGlobal.get(domain);
+        if (lastGood !== undefined) {
+          globalOverrides[domain] = lastGood.value;
+        }
+      }
+    }
+
+    const result = resolveAll({
+      shippedDir: this.shippedDir,
+      globalDir: this.globalDir,
+      globalOverrides,
+    });
     this.resolved = { config: result.config, sources: result.sources };
-    this.rejections = result.rejections;
+
+    const retainedDomains = new Set(retainedRejections.map((r) => r.domain));
+    this.rejections = [
+      ...retainedRejections,
+      ...result.rejections.filter((r) => !(r.layer === "global" && retainedDomains.has(r.domain))),
+    ];
   }
 
   /**
@@ -162,6 +230,7 @@ export class ConfigService {
     renameSync(tmp, target);
     const contentHash = sha256(json5Text);
     this.appliedHashes.set(domain, contentHash);
+    this.rememberLastGood(domain, { value, contentHash, raw: json5Text });
     this.reload();
     this.sink({
       type: "config.changed",
@@ -230,6 +299,7 @@ export class ConfigService {
         });
         continue;
       }
+      this.rememberLastGood(domain, file);
       this.reload();
       this.sink({
         type: "config.changed",

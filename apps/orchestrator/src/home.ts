@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -34,14 +34,27 @@ export function homePaths(home: string): HomePaths {
   };
 }
 
+function writeToken(tokenPath: string): void {
+  writeFileSync(tokenPath, randomBytes(32).toString("hex"), { mode: 0o600 });
+  chmodSync(tokenPath, 0o600);
+}
+
 /** Creates the home tree (0700) and the daemon bearer token (0600) if missing. */
 export function ensureHome(home: string): HomePaths {
   const paths = homePaths(home);
   for (const dir of [paths.home, paths.configDir, paths.eventsDir, paths.logsDir]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
   }
   if (!existsSync(paths.tokenPath)) {
-    writeFileSync(paths.tokenPath, randomBytes(32).toString("hex"), { mode: 0o600 });
+    writeToken(paths.tokenPath);
+  } else {
+    const existing = readFileSync(paths.tokenPath, "utf8").trim();
+    if (existing.length === 0) {
+      writeToken(paths.tokenPath);
+    } else {
+      chmodSync(paths.tokenPath, 0o600);
+    }
   }
   return paths;
 }

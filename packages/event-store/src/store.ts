@@ -82,8 +82,12 @@ export class EventStore {
     this.log.append(envelope);
     this.nextSeq += 1;
     this.projection.apply(envelope);
-    for (const listener of this.listeners) {
-      listener(envelope);
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(envelope);
+      } catch {
+        this.listeners.delete(listener);
+      }
     }
     return envelope;
   }

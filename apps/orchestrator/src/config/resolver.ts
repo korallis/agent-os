@@ -184,6 +184,11 @@ export interface ResolveAllOptions {
   projectDir?: string;
   projectPolicy?: ProjectLayerPolicy;
   taskOverrides?: Partial<Record<ConfigDomain, unknown>>;
+  /**
+   * When set for a domain, use this as the global layer instead of reading
+   * disk (last-good retention when on-disk content is currently invalid).
+   */
+  globalOverrides?: Partial<Record<ConfigDomain, unknown>>;
 }
 
 export interface ResolveAllResult {
@@ -206,15 +211,19 @@ export function resolveAll(options: ResolveAllOptions): ResolveAllResult {
 
     const layers: DomainLayerInputs = { shipped: shipped.value };
 
-    try {
-      const global = loadLayerFile(options.globalDir, domain);
-      if (global !== null) layers.global = global.value;
-    } catch (error) {
-      rejections.push({
-        domain,
-        layer: "global",
-        issues: [{ path: "", message: `JSON5 parse error: ${(error as Error).message}` }],
-      });
+    if (options.globalOverrides !== undefined && Object.hasOwn(options.globalOverrides, domain)) {
+      layers.global = options.globalOverrides[domain];
+    } else {
+      try {
+        const global = loadLayerFile(options.globalDir, domain);
+        if (global !== null) layers.global = global.value;
+      } catch (error) {
+        rejections.push({
+          domain,
+          layer: "global",
+          issues: [{ path: "", message: `JSON5 parse error: ${(error as Error).message}` }],
+        });
+      }
     }
 
     if (options.projectDir !== undefined) {

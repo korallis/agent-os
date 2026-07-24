@@ -48,6 +48,7 @@ function sendError(
 }
 
 function tokenMatches(provided: string, expected: string): boolean {
+  if (expected.length === 0) return false;
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
