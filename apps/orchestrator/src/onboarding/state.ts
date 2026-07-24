@@ -214,27 +214,31 @@ export class OnboardingService {
 
   setClaudeBilling(mode: ClaudeBillingMode): OnboardingState {
     const previous = this.state.step;
+    const detected = new Set(listDetectedProviders(this.home).map((p) => p.provider));
     this.state = {
       ...this.state,
       step: stepAtOrAdvance(this.state.step, "claude-billing"),
-      providers: this.state.providers.map((p) =>
-        p.provider === "anthropic"
-          ? {
-              ...p,
-              claudeBillingMode: mode,
-              claudeSdk:
-                mode === "subscription-sdk"
-                  ? (p.claudeSdk ?? {
-                      claudeCodeLogin: false,
-                      sdkInstalled: false,
-                      noAmbientApiKey: false,
-                      isolationDefaults: false,
-                      catalogHealthcheck: false,
-                    })
-                  : null,
-            }
-          : p,
-      ),
+      providers: this.state.providers.map((p) => {
+        if (p.provider !== "anthropic") return p;
+        const updated: OnboardingProviderChoice = {
+          ...p,
+          claudeBillingMode: mode,
+          claudeSdk:
+            mode === "subscription-sdk"
+              ? (p.claudeSdk ?? {
+                  claudeCodeLogin: false,
+                  sdkInstalled: false,
+                  noAmbientApiKey: false,
+                  isolationDefaults: false,
+                  catalogHealthcheck: false,
+                })
+              : null,
+        };
+        return {
+          ...updated,
+          authVerified: isAuthVerified(this.home, "anthropic", detected, updated),
+        };
+      }),
     };
     this.save(previous);
     return this.state;

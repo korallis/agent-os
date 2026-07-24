@@ -127,15 +127,33 @@ export function ProvidersPanel() {
     return () => clearInterval(id);
   }, []);
 
-  const connectApiKey = async (provider: string, apiKey: string) => {
+  const connectApiKey = async (provider: string, apiKey: string): Promise<boolean> => {
     setBusy(true);
+    setError(null);
     try {
-      await fetch("/api/agentos/connections/api-key", {
+      const res = await fetch("/api/agentos/connections/api-key", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ provider, apiKey }),
       });
+      if (!res.ok) {
+        let message = `api-key connect ${res.status}`;
+        try {
+          const body = (await res.json()) as { error?: { message?: string } };
+          if (typeof body.error?.message === "string" && body.error.message.length > 0) {
+            message = body.error.message;
+          }
+        } catch {
+          // keep status fallback
+        }
+        setError(message);
+        return false;
+      }
       setTick((t) => t + 1);
+      return true;
+    } catch {
+      setError("api-key connect failed");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -345,10 +363,14 @@ export function ProvidersPanel() {
                       className="flex flex-col gap-2"
                       onSubmit={(e) => {
                         e.preventDefault();
-                        const fd = new FormData(e.currentTarget);
+                        const form = e.currentTarget;
+                        const fd = new FormData(form);
                         const key = String(fd.get("key") ?? "");
-                        if (key.length > 0) void connectApiKey(provider, key);
-                        e.currentTarget.reset();
+                        if (key.length > 0) {
+                          void connectApiKey(provider, key).then((ok) => {
+                            if (ok) form.reset();
+                          });
+                        }
                       }}
                     >
                       <input
