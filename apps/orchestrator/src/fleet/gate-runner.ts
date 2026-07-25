@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ValidationConfig } from "@agent-os/protocol";
+import { scrubEnv } from "../security/env-scrub.js";
 
 export type GateOutcome = "PASS" | "FAIL" | "GATE_ERROR" | "EXPECTED_RED";
 
@@ -13,6 +14,34 @@ export interface GateRunResult {
   outputHash: string;
   durationMs: number;
   failLines: string[];
+}
+
+/**
+ * Minimal allowlist env for gate subprocesses. Brain-authored gates are untrusted
+ * code on the Captain's machine — never inherit provider keys or the daemon env.
+ */
+export function buildGateEnv(
+  parent: NodeJS.ProcessEnv,
+  target: "baseline" | "candidate",
+): Record<string, string> {
+  const extraAllow: Record<string, string> = {
+    AGENTOS_GATE_TARGET: target,
+  };
+  // uv run needs its cache dir when present; still no secrets.
+  if (parent.UV_CACHE_DIR !== undefined && parent.UV_CACHE_DIR.length > 0) {
+    extraAllow.UV_CACHE_DIR = parent.UV_CACHE_DIR;
+  }
+  if (
+    parent.UV_PYTHON_INSTALL_DIR !== undefined &&
+    parent.UV_PYTHON_INSTALL_DIR.length > 0
+  ) {
+    extraAllow.UV_PYTHON_INSTALL_DIR = parent.UV_PYTHON_INSTALL_DIR;
+  }
+  return scrubEnv(parent, {
+    grantProviderKey: null,
+    extraAllow,
+    assertSingle: false,
+  }).env;
 }
 
 /**
@@ -52,9 +81,11 @@ export class GateRunner {
     target: "baseline" | "candidate";
     cwd: string;
     expectedRed?: boolean;
+    /** Override gate language for this run (tests / explicit authoring). */
+    language?: "py" | "ts";
   }): GateRunResult {
     const dir = this.gateWorkspace(input.taskId);
-    const language = this.config.gateLanguage;
+    const language = input.language ?? this.config.gateLanguage;
     const gateFile = language === "py" ? join(dir, "gate.py") : join(dir, "gate.ts");
 
     if (!existsSync(gateFile)) {
@@ -70,6 +101,7 @@ export class GateRunner {
     let stdout = "";
     let stderr = "";
     let status = 0;
+    const gateEnv = buildGateEnv(process.env, input.target);
 
     if (process.env.AGENTOS_FAKE_GATE === "1") {
       const forced = process.env.AGENTOS_FAKE_GATE_OUTCOME as GateOutcome | undefined;
@@ -88,7 +120,7 @@ export class GateRunner {
           cwd: input.cwd,
           encoding: "utf8",
           timeout: this.config.gateTimeoutSeconds * 1000,
-          env: { ...process.env, AGENTOS_GATE_TARGET: input.target },
+          env: gateEnv,
         },
       );
       status = uv.status ?? 1;
@@ -112,7 +144,7 @@ export class GateRunner {
           cwd: input.cwd,
           encoding: "utf8",
           timeout: this.config.gateTimeoutSeconds * 1000,
-          env: { ...process.env, AGENTOS_GATE_TARGET: input.target },
+          env: gateEnv,
         },
       );
       status = node.status ?? 1;

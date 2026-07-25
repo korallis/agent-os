@@ -192,7 +192,10 @@ export class FleetService {
       case "session_end":
         // Fast path for extension-driven end: settle cleanly when still live.
         // SIGKILL / pane death without session_end is handled by reconcileDeadPanes.
+        // Release the worktree lease the same way stop_crewmate does so normal
+        // settle-and-exit does not exhaust the pool.
         this.tools.markSessionStatus(frame.sessionId, "settled");
+        this.tools.releaseSessionOnEnd(frame.sessionId);
         void this.options.sockets?.closeSession(frame.sessionId).catch(() => undefined);
         break;
       case "session_start":

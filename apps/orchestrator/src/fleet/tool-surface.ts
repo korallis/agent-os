@@ -624,20 +624,29 @@ export class ToolSurface {
    */
   private releaseOneWorktreeLease(
     leaseId: string,
-    options: { forceQuarantine?: boolean } = {},
+    options: { forceQuarantine?: boolean; finalSha?: string } = {},
   ): void {
     const lease = this.deps.worktrees.list().find((l) => l.id === leaseId);
     if (lease === undefined) return;
     const owningTaskId = lease.taskId;
+    const releasedPath = lease.path;
     let result;
     try {
-      result = this.deps.worktrees.release(
-        leaseId,
-        options.forceQuarantine === true ? { forceQuarantine: true } : {},
-      );
+      result = this.deps.worktrees.release(leaseId, {
+        ...(options.forceQuarantine === true ? { forceQuarantine: true } : {}),
+        ...(options.finalSha !== undefined ? { finalSha: options.finalSha } : {}),
+      });
     } catch {
       // best-effort — do not block stop/lost/cancel on a reclaim race
       return;
+    }
+    // Only clear path refs when the tree returns to idle (verified-reset). Idle
+    // trees may be re-issued; keeping refs would make DONE cleanliness checks
+    // judge a path owned by a different task. Quarantined trees stay associated
+    // so deliver_task can still refuse against the preserved dirty path after
+    // Captain clears deliveryBlocked.
+    if (result.state === "idle") {
+      this.clearWorktreePathRefs(releasedPath);
     }
     if (result.state !== "quarantined" || owningTaskId === null) return;
     const task = this.tasks.get(owningTaskId);
@@ -648,6 +657,45 @@ export class ToolSurface {
       result.quarantineReason ??
       "worktree quarantined on release; uncommitted builder work preserved";
     this.blockDelivery(task, leaseId, reason, dirtyPaths);
+  }
+
+  /**
+   * When a lease is released, clear task.worktreePath / session.worktreePath that
+   * still point at that path. Prevents idle reuse from leaving non-terminal tasks
+   * associated with a tree owned by a different lease/task.
+   */
+  private clearWorktreePathRefs(worktreePath: string): void {
+    const target = resolve(worktreePath);
+    for (const [sessionId, session] of this.sessions) {
+      if (session.worktreePath === null) continue;
+      if (resolve(session.worktreePath) !== target) continue;
+      this.sessions.set(sessionId, { ...session, worktreePath: null });
+    }
+    for (const task of this.tasks.values()) {
+      if (isTerminalPhase(task.phase)) {
+        // Terminal tasks keep historical paths for audit; they no longer drive
+        // delivery cleanliness against live pool state.
+        continue;
+      }
+      let changed = false;
+      let worktreePathField = task.worktreePath;
+      if (worktreePathField !== null && resolve(worktreePathField) === target) {
+        worktreePathField = null;
+        changed = true;
+      }
+      const sessions = task.sessions.map((s) => {
+        if (s.worktreePath === null || resolve(s.worktreePath) !== target) return s;
+        changed = true;
+        return { ...s, worktreePath: null };
+      });
+      if (!changed) continue;
+      this.saveTask({
+        ...task,
+        worktreePath: worktreePathField,
+        sessions,
+        updatedAt: new Date().toISOString(),
+      });
+    }
   }
 
   private readDirtyPaths(worktreePath: string): string[] {
@@ -966,12 +1014,17 @@ export class ToolSurface {
       };
       this.sessions.set(sessionId, fleetSession);
 
+      // task.worktreePath is the builder/delivery tree only — scout/planner/etc.
+      // must not clobber the path run_gate(candidate) and deliver_task depend on.
       task = {
         ...task,
         sessions: [...task.sessions.filter((s) => s.sessionId !== sessionId), taskSession],
         worktreePath:
-          leaseId !== null ? (worktreePath ?? task.worktreePath) : task.worktreePath,
-        branch: branch ?? task.branch,
+          input.role === "builder" && worktreePath !== null
+            ? worktreePath
+            : task.worktreePath,
+        branch:
+          input.role === "builder" && branch !== null ? branch : task.branch,
         updatedAt: now,
       };
 
@@ -1033,7 +1086,9 @@ export class ToolSurface {
     void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId: input.sessionId });
     const now = new Date().toISOString();
-    this.sessions.set(input.sessionId, { ...session, status: "stopped" });
+    // Re-read after release so cleared worktreePath refs are not re-stamped.
+    const released = this.sessions.get(input.sessionId) ?? session;
+    this.sessions.set(input.sessionId, { ...released, status: "stopped" });
     if (session.taskId !== null) {
       const task = this.tasks.get(session.taskId);
       if (task !== undefined) {
@@ -1153,10 +1208,27 @@ export class ToolSurface {
     }
 
     const project = this.deps.projects.get(task.projectId);
-    const cwd =
-      input.target === "baseline"
-        ? this.deps.gates.gateWorkspace(task.id)
-        : (task.worktreePath ?? project?.path ?? this.deps.home);
+    let cwd: string;
+    if (input.target === "baseline") {
+      cwd = this.deps.gates.gateWorkspace(task.id);
+    } else {
+      // Candidate gates never run in the Captain's primary checkout — same
+      // isolation rule as spawn_crewmate.
+      const builderPath = this.resolveBuilderWorktreePath(task);
+      if (builderPath === null) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `run_gate(candidate) requires an isolated builder worktree for task ${task.id}; none is associated`,
+        );
+      }
+      if (project !== null && resolve(builderPath) === resolve(project.path)) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `run_gate(candidate) refusing Captain's primary checkout for task ${task.id}`,
+        );
+      }
+      cwd = builderPath;
+    }
 
     const result = this.deps.gates.run({
       taskId: task.id,
@@ -1490,7 +1562,8 @@ export class ToolSurface {
         );
       }
       const now = new Date().toISOString();
-      this.sessions.set(session.sessionId, { ...session, status: "stopped" });
+      const current = this.sessions.get(session.sessionId) ?? session;
+      this.sessions.set(session.sessionId, { ...current, status: "stopped" });
       const task = this.tasks.get(taskId);
       if (task !== undefined) {
         this.saveTask({
@@ -1549,7 +1622,7 @@ export class ToolSurface {
     // delivery.json is written only after every lease clears the clean gate.
     for (const lease of this.deps.worktrees.list().filter((l) => l.taskId === task.id)) {
       if (process.env.AGENTOS_FAKE_GIT === "1") {
-        this.deps.worktrees.release(lease.id, {});
+        this.releaseOneWorktreeLease(lease.id);
         continue;
       }
 
@@ -1599,7 +1672,7 @@ export class ToolSurface {
         const sha = rev.stdout.trim();
         if (sha.length > 0) finalSha = sha;
       }
-      this.deps.worktrees.release(
+      this.releaseOneWorktreeLease(
         lease.id,
         finalSha !== undefined ? { finalSha } : {},
       );
@@ -1960,9 +2033,10 @@ export class ToolSurface {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
     if (session.status === "lost" || session.status === "stopped") return;
-    this.sessions.set(sessionId, { ...session, status: "lost" });
     void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId });
+    const released = this.sessions.get(sessionId) ?? session;
+    this.sessions.set(sessionId, { ...released, status: "lost" });
     this.sink({
       type: "session.lost",
       payload: { sessionId, taskId: session.taskId, reason },
@@ -1990,6 +2064,39 @@ export class ToolSurface {
         this.saveTask(withSession);
       }
     }
+  }
+
+  /**
+   * Clean Pi exit (ext.lifecycle session_end): release the worktree lease so
+   * settle-and-exit does not exhaust the pool. Reuses the shared release helper
+   * (verified-reset when clean, quarantine + deliveryBlocked when dirty).
+   */
+  releaseSessionOnEnd(sessionId: string): void {
+    this.releaseWorktreeLeases({ sessionId });
+  }
+
+  /**
+   * Builder/delivery worktree for candidate gates. Prefer a live builder session
+   * path, then task.worktreePath (builder-only field). Never the primary checkout.
+   */
+  private resolveBuilderWorktreePath(task: TaskSnapshot): string | null {
+    const liveBuilders = [...this.sessions.values()].filter(
+      (s) =>
+        s.taskId === task.id &&
+        s.role === "builder" &&
+        s.worktreePath !== null &&
+        s.status !== "stopped" &&
+        s.status !== "lost",
+    );
+    if (liveBuilders.length > 0) {
+      const path = liveBuilders[liveBuilders.length - 1]!.worktreePath;
+      if (path !== null) return path;
+    }
+    if (task.worktreePath !== null) return task.worktreePath;
+    const fromHistory = [...task.sessions]
+      .reverse()
+      .find((s) => s.role === "builder" && s.worktreePath !== null);
+    return fromHistory?.worktreePath ?? null;
   }
 }
 

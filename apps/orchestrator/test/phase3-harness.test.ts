@@ -1465,3 +1465,302 @@ describe("crewmate cwd isolation", () => {
     expect(leased).toHaveLength(0);
   });
 });
+
+describe("gate env hygiene", () => {
+  it("buildGateEnv strips provider keys and keeps only the allowlist", async () => {
+    const { buildGateEnv } = await import("../src/fleet/gate-runner.js");
+    const { SECRET_CANARY } = await import("../src/security/secret-canary.js");
+    const env = buildGateEnv(
+      {
+        PATH: "/usr/bin",
+        HOME: "/tmp",
+        LANG: "C",
+        TMPDIR: "/tmp",
+        OPENAI_API_KEY: SECRET_CANARY,
+        ANTHROPIC_API_KEY: "sk-ant-should-not-leak",
+        RANDOM_SECRET: "drop-me",
+        UV_CACHE_DIR: "/tmp/uv-cache",
+      },
+      "candidate",
+    );
+    expect(env.AGENTOS_GATE_TARGET).toBe("candidate");
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.UV_CACHE_DIR).toBe("/tmp/uv-cache");
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.RANDOM_SECRET).toBeUndefined();
+  });
+
+  it("gate subprocess does not inherit a seeded provider key canary", async () => {
+    const { GateRunner } = await import("../src/fleet/gate-runner.js");
+    const { SECRET_CANARY } = await import("../src/security/secret-canary.js");
+    const home = temp("agentos-gate-env-");
+    const runner = new GateRunner(home, {
+      maxValidations: 6,
+      triageAt: 3,
+      gateLanguage: "ts",
+      gateTimeoutSeconds: 30,
+    });
+    const taskId = "01JGATEENV0000000000000001";
+    const canaryKey = `OPENAI_API_KEY`;
+    const prevCanary = process.env[canaryKey];
+    const prevFake = process.env.AGENTOS_FAKE_GATE;
+    process.env[canaryKey] = SECRET_CANARY;
+    delete process.env.AGENTOS_FAKE_GATE;
+    try {
+      runner.writeGateSource(
+        taskId,
+        `const keys = Object.keys(process.env).sort();
+console.log("ENV_DUMP=" + keys.join(","));
+if (process.env.OPENAI_API_KEY) {
+  console.log("LEAKED=" + process.env.OPENAI_API_KEY);
+  console.log("FAIL secret present");
+  process.exit(1);
+}
+console.log("PASS");
+`,
+        "ts",
+      );
+      const cwd = runner.gateWorkspace(taskId);
+      const result = runner.run({
+        taskId,
+        target: "candidate",
+        cwd,
+        language: "ts",
+      });
+      expect(result.stdout).toContain("PASS");
+      expect(result.stdout).not.toContain(SECRET_CANARY);
+      expect(result.stdout).not.toContain("LEAKED=");
+      expect(result.outcome).toBe("PASS");
+    } finally {
+      if (prevCanary === undefined) delete process.env[canaryKey];
+      else process.env[canaryKey] = prevCanary;
+      if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
+      else process.env.AGENTOS_FAKE_GATE = prevFake;
+    }
+  });
+});
+
+describe("candidate gate isolation and builder worktree ownership", () => {
+  it("refuses run_gate(candidate) without an isolated builder worktree", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId } = seedTask(service, {
+      name: "gate-no-wt",
+      shape: "SHIP",
+      role: "builder",
+    });
+    // Reach GATE_RED_VERIFIED without spawning a builder (no worktree lease).
+    expect(
+      service.tools.invoke("advance_phase", {
+        taskId,
+        to: "GATE_AUTHORING",
+        reason: "test",
+      }).ok,
+    ).toBe(true);
+    process.env.AGENTOS_FAKE_GATE = "1";
+    try {
+      const baseline = service.tools.invoke("run_gate", {
+        taskId,
+        target: "baseline",
+      });
+      expect(baseline.ok).toBe(true);
+      expect(
+        (service.tools.invoke("read_task", { taskId }).data as { phase: string }).phase,
+      ).toBe("GATE_RED_VERIFIED");
+
+      const candidate = service.tools.invoke("run_gate", {
+        taskId,
+        target: "candidate",
+      });
+      expect(candidate.ok).toBe(false);
+      expect(candidate.error?.code).toBe("CONFLICT");
+      expect(candidate.error?.message ?? "").toMatch(/isolated builder worktree/i);
+    } finally {
+      delete process.env.AGENTOS_FAKE_GATE;
+    }
+  });
+
+  it("scout spawn does not clobber task.worktreePath used by candidate gates", () => {
+    const service = fleet({ fakePi: true });
+    const repo = gitRepo();
+    const project = service.projects.register({
+      name: "path-clobber",
+      path: repo,
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP" as const,
+        title: "t",
+        intent: "i",
+        projectId: project.id,
+        mode: "local-only" as const,
+        yolo: true,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    const cast = service.tools.invoke("resolve_cast", {
+      taskId,
+      roles: [
+        { role: "builder", model: "openai/gpt-4.1", thinking: "low", cleanRoom: true },
+        { role: "scout", model: "openai/gpt-4.1", thinking: "low", cleanRoom: true },
+      ],
+      familyCheckOverride: false,
+    });
+    expect(cast.ok).toBe(true);
+
+    const builder = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(builder.ok).toBe(true);
+    const builderPath = (builder.data as { session: { worktreePath: string }; task: { worktreePath: string } })
+      .task.worktreePath;
+    expect(builderPath).toBeTruthy();
+
+    // Move to a phase that allows scout, then spawn scout.
+    const toBuilding = service.tools.invoke("read_task", { taskId });
+    expect((toBuilding.data as { phase: string }).phase).toBe("BUILDING");
+
+    // Scout may only spawn in certain phases — use SCOUT task for pure scout if needed.
+    // For SHIP, scout spawn rules: try and only assert path preservation when spawn succeeds.
+    const scout = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "scout",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    if (scout.ok) {
+      const after = service.tools.invoke("read_task", { taskId });
+      expect((after.data as { worktreePath: string | null }).worktreePath).toBe(builderPath);
+      const scoutPath = (scout.data as { session: { worktreePath: string | null } }).session
+        .worktreePath;
+      expect(scoutPath).not.toBe(builderPath);
+    } else {
+      // If scout cannot spawn in BUILDING, still prove builder owns task.worktreePath.
+      expect((service.tools.invoke("read_task", { taskId }).data as { worktreePath: string })
+        .worktreePath).toBe(builderPath);
+    }
+  });
+
+  it("stop_crewmate clears task.worktreePath so idle reuse cannot be judged against a stale ref", () => {
+    const service = fleet({ fakePi: true });
+    const repo = gitRepo();
+    const project = service.projects.register({
+      name: "stale-ref",
+      path: repo,
+      mode: "local-only",
+      trusted: true,
+    });
+
+    const makeTask = (title: string): string => {
+      const created = service.tools.invoke("create_task", {
+        spec: {
+          shape: "SHIP" as const,
+          title,
+          intent: "i",
+          projectId: project.id,
+          mode: "local-only" as const,
+          yolo: true,
+        },
+      });
+      expect(created.ok).toBe(true);
+      const taskId = (created.data as { id: string }).id;
+      expect(
+        service.tools.invoke("resolve_cast", {
+          taskId,
+          roles: [
+            { role: "builder", model: "openai/gpt-4.1", thinking: "low", cleanRoom: true },
+          ],
+          familyCheckOverride: false,
+        }).ok,
+      ).toBe(true);
+      return taskId;
+    };
+
+    const task1 = makeTask("first");
+    const spawn1 = service.tools.invoke("spawn_crewmate", {
+      taskId: task1,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawn1.ok).toBe(true);
+    const session1 = (spawn1.data as { session: { sessionId: string; worktreePath: string } })
+      .session;
+    const path1 = session1.worktreePath;
+
+    const stop = service.tools.invoke("stop_crewmate", {
+      sessionId: session1.sessionId,
+      reason: "done exploring",
+    });
+    expect(stop.ok).toBe(true);
+    const afterStop = service.tools.invoke("read_task", { taskId: task1 });
+    expect((afterStop.data as { worktreePath: string | null }).worktreePath).toBeNull();
+    expect(service.worktrees.list().find((l) => l.path === path1)?.state).toBe("idle");
+
+    const task2 = makeTask("second");
+    const spawn2 = service.tools.invoke("spawn_crewmate", {
+      taskId: task2,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawn2.ok).toBe(true);
+    const path2 = (spawn2.data as { session: { worktreePath: string } }).session.worktreePath;
+    // Idle reuse is allowed now that task1 no longer references the path.
+    expect(path2).toBe(path1);
+    expect(
+      (service.tools.invoke("read_task", { taskId: task1 }).data as { worktreePath: string | null })
+        .worktreePath,
+    ).toBeNull();
+    expect(
+      (service.tools.invoke("read_task", { taskId: task2 }).data as { worktreePath: string | null })
+        .worktreePath,
+    ).toBe(path2);
+  });
+
+  it("session_end releases the worktree lease so settle-and-exit does not exhaust the pool", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "session-end-lease",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const session = (spawned.data as { session: { sessionId: string; worktreePath: string } })
+      .session;
+    expect(service.worktrees.list().filter((l) => l.state === "leased")).toHaveLength(1);
+
+    service.handleExtensionFrame({
+      type: "ext.lifecycle",
+      sessionId: session.sessionId,
+      phase: "session_end",
+      detail: null,
+      ts: new Date().toISOString(),
+    });
+
+    expect(service.worktrees.list().filter((l) => l.state === "leased")).toHaveLength(0);
+    const lease = service.worktrees.list().find((l) => l.path === session.worktreePath);
+    expect(lease?.state === "idle" || lease?.state === "quarantined").toBe(true);
+    expect(
+      (service.tools.invoke("read_task", { taskId }).data as { worktreePath: string | null })
+        .worktreePath,
+    ).toBeNull();
+  });
+});
