@@ -16,6 +16,10 @@
  * "no dropped frames" criterion has to rule out.
  *
  * Usage: node tooling/gates/phase-6-terminal.mjs
+ *
+ * Stream window for T1 defaults to 600_000 ms (the measured 10-minute soak).
+ * Set AGENTOS_TERMINAL_SOAK_MS to a shorter value for local iteration; CI uses
+ * the real duration so a product that only emits a brief initial capture fails.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -29,6 +33,10 @@ const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.j
 const TMUX_SOCKET = `agentos-p6t-${process.pid}`;
 const PORT = 4700 + 1100 + Math.floor(Math.random() * 40);
 const BASE = `http://127.0.0.1:${PORT}`;
+const DEFAULT_SOAK_MS = 600_000;
+const parsedSoak = Number(process.env.AGENTOS_TERMINAL_SOAK_MS);
+const SOAK_MS =
+  Number.isFinite(parsedSoak) && parsedSoak > 0 ? parsedSoak : DEFAULT_SOAK_MS;
 
 const results = [];
 function gate(id, name, ok, detail) {
@@ -39,6 +47,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const cleanups = [];
 let daemon;
+let exitCode = 1;
 
 try {
   const home = mkdtempSync(join(tmpdir(), "agentos-p6t-home-"));
@@ -184,15 +193,15 @@ try {
     sawContent &&
     (paneChanges ? contiguous(seqs) : seqs.length === 1 || contiguous(seqs));
 
-  const first = await streamFor(6000);
+  const first = await streamFor(SOAK_MS);
   gate(
     "T1",
     "frames are sequenced from 1 with real pane content, and every frame received is contiguous",
     streamOk(first.seqs, first.sawContent),
-    `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${paneChanges ? contiguous(first.seqs) : first.seqs.length === 1 ? "n/a (pane did not change)" : contiguous(first.seqs)} content=${first.sawContent} paneTickerStarted=${paneChanges}`,
+    `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${paneChanges ? contiguous(first.seqs) : first.seqs.length === 1 ? "n/a (pane did not change)" : contiguous(first.seqs)} content=${first.sawContent} paneTickerStarted=${paneChanges} soakMs=${SOAK_MS}`,
   );
 
-  const second = await streamFor(4000);
+  const second = await streamFor(Math.min(4_000, SOAK_MS));
   gate(
     "T2",
     "a reconnect resumes the same pane and restarts its own numbering at 1",
@@ -215,10 +224,10 @@ try {
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} gates passed`);
-  process.exit(failed.length === 0 ? 0 : 1);
+  exitCode = failed.length === 0 ? 0 : 1;
 } catch (error) {
   console.error(error);
-  process.exit(1);
+  exitCode = 1;
 } finally {
   try {
     daemon?.kill("SIGTERM");
@@ -234,3 +243,5 @@ try {
     }
   }
 }
+
+process.exit(exitCode);

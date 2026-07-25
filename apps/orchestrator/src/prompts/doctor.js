@@ -1,0 +1,41 @@
+export function runConfigDoctor(prompts, projectDir) {
+    const templates = prompts.list(projectDir).map((info) => {
+        const needsDecision = info.customized && info.upstreamChanged;
+        return {
+            ref: info.ref,
+            layer: info.layer,
+            customized: info.customized,
+            upstreamChanged: info.upstreamChanged,
+            needsDecision,
+        };
+    });
+    return {
+        templates,
+        customizedCount: templates.filter((t) => t.customized).length,
+        upstreamChangedCount: templates.filter((t) => t.upstreamChanged).length,
+        needsDecisionCount: templates.filter((t) => t.needsDecision).length,
+    };
+}
+/** Human-readable lines for the CLI. Silent when nothing has drifted. */
+export function formatConfigDoctor(report) {
+    const lines = [];
+    if (report.customizedCount === 0 && report.upstreamChangedCount === 0) {
+        lines.push("config doctor: no prompt templates have drifted from shipped defaults");
+        return lines;
+    }
+    lines.push(`config doctor: ${report.customizedCount} customized, ${report.upstreamChangedCount} with upstream updates, ${report.needsDecisionCount} needing a decision`);
+    for (const template of report.templates) {
+        if (!template.customized && !template.upstreamChanged)
+            continue;
+        const marks = [];
+        if (template.customized)
+            marks.push("customized");
+        if (template.upstreamChanged)
+            marks.push("upstream-updated");
+        lines.push(`  ${template.needsDecision ? "!" : "·"} ${template.ref} (${template.layer}) — ${marks.join(", ")}`);
+    }
+    if (report.needsDecisionCount > 0) {
+        lines.push("  ! = your edit and an upstream change — review the three-way diff before upgrading; upgrade never overwrites your copy");
+    }
+    return lines;
+}

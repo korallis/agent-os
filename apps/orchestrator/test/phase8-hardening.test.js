@@ -1,0 +1,607 @@
+import { generateKeyPairSync, sign as signPayload } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { ConfigService } from "../src/config/service.js";
+import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
+import { AfkService } from "../src/fleet/afk.js";
+import { decideHandoff } from "../src/fleet/brain-handoff.js";
+import { FleetService } from "../src/fleet/service.js";
+import { familyFromModel } from "../src/substrate/family.js";
+import { SelfUpdater } from "../src/update/self-update.js";
+const temps = [];
+function temp(prefix) {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    temps.push(dir);
+    return dir;
+}
+afterEach(() => {
+    for (const dir of temps.splice(0)) {
+        try {
+            rmSync(dir, { recursive: true, force: true });
+        }
+        catch {
+            // best-effort
+        }
+    }
+});
+describe("/afk autonomy posture", () => {
+    const faq = [
+        {
+            match: ["bump", "zod"],
+            answer: "Yes — patch and minor bumps are pre-approved.",
+            rationale: "Captain pre-approved dependency patch/minor bumps",
+        },
+    ];
+    it("answers only what the Captain pre-decided", () => {
+        const afk = new AfkService(temp("agentos-p8-afk-"));
+        afk.arm({ faq });
+        const matched = afk.tryAnswer("OK to bump zod 4.1 to 4.2?");
+        expect(matched?.answer).toContain("pre-approved");
+        expect(matched?.rationale).toContain("Captain pre-approved");
+        // The critical property: anything not pre-decided is NOT auto-answered.
+        expect(afk.tryAnswer("Should I delete the production database?")).toBeNull();
+    });
+    it("does nothing at all while disarmed", () => {
+        const afk = new AfkService(temp("agentos-p8-afk-off-"));
+        afk.arm({ faq });
+        afk.disarm();
+        expect(afk.tryAnswer("OK to bump zod 4.1 to 4.2?")).toBeNull();
+    });
+    it("treats an expired posture as off", () => {
+        const afk = new AfkService(temp("agentos-p8-afk-exp-"));
+        afk.arm({ faq, untilIso: new Date(Date.now() - 1000).toISOString() });
+        expect(afk.isActive()).toBe(false);
+        expect(afk.tryAnswer("OK to bump zod 4.1 to 4.2?")).toBeNull();
+    });
+    it("counts answered and escalated separately", () => {
+        const afk = new AfkService(temp("agentos-p8-afk-count-"));
+        afk.arm({ faq });
+        afk.tryAnswer("bump zod please");
+        afk.tryAnswer("something entirely unrelated");
+        const state = afk.state();
+        expect(state.answered).toBe(1);
+        expect(state.escalated).toBe(1);
+    });
+});
+describe("Brain budget handoff", () => {
+    const config = {
+        cast: "auto",
+        thinking: "high",
+        preferenceOrder: ["anthropic via claude-oauth"],
+        handoff: { thresholdPct: 80, target: "same-family-api-key" },
+        respawnBlocked: false,
+    };
+    const budgets = {
+        perTaskUsd: 5,
+        claudeExtraUsageDailyUsd: 10,
+        brainTokensPerDay: 1_000_000,
+        gatewayHardUsd: 25,
+    };
+    const sample = (pct, tier = "live") => ({
+        id: "01JQUOTA000000000000000000",
+        connectionId: "01JCONN00000000000000000AA",
+        provider: "anthropic",
+        metrics: [
+            {
+                kind: "weekly-window-pct",
+                value: pct,
+                unit: "percent",
+                tier,
+                source: "OAUTH",
+                syncedAt: new Date().toISOString(),
+                reason: null,
+                resetsAt: null,
+                limitReached: pct >= 100,
+            },
+        ],
+        sampledAt: new Date().toISOString(),
+    });
+    it("does not hand off below the threshold", () => {
+        const decision = decideHandoff({
+            brainModel: "anthropic/claude-fable-5",
+            brainConnectionId: "01JCONN00000000000000000AA",
+            config,
+            budgets,
+            samples: [sample(42)],
+            candidates: [{ model: "anthropic/claude-sonnet-4-5", worstWindowPct: null }],
+        });
+        expect(decision.shouldHandoff).toBe(false);
+        expect(decision.observedPct).toBe(42);
+    });
+    it("hands off at the threshold, preferring the same family", () => {
+        const decision = decideHandoff({
+            brainModel: "anthropic/claude-fable-5",
+            brainConnectionId: "01JCONN00000000000000000AA",
+            config,
+            budgets,
+            samples: [sample(80)],
+            candidates: [
+                { model: "openai/gpt-5.6-sol", worstWindowPct: null },
+                { model: "anthropic/claude-sonnet-4-5", worstWindowPct: null },
+            ],
+        });
+        expect(decision.shouldHandoff).toBe(true);
+        expect(decision.toModel).toBe("anthropic/claude-sonnet-4-5");
+        expect(decision.thresholdPct).toBe(80);
+    });
+    it("hands Anthropic OAuth Brain off to OpenRouter-qualified Sonnet", () => {
+        // Default same-family refuge: openrouter/anthropic/… must not collapse to
+        // the bare anthropic/… string the OAuth Brain already uses.
+        expect(familyFromModel("openrouter/anthropic/claude-sonnet-4-5")).toBe("anthropic");
+        expect(familyFromModel("vercel-ai-gateway/anthropic/claude-sonnet-4-5")).toBe("anthropic");
+        const decision = decideHandoff({
+            brainModel: "anthropic/claude-sonnet-4-5",
+            brainConnectionId: "01JCONN00000000000000000AA",
+            config,
+            budgets,
+            samples: [sample(93)],
+            candidates: [
+                { model: "openrouter/anthropic/claude-sonnet-4-5", worstWindowPct: null },
+            ],
+        });
+        expect(decision.shouldHandoff).toBe(true);
+        expect(decision.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+    });
+    it("prefers an under-threshold refuge over an over-threshold same-family one", () => {
+        const decision = decideHandoff({
+            brainModel: "anthropic/claude-sonnet-4-5",
+            brainConnectionId: "01JCONN00000000000000000AA",
+            config,
+            budgets,
+            samples: [sample(93)],
+            candidates: [
+                { model: "openrouter/anthropic/claude-sonnet-4-5", worstWindowPct: 91 },
+                { model: "xai/grok-3", worstWindowPct: 10 },
+            ],
+        });
+        expect(decision.shouldHandoff).toBe(true);
+        expect(decision.toModel).toBe("xai/grok-3");
+        expect(decision.reason).not.toContain("only over-threshold refuge");
+    });
+    it("falls back to an over-threshold refuge only as a last resort", () => {
+        const decision = decideHandoff({
+            brainModel: "anthropic/claude-sonnet-4-5",
+            brainConnectionId: "01JCONN00000000000000000AA",
+            config,
+            budgets,
+            samples: [sample(93)],
+            candidates: [
+                { model: "openrouter/anthropic/claude-sonnet-4-5", worstWindowPct: 91 },
+                { model: "xai/grok-3", worstWindowPct: 88 },
+            ],
+        });
+        expect(decision.shouldHandoff).toBe(true);
+        expect(decision.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+        expect(decision.reason).toContain("only over-threshold refuge available");
+    });
+    function fleetConnections(now) {
+        const conn = (id, provider, family) => ({
+            id,
+            kind: "pi-api-key",
+            provider,
+            label: provider,
+            family,
+            billingSurface: "api-metered",
+            billingMode: null,
+            health: "healthy",
+            healthReason: null,
+            authStorePresence: null,
+            effectiveCredentialPath: "env-keychain",
+            personalUseOnly: true,
+            supportedRoles: ["brain"],
+            limitReached: false,
+            limitReachedReason: null,
+            createdAt: now,
+            updatedAt: now,
+        });
+        const anthropicId = "01JCONN0000000000000000ANT";
+        const openrouterId = "01JCONN0000000000000000ORR";
+        const xaiId = "01JCONN0000000000000000XAI";
+        return {
+            anthropicId,
+            openrouterId,
+            xaiId,
+            connections: [
+                conn(anthropicId, "anthropic", "anthropic"),
+                conn(openrouterId, "openrouter", "other"),
+                conn(xaiId, "xai", "xai"),
+            ],
+        };
+    }
+    function windowSample(connectionId, provider, pct, now) {
+        return {
+            id: `01JQUOTA${connectionId.slice(-8)}0000000000`,
+            connectionId,
+            provider,
+            metrics: [
+                {
+                    kind: "weekly-window-pct",
+                    value: pct,
+                    unit: "percent",
+                    tier: "live",
+                    source: "OAUTH",
+                    syncedAt: now,
+                    reason: null,
+                    resetsAt: null,
+                    limitReached: false,
+                },
+            ],
+            sampledAt: now,
+        };
+    }
+    it("suppresses a second handoff while cooldown is active", () => {
+        const home = temp("agentos-p8-handoff-cd-");
+        mkdirSync(join(home, "config"), { recursive: true });
+        const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+        configService.installDefaults();
+        const now = new Date().toISOString();
+        const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+        const registry = { list: () => connections };
+        // Every connected provider is over threshold so same-family openrouter is
+        // the last-resort refuge — without cooldown the next tick would bounce again.
+        const samples = [
+            windowSample(anthropicId, "anthropic", 93, now),
+            windowSample(openrouterId, "openrouter", 91, now),
+            windowSample(xaiId, "xai", 88, now),
+        ];
+        const service = new FleetService({
+            home,
+            config: configService,
+            connections: registry,
+            quotaSamples: () => samples,
+            fakeTmux: true,
+            fakeBrain: true,
+        });
+        service.start();
+        // Force the Brain onto Anthropic OAuth model string.
+        service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+        const first = service.evaluateBrainHandoff();
+        expect(first?.shouldHandoff).toBe(true);
+        expect(first?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+        expect(first?.reason).toContain("only over-threshold refuge available");
+        expect(service.lastBrainHandoff()?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+        expect(service.lastBrainHandoff()?.landed).toBe(true);
+        const second = service.evaluateBrainHandoff();
+        expect(second?.shouldHandoff).toBe(false);
+        expect(second?.reason).toContain("cooldown");
+        expect(service.brain.getSnapshot().model).toBe("openrouter/anthropic/claude-sonnet-4-5");
+        service.stop();
+    });
+    it("persists the handoff target across daemon restart", () => {
+        const home = temp("agentos-p8-handoff-dur-");
+        mkdirSync(join(home, "config"), { recursive: true });
+        const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+        configService.installDefaults();
+        const now = new Date().toISOString();
+        const { connections } = fleetConnections(now);
+        const registry = { list: () => connections };
+        const first = new FleetService({
+            home,
+            config: configService,
+            connections: registry,
+            fakeTmux: true,
+            fakeBrain: true,
+        });
+        first.start();
+        // Prefer-order would land on Anthropic; handoff must stick to the refuge.
+        first.brain.handoff("xai/grok-3", "budget threshold crossed");
+        expect(first.brain.getSnapshot().model).toBe("xai/grok-3");
+        first.stop();
+        const restarted = new FleetService({
+            home,
+            config: configService,
+            connections: registry,
+            fakeTmux: true,
+            fakeBrain: true,
+        });
+        restarted.start();
+        expect(restarted.brain.handoffTarget()).toBe("xai/grok-3");
+        expect(restarted.brain.getSnapshot().model).toBe("xai/grok-3");
+        restarted.stop();
+    });
+    it("does not emit handoff_completed or thrash when the post-handoff seat is down", () => {
+        const home = temp("agentos-p8-handoff-down-");
+        mkdirSync(join(home, "config"), { recursive: true });
+        const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+        configService.installDefaults();
+        const now = new Date().toISOString();
+        const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+        const registry = { list: () => connections };
+        // All over threshold so a failed land still sits on a connection that would
+        // re-trigger handoff every tick without the short retry backoff.
+        const samples = [
+            windowSample(anthropicId, "anthropic", 93, now),
+            windowSample(openrouterId, "openrouter", 91, now),
+            windowSample(xaiId, "xai", 88, now),
+        ];
+        const events = [];
+        // No fakeBrain and no Pi → start() enters BRAIN_DOWN after handoff.
+        const service = new FleetService({
+            home,
+            config: configService,
+            connections: registry,
+            quotaSamples: () => samples,
+            fakeTmux: true,
+            fakeBrain: false,
+        });
+        service.onEvent((event) => {
+            events.push(event);
+        });
+        service.start();
+        service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+        expect(service.brain.getSnapshot().status).toBe("down");
+        events.length = 0;
+        const first = service.evaluateBrainHandoff();
+        expect(first?.shouldHandoff).toBe(true);
+        expect(service.brain.getSnapshot().status).toBe("down");
+        expect(service.lastBrainHandoff()?.landed).toBe(false);
+        expect(events.some((e) => e.type === "brain.handoff_completed")).toBe(false);
+        expect(events.some((e) => e.type === "brain.handoff_triggered")).toBe(true);
+        expect(events.some((e) => e.type === "brain.down")).toBe(true);
+        // Short retry backoff — not the success cooldown, but enough to stop thrash.
+        const second = service.evaluateBrainHandoff();
+        expect(second?.shouldHandoff).toBe(false);
+        expect(second?.reason ?? "").toContain("retry backoff");
+        expect(service.lastBrainHandoff()?.landed).toBe(false);
+        service.stop();
+    });
+    it("restores success cooldown from durable handoff across restart", () => {
+        const home = temp("agentos-p8-handoff-cd-restore-");
+        mkdirSync(join(home, "config"), { recursive: true });
+        const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+        configService.installDefaults();
+        const now = new Date().toISOString();
+        const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+        const registry = { list: () => connections };
+        // All over threshold so the refuge remains over threshold after the move —
+        // without a restored cooldown the restart would immediately hand off again.
+        const samples = [
+            windowSample(anthropicId, "anthropic", 93, now),
+            windowSample(openrouterId, "openrouter", 91, now),
+            windowSample(xaiId, "xai", 88, now),
+        ];
+        const first = new FleetService({
+            home,
+            config: configService,
+            connections: registry,
+            quotaSamples: () => samples,
+            fakeTmux: true,
+            fakeBrain: true,
+        });
+        first.start();
+        first.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+        const decision = first.evaluateBrainHandoff();
+        expect(decision?.shouldHandoff).toBe(true);
+        expect(first.lastBrainHandoff()?.landed).toBe(true);
+        const durable = first.brain.durableHandoff();
+        expect(durable?.landed).toBe(true);
+        expect(durable?.toModel).toBe(first.lastBrainHandoff()?.toModel);
+        first.stop();
+        // Daemon bounce mid-cooldown must not immediately re-handoff.
+        const restarted = new FleetService({
+            home,
+            config: configService,
+            connections: registry,
+            quotaSamples: () => samples,
+            fakeTmux: true,
+            fakeBrain: true,
+        });
+        restarted.start();
+        expect(restarted.lastBrainHandoff()?.toModel).toBe(durable?.toModel);
+        expect(restarted.lastBrainHandoff()?.landed).toBe(true);
+        const suppressed = restarted.evaluateBrainHandoff();
+        expect(suppressed?.shouldHandoff).toBe(false);
+        expect(suppressed?.reason ?? "").toContain("handoff cooldown");
+        restarted.stop();
+    });
+    it("fleet path prefers under-threshold xai over exhausted same-family openrouter", () => {
+        const home = temp("agentos-p8-handoff-healthy-");
+        mkdirSync(join(home, "config"), { recursive: true });
+        const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+        configService.installDefaults();
+        const now = new Date().toISOString();
+        const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+        const registry = { list: () => connections };
+        const samples = [
+            windowSample(anthropicId, "anthropic", 93, now),
+            windowSample(openrouterId, "openrouter", 91, now),
+            windowSample(xaiId, "xai", 10, now),
+        ];
+        const service = new FleetService({
+            home,
+            config: configService,
+            connections: registry,
+            quotaSamples: () => samples,
+            fakeTmux: true,
+            fakeBrain: true,
+        });
+        service.start();
+        service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+        const decision = service.evaluateBrainHandoff();
+        expect(decision?.shouldHandoff).toBe(true);
+        // Same-family openrouter is over threshold; healthy xai must win.
+        expect(decision?.toModel).toBe("xai/grok-3");
+        expect(decision?.reason).not.toContain("only over-threshold refuge");
+        service.stop();
+    });
+    it("says so plainly when the threshold is crossed but nothing is available", () => {
+        const decision = decideHandoff({
+            brainModel: "anthropic/claude-fable-5",
+            brainConnectionId: "01JCONN00000000000000000AA",
+            config,
+            budgets,
+            samples: [sample(95)],
+            candidates: [],
+        });
+        // Not a silent no-op: the reason must name the unmet condition.
+        expect(decision.shouldHandoff).toBe(false);
+        expect(decision.reason).toContain("no eligible handoff target");
+    });
+    it("records whether the deciding number was live or an estimate", () => {
+        const decision = decideHandoff({
+            brainModel: "anthropic/claude-fable-5",
+            brainConnectionId: "01JCONN00000000000000000AA",
+            config,
+            budgets,
+            samples: [sample(88, "estimate")],
+            candidates: [{ model: "anthropic/claude-sonnet-4-5", worstWindowPct: null }],
+        });
+        expect(decision.shouldHandoff).toBe(true);
+        expect(decision.basis).toBe("estimate");
+    });
+});
+describe("signed self-update", () => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const publicPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+    function sign(version, digestHex) {
+        // Ed25519 is a one-shot algorithm: null digest, sign the bytes directly.
+        return signPayload(null, SelfUpdater.signedMessage(version, digestHex), privateKey).toString("base64");
+    }
+    function manifestFor(version, payload) {
+        const sha256 = SelfUpdater.digest(payload);
+        return { version, sha256, signature: sign(version, sha256) };
+    }
+    it("refuses a release whose digest does not match its manifest", () => {
+        const updater = new SelfUpdater(temp("agentos-p8-up-"), publicPem);
+        const payload = Buffer.from("real release");
+        const manifest = manifestFor("1.1.0", payload);
+        const tampered = Buffer.from("swapped release");
+        const outcome = updater.apply(manifest, tampered);
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok)
+            expect(outcome.code).toBe("DIGEST_MISMATCH");
+    });
+    it("refuses a release signed by the wrong key", () => {
+        const other = generateKeyPairSync("ed25519");
+        const updater = new SelfUpdater(temp("agentos-p8-up-wrong-"), other.publicKey.export({ type: "spki", format: "pem" }).toString());
+        const payload = Buffer.from("release");
+        const outcome = updater.apply(manifestFor("1.2.0", payload), payload);
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok)
+            expect(outcome.code).toBe("SIGNATURE_INVALID");
+    });
+    it("refuses to update at all when no public key is compiled in", () => {
+        const updater = new SelfUpdater(temp("agentos-p8-up-nokey-"), null);
+        const payload = Buffer.from("release");
+        const outcome = updater.apply(manifestFor("1.3.0", payload), payload);
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok)
+            expect(outcome.code).toBe("NO_PUBLIC_KEY");
+    });
+    it("refuses a traversal version token even when the signature covers it", () => {
+        const root = temp("agentos-p8-up-trav-");
+        const updater = new SelfUpdater(root, publicPem);
+        const payload = Buffer.from("evil payload");
+        const version = "../../evil";
+        const sha256 = SelfUpdater.digest(payload);
+        // Sign as an attacker who also controls the signing step for this vector —
+        // the path check must still refuse before any write escapes versions/.
+        const outcome = updater.apply({ version, sha256, signature: sign(version, sha256) }, payload);
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok)
+            expect(outcome.code).toBe("VERSION_UNSAFE");
+        expect(updater.currentVersion()).toBeNull();
+    });
+    it("refuses a version-swapped manifest that keeps a valid payload digest", () => {
+        const updater = new SelfUpdater(temp("agentos-p8-up-vswap-"), publicPem);
+        const payload = Buffer.from("legit release");
+        const sha256 = SelfUpdater.digest(payload);
+        // Signature was made for version 1.0.0; attacker rewrites the label only.
+        const outcome = updater.apply({ version: "9.9.9", sha256, signature: sign("1.0.0", sha256) }, payload);
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok)
+            expect(outcome.code).toBe("SIGNATURE_INVALID");
+    });
+    it("applies a verified release and can roll back without the network", () => {
+        const root = temp("agentos-p8-up-ok-");
+        const updater = new SelfUpdater(root, publicPem);
+        updater.seedCurrent("1.0.0", Buffer.from("v1"));
+        const payload = Buffer.from("v2 release");
+        const outcome = updater.apply(manifestFor("2.0.0", payload), payload);
+        expect(outcome.ok).toBe(true);
+        expect(updater.currentVersion()).toBe("2.0.0");
+        expect(updater.previousVersion()).toBe("1.0.0");
+        const rolled = updater.rollback();
+        expect(rolled.ok).toBe(true);
+        expect(updater.currentVersion()).toBe("1.0.0");
+        // Bouncing back is possible without another download.
+        expect(updater.previousVersion()).toBe("2.0.0");
+    });
+    it("fails loudly when asked to roll back with nothing retained", () => {
+        const updater = new SelfUpdater(temp("agentos-p8-up-noroll-"), publicPem);
+        const rolled = updater.rollback();
+        expect(rolled.ok).toBe(false);
+        expect(rolled.reason).toContain("no retained previous version");
+    });
+});
+describe("analytics breakdowns reconcile with the totals", () => {
+    const spawnedAt = new Date().toISOString();
+    function usageEvent(sessionId, provider, input, output) {
+        return {
+            id: `01JEVT${sessionId}${input}`,
+            seq: 1,
+            ts: spawnedAt,
+            event: {
+                type: "ext.usage",
+                payload: {
+                    sessionId,
+                    provider,
+                    model: "m1",
+                    inputTokens: input,
+                    outputTokens: output,
+                    costUsd: null,
+                    requestId: null,
+                },
+            },
+        };
+    }
+    it("splits by billing surface and Brain lane without losing a single token", async () => {
+        const { AnalyticsService } = await import("../src/analytics/service.js");
+        const service = new AnalyticsService(() => ({
+            events: [
+                usageEvent("SBRAIN", "anthropic", 100, 50),
+                usageEvent("SCREW1", "anthropic", 200, 30),
+                usageEvent("SCREW2", "openai", 40, 10),
+            ],
+            truncated: false,
+        }), () => [], () => ({
+            facts: [
+                { sessionId: "SBRAIN", role: "brain", model: "anthropic/x", taskId: null },
+                { sessionId: "SCREW1", role: "builder", model: "anthropic/x", taskId: "t1" },
+                { sessionId: "SCREW2", role: "validator", model: "openai/y", taskId: "t1" },
+            ],
+            truncated: false,
+        }), () => [
+            { provider: "anthropic", billingSurface: "plan-quota" },
+            { provider: "openai", billingSurface: "api-metered" },
+        ]);
+        const snapshot = service.snapshot({ days: 1 });
+        expect(snapshot.totals.inputTokens).toBe(340);
+        expect(snapshot.totals.outputTokens).toBe(90);
+        // The whole point of the reconcile: every breakdown sums back exactly.
+        expect(snapshot.reconcile.exact).toBe(true);
+        expect(snapshot.reconcile.billingSurfacesMatchTotals).toBe(true);
+        expect(snapshot.reconcile.brainPlusCrewMatchTotals).toBe(true);
+        expect(snapshot.brain.brainInputTokens).toBe(100);
+        expect(snapshot.brain.crewInputTokens).toBe(240);
+        const surfaces = Object.fromEntries(snapshot.billingSurfaces.map((s) => [s.surface, s.inputTokens]));
+        expect(surfaces["plan-quota"]).toBe(300);
+        expect(surfaces["api-metered"]).toBe(40);
+    });
+    it("buckets a provider with conflicting billing surfaces as unattributed, not a guess", async () => {
+        const { AnalyticsService } = await import("../src/analytics/service.js");
+        const service = new AnalyticsService(() => ({ events: [usageEvent("S1", "anthropic", 10, 5)], truncated: false }), () => [], () => ({ facts: [], truncated: false }), 
+        // Two connections on the same provider billing differently: a usage frame
+        // naming only the provider genuinely cannot be attributed to either.
+        () => [
+            { provider: "anthropic", billingSurface: "plan-quota" },
+            { provider: "anthropic", billingSurface: "api-metered" },
+        ]);
+        const snapshot = service.snapshot({ days: 1 });
+        expect(snapshot.billingSurfaces).toHaveLength(1);
+        expect(snapshot.billingSurfaces[0]?.surface).toBe("unattributed");
+        expect(snapshot.reconcile.exact).toBe(true);
+    });
+});

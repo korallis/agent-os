@@ -1,0 +1,2777 @@
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { monotonicFactory } from "ulid";
+import { ZodError } from "zod";
+import { spawnSync } from "node:child_process";
+import { readdirSync } from "node:fs";
+import { enforceFusionContract } from "@agent-os/fusion-core";
+import { answerCrewmateInputSchema, authorGateInputSchema, cancelTaskInputSchema, createTaskInputSchema, deliverTaskInputSchema, dispatchFusionInputSchema, escalateToCaptainInputSchema, notifyCaptainInputSchema, readPolicyInputSchema, readTaskInputSchema, resolveCastInputSchema, resolveDeliveryBlockInputSchema, respawnCrewmateInputSchema, runGateInputSchema, sendToCrewInputSchema, spawnCrewmateInputSchema, stowKnowledgeInputSchema, stopCrewmateInputSchema, updateTaskInputSchema, advancePhaseInputSchema, brainToolNameSchema, } from "@agent-os/protocol";
+import { resolveProviderKeyGrant } from "../pi/connections.js";
+import { buildPiSpawnSpec } from "../pi/manager.js";
+import { familyFromModel } from "../substrate/family.js";
+import { assertTransition, canRunGate, canSpawnBuilder, canSpawnScout, canTransition, IllegalTransitionError, isTerminalPhase, } from "../substrate/task-machine.js";
+import { GateRunner } from "./gate-runner.js";
+import { SessionKeyStore } from "./sessions.js";
+/** Shipped instruction template per fusion kind (overridable per call/project). */
+const DEFAULT_FUSION_TEMPLATES = {
+    opinion: "fusion/opinion.md",
+    fusion: "fusion/fusion.md",
+    "plan-fusion": "fusion/fusion.md",
+};
+const nextUlid = monotonicFactory();
+/**
+ * Tools a non-Brain session may call over its own socket. Strictly self-scoped:
+ * read own task/policy and report upward. Never `read_run_artifacts` — that
+ * would let an /opinion side cross-read peer artifacts and break clean-room
+ * independence. Everything that writes, moves the fleet, or reads run trees
+ * is Brain-only (or Captain REST).
+ */
+const CREW_ALLOWED_TOOLS = new Set([
+    "read_task",
+    "read_policy",
+    "notify_captain",
+]);
+/**
+ * Captain REST only — never available on a session socket (Brain or crew).
+ * Clears sticky deliveryBlocked after human inspection.
+ */
+const CAPTAIN_ONLY_TOOLS = new Set(["resolve_delivery_block"]);
+/**
+ * Brain tool surface (master plan §5.3).
+ * Deterministic substrate: validates transitions + policy, executes, records events.
+ * Never makes judgment calls.
+ */
+export class ToolSurface {
+    deps;
+    tasks = new Map();
+    sessions = new Map();
+    idempotency = new Map();
+    toolIdempotency = new Map();
+    sink = () => undefined;
+    brain;
+    brainDown = false;
+    questions = new Map();
+    brainSessionId = null;
+    /**
+     * sessionId → fusion side ownership for O(1) usage attribution and settle
+     * completion. Lifetime is owned by clearFusionRunSessionState only: entries
+     * stay until the whole run completes so late ext.usage after agent_settled
+     * or session_end still attributes while siblings are in flight.
+     */
+    fusionBySessionId = new Map();
+    /** sessionId → SessionKeyStore directory for this spawn. */
+    sessionDirs = new Map();
+    constructor(deps) {
+        this.deps = deps;
+        this.brain = {
+            status: "down",
+            sessionId: null,
+            model: null,
+            thinking: null,
+            family: null,
+            provider: null,
+            tmuxWindow: null,
+            wakeQueueDepth: 0,
+            lastReconcileAt: null,
+            handoffFrom: null,
+            handoffReason: null,
+        };
+    }
+    onEvent(sink) {
+        this.sink = sink;
+    }
+    setBrainSnapshot(brain) {
+        this.brain = brain;
+        this.brainDown = brain.status === "down";
+        this.deps.watcher.setBrainDown(this.brainDown);
+    }
+    /**
+     * Attribute an `ext.usage` frame to the fusion side that owns its session.
+     * No-op for sessions that are not part of a fusion run.
+     */
+    attributeFusionUsage(sessionId, usage) {
+        const ref = this.fusionBySessionId.get(sessionId);
+        if (ref === undefined)
+            return;
+        this.deps.fusionRuns.recordSideUsage(ref.taskId, ref.runId, sessionId, usage, ref.sideIndex);
+    }
+    /**
+     * True when the Captain stamped a cross-family override onto this task.
+     * Overrides are evidence-stamped in `policyOverrides` — never implicit.
+     */
+    hasFamilyOverride(task) {
+        return task.policyOverrides.some((o) => o.policyId === "crossFamilyBuilderValidator");
+    }
+    /** True when the Captain stamped a red-baseline override onto this task. */
+    hasRedBaselineOverride(task) {
+        return task.policyOverrides.some((o) => o.policyId === "redBaselineGateRequired");
+    }
+    /** Fusion runs recorded for a task, newest first. */
+    listFusionRuns(taskId) {
+        return this.deps.fusionRuns.listForTask(taskId);
+    }
+    /**
+     * Session directory for a {project, role, model} triple. A changed model
+     * yields a different key, so transcripts never cross model families.
+     */
+    ensureSessionKey(input) {
+        return this.deps.sessionKeys.ensure(input).dir;
+    }
+    /** The session id whose extension channel is allowed to orchestrate. */
+    setBrainSessionId(sessionId) {
+        this.brainSessionId = sessionId;
+    }
+    /**
+     * Route a tool call that arrived over a session's extension socket.
+     *
+     * Authorization is by session, not by claim: only the live Brain session may
+     * orchestrate. Crewmates get a small self-service subset — they can read the
+     * task they are working on, ask for policy, and report — so a compromised or
+     * confused crewmate cannot spawn fleets or deliver work.
+     */
+    invokeFromSession(sessionId, tool, input) {
+        const parsed = brainToolNameSchema.safeParse(tool);
+        if (!parsed.success) {
+            return {
+                invocationId: nextUlid(),
+                ok: false,
+                error: err("VALIDATION_ERROR", `unknown tool: ${tool}`),
+                durationMs: 0,
+            };
+        }
+        const name = parsed.data;
+        if (CAPTAIN_ONLY_TOOLS.has(name)) {
+            return {
+                invocationId: nextUlid(),
+                ok: false,
+                error: err("UNAUTHORIZED_TOOL", `${name} is Captain-only — not available over a session socket`),
+                durationMs: 0,
+            };
+        }
+        const isBrain = this.brainSessionId !== null && sessionId === this.brainSessionId;
+        if (!isBrain && !CREW_ALLOWED_TOOLS.has(name)) {
+            return {
+                invocationId: nextUlid(),
+                ok: false,
+                error: err("UNAUTHORIZED_TOOL", `session ${sessionId} is not the Brain — ${name} is not available to crewmates`),
+                durationMs: 0,
+            };
+        }
+        return this.invoke(name, input);
+    }
+    isBrainDown() {
+        return this.brainDown;
+    }
+    getTask(id) {
+        return this.tasks.get(id) ?? null;
+    }
+    listTasks() {
+        return [...this.tasks.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }
+    listSessions() {
+        return [...this.sessions.values()];
+    }
+    readFleetState() {
+        return {
+            brain: {
+                ...this.brain,
+                wakeQueueDepth: this.deps.watcher.queueDepth(),
+            },
+            tasks: this.listTasks(),
+            sessions: this.listSessions(),
+            worktrees: this.deps.worktrees.list(),
+            wakeQueue: this.deps.watcher.getQueue(),
+            projects: this.deps.projects.list(),
+            brainDown: this.brainDown,
+            generatedAt: new Date().toISOString(),
+        };
+    }
+    /** Hydrate from durable task store (daemon boot). Rebuilds in-memory session rows. */
+    hydrateTask(task) {
+        const normalized = {
+            ...task,
+            deliveryBlocked: task.deliveryBlocked ?? null,
+            redProof: task.redProof ?? null,
+            lastFailLedger: task.lastFailLedger ?? null,
+        };
+        this.tasks.set(normalized.id, normalized);
+        if (normalized.idempotencyKey !== null) {
+            this.idempotency.set(normalized.idempotencyKey, normalized);
+        }
+        // Restore daemon-authoritative proof/ledger into process memory (HMAC-checked).
+        if (normalized.redProof !== null) {
+            this.deps.gates.installRedProof(normalized.id, normalized.redProof);
+        }
+        if (normalized.lastFailLedger !== null) {
+            this.deps.gates.installFailLedger(normalized.id, normalized.lastFailLedger);
+        }
+        task = normalized;
+        for (const s of task.sessions) {
+            const fleetSession = {
+                sessionId: s.sessionId,
+                taskId: task.id,
+                role: s.role,
+                model: s.model,
+                thinking: s.thinking,
+                family: s.family,
+                tmuxWindow: s.tmuxWindow,
+                status: s.status,
+                worktreePath: s.worktreePath,
+                startedAt: s.startedAt,
+            };
+            this.sessions.set(s.sessionId, fleetSession);
+        }
+    }
+    /**
+     * Rebuild RED proofs from the append-only event log (kill -9 path).
+     * HMAC is verified against the daemon key — forged or re-signed-without-key
+     * entries are rejected. Later valid events win.
+     */
+    hydrateRedProofFromEvent(payload) {
+        const proof = this.deps.gates.installRedProofFromEvent(payload.taskId, payload);
+        if (proof === null)
+            return;
+        const task = this.tasks.get(payload.taskId);
+        if (task === undefined)
+            return;
+        this.tasks.set(payload.taskId, {
+            ...task,
+            redProof: proof,
+            updatedAt: new Date().toISOString(),
+        });
+    }
+    /**
+     * Rebuild fusion side ownership from durable run.json after a daemon restart.
+     * Sides with a sessionId that have not yet settled remain in-flight so
+     * settle/session_end can still write artifacts and emit fusion.completed.
+     * Open runs are then reconciled via the shared finalize path so a kill-9
+     * mid-dispatch (null sessionId), halt-without-settle (stopped/settled
+     * without settledAt), missing pane, or all-settled-missing-completedAt
+     * cannot leave a run permanently on fusion.dispatched.
+     */
+    hydrateFusionOwnership() {
+        for (const task of this.tasks.values()) {
+            for (const run of this.deps.fusionRuns.listForTask(task.id)) {
+                if (run.completedAt != null)
+                    continue;
+                run.sides.forEach((side, sideIndex) => {
+                    if (side.sessionId === null)
+                        return;
+                    if (side.settledAt != null || side.artifactPath !== null)
+                        return;
+                    this.fusionBySessionId.set(side.sessionId, {
+                        taskId: task.id,
+                        runId: run.runId,
+                        sideIndex,
+                    });
+                    const key = SessionKeyStore.computeKey({
+                        projectId: task.projectId,
+                        role: side.role,
+                        model: side.model,
+                    });
+                    const record = this.deps.sessionKeys.get(key);
+                    if (record !== null) {
+                        this.sessionDirs.set(side.sessionId, record.dir);
+                    }
+                });
+            }
+        }
+        // Boot counterpart of halt finalize: any side that can no longer make
+        // progress on its own (never spawned, non-live status, missing pane),
+        // plus all-settled-missing-completedAt. One shared helper so boot cannot
+        // diverge from runtime.
+        for (const task of this.tasks.values()) {
+            for (const run of this.deps.fusionRuns.listForTask(task.id)) {
+                if (run.completedAt != null)
+                    continue;
+                const hasNeverSpawned = run.sides.some((s) => s.sessionId === null &&
+                    s.settledAt == null &&
+                    s.artifactPath === null);
+                this.finalizeOpenFusionRun(task.id, run.runId, hasNeverSpawned
+                    ? "fusion side never spawned (daemon interrupted mid-dispatch)"
+                    : undefined);
+            }
+        }
+    }
+    /**
+     * After boot hydrate: re-open per-session listeners for non-terminal live
+     * sessions so surviving Pi panes can re-hello.
+     */
+    rebindSessionListeners() {
+        if (this.deps.sockets === undefined)
+            return;
+        for (const session of this.sessions.values()) {
+            if (session.status !== "starting" && session.status !== "running")
+                continue;
+            try {
+                this.deps.sockets.openSession(session.sessionId);
+            }
+            catch {
+                // Bind failure is non-fatal at boot; reconcile will mark the session lost
+                // if the pane is also gone.
+            }
+        }
+    }
+    /**
+     * Fallback liveness: any starting/running session whose tmux window is gone
+     * becomes SESSION_LOST. Prefer the extension session_end path; this is the
+     * pane-scraping fallback.
+     */
+    reconcileDeadPanes() {
+        const lost = [];
+        for (const session of [...this.sessions.values()]) {
+            if (session.status !== "starting" && session.status !== "running")
+                continue;
+            if (this.deps.tmux.hasWindow(session.tmuxWindow))
+                continue;
+            this.markSessionLost(session.sessionId, "tmux pane missing (reconcile)");
+            lost.push(session.sessionId);
+        }
+        return lost;
+    }
+    /**
+     * Boot/restart reconcile for the session-key gate (master plan §6.5 / G6).
+     *
+     * For each non-terminal task that already has crewmate sessions, compare the
+     * resolved cast against SessionKeyStore and respawn ONLY roles whose session
+     * directory is absent — surviving dirs (and their live panes) are left alone.
+     * Live sessions whose key dir vanished are marked lost before respawn so a
+     * wiped directory cannot leave an orphan "running" row blocking the gate.
+     */
+    reconcileMissingCastRoles() {
+        const respawned = [];
+        for (const task of this.listTasks()) {
+            if (isTerminalPhase(task.phase))
+                continue;
+            if (task.cast.length === 0 || task.sessions.length === 0)
+                continue;
+            const expected = task.cast.map((c) => ({ role: c.role, model: c.model }));
+            const missing = this.deps.sessionKeys.missingRoles(task.projectId, expected);
+            for (const slot of missing) {
+                const castEntry = task.cast.find((c) => c.role === slot.role && c.model === slot.model);
+                if (castEntry === undefined)
+                    continue;
+                try {
+                    for (const s of [...this.sessions.values()]) {
+                        if (s.taskId === task.id &&
+                            s.role === slot.role &&
+                            s.model === slot.model &&
+                            (s.status === "starting" || s.status === "running" || s.status === "settled")) {
+                            this.markSessionLost(s.sessionId, "session-key directory missing (reconcile)");
+                        }
+                    }
+                    this.spawnCrewmate({
+                        taskId: task.id,
+                        role: castEntry.role,
+                        model: castEntry.model,
+                        thinking: castEntry.thinking,
+                        cleanRoom: castEntry.cleanRoom,
+                        vars: {},
+                    });
+                    respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
+                }
+                catch (error) {
+                    // A failed respawn must not abort boot-time rehydrate or sibling slots.
+                    const message = error instanceof Error ? error.message : String(error);
+                    const summary = `session-key reconcile failed to respawn ${slot.role}/${slot.model} for task ${task.id}: ${message}`;
+                    this.sink({
+                        type: "captain.escalation",
+                        payload: {
+                            taskId: task.id,
+                            summary,
+                            severity: "warn",
+                        },
+                    });
+                    process.stderr.write(`[agentos] ${summary}\n`);
+                }
+            }
+        }
+        return respawned;
+    }
+    invoke(tool, rawInput, options = {}) {
+        const started = Date.now();
+        const invocationId = nextUlid();
+        if (options.idempotencyKey !== undefined) {
+            const cached = this.toolIdempotency.get(`${tool}:${options.idempotencyKey}`);
+            if (cached !== undefined)
+                return cached;
+        }
+        // Orchestration tools blocked in BRAIN_DOWN except read_* and Captain REST.
+        if (this.brainDown &&
+            tool !== "read_fleet_state" &&
+            tool !== "read_task" &&
+            tool !== "read_policy" &&
+            tool !== "read_run_artifacts" &&
+            tool !== "notify_captain") {
+            // Captain REST may still create_task / resolve_delivery_block.
+            if (tool !== "create_task" && tool !== "resolve_delivery_block") {
+                return this.finish(invocationId, tool, null, started, {
+                    ok: false,
+                    error: err("BRAIN_DOWN", "brain is down — orchestration tools are blocked"),
+                });
+            }
+        }
+        try {
+            const data = this.dispatch(tool, rawInput);
+            const result = this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+                ok: true,
+                data,
+            });
+            if (options.idempotencyKey !== undefined) {
+                this.toolIdempotency.set(`${tool}:${options.idempotencyKey}`, result);
+            }
+            return result;
+        }
+        catch (error) {
+            if (error instanceof IllegalTransitionError) {
+                return this.finish(invocationId, tool, error.taskId, started, {
+                    ok: false,
+                    error: err("ILLEGAL_TRANSITION", error.message, {
+                        from: error.from,
+                        to: error.to,
+                    }),
+                });
+            }
+            if (error instanceof ToolSurfaceError) {
+                return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+                    ok: false,
+                    error: err(error.code, error.message, error.details),
+                });
+            }
+            // Bad tool input is the caller's error, not an internal fault — the Brain
+            // needs a path-precise VALIDATION_ERROR it can act on.
+            if (error instanceof ZodError) {
+                return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+                    ok: false,
+                    error: err("VALIDATION_ERROR", `invalid input for ${tool}`, {
+                        issues: error.issues.map((i) => ({
+                            path: i.path.join("."),
+                            message: i.message,
+                        })),
+                    }),
+                });
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+                ok: false,
+                error: err("INTERNAL", message),
+            });
+        }
+    }
+    finish(invocationId, tool, taskId, started, body) {
+        const durationMs = Date.now() - started;
+        this.sink({
+            type: "tool.invoked",
+            payload: {
+                invocationId,
+                tool,
+                taskId,
+                ok: body.ok,
+                errorCode: body.ok ? null : body.error.code,
+                durationMs,
+            },
+        });
+        if (body.ok) {
+            return { invocationId, ok: true, data: body.data, durationMs };
+        }
+        return { invocationId, ok: false, error: body.error, durationMs };
+    }
+    dispatch(tool, raw) {
+        switch (tool) {
+            case "create_task":
+                return this.createTask(raw);
+            case "update_task":
+                return this.updateTask(raw);
+            case "cancel_task":
+                return this.cancelTask(raw);
+            case "read_fleet_state":
+                return this.readFleetState();
+            case "read_task":
+                return this.readTask(raw);
+            case "read_run_artifacts":
+                return this.readRunArtifacts(raw);
+            case "resolve_cast":
+                return this.resolveCast(raw);
+            case "spawn_crewmate":
+                return this.spawnCrewmate(raw);
+            case "stop_crewmate":
+                return this.stopCrewmate(raw);
+            case "respawn_crewmate":
+                return this.respawnCrewmate(raw);
+            case "dispatch_fusion":
+                return this.dispatchFusion(raw);
+            case "author_gate":
+                return this.authorGate(raw);
+            case "run_gate":
+                return this.runGate(raw);
+            case "send_to_crew":
+                return this.sendToCrew(raw);
+            case "answer_crewmate":
+                return this.answerCrewmate(raw);
+            case "deliver_task":
+                return this.deliverTask(raw);
+            case "resolve_delivery_block":
+                return this.resolveDeliveryBlock(raw);
+            case "escalate_to_captain":
+                return this.escalate(raw);
+            case "notify_captain":
+                return this.notify(raw);
+            case "route_to_secondmate":
+                throw new ToolSurfaceError("NOT_FOUND", "secondmates are Phase 7 — not provisioned");
+            case "read_secondmate_bearings":
+                throw new ToolSurfaceError("NOT_FOUND", "secondmates are Phase 7 — not provisioned");
+            case "stow_knowledge":
+                return this.stowKnowledge(raw);
+            case "read_policy":
+                return this.readPolicy(raw);
+            case "advance_phase":
+                return this.advancePhase(raw);
+            default: {
+                const _exhaustive = tool;
+                throw new ToolSurfaceError("VALIDATION_ERROR", `unknown tool: ${String(_exhaustive)}`);
+            }
+        }
+    }
+    cfg() {
+        return this.deps.config.effective().config;
+    }
+    createTask(raw) {
+        const input = createTaskInputSchema.parse(raw);
+        if (input.idempotencyKey !== undefined) {
+            const existing = this.idempotency.get(input.idempotencyKey);
+            if (existing !== undefined)
+                return existing;
+        }
+        const project = this.deps.projects.get(input.spec.projectId);
+        if (project === null) {
+            throw new ToolSurfaceError("NOT_FOUND", `project not found: ${input.spec.projectId}`);
+        }
+        const now = new Date().toISOString();
+        const maxValidations = this.cfg().validation.maxValidations;
+        const yolo = input.spec.shape === "SHIP" ? input.spec.yolo : false;
+        const mode = input.spec.shape === "SHIP" ? input.spec.mode : input.spec.mode;
+        const task = {
+            id: nextUlid(),
+            shape: input.spec.shape,
+            title: input.spec.title,
+            intent: input.spec.intent,
+            projectId: input.spec.projectId,
+            mode,
+            yolo,
+            phase: "QUEUED",
+            failureCause: null,
+            cast: [],
+            sessions: [],
+            validationAttempt: 0,
+            maxValidations,
+            branch: null,
+            worktreePath: null,
+            needsCaptainSummary: null,
+            deliveryBlocked: null,
+            redProof: null,
+            lastFailLedger: null,
+            idempotencyKey: input.idempotencyKey ?? null,
+            createdAt: now,
+            updatedAt: now,
+            configSnapshotHash: hashConfig(this.cfg()),
+            policyOverrides: [],
+        };
+        this.tasks.set(task.id, task);
+        if (task.idempotencyKey !== null) {
+            this.idempotency.set(task.idempotencyKey, task);
+        }
+        this.persistTask(task);
+        this.sink({
+            type: "task.created",
+            payload: {
+                taskId: task.id,
+                shape: task.shape,
+                projectId: task.projectId,
+                title: task.title,
+                mode: task.mode,
+                phase: task.phase,
+                idempotencyKey: task.idempotencyKey,
+            },
+        });
+        return task;
+    }
+    updateTask(raw) {
+        const input = updateTaskInputSchema.parse(raw);
+        const task = this.requireTask(input.taskId);
+        if (isTerminalPhase(task.phase)) {
+            throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
+        }
+        const updated = {
+            ...task,
+            title: input.patch.title ?? task.title,
+            intent: input.patch.intent ?? task.intent,
+            mode: input.patch.mode ?? task.mode,
+            updatedAt: new Date().toISOString(),
+        };
+        this.saveTask(updated);
+        this.sink({
+            type: "task.updated",
+            payload: { taskId: updated.id, title: updated.title, phase: updated.phase },
+        });
+        return updated;
+    }
+    cancelTask(raw) {
+        const input = cancelTaskInputSchema.parse(raw);
+        this.requireTask(input.taskId);
+        // Halt → release → stamp happens inside transition for terminal phases.
+        return this.transition(this.requireTask(input.taskId), "CANCELLED", input.reason);
+    }
+    /**
+     * Reclaim worktree slots for a session and/or task. No finalSha so the pool
+     * verified-resets clean trees and quarantines dirty ones. Task-linked
+     * quarantine stamps deliveryBlocked on the owning task.
+     */
+    releaseWorktreeLeases(filter) {
+        for (const lease of this.deps.worktrees.list()) {
+            if (lease.state !== "leased" && lease.state !== "reclaiming")
+                continue;
+            const sessionMatch = filter.sessionId !== undefined && lease.sessionId === filter.sessionId;
+            const taskMatch = filter.taskId !== undefined &&
+                filter.taskId !== null &&
+                lease.taskId === filter.taskId;
+            if (!sessionMatch && !taskMatch)
+                continue;
+            if (filter.onlyHaltedSessions === true && lease.sessionId !== null) {
+                const session = this.sessions.get(lease.sessionId);
+                if (session !== undefined &&
+                    session.status !== "stopped" &&
+                    session.status !== "lost") {
+                    continue;
+                }
+            }
+            this.releaseOneWorktreeLease(lease.id);
+        }
+    }
+    /**
+     * Boot/reconcile: release leases whose session is gone. Uses the shared
+     * release helper so dirty quarantine stamps deliveryBlocked on the task.
+     */
+    reclaimOrphanedLeases(isLiveSession) {
+        let reclaimed = 0;
+        for (const lease of this.deps.worktrees.list()) {
+            if (lease.state !== "leased" && lease.state !== "reclaiming")
+                continue;
+            if (isLiveSession(lease.sessionId))
+                continue;
+            this.releaseOneWorktreeLease(lease.id);
+            reclaimed += 1;
+        }
+        return reclaimed;
+    }
+    /**
+     * Release a single lease. When the tree quarantines and was task-linked,
+     * stamp deliveryBlocked on the owning task so deliver_task cannot mark DONE
+     * after the lease association is cleared. Sole choke point for task-linked
+     * quarantine stamps (stop, lost, reclaim, SCOUT audit, deliver dirty path).
+     */
+    releaseOneWorktreeLease(leaseId, options = {}) {
+        const lease = this.deps.worktrees.list().find((l) => l.id === leaseId);
+        if (lease === undefined)
+            return;
+        const owningTaskId = lease.taskId;
+        const releasedPath = lease.path;
+        let result;
+        try {
+            result = this.deps.worktrees.release(leaseId, {
+                ...(options.forceQuarantine === true ? { forceQuarantine: true } : {}),
+                ...(options.finalSha !== undefined ? { finalSha: options.finalSha } : {}),
+            });
+        }
+        catch {
+            // best-effort — do not block stop/lost/cancel on a reclaim race
+            return;
+        }
+        // Only clear path refs when the tree returns to idle (verified-reset). Idle
+        // trees may be re-issued; keeping refs would make DONE cleanliness checks
+        // judge a path owned by a different task. Quarantined trees stay associated
+        // so deliver_task can still refuse against the preserved dirty path after
+        // Captain clears deliveryBlocked.
+        if (result.state === "idle") {
+            this.clearWorktreePathRefs(releasedPath);
+        }
+        if (result.state !== "quarantined" || owningTaskId === null)
+            return;
+        const task = this.tasks.get(owningTaskId);
+        if (task === undefined || isTerminalPhase(task.phase))
+            return;
+        if (task.deliveryBlocked !== null)
+            return;
+        const dirtyPaths = this.readDirtyPaths(result.path);
+        const reason = result.quarantineReason ??
+            "worktree quarantined on release; uncommitted builder work preserved";
+        this.blockDelivery(task, leaseId, reason, dirtyPaths);
+    }
+    /**
+     * When a lease is released, clear task.worktreePath / session.worktreePath that
+     * still point at that path. Prevents idle reuse from leaving non-terminal tasks
+     * associated with a tree owned by a different lease/task.
+     */
+    clearWorktreePathRefs(worktreePath) {
+        const target = resolve(worktreePath);
+        for (const [sessionId, session] of this.sessions) {
+            if (session.worktreePath === null)
+                continue;
+            if (resolve(session.worktreePath) !== target)
+                continue;
+            this.sessions.set(sessionId, { ...session, worktreePath: null });
+        }
+        for (const task of this.tasks.values()) {
+            if (isTerminalPhase(task.phase)) {
+                // Terminal tasks keep historical paths for audit; they no longer drive
+                // delivery cleanliness against live pool state.
+                continue;
+            }
+            let changed = false;
+            let worktreePathField = task.worktreePath;
+            if (worktreePathField !== null && resolve(worktreePathField) === target) {
+                worktreePathField = null;
+                changed = true;
+            }
+            const sessions = task.sessions.map((s) => {
+                if (s.worktreePath === null || resolve(s.worktreePath) !== target)
+                    return s;
+                changed = true;
+                return { ...s, worktreePath: null };
+            });
+            if (!changed)
+                continue;
+            this.saveTask({
+                ...task,
+                worktreePath: worktreePathField,
+                sessions,
+                updatedAt: new Date().toISOString(),
+            });
+        }
+    }
+    readDirtyPaths(worktreePath) {
+        if (process.env.AGENTOS_FAKE_GIT === "1")
+            return [];
+        const dirty = spawnSync("git", ["-C", worktreePath, "status", "--porcelain"], {
+            encoding: "utf8",
+            timeout: 15_000,
+        });
+        if (dirty.error !== undefined || dirty.status !== 0)
+            return [];
+        return dirty.stdout
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .map((line) => line.slice(3).trim() || line);
+    }
+    readTask(raw) {
+        const input = readTaskInputSchema.parse(raw);
+        return this.requireTask(input.taskId);
+    }
+    readRunArtifacts(raw) {
+        const input = readTaskInputSchema.parse(raw);
+        const dir = join(this.deps.home, "runs", input.taskId);
+        return { taskId: input.taskId, path: dir, files: listFilesRecursive(dir) };
+    }
+    resolveCast(raw) {
+        const input = resolveCastInputSchema.parse(raw);
+        const task = this.requireTask(input.taskId);
+        const policies = this.cfg().policies;
+        const cast = input.roles.map((r) => ({
+            role: r.role,
+            model: r.model,
+            thinking: r.thinking,
+            family: familyFromModel(r.model),
+            cleanRoom: r.cleanRoom,
+        }));
+        // LIMIT REACHED exclusion
+        if (this.deps.connections !== undefined) {
+            for (const role of cast) {
+                const provider = role.model.split("/")[0] ?? "";
+                const conn = this.deps.connections
+                    .list()
+                    .find((c) => c.provider === provider || role.model.startsWith(c.provider));
+                if (conn?.limitReached === true) {
+                    throw new ToolSurfaceError("LIMIT_REACHED", `connection ${conn.id} (${conn.provider}) is LIMIT REACHED — excluded from cast`, { connectionId: conn.id, provider: conn.provider, role: role.role });
+                }
+            }
+        }
+        // Cross-family builder ≠ validator
+        const builder = cast.find((c) => c.role === "builder");
+        const validator = cast.find((c) => c.role === "validator");
+        if (policies.crossFamilyBuilderValidator &&
+            builder !== undefined &&
+            validator !== undefined &&
+            builder.family === validator.family &&
+            !input.familyCheckOverride) {
+            throw new ToolSurfaceError("POLICY_VIOLATION", `builder family (${builder.family}) must differ from validator family (${validator.family})`, { builder: builder.model, validator: validator.model });
+        }
+        // Distinct planner families for plan-fusion casts
+        const planners = cast.filter((c) => c.role === "planner");
+        if (policies.distinctPlannerFamilies && planners.length >= 2) {
+            const families = new Set(planners.map((p) => p.family));
+            if (families.size < 2 && !input.familyCheckOverride) {
+                throw new ToolSurfaceError("POLICY_VIOLATION", "plan-fusion requires ≥2 distinct planner families");
+            }
+        }
+        let policyOverrides = task.policyOverrides;
+        if (input.familyCheckOverride) {
+            policyOverrides = [
+                ...policyOverrides,
+                {
+                    policyId: "crossFamilyBuilderValidator",
+                    configuredValue: "overridden",
+                    layer: "task",
+                    stampedAt: new Date().toISOString(),
+                },
+            ];
+        }
+        const nextBase = {
+            ...task,
+            cast,
+            policyOverrides,
+            updatedAt: new Date().toISOString(),
+        };
+        this.saveTask(nextBase);
+        let next = nextBase;
+        if (task.phase === "QUEUED") {
+            next = this.transition(nextBase, "DISPATCH_RESOLVED", "cast resolved");
+        }
+        this.sink({
+            type: "task.cast_resolved",
+            payload: {
+                taskId: next.id,
+                roles: cast.map((c) => ({
+                    role: c.role,
+                    model: c.model,
+                    thinking: c.thinking,
+                    family: c.family,
+                })),
+                familyCheckOverridden: input.familyCheckOverride,
+            },
+        });
+        return { taskId: next.id, cast };
+    }
+    spawnCrewmate(raw) {
+        const input = spawnCrewmateInputSchema.parse(raw);
+        let task = this.requireTask(input.taskId);
+        if (isTerminalPhase(task.phase)) {
+            throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase}); cannot spawn`);
+        }
+        const project = this.deps.projects.get(task.projectId);
+        if (project === null) {
+            throw new ToolSurfaceError("NOT_FOUND", `project not found: ${task.projectId}`);
+        }
+        if (input.role === "scout" && !canSpawnScout(task.phase)) {
+            throw new ToolSurfaceError("ILLEGAL_TRANSITION", `cannot spawn scout in phase ${task.phase}`);
+        }
+        const redBaselineConfigured = this.cfg().policies.redBaselineGateRequired;
+        if (input.role === "builder" && input.redBaselineOverride) {
+            task = {
+                ...task,
+                policyOverrides: [
+                    ...task.policyOverrides,
+                    {
+                        policyId: "redBaselineGateRequired",
+                        configuredValue: "overridden",
+                        layer: "task",
+                        stampedAt: new Date().toISOString(),
+                    },
+                ],
+                updatedAt: new Date().toISOString(),
+            };
+            this.saveTask(task);
+        }
+        const enforceRedBaseline = redBaselineConfigured && !this.hasRedBaselineOverride(task);
+        if (input.role === "builder") {
+            if (enforceRedBaseline && !this.deps.gates.hasRedProofForCurrentSource(task.id)) {
+                throw new ToolSurfaceError("POLICY_VIOLATION", `cannot spawn builder: missing RED baseline proof for current gate source (EXPECTED_RED must be established before the builder starts)`, { taskId: task.id, phase: task.phase });
+            }
+            if (!canSpawnBuilder(task.phase, { redBaselineRequired: enforceRedBaseline })) {
+                throw new ToolSurfaceError("ILLEGAL_TRANSITION", `cannot spawn builder in phase ${task.phase}`);
+            }
+        }
+        const family = familyFromModel(input.model);
+        // Cross-family is a scheduler invariant, not a cast-time courtesy. Enforce
+        // it again at spawn — server-derived from the model string — so a caller
+        // that skips or reshapes resolve_cast cannot slip a same-family
+        // builder/validator pair past the check (master plan §11 Phase 5:
+        // "same-family builder/validator impossible via API, CLI, profile import,
+        // recovery, AND Brain tool calls").
+        if (this.cfg().policies.crossFamilyBuilderValidator && !this.hasFamilyOverride(task)) {
+            const counterpartRole = input.role === "validator" ? "builder" : "validator";
+            if (input.role === "validator" || input.role === "builder") {
+                const counterpartFamilies = new Set();
+                for (const cast of task.cast.filter((c) => c.role === counterpartRole)) {
+                    counterpartFamilies.add(familyFromModel(cast.model));
+                }
+                for (const session of task.sessions.filter((s) => s.role === counterpartRole)) {
+                    counterpartFamilies.add(familyFromModel(session.model));
+                }
+                if (counterpartFamilies.has(family)) {
+                    throw new ToolSurfaceError("POLICY_VIOLATION", `cannot spawn ${input.role} on family ${family}: the task's ${counterpartRole} is the same family`, { role: input.role, family, counterpartRole });
+                }
+            }
+        }
+        const sessionId = nextUlid();
+        const windowName = `${input.role}-${sessionId.slice(0, 8).toLowerCase()}`;
+        let worktreePath = null;
+        let branch = task.branch;
+        let leaseId = null;
+        let sessionSocketOpened = false;
+        let cwd;
+        const poolRoles = new Set(["builder", "scout", "planner", "fusion", "healthcheck"]);
+        if (input.role === "validator") {
+            // Write-jail: a validator only ever sees the gate workspace, never the
+            // product tree it is judging.
+            cwd = this.deps.gates.gateWorkspace(task.id);
+            worktreePath = cwd;
+        }
+        else if (input.role === "brain") {
+            cwd = this.deps.home;
+            worktreePath = null;
+        }
+        else if (poolRoles.has(input.role)) {
+            try {
+                const lease = this.deps.worktrees.lease({
+                    projectId: task.projectId,
+                    repoPath: project.path,
+                    taskId: task.id,
+                    sessionId,
+                    ...(task.branch !== null ? { branch: task.branch } : {}),
+                });
+                worktreePath = lease.path;
+                branch = lease.branch;
+                leaseId = lease.id;
+                cwd = lease.path;
+            }
+            catch (error) {
+                if (error instanceof Error && error.message.includes("exhausted")) {
+                    task = this.transition(task, "WAITING_WORKTREE", error.message);
+                    throw new ToolSurfaceError("CONFLICT", error.message);
+                }
+                if (error instanceof Error &&
+                    (error.message.includes("git worktree add failed") ||
+                        error.message.includes("git worktree branch"))) {
+                    throw new ToolSurfaceError("SPAWN_FAILED", error.message);
+                }
+                throw error;
+            }
+        }
+        else {
+            throw new ToolSurfaceError("SPAWN_FAILED", `role ${input.role} has no isolated cwd; refusing to spawn in the primary checkout`);
+        }
+        if (cwd === project.path) {
+            throw new ToolSurfaceError("SPAWN_FAILED", `refusing to spawn ${input.role} in the Captain's primary checkout`);
+        }
+        // Per-model session key: a model change yields a new directory so transcripts
+        // never cross families. buildPiSpawnSpec hands it to Pi via --session-dir +
+        // PI_CODING_AGENT_SESSION_DIR; AGENTOS_SESSION_DIR is extension output only.
+        // Preflight before ensure; remove a newly created key dir on launch failure
+        // so missingRoles does not treat an orphan as "role present".
+        const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
+        const piDetection = this.deps.pi;
+        const extensionPath = this.deps.extensionPath;
+        const sessionKeyInput = {
+            projectId: task.projectId,
+            role: input.role,
+            model: input.model,
+        };
+        let sessionKeyCreated = false;
+        try {
+            if (!fake) {
+                if (piDetection?.binary == null) {
+                    throw new ToolSurfaceError("PI_UNAVAILABLE", "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates");
+                }
+                if (extensionPath === undefined || !existsSync(extensionPath)) {
+                    throw new ToolSurfaceError("PI_UNAVAILABLE", "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry");
+                }
+            }
+            const sessionKeyExisted = this.deps.sessionKeys.has(sessionKeyInput);
+            const sessionDir = this.deps.sessionKeys.ensure(sessionKeyInput).dir;
+            sessionKeyCreated = !sessionKeyExisted;
+            this.sessionDirs.set(sessionId, sessionDir);
+            let tmuxWindow = `agentos:${windowName}`;
+            if (fake) {
+                // Deterministic side output so fusion gates can assert artifacts without
+                // a paid model. Per-session path matches the real extension layout so
+                // sequential runs never share a file. Stay alive so pane-liveness
+                // reconcile does not spuriously SESSION_LOST on short-lived echo.
+                const outputsDir = join(sessionDir, "outputs");
+                mkdirSync(outputsDir, { recursive: true, mode: 0o700 });
+                writeFileSync(join(outputsDir, `${sessionId}.md`), `fake-pi ${input.role} ${input.model} session=${sessionId}\n`, { mode: 0o600 });
+                this.deps.tmux.newWindow({
+                    windowName,
+                    argv: [
+                        "sh",
+                        "-c",
+                        `echo fake-pi ${input.role} ${sessionId}; exec sleep 86400`,
+                    ],
+                    cwd,
+                });
+            }
+            else {
+                // Control channel is a hard precondition of spawn — never launch Pi with a dead socket.
+                let socketPath;
+                try {
+                    if (this.deps.sockets !== undefined) {
+                        socketPath = this.deps.sockets.openSession(sessionId);
+                        sessionSocketOpened = true;
+                    }
+                    else {
+                        socketPath = join(this.deps.home, "sockets", `${sessionId}.sock`);
+                    }
+                }
+                catch (error) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    throw new ToolSurfaceError("SPAWN_FAILED", `session control channel failed to open: ${message}`);
+                }
+                const prompt = input.prompt ??
+                    `Agent OS role=${input.role}. Task: ${task.title}\n\n${task.intent}`;
+                const grant = resolveProviderKeyGrant(this.deps.home, input.model, this.deps.connections);
+                // Narrowed by preflight above; TypeScript cannot see the throw path.
+                if (piDetection == null || extensionPath === undefined) {
+                    throw new ToolSurfaceError("PI_UNAVAILABLE", "Pi detection or extension path missing after preflight");
+                }
+                const gateWorkspace = input.role === "builder" || input.role === "validator"
+                    ? this.deps.gates.gateWorkspace(task.id)
+                    : undefined;
+                // Seat allowlist root: builder = leased worktree; validator = gate workspace.
+                const seatWorkspace = input.role === "builder" || input.role === "validator" ? cwd : undefined;
+                const spec = buildPiSpawnSpec({
+                    agentosHome: this.deps.home,
+                    detection: piDetection,
+                    args: ["--mode", "json", "-p", prompt, "--model", input.model],
+                    cwd,
+                    sessionId,
+                    role: input.role,
+                    socketPath,
+                    extensionPath,
+                    sessionDir,
+                    thinking: input.thinking,
+                    cleanRoom: input.cleanRoom,
+                    grantProviderKey: grant,
+                    ...(gateWorkspace !== undefined ? { gateWorkspace } : {}),
+                    ...(seatWorkspace !== undefined ? { seatWorkspace } : {}),
+                });
+                const win = this.deps.tmux.newWindow({
+                    windowName,
+                    argv: [spec.binary, ...spec.args],
+                    env: spec.env,
+                    cwd,
+                });
+                tmuxWindow = win.target;
+            }
+            const now = new Date().toISOString();
+            const taskSession = {
+                sessionId,
+                role: input.role,
+                model: input.model,
+                thinking: input.thinking,
+                family,
+                tmuxWindow,
+                worktreePath,
+                status: "running",
+                startedAt: now,
+                lastEventAt: now,
+            };
+            const fleetSession = {
+                sessionId,
+                taskId: task.id,
+                role: input.role,
+                model: input.model,
+                thinking: input.thinking,
+                family,
+                tmuxWindow,
+                status: "running",
+                worktreePath,
+                startedAt: now,
+            };
+            this.sessions.set(sessionId, fleetSession);
+            // task.worktreePath is the builder/delivery tree only — scout/planner/etc.
+            // must not clobber the path run_gate(candidate) and deliver_task depend on.
+            task = {
+                ...task,
+                sessions: [...task.sessions.filter((s) => s.sessionId !== sessionId), taskSession],
+                worktreePath: input.role === "builder" && worktreePath !== null
+                    ? worktreePath
+                    : task.worktreePath,
+                branch: input.role === "builder" && branch !== null ? branch : task.branch,
+                updatedAt: now,
+            };
+            this.saveTask(task);
+            if (input.role === "builder" && task.phase !== "BUILDING") {
+                task = this.transition(task, "BUILDING", "builder spawned", {
+                    redBaselineRequired: enforceRedBaseline ? true : false,
+                });
+            }
+            else if (input.role === "planner" && task.phase === "DISPATCH_RESOLVED") {
+                task = this.transition(task, "PLANNING", "planner spawned");
+            }
+            else if (input.role === "validator" && task.phase === "DISPATCH_RESOLVED") {
+                task = this.transition(task, "GATE_AUTHORING", "validator spawned");
+            }
+            this.sink({
+                type: "session.spawned",
+                payload: {
+                    sessionId,
+                    taskId: task.id,
+                    role: input.role,
+                    model: input.model,
+                    family,
+                    tmuxWindow,
+                    worktreePath,
+                },
+            });
+            // Fake Pi auto-settles for zero-token idle proofs and local-only SHIP.
+            // Status stays "running" (historical harness contract); the wake is what
+            // the Brain sees. Fusion sides finalize via completeFusionSide after the
+            // dispatch path registers ownership.
+            // A PROGRESS wake is classified first so the zero-token absorb path is
+            // exercised end-to-end (same class a real extension lifecycle would emit).
+            // Synthetic ext.usage mirrors a real provider frame so analytics and
+            // Console gates can assert non-zero telemetry without a paid model.
+            if (fake) {
+                const slash = input.model.indexOf("/");
+                const provider = slash === -1 ? "unknown" : input.model.slice(0, slash);
+                const modelName = slash === -1 ? input.model : input.model.slice(slash + 1);
+                this.sink({
+                    type: "ext.usage",
+                    payload: {
+                        sessionId,
+                        provider,
+                        model: modelName,
+                        inputTokens: 128,
+                        outputTokens: 64,
+                        costUsd: null,
+                    },
+                });
+                this.deps.watcher.classify({
+                    class: "PROGRESS",
+                    taskId: task.id,
+                    sessionId,
+                    summary: `progress on ${task.title}`,
+                });
+                this.deps.watcher.classify({
+                    class: "AGENT_SETTLED",
+                    taskId: task.id,
+                    sessionId,
+                    summary: `${input.role} settled (fake pi)`,
+                });
+            }
+            return { session: fleetSession, task: this.requireTask(task.id) };
+        }
+        catch (error) {
+            this.sessionDirs.delete(sessionId);
+            if (sessionKeyCreated) {
+                this.deps.sessionKeys.remove(sessionKeyInput);
+            }
+            if (sessionSocketOpened) {
+                void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
+            }
+            if (leaseId !== null) {
+                this.releaseOneWorktreeLease(leaseId);
+            }
+            throw error;
+        }
+    }
+    stopCrewmate(raw) {
+        const input = stopCrewmateInputSchema.parse(raw);
+        const session = this.sessions.get(input.sessionId);
+        if (session === undefined) {
+            throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
+        }
+        if (session.role === "scout") {
+            this.auditScoutSession(input.sessionId);
+        }
+        // Finalize any in-flight fusion side so a stop cannot leave the run
+        // stranded on fusion.dispatched. Pass reason so the last side's stop is
+        // not reported as a clean fusion.completed success. Ownership stays until
+        // the whole run completes (clearFusionRunSessionState). Suppress
+        // releaseSettled's session.stopped — this method owns the single terminal
+        // lifecycle event with the caller reason.
+        this.completeFusionSide(input.sessionId, input.reason, {
+            suppressStopEvent: true,
+        });
+        const afterFusion = this.sessions.get(input.sessionId) ?? session;
+        if (afterFusion.status !== "stopped" && afterFusion.status !== "lost") {
+            this.deps.tmux.killWindow(session.tmuxWindow);
+            void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
+            this.releaseWorktreeLeases({ sessionId: input.sessionId });
+        }
+        this.clearFusionSession(input.sessionId);
+        const now = new Date().toISOString();
+        // Re-read after release so cleared worktreePath refs are not re-stamped.
+        const released = this.sessions.get(input.sessionId) ?? session;
+        this.sessions.set(input.sessionId, { ...released, status: "stopped" });
+        if (session.taskId !== null) {
+            const task = this.tasks.get(session.taskId);
+            if (task !== undefined) {
+                this.saveTask({
+                    ...task,
+                    sessions: task.sessions.map((s) => s.sessionId === input.sessionId
+                        ? { ...s, status: "stopped", lastEventAt: now }
+                        : s),
+                    updatedAt: now,
+                });
+            }
+        }
+        this.sink({
+            type: "session.stopped",
+            payload: {
+                sessionId: input.sessionId,
+                taskId: session.taskId,
+                reason: input.reason,
+            },
+        });
+        return { sessionId: input.sessionId };
+    }
+    respawnCrewmate(raw) {
+        const input = respawnCrewmateInputSchema.parse(raw);
+        const session = this.sessions.get(input.sessionId);
+        if (session === undefined || session.taskId === null) {
+            throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
+        }
+        this.stopCrewmate({ sessionId: input.sessionId, reason: input.reason });
+        return this.spawnCrewmate({
+            taskId: session.taskId,
+            role: session.role,
+            model: session.model,
+            thinking: session.thinking,
+            cleanRoom: true,
+            vars: {},
+        });
+    }
+    /**
+     * `/opinion`, `/fusion` and plan-fusion (master plan §6.3).
+     *
+     * The instruction is rendered ONCE from the layered prompt pack and handed to
+     * every side byte-for-byte. That is the clean-room contract: each family
+     * answers the same question in isolation, and `promptsIdentical` on the run
+     * record is the durable proof — not a claim in a comment.
+     */
+    dispatchFusion(raw) {
+        const input = dispatchFusionInputSchema.parse(raw);
+        const task = this.requireTask(input.taskId);
+        const policies = this.cfg().policies;
+        // Family is always derived from model server-side. Client-supplied
+        // cast.family is ignored for policy and durable records so mislabels
+        // cannot bypass cross-family invariants.
+        const casts = input.casts.map((cast) => ({
+            ...cast,
+            family: familyFromModel(cast.model),
+        }));
+        // Cross-family invariants: an opinion or a plan-fusion whose sides all
+        // share a family is not a second opinion, it is an echo.
+        const families = new Set(casts.map((c) => c.family));
+        if (input.kind === "plan-fusion" && policies.distinctPlannerFamilies && families.size < 2) {
+            throw new ToolSurfaceError("POLICY_VIOLATION", "plan-fusion requires ≥2 distinct families");
+        }
+        if (input.kind === "opinion" && casts.length >= 2 && families.size < 2) {
+            throw new ToolSurfaceError("POLICY_VIOLATION", "/opinion requires ≥2 distinct model families — a same-family panel is not an independent opinion", { families: [...families] });
+        }
+        // Default spawn policy by kind (§6.3): opinion / plan-fusion spawn clean-room
+        // sides; fusion with a completed artifact is a contract check only.
+        const spawnSides = input.spawnSides ?? (input.kind === "opinion" || input.kind === "plan-fusion");
+        const runId = nextUlid();
+        const project = this.deps.projects.get(task.projectId);
+        // Render the instruction from the layered prompt pack when a ref is given.
+        const templateRef = input.instructionTemplateRef ??
+            (input.instruction === undefined ? DEFAULT_FUSION_TEMPLATES[input.kind] : undefined);
+        let instruction = input.instruction ?? "";
+        let templateInfo = null;
+        let renderedHash = null;
+        if (templateRef !== undefined && this.deps.prompts !== undefined) {
+            const vars = {
+                TASK_TITLE: task.title,
+                TASK_INTENT: task.intent,
+                QUESTION: input.vars.QUESTION ?? task.title,
+                CONTEXT: input.vars.CONTEXT ?? task.intent,
+                ...input.vars,
+            };
+            try {
+                const rendered = this.deps.prompts.render(templateRef, vars, project?.trusted === true ? join(project.path, ".agentos", "prompts") : undefined);
+                instruction = rendered.rendered;
+                templateInfo = rendered.info;
+                renderedHash = rendered.renderedHash;
+            }
+            catch (error) {
+                // An undefined {{VAR}} or a missing ref is the caller's error, stated
+                // precisely — never a half-rendered instruction sent to a model.
+                throw new ToolSurfaceError("VALIDATION_ERROR", error instanceof Error ? error.message : String(error), { templateRef });
+            }
+        }
+        if (instruction.length === 0) {
+            instruction = `Fusion kind=${input.kind} for ${task.title}\n`;
+        }
+        const instructionHash = sha256(instruction);
+        // Every side receives the SAME rendered bytes.
+        const sides = casts.map((cast) => ({
+            role: cast.role,
+            model: cast.model,
+            family: cast.family,
+            sessionId: null,
+            promptHash: instructionHash,
+            artifactPath: null,
+            inputTokens: null,
+            outputTokens: null,
+            costUsd: null,
+        }));
+        const promptsIdentical = new Set(sides.map((s) => s.promptHash)).size === 1;
+        // Aggregator family retention: the fusion agent runs on the ARCHITECT
+        // side's family — the first planner in the cast — and that choice is
+        // recorded on the run rather than silently made.
+        const architect = casts.find((c) => c.role === "planner") ?? casts[0];
+        const aggregatorFamily = architect?.family ?? null;
+        let contractOk = null;
+        if (input.kind === "fusion" && input.instruction !== undefined) {
+            const contract = enforceFusionContract(input.instruction);
+            contractOk = contract.ok;
+            if (!contract.ok) {
+                throw new ToolSurfaceError("FUSION_CONTRACT", `fusion artifact contract failed: ${contract.errors.join("; ")}`, { errors: contract.errors });
+            }
+        }
+        const run = {
+            runId,
+            taskId: task.id,
+            kind: input.kind,
+            templateRef: templateInfo?.ref ?? templateRef ?? null,
+            templateLayer: templateInfo?.layer ?? null,
+            templateHash: templateInfo?.contentHash ?? null,
+            renderedHash,
+            promptsIdentical,
+            sides,
+            aggregatorFamily,
+            contractOk,
+            createdAt: new Date().toISOString(),
+            completedAt: null,
+            error: null,
+        };
+        this.deps.fusionRuns.create(run);
+        this.deps.fusionRuns.writeInstruction(task.id, runId, instruction);
+        if (input.kind === "fusion" && input.instruction !== undefined) {
+            this.deps.fusionRuns.writeFused(task.id, runId, input.instruction);
+        }
+        this.sink({
+            type: "fusion.dispatched",
+            payload: { taskId: task.id, kind: input.kind, runId },
+        });
+        // Spawn one clean-room Pi per side, each with the identical instruction and
+        // its own per-model session key. side_completed / completed fire on settle.
+        if (spawnSides) {
+            const spawnedSessionIds = sides.map(() => null);
+            for (let i = 0; i < sides.length; i++) {
+                const side = sides[i];
+                const cast = casts[i];
+                try {
+                    const result = this.spawnCrewmate({
+                        taskId: task.id,
+                        role: side.role,
+                        model: side.model,
+                        thinking: cast.thinking,
+                        // §6.3: /opinion and plan-fusion are always clean-room — ignore cast.
+                        cleanRoom: input.kind === "opinion" || input.kind === "plan-fusion"
+                            ? true
+                            : cast.cleanRoom,
+                        vars: {},
+                        prompt: instruction,
+                    });
+                    const sessionId = result.session.sessionId;
+                    spawnedSessionIds[i] = sessionId;
+                    this.fusionBySessionId.set(sessionId, {
+                        taskId: task.id,
+                        runId,
+                        sideIndex: i,
+                    });
+                    // Persist immediately so kill-9 mid-loop can hydrate ownership and
+                    // early ext.usage frames can attribute by sideIndex.
+                    const latest = this.deps.fusionRuns.get(task.id, runId) ?? run;
+                    const withSession = latest.sides.map((s, j) => j === i ? { ...s, sessionId: s.sessionId ?? sessionId } : s);
+                    this.deps.fusionRuns.save({ ...latest, sides: withSession });
+                    // Fake-Pi writes per-session output during spawn and never sends
+                    // agent_settled over the extension channel — finalize as soon as
+                    // ownership is registered. Real Pi finalizes via settle / session_end.
+                    if (this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1") {
+                        this.completeFusionSide(sessionId);
+                    }
+                }
+                catch (error) {
+                    // Partial spawn must not leave a durable in-flight run: stop any
+                    // already-spawned crewmates (pane/socket/lease), finalize sides,
+                    // complete the run with error, then rethrow the typed tool error.
+                    const message = error instanceof ToolSurfaceError
+                        ? error.message
+                        : error instanceof Error
+                            ? error.message
+                            : String(error);
+                    this.failRemainingFusionSides(task.id, runId, spawnedSessionIds, i, message);
+                    throw error;
+                }
+            }
+        }
+        else {
+            // Pure contract / bookkeeping dispatch — no sides to wait on.
+            this.emitFusionCompleted(run);
+            if (input.kind === "plan-fusion" && task.phase === "PLANNING") {
+                this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+            }
+        }
+        return contractOk === null
+            ? { runId, promptsIdentical, aggregatorFamily, spawned: spawnSides }
+            : { runId, promptsIdentical, aggregatorFamily, contractOk, spawned: spawnSides };
+    }
+    /**
+     * After a mid-cast spawn failure: stop already-spawned crewmates (pane,
+     * socket, lease), then settle remaining sides and complete the run through
+     * the shared finalize helper so Console never sits on "dispatched".
+     */
+    failRemainingFusionSides(taskId, runId, spawnedSessionIds, failedAtIndex, errorMessage) {
+        const stopReason = `fusion spawn failed at side ${failedAtIndex}: ${errorMessage}`;
+        for (let i = 0; i < failedAtIndex; i++) {
+            const sessionId = spawnedSessionIds[i];
+            if (sessionId == null)
+                continue;
+            const live = this.sessions.get(sessionId);
+            if (live === undefined ||
+                live.status === "stopped" ||
+                live.status === "lost") {
+                continue;
+            }
+            try {
+                this.stopCrewmate({
+                    sessionId,
+                    reason: stopReason,
+                });
+            }
+            catch {
+                // Best-effort teardown; finalize below even if stop races.
+            }
+        }
+        // Same lifecycle as halt/boot: never-spawned sides, remaining session
+        // sides, tryComplete with the failure latched.
+        this.finalizeOpenFusionRun(taskId, runId, errorMessage);
+    }
+    /**
+     * Latch a non-empty failure reason onto the durable FusionRun. Reasons
+     * accumulate (semicolon-separated, de-duplicated) so a clean last settle
+     * cannot erase an earlier side stop/lost/abort.
+     */
+    latchFusionError(taskId, runId, error) {
+        const run = this.deps.fusionRuns.get(taskId, runId);
+        if (run === null)
+            return null;
+        if (error == null || error.length === 0)
+            return run;
+        const existing = run.error ?? null;
+        const next = mergeFusionErrors(existing, error);
+        if (next === existing)
+            return run;
+        const updated = { ...run, error: next };
+        this.deps.fusionRuns.save(updated);
+        return updated;
+    }
+    /**
+     * Capture a fusion side's output when its session settles, emit
+     * fusion.side_completed, and finish the run when every side is done.
+     * The settled side's pane is killed and its worktree lease released so it
+     * does not hold a pool slot. fusionBySessionId stays until the run
+     * completes so late usage frames after agent_settled still attribute.
+     */
+    completeFusionSide(sessionId, error, options = {}) {
+        const ref = this.fusionBySessionId.get(sessionId);
+        if (ref === undefined)
+            return;
+        // Latch immediately so a later clean settle cannot drop this reason.
+        this.latchFusionError(ref.taskId, ref.runId, error);
+        const run = this.deps.fusionRuns.get(ref.taskId, ref.runId);
+        if (run === null) {
+            this.fusionBySessionId.delete(sessionId);
+            return;
+        }
+        const side = run.sides[ref.sideIndex];
+        if (side === undefined) {
+            this.fusionBySessionId.delete(sessionId);
+            return;
+        }
+        if (side.settledAt != null || side.artifactPath !== null) {
+            // Already recorded (e.g. double settle from agent_settled + session_end).
+            this.tryCompleteFusionRun(ref.taskId, ref.runId);
+            this.releaseSettledFusionCrewmate(sessionId, options);
+            return;
+        }
+        const content = this.readSideOutput(sessionId);
+        const artifactPath = content === null
+            ? null
+            : this.deps.fusionRuns.writeSideArtifact(ref.taskId, ref.runId, ref.sideIndex, side.model, content);
+        const settledAt = new Date().toISOString();
+        const sides = run.sides.map((s, i) => i === ref.sideIndex
+            ? {
+                ...s,
+                sessionId: s.sessionId ?? sessionId,
+                artifactPath,
+                settledAt,
+            }
+            : s);
+        this.deps.fusionRuns.save({ ...run, sides });
+        this.sink({
+            type: "fusion.side_completed",
+            payload: {
+                taskId: ref.taskId,
+                runId: ref.runId,
+                role: side.role,
+                model: side.model,
+                family: side.family,
+                promptHash: side.promptHash,
+                artifactPath,
+            },
+        });
+        this.tryCompleteFusionRun(ref.taskId, ref.runId);
+        this.releaseSettledFusionCrewmate(sessionId, options);
+    }
+    /**
+     * Stop a settled fusion side's pane and free its worktree lease without
+     * dropping fusion ownership (that stays until the whole run completes).
+     * When `suppressStopEvent` is set, the caller owns the single terminal
+     * lifecycle event (stop_crewmate / markSessionLost).
+     */
+    releaseSettledFusionCrewmate(sessionId, options = {}) {
+        const session = this.sessions.get(sessionId);
+        if (session === undefined) {
+            // Artifact already captured; free the dir map even if the session row is gone.
+            this.sessionDirs.delete(sessionId);
+            return;
+        }
+        if (session.status === "stopped" || session.status === "lost") {
+            this.sessionDirs.delete(sessionId);
+            return;
+        }
+        try {
+            this.deps.tmux.killWindow(session.tmuxWindow);
+        }
+        catch {
+            // Pane may already be gone (real session_end / prior halt).
+        }
+        void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
+        this.releaseWorktreeLeases({ sessionId });
+        const now = new Date().toISOString();
+        const released = this.sessions.get(sessionId) ?? session;
+        this.sessions.set(sessionId, { ...released, status: "stopped" });
+        // Artifact already read; drop the session-dir mapping so happy-path settle
+        // does not retain unbounded sessionId→dir entries (fake-Pi has no session_end).
+        this.sessionDirs.delete(sessionId);
+        if (session.taskId !== null) {
+            const task = this.tasks.get(session.taskId);
+            if (task !== undefined) {
+                this.saveTask({
+                    ...task,
+                    sessions: task.sessions.map((s) => s.sessionId === sessionId
+                        ? { ...s, status: "stopped", lastEventAt: now }
+                        : s),
+                    updatedAt: now,
+                });
+            }
+        }
+        if (options.suppressStopEvent !== true) {
+            this.sink({
+                type: "session.stopped",
+                payload: {
+                    sessionId,
+                    taskId: session.taskId,
+                    reason: "fusion side settled",
+                },
+            });
+        }
+    }
+    /**
+     * Read the extension-written side answer for this session only.
+     * Path is `$SESSION_DIR/outputs/$sessionId.md` so sequential runs that share
+     * a per-model session key never re-attribute a prior run's bytes.
+     * Null / empty / whitespace-only reads are treated as no artifact.
+     */
+    readSideOutput(sessionId) {
+        const sessionDir = this.sessionDirs.get(sessionId);
+        if (sessionDir === undefined)
+            return null;
+        const outputPath = join(sessionDir, "outputs", `${sessionId}.md`);
+        if (!existsSync(outputPath))
+            return null;
+        try {
+            const content = readFileSync(outputPath, "utf8");
+            if (content.trim().length === 0)
+                return null;
+            return content;
+        }
+        catch {
+            return null;
+        }
+    }
+    tryCompleteFusionRun(taskId, runId, error) {
+        // Latch any late reason before the all-sides check so order of settle
+        // cannot drop a prior failure when the last side is clean.
+        const run = this.latchFusionError(taskId, runId, error);
+        if (run === null)
+            return;
+        if (run.completedAt != null)
+            return;
+        // A side is done when it has settled (possibly without an artifact) or,
+        // for older records, when an artifact path was already written.
+        if (!run.sides.every((s) => s.settledAt != null || s.artifactPath !== null)) {
+            return;
+        }
+        // Sole owner of fusionBySessionId lifetime: drop only when every side is done.
+        this.clearFusionRunSessionState(runId, run.sides.map((s) => s.sessionId));
+        this.emitFusionCompleted(run);
+        const latchedError = this.deps.fusionRuns.get(taskId, runId)?.error ?? run.error;
+        if (run.kind === "plan-fusion" &&
+            (latchedError == null || latchedError.length === 0)) {
+            const task = this.tasks.get(taskId);
+            if (task !== undefined && task.phase === "PLANNING") {
+                this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+            }
+        }
+    }
+    emitFusionCompleted(run, error) {
+        const latest = this.latchFusionError(run.taskId, run.runId, error) ??
+            this.deps.fusionRuns.get(run.taskId, run.runId) ??
+            run;
+        if (latest.completedAt != null)
+            return;
+        const completedAt = new Date().toISOString();
+        const durableError = latest.error != null && latest.error.length > 0 ? latest.error : null;
+        this.deps.fusionRuns.save({
+            ...latest,
+            completedAt,
+            error: durableError,
+        });
+        this.sink({
+            type: "fusion.completed",
+            payload: {
+                taskId: latest.taskId,
+                runId: latest.runId,
+                kind: latest.kind,
+                promptsIdentical: latest.promptsIdentical,
+                aggregatorFamily: latest.aggregatorFamily,
+                contractOk: latest.contractOk,
+                ...(durableError != null ? { error: durableError } : {}),
+            },
+        });
+    }
+    /**
+     * Drop fusion ownership and session-dir entries for a finished/failed run.
+     * This is the only path that clears fusionBySessionId for a live run —
+     * stop/lost/session_end must not drop ownership while siblings are in flight.
+     */
+    clearFusionRunSessionState(runId, sessionIds) {
+        for (const [sid, ref] of this.fusionBySessionId) {
+            if (ref.runId === runId) {
+                this.fusionBySessionId.delete(sid);
+                this.sessionDirs.delete(sid);
+            }
+        }
+        for (const sessionId of sessionIds) {
+            if (sessionId == null)
+                continue;
+            this.fusionBySessionId.delete(sessionId);
+            this.sessionDirs.delete(sessionId);
+        }
+    }
+    /**
+     * Drop the session-dir mapping only. Fusion ownership is intentionally not
+     * cleared here — that is clearFusionRunSessionState's job at run completion.
+     */
+    clearFusionSession(sessionId) {
+        this.sessionDirs.delete(sessionId);
+    }
+    authorGate(raw) {
+        const input = authorGateInputSchema.parse(raw);
+        let task = this.requireTask(input.taskId);
+        if (task.phase === "DISPATCH_RESOLVED" || task.phase === "PLAN_FUSED") {
+            task = this.transition(task, "GATE_AUTHORING", "author_gate");
+        }
+        else if (task.phase !== "GATE_AUTHORING") {
+            throw new ToolSurfaceError("ILLEGAL_TRANSITION", `run_gate authoring not legal in phase ${task.phase}`);
+        }
+        const source = input.gateSource ??
+            `#!/usr/bin/env python3\n# /// script\n# requires-python = ">=3.11"\n# dependencies = []\n# ///\nimport os\nif os.environ.get("AGENTOS_GATE_TARGET") == "baseline":\n    print("EXPECTED_RED")\n    print("FAIL baseline")\n    raise SystemExit(1)\nprint("PASS")\n`;
+        const path = this.deps.gates.writeGateSource(task.id, source);
+        return { taskId: task.id, gatePath: path };
+    }
+    runGate(raw) {
+        const input = runGateInputSchema.parse(raw);
+        let task = this.requireTask(input.taskId);
+        if (!canRunGate(task.phase, input.target)) {
+            throw new ToolSurfaceError("ILLEGAL_TRANSITION", `run_gate(${input.target}) illegal in phase ${task.phase}`);
+        }
+        const project = this.deps.projects.get(task.projectId);
+        let cwd;
+        if (input.target === "baseline") {
+            cwd = this.deps.gates.gateWorkspace(task.id);
+        }
+        else {
+            // Candidate gates never run in the Captain's primary checkout — same
+            // isolation rule as spawn_crewmate.
+            const builderPath = this.resolveBuilderWorktreePath(task);
+            if (builderPath === null) {
+                throw new ToolSurfaceError("CONFLICT", `run_gate(candidate) requires an isolated builder worktree for task ${task.id}; none is associated`);
+            }
+            if (project !== null && resolve(builderPath) === resolve(project.path)) {
+                throw new ToolSurfaceError("CONFLICT", `run_gate(candidate) refusing Captain's primary checkout for task ${task.id}`);
+            }
+            cwd = builderPath;
+            // A candidate verdict only means something if THIS revision of the gate
+            // was proven red at baseline. Editing the gate drops the proof, so a
+            // validator cannot weaken the gate after the fact and call the build
+            // green (master plan §11 Phase 5: "gate revisions re-prove RED").
+            // Captain-stamped redBaselineOverride disables the policy holistically
+            // (spawn + candidate), not only the spawn half.
+            const enforceRedBaseline = this.cfg().policies.redBaselineGateRequired &&
+                !this.hasRedBaselineOverride(task);
+            if (enforceRedBaseline && !this.deps.gates.hasRedProofForCurrentSource(task.id)) {
+                throw new ToolSurfaceError("GATE_ERROR", `gate revision has no RED baseline proof for task ${task.id} — re-run run_gate(baseline) before judging a candidate`, { gateSourceHash: this.deps.gates.gateSourceHash(task.id) });
+            }
+        }
+        const enforceRedBaselineForRun = this.cfg().policies.redBaselineGateRequired &&
+            !this.hasRedBaselineOverride(task);
+        const result = this.deps.gates.run({
+            taskId: task.id,
+            target: input.target,
+            cwd,
+            expectedRed: enforceRedBaselineForRun,
+        });
+        this.sink({
+            type: "gate.result",
+            payload: {
+                taskId: task.id,
+                target: input.target,
+                outcome: result.outcome,
+                attempt: task.validationAttempt,
+                outputHash: result.outputHash,
+            },
+        });
+        // Stamp daemon-owned proof/ledger onto the durable task record.
+        // Emit gate.red_proven before task.json so kill -9 can rebuild from the log.
+        const proof = this.deps.gates.getRedProof(task.id);
+        const ledger = this.deps.gates.getFailLedger(task.id);
+        if (input.target === "baseline" &&
+            (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") &&
+            proof !== null) {
+            // HMAC travels with the event so hydrate can verify — never re-sign.
+            this.sink({
+                type: "gate.red_proven",
+                payload: {
+                    taskId: task.id,
+                    gateSourceHash: proof.gateSourceHash,
+                    outcome: proof.outcome,
+                    provenAt: proof.provenAt,
+                    hmac: proof.hmac,
+                },
+            });
+        }
+        if (proof !== null || ledger !== null) {
+            task = {
+                ...task,
+                redProof: proof ?? task.redProof,
+                lastFailLedger: ledger ?? task.lastFailLedger,
+                updatedAt: new Date().toISOString(),
+            };
+            this.saveTask(task);
+        }
+        if (input.target === "baseline") {
+            if (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") {
+                // Mid-build re-prove stays in BUILDING/VALIDATING so the rebuild loop
+                // can continue after the daemon records a fresh RED proof. First-time
+                // proof advances into GATE_RED_VERIFIED.
+                if (task.phase !== "BUILDING" && task.phase !== "VALIDATING") {
+                    task = this.transition(task, "GATE_RED_VERIFIED", "baseline red proven");
+                }
+            }
+            else if (result.outcome === "PASS") {
+                throw new ToolSurfaceError("GATE_ERROR", "GATE DEFECT: baseline passed — refusing builder spawn");
+            }
+            else {
+                throw new ToolSurfaceError("GATE_ERROR", `baseline gate error: ${result.stderr}`);
+            }
+        }
+        else {
+            // candidate
+            if (result.outcome === "PASS") {
+                // stay in VALIDATING or move toward DELIVERING — Brain decides via advance/deliver
+                if (task.phase === "BUILDING") {
+                    task = this.transition(task, "VALIDATING", "candidate gate pass");
+                }
+            }
+            else if (result.outcome === "FAIL") {
+                const attempt = task.validationAttempt + 1;
+                task = {
+                    ...task,
+                    validationAttempt: attempt,
+                    lastFailLedger: ledger ?? task.lastFailLedger,
+                    updatedAt: new Date().toISOString(),
+                };
+                this.saveTask(task);
+                if (attempt >= task.maxValidations) {
+                    task = this.transition(task, "VALIDATION_EXHAUSTED", "max validations reached");
+                }
+                else {
+                    task = this.transition(task, "BUILDING", "gate fail — rebuild");
+                }
+            }
+            else {
+                // GATE_ERROR is not RED: an infrastructure failure must not burn a
+                // validation attempt or advance the task toward exhaustion.
+                throw new ToolSurfaceError("GATE_ERROR", `candidate gate error (infrastructure, not a RED verdict): ${result.stderr}`, { infrastructureError: result.infrastructureError });
+            }
+        }
+        return {
+            outcome: result.outcome,
+            outputHash: result.outputHash,
+            failLines: result.failLines,
+        };
+    }
+    sendToCrew(raw) {
+        const input = sendToCrewInputSchema.parse(raw);
+        const session = this.sessions.get(input.sessionId);
+        if (session === undefined) {
+            throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
+        }
+        let message = input.message ?? "";
+        let failHash;
+        if (input.gateFailRef !== undefined) {
+            // Verbatim FAIL injection. Substrate injects the ledger's exact bytes and
+            // compares to the stored hash — no split/trim/filter reconstruction.
+            const taskId = session.taskId;
+            if (taskId === null) {
+                throw new ToolSurfaceError("GATE_ERROR", "verbatim FAIL hash unavailable — refusing to inject unverifiable gate output");
+            }
+            const ledger = this.deps.gates.getFailLedger(taskId);
+            if (ledger === null || ledger.text.length === 0) {
+                throw new ToolSurfaceError("NOT_FOUND", "no gate fail lines held for verbatim inject");
+            }
+            if (ledger.hash.length === 0) {
+                throw new ToolSurfaceError("GATE_ERROR", "verbatim FAIL hash missing — refusing to inject unverifiable gate output", { taskId });
+            }
+            message = ledger.text;
+            const actual = GateRunner.hashText(message);
+            if (ledger.hash !== actual) {
+                throw new ToolSurfaceError("GATE_ERROR", "verbatim FAIL hash mismatch — refusing to inject altered gate output", { expected: ledger.hash, actual });
+            }
+            failHash = ledger.hash;
+        }
+        if (message.length === 0) {
+            throw new ToolSurfaceError("VALIDATION_ERROR", "message or gateFailRef required");
+        }
+        // Prefer the live extension inject path when the session socket is up;
+        // fall back to tmux send-keys for panes whose control channel has dropped.
+        let sent = this.deps.sockets?.sendControl(input.sessionId, {
+            type: "ctl.injectMessage",
+            sessionId: input.sessionId,
+            message,
+            ts: new Date().toISOString(),
+        }) ?? false;
+        if (!sent) {
+            try {
+                this.deps.tmux.sendKeys(session.tmuxWindow, message);
+                sent = true;
+            }
+            catch {
+                sent = false;
+            }
+        }
+        if (!sent) {
+            throw new ToolSurfaceError("CONFLICT", `no live channel to session ${input.sessionId} — message not delivered`);
+        }
+        return failHash === undefined ? { sent } : { sent, failHash };
+    }
+    /** Record a blocking question a crewmate asked over its extension socket. */
+    recordQuestion(input) {
+        const session = this.sessions.get(input.sessionId);
+        const pending = {
+            questionId: input.questionId,
+            sessionId: input.sessionId,
+            taskId: session?.taskId ?? null,
+            question: input.question,
+            askedAt: new Date().toISOString(),
+        };
+        this.questions.set(input.questionId, pending);
+        this.sink({
+            type: "crew.question",
+            payload: {
+                questionId: pending.questionId,
+                sessionId: pending.sessionId,
+                taskId: pending.taskId,
+                question: pending.question,
+            },
+        });
+        this.deps.watcher.classify({
+            class: "NEEDS_INPUT",
+            taskId: pending.taskId,
+            sessionId: pending.sessionId,
+            summary: pending.question.slice(0, 500),
+        });
+        return pending;
+    }
+    listQuestions() {
+        return [...this.questions.values()];
+    }
+    /**
+     * Route an answer back to the exact session that asked. Delivered over the
+     * session's control socket; falls back to `send-keys` for a human-attached
+     * pane whose extension channel has dropped.
+     */
+    answerCrewmate(raw) {
+        const input = answerCrewmateInputSchema.parse(raw);
+        const pending = this.questions.get(input.questionId);
+        if (pending === undefined) {
+            throw new ToolSurfaceError("NOT_FOUND", `question not found: ${input.questionId}`);
+        }
+        const session = this.sessions.get(pending.sessionId);
+        if (session === undefined) {
+            throw new ToolSurfaceError("NOT_FOUND", `session not found: ${pending.sessionId}`);
+        }
+        let delivered = this.deps.sockets?.sendControl(pending.sessionId, {
+            type: "ctl.injectMessage",
+            sessionId: pending.sessionId,
+            message: input.answer,
+            ts: new Date().toISOString(),
+        }) ?? false;
+        if (!delivered) {
+            try {
+                this.deps.tmux.sendKeys(session.tmuxWindow, input.answer);
+                delivered = true;
+            }
+            catch {
+                delivered = false;
+            }
+        }
+        if (!delivered) {
+            throw new ToolSurfaceError("CONFLICT", `no live channel to session ${pending.sessionId} — answer not delivered`);
+        }
+        this.questions.delete(input.questionId);
+        this.sink({
+            type: "crew.answered",
+            payload: {
+                questionId: input.questionId,
+                sessionId: pending.sessionId,
+                delivered: true,
+            },
+        });
+        return { questionId: input.questionId, sessionId: pending.sessionId, delivered: true };
+    }
+    /**
+     * SCOUT sessions are read-only by policy. Enforcement is an audit of the real
+     * worktree: any tracked modification or untracked file quarantines the lease
+     * and escalates. Only a successful empty porcelain status is clean — git
+     * failure or a missing .git on a real lease fails closed. Called when a
+     * scout session settles or is stopped.
+     */
+    auditScoutSession(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (session === undefined || session.role !== "scout") {
+            return { clean: true, changedPaths: [] };
+        }
+        if (!this.cfg().policies.scoutReadOnly) {
+            return { clean: true, changedPaths: [] };
+        }
+        const path = session.worktreePath;
+        if (path === null) {
+            return { clean: true, changedPaths: [] };
+        }
+        // Fake-git marker trees are not auditable via git; real leases must have .git.
+        if (process.env.AGENTOS_FAKE_GIT === "1") {
+            return { clean: true, changedPaths: [] };
+        }
+        if (!existsSync(join(path, ".git"))) {
+            return this.failScoutAudit(session, sessionId, path, ["(audit could not be performed: worktree is not a git repository)"], `SCOUT ${sessionId} worktree is not a git repository — write policy could not be verified`);
+        }
+        const status = spawnSync("git", ["-C", path, "status", "--porcelain"], {
+            encoding: "utf8",
+            timeout: 15_000,
+        });
+        if (status.error !== undefined || status.status !== 0) {
+            const detail = (status.error?.message ||
+                status.stderr ||
+                status.stdout ||
+                `exit ${String(status.status)}`)
+                .toString()
+                .trim();
+            return this.failScoutAudit(session, sessionId, path, [`(audit could not be performed: git status failed: ${detail})`], `SCOUT ${sessionId} git status failed — write policy could not be verified: ${detail}`);
+        }
+        const changedPaths = status.stdout
+            .split("\n")
+            .map((l) => l.trim())
+            .filter((l) => l.length > 0);
+        if (changedPaths.length === 0) {
+            return { clean: true, changedPaths: [] };
+        }
+        return this.failScoutAudit(session, sessionId, path, changedPaths, `SCOUT ${sessionId} wrote ${changedPaths.length} path(s) in a read-only worktree`);
+    }
+    failScoutAudit(session, sessionId, path, changedPaths, summary) {
+        let quarantined = false;
+        for (const lease of this.deps.worktrees.list().filter((l) => l.sessionId === sessionId)) {
+            this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
+            quarantined = true;
+        }
+        this.sink({
+            type: "scout.write_violation",
+            payload: {
+                sessionId,
+                taskId: session.taskId ?? sessionId,
+                worktreePath: path,
+                changedPaths,
+                quarantined,
+            },
+        });
+        if (session.taskId !== null) {
+            this.invoke("escalate_to_captain", {
+                taskId: session.taskId,
+                summary,
+                severity: "critical",
+            });
+        }
+        return { clean: false, changedPaths };
+    }
+    /**
+     * Halt every live session for a task: scout audit, kill tmux window, close
+     * session socket, persist status stopped. Does not release worktree leases —
+     * callers release next (with finalSha on successful deliver, or plain release
+     * on cancel / abort).
+     */
+    haltTaskSessions(taskId, reason) {
+        const live = [...this.sessions.values()].filter((s) => s.taskId === taskId && s.status !== "stopped" && s.status !== "lost");
+        for (const session of live) {
+            try {
+                if (session.role === "scout") {
+                    this.auditScoutSession(session.sessionId);
+                }
+                this.deps.tmux.killWindow(session.tmuxWindow);
+                void this.deps.sockets?.closeSession(session.sessionId).catch(() => undefined);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new ToolSurfaceError("CONFLICT", `cannot halt task ${taskId}: session ${session.sessionId} is still live and could not be stopped (${message})`);
+            }
+            if (this.deps.tmux.hasWindow(session.tmuxWindow)) {
+                throw new ToolSurfaceError("CONFLICT", `cannot halt task ${taskId}: session ${session.sessionId} is still live (tmux window ${session.tmuxWindow} remains)`);
+            }
+            const now = new Date().toISOString();
+            const current = this.sessions.get(session.sessionId) ?? session;
+            this.sessions.set(session.sessionId, { ...current, status: "stopped" });
+            const task = this.tasks.get(taskId);
+            if (task !== undefined) {
+                this.saveTask({
+                    ...task,
+                    sessions: task.sessions.map((s) => s.sessionId === session.sessionId
+                        ? { ...s, status: "stopped", lastEventAt: now }
+                        : s),
+                    updatedAt: now,
+                });
+            }
+            this.sink({
+                type: "session.stopped",
+                payload: {
+                    sessionId: session.sessionId,
+                    taskId,
+                    reason,
+                },
+            });
+        }
+    }
+    /**
+     * Single choke point when a task leaves the live set: finalize in-flight
+     * fusion sides, halt every session, then release every task-linked lease
+     * (clean → verified-reset, dirty → quarantine + deliveryBlocked stamp).
+     * Used by cancel/FAILED terminal paths and as the deliver abort reclaim.
+     */
+    haltAndReleaseTask(taskId, reason) {
+        // Same completeFusionSide path as stop_crewmate / markSessionLost so
+        // cancel_task / FAILED / DONE cannot strand runs on fusion.dispatched.
+        // Pass reason so fusion.completed.error distinguishes abort from success.
+        this.finalizeFusionSidesForTask(taskId, reason);
+        this.haltTaskSessions(taskId, reason);
+        this.releaseWorktreeLeases({ taskId });
+    }
+    /**
+     * Settle every in-flight fusion side for a task via the shared
+     * completeFusionSide helper (artifact capture, side_completed, and
+     * fusion.completed when the last side settles). When `error` is set
+     * (cancel / FAILED / deliver abort), it is latched onto the durable run
+     * and reported on fusion.completed regardless of settle order.
+     */
+    finalizeFusionSidesForTask(taskId, error) {
+        // Latch the abort reason once per open run before settling sides so a
+        // clean mid-loop settle cannot erase it.
+        if (error != null && error.length > 0) {
+            for (const run of this.deps.fusionRuns.listForTask(taskId)) {
+                if (run.completedAt != null)
+                    continue;
+                this.latchFusionError(taskId, run.runId, error);
+            }
+        }
+        const ownedSessionIds = [
+            ...new Set([...this.fusionBySessionId.entries()]
+                .filter(([, ref]) => ref.taskId === taskId)
+                .map(([sessionId]) => sessionId)),
+        ];
+        for (const sessionId of ownedSessionIds) {
+            this.completeFusionSide(sessionId, error);
+        }
+        // Durable open runs: never-spawned sides, lost ownership, tryComplete.
+        // Same finalizeOpenFusionRun used by boot hydrate — one lifecycle rule.
+        for (const run of this.deps.fusionRuns.listForTask(taskId)) {
+            if (run.completedAt != null)
+                continue;
+            this.finalizeOpenFusionRun(taskId, run.runId, error);
+        }
+    }
+    /**
+     * Single durable-run finalize: settle never-spawned (null sessionId) sides,
+     * complete session-owned sides that cannot still make progress (or are
+     * force-finalized on error paths), leave live sides for settle/session_end,
+     * and tryComplete when every side is done (including all-settled runs that
+     * still lack completedAt).
+     * Used by halt/cancel, mid-spawn failure, and boot hydrate so the rule is not forked.
+     */
+    finalizeOpenFusionRun(taskId, runId, error) {
+        if (error != null && error.length > 0) {
+            this.latchFusionError(taskId, runId, error);
+        }
+        const force = error != null && error.length > 0;
+        const initial = this.deps.fusionRuns.get(taskId, runId);
+        if (initial === null || initial.completedAt != null)
+            return;
+        const sideCount = initial.sides.length;
+        for (let sideIndex = 0; sideIndex < sideCount; sideIndex++) {
+            const latest = this.deps.fusionRuns.get(taskId, runId);
+            if (latest === null)
+                break;
+            if (latest.completedAt != null)
+                break;
+            const side = latest.sides[sideIndex];
+            if (side === undefined)
+                continue;
+            if (side.settledAt != null || side.artifactPath !== null)
+                continue;
+            if (side.sessionId === null) {
+                const settledAt = new Date().toISOString();
+                const sides = latest.sides.map((s, i) => i === sideIndex ? { ...s, settledAt } : s);
+                this.deps.fusionRuns.save({ ...latest, sides });
+                this.sink({
+                    type: "fusion.side_completed",
+                    payload: {
+                        taskId,
+                        runId: latest.runId,
+                        role: side.role,
+                        model: side.model,
+                        family: side.family,
+                        promptHash: side.promptHash,
+                        artifactPath: null,
+                    },
+                });
+                this.tryCompleteFusionRun(taskId, latest.runId, error);
+                continue;
+            }
+            this.fusionBySessionId.set(side.sessionId, {
+                taskId,
+                runId: latest.runId,
+                sideIndex,
+            });
+            // Property, not a status enum: can this side still receive lifecycle
+            // events? Only starting/running rows with a live pane can. Anything else
+            // (settled/stopped/lost/wedged/missing row/gone pane/unknown) must be
+            // finalized here — default to finalize when progress is no or unknown.
+            const canStillMakeProgress = this.fusionSideCanStillMakeProgress(side.sessionId);
+            // Force (halt / mid-spawn fail / never-spawned sibling) completes live
+            // sides; boot hydrate only settles sides that can no longer settle alone.
+            if (force || !canStillMakeProgress) {
+                this.completeFusionSide(side.sessionId, error);
+            }
+        }
+        // Crash window: all sides already settled but completedAt still null.
+        this.tryCompleteFusionRun(taskId, runId, error);
+    }
+    /**
+     * Whether a fusion side can still emit agent_settled / session_end on its own.
+     * True only for a known session in a live status whose tmux window still
+     * exists. Missing sessions, non-live statuses (including settled-without-
+     * settledAt), gone panes, and unknown rows all return false so boot recovery
+     * finalizes them through completeFusionSide rather than waiting forever.
+     */
+    fusionSideCanStillMakeProgress(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (session === undefined)
+            return false;
+        if (session.status !== "starting" && session.status !== "running") {
+            return false;
+        }
+        try {
+            return this.deps.tmux.hasWindow(session.tmuxWindow);
+        }
+        catch {
+            // Unknown liveness → cannot assume progress; finalize on boot/halt.
+            return false;
+        }
+    }
+    deliverTask(raw) {
+        const input = deliverTaskInputSchema.parse(raw);
+        let task = this.requireTask(input.taskId);
+        const deliverable = [
+            "BUILDING",
+            "VALIDATING",
+            "GATE_RED_VERIFIED",
+            "DISPATCH_RESOLVED",
+            "DELIVERING",
+        ];
+        if (!deliverable.includes(task.phase)) {
+            throw new ToolSurfaceError("ILLEGAL_TRANSITION", `cannot deliver from phase ${task.phase}`);
+        }
+        // Sticky refuse before any side effects (DELIVERING transition / delivery.json).
+        this.assertNotDeliveryBlocked(task);
+        if (task.phase !== "DELIVERING") {
+            task = this.transition(task, "DELIVERING", "deliver_task");
+        }
+        // After halt begins, abort must reclaim leases only for sessions already
+        // stopped/lost. Never release a tree a live Pi still has as cwd (partial
+        // halt failure); reconcile reclaims those once panes are gone.
+        // Success finalizes fusion via DONE → haltAndReleaseTask; abort paths
+        // finalize in finally so runs cannot sit on fusion.dispatched.
+        let deliveryComplete = false;
+        let deliverAbortReason = null;
+        try {
+            this.haltTaskSessions(task.id, "deliver_task halt");
+            task = this.requireTask(task.id);
+            this.assertNotDeliveryBlocked(task);
+            const branch = task.branch ?? `ao/${task.id.slice(0, 10).toLowerCase()}`;
+            // Only verified-reset when porcelain is clean. Dirty trees quarantine and
+            // surface CONFLICT so uncommitted builder work is never discarded on DONE.
+            // delivery.json is written only after every lease clears the clean gate.
+            for (const lease of this.deps.worktrees.list().filter((l) => l.taskId === task.id)) {
+                if (process.env.AGENTOS_FAKE_GIT === "1") {
+                    this.releaseOneWorktreeLease(lease.id);
+                    continue;
+                }
+                const dirty = spawnSync("git", ["-C", lease.path, "status", "--porcelain"], {
+                    encoding: "utf8",
+                    timeout: 15_000,
+                });
+                if (dirty.error !== undefined || dirty.status !== 0) {
+                    const detail = (dirty.error?.message ||
+                        dirty.stderr ||
+                        dirty.stdout ||
+                        `git status exit ${String(dirty.status)}`)
+                        .toString()
+                        .trim();
+                    const reason = `worktree status failed (${detail}); quarantined`;
+                    this.blockDelivery(task, lease.id, reason, []);
+                    this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
+                    throw new ToolSurfaceError("CONFLICT", `cannot deliver task ${task.id}: ${reason}`);
+                }
+                if (dirty.stdout.trim().length > 0) {
+                    const dirtyPaths = dirty.stdout
+                        .split("\n")
+                        .map((line) => line.trim())
+                        .filter((line) => line.length > 0)
+                        .map((line) => line.slice(3).trim() || line);
+                    const reason = "worktree has uncommitted changes; quarantined for Captain inspection";
+                    this.blockDelivery(task, lease.id, reason, dirtyPaths);
+                    this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
+                    throw new ToolSurfaceError("CONFLICT", `cannot deliver task ${task.id}: ${reason}`);
+                }
+                let finalSha;
+                const rev = spawnSync("git", ["-C", lease.path, "rev-parse", "HEAD"], {
+                    encoding: "utf8",
+                    timeout: 15_000,
+                });
+                if (rev.status === 0) {
+                    const sha = rev.stdout.trim();
+                    if (sha.length > 0)
+                        finalSha = sha;
+                }
+                this.releaseOneWorktreeLease(lease.id, finalSha !== undefined ? { finalSha } : {});
+            }
+            // Single choke point before durable delivery marker / DONE.
+            task = this.requireTask(task.id);
+            this.assertDoneInvariant(task);
+            const runDir = join(this.deps.home, "runs", task.id);
+            mkdirSync(runDir, { recursive: true, mode: 0o700 });
+            writeFileSync(join(runDir, "delivery.json"), JSON.stringify({
+                mode: task.mode,
+                branch,
+                at: new Date().toISOString(),
+                shape: task.shape,
+            }, null, 2) + "\n", { mode: 0o600 });
+            // DONE is only written here; clear the stamp only after the invariant holds.
+            // Sessions and leases are already halted/released — transition will no-op those steps.
+            task = {
+                ...this.transition(task, "DONE", "delivered", { allowDone: true }),
+                branch,
+                deliveryBlocked: null,
+            };
+            this.saveTask(task);
+            deliveryComplete = true;
+            return task;
+        }
+        catch (error) {
+            deliverAbortReason =
+                error instanceof ToolSurfaceError
+                    ? error.message
+                    : error instanceof Error
+                        ? error.message
+                        : String(error);
+            throw error;
+        }
+        finally {
+            if (!deliveryComplete) {
+                // Dirty tree / status failure / deliveryBlocked / partial halt: finalize
+                // any in-flight fusion via the shared helper before reclaiming leases.
+                this.finalizeFusionSidesForTask(input.taskId, deliverAbortReason ?? "deliver_task aborted");
+                this.releaseWorktreeLeases({
+                    taskId: input.taskId,
+                    onlyHaltedSessions: true,
+                });
+            }
+        }
+    }
+    /**
+     * Captain-only (REST invoke): clear a sticky deliveryBlocked stamp. Never
+     * runs as a side effect of phase moves. Emits an audit event with the reason.
+     */
+    resolveDeliveryBlock(raw) {
+        const input = resolveDeliveryBlockInputSchema.parse(raw);
+        const task = this.requireTask(input.taskId);
+        if (task.deliveryBlocked === null) {
+            throw new ToolSurfaceError("CONFLICT", `task ${task.id} has no delivery block to resolve`);
+        }
+        const previous = task.deliveryBlocked;
+        const updated = {
+            ...task,
+            deliveryBlocked: null,
+            updatedAt: new Date().toISOString(),
+        };
+        this.saveTask(updated);
+        this.sink({
+            type: "task.delivery_block_resolved",
+            payload: {
+                taskId: task.id,
+                reason: input.reason,
+                previousLeaseId: previous.leaseId,
+                previousReason: previous.reason,
+                clearedBy: "captain",
+            },
+        });
+        return updated;
+    }
+    /** Persist a sticky delivery refusal on the task (survives lease quarantine). */
+    blockDelivery(task, leaseId, reason, dirtyPaths) {
+        this.saveTask({
+            ...task,
+            deliveryBlocked: {
+                leaseId,
+                reason,
+                dirtyPaths,
+                blockedAt: new Date().toISOString(),
+            },
+            updatedAt: new Date().toISOString(),
+        });
+    }
+    assertNotDeliveryBlocked(task) {
+        if (task.deliveryBlocked === null)
+            return;
+        throw new ToolSurfaceError("CONFLICT", `cannot deliver task ${task.id}: delivery blocked (${task.deliveryBlocked.reason}); Captain must resolve before delivery`, {
+            leaseId: task.deliveryBlocked.leaseId,
+            dirtyPaths: task.deliveryBlocked.dirtyPaths,
+        });
+    }
+    /**
+     * Delivery invariant (single choke point): a task may only reach DONE via
+     * deliver_task. Preconditions are re-derived from durable state at call time:
+     * no unresolved deliveryBlocked, all leases released, and clean porcelain on
+     * every worktree ever associated with the task. If cleanliness cannot be
+     * proven, refuse.
+     */
+    assertDoneInvariant(task) {
+        this.assertNotDeliveryBlocked(task);
+        const outstanding = this.deps.worktrees
+            .list()
+            .filter((l) => l.taskId === task.id &&
+            (l.state === "leased" || l.state === "reclaiming"));
+        if (outstanding.length > 0) {
+            throw new ToolSurfaceError("CONFLICT", `cannot mark task ${task.id} DONE: ${String(outstanding.length)} worktree lease(s) still held`);
+        }
+        this.assertAssociatedWorktreesClean(task);
+    }
+    /**
+     * Paths of worktrees ever associated with this task, from durable task state
+     * and the lease pool (including quarantined leases whose taskId was cleared).
+     */
+    associatedWorktreePaths(task) {
+        const paths = new Set();
+        if (task.worktreePath !== null)
+            paths.add(task.worktreePath);
+        for (const s of task.sessions) {
+            if (s.worktreePath !== null)
+                paths.add(s.worktreePath);
+        }
+        for (const lease of this.deps.worktrees.list()) {
+            if (lease.taskId === task.id)
+                paths.add(lease.path);
+        }
+        if (task.deliveryBlocked !== null) {
+            const blocked = this.deps.worktrees
+                .list()
+                .find((l) => l.id === task.deliveryBlocked.leaseId);
+            if (blocked !== undefined)
+                paths.add(blocked.path);
+        }
+        return [...paths];
+    }
+    assertAssociatedWorktreesClean(task) {
+        if (process.env.AGENTOS_FAKE_GIT === "1")
+            return;
+        const gateWorkspace = join(this.deps.home, "runs", task.id, "gate-workspace");
+        for (const path of this.associatedWorktreePaths(task)) {
+            if (resolve(path) === resolve(gateWorkspace))
+                continue;
+            if (!existsSync(path)) {
+                throw new ToolSurfaceError("CONFLICT", `cannot mark task ${task.id} DONE: associated worktree missing (${path}); cleanliness cannot be proven`);
+            }
+            if (!existsSync(join(path, ".git"))) {
+                throw new ToolSurfaceError("CONFLICT", `cannot mark task ${task.id} DONE: associated worktree is not a git repo (${path})`);
+            }
+            const dirty = spawnSync("git", ["-C", path, "status", "--porcelain"], {
+                encoding: "utf8",
+                timeout: 15_000,
+            });
+            if (dirty.error !== undefined || dirty.status !== 0) {
+                const detail = (dirty.error?.message ||
+                    dirty.stderr ||
+                    dirty.stdout ||
+                    `git status exit ${String(dirty.status)}`)
+                    .toString()
+                    .trim();
+                throw new ToolSurfaceError("CONFLICT", `cannot mark task ${task.id} DONE: cannot prove worktree clean (${path}): ${detail}`);
+            }
+            if (dirty.stdout.trim().length > 0) {
+                throw new ToolSurfaceError("CONFLICT", `cannot mark task ${task.id} DONE: associated worktree has uncommitted changes (${path})`);
+            }
+        }
+    }
+    escalate(raw) {
+        const input = escalateToCaptainInputSchema.parse(raw);
+        // `/afk`: answer only what the Captain pre-decided. A question with no
+        // matching FAQ entry falls through to the normal escalation below and
+        // waits — inventing an answer would be worse than the delay, because the
+        // Brain would act on an instruction the Captain never gave.
+        if (this.deps.afk !== undefined && this.deps.afk.isActive()) {
+            const answered = this.deps.afk.tryAnswer(input.summary);
+            if (answered !== null) {
+                return { ok: true, autoAnswered: true, answer: answered.answer };
+            }
+        }
+        if (input.taskId !== undefined) {
+            const task = this.requireTask(input.taskId);
+            if (!isTerminalPhase(task.phase)) {
+                this.transition(task, "NEEDS_CAPTAIN", input.summary);
+            }
+        }
+        this.sink({
+            type: "captain.escalation",
+            payload: {
+                taskId: input.taskId ?? null,
+                summary: input.summary,
+                severity: input.severity,
+            },
+        });
+        return { ok: true, autoAnswered: false, answer: null };
+    }
+    notify(raw) {
+        const input = notifyCaptainInputSchema.parse(raw);
+        this.sink({
+            type: "captain.escalation",
+            payload: {
+                taskId: null,
+                summary: input.summary,
+                severity: input.severity,
+            },
+        });
+        return { ok: true };
+    }
+    stowKnowledge(raw) {
+        const input = stowKnowledgeInputSchema.parse(raw);
+        const project = this.deps.projects.get(input.projectId);
+        if (project === null) {
+            throw new ToolSurfaceError("NOT_FOUND", `project not found: ${input.projectId}`);
+        }
+        const rel = input.relativePath ?? `docs/notes/stow-${Date.now()}.md`;
+        const notesRoot = resolve(project.path, "docs", "notes");
+        const full = resolve(project.path, rel);
+        const notesPrefix = notesRoot.endsWith(sep) ? notesRoot : `${notesRoot}${sep}`;
+        if (!full.startsWith(notesPrefix)) {
+            throw new ToolSurfaceError("POLICY_VIOLATION", "stow_knowledge path must be under docs/notes/");
+        }
+        mkdirSync(notesRoot, { recursive: true });
+        writeFileSync(full, input.notes, { mode: 0o600 });
+        return { path: full };
+    }
+    readPolicy(raw) {
+        const input = readPolicyInputSchema.parse(raw);
+        const effective = this.deps.config.effective();
+        return {
+            domain: input.domain,
+            value: effective.config[input.domain],
+        };
+    }
+    advancePhase(raw) {
+        const input = advancePhaseInputSchema.parse(raw);
+        const task = this.requireTask(input.taskId);
+        const to = input.to;
+        if (to === "DONE") {
+            throw new ToolSurfaceError("ILLEGAL_TRANSITION", `task ${task.id} may only reach DONE via deliver_task (clean tree, no deliveryBlocked, leases released)`);
+        }
+        if (to === "CANCELLED") {
+            throw new ToolSurfaceError("ILLEGAL_TRANSITION", `task ${task.id} may only reach CANCELLED via cancel_task`);
+        }
+        return this.transition(task, to, input.reason ?? null);
+    }
+    requireTask(id) {
+        const task = this.tasks.get(id);
+        if (task === undefined) {
+            throw new ToolSurfaceError("NOT_FOUND", `task not found: ${id}`);
+        }
+        return task;
+    }
+    transition(task, to, reason, options = {}) {
+        const current = this.tasks.get(task.id) ?? task;
+        const from = current.phase;
+        // DONE is only reachable through deliver_task after assertDoneInvariant.
+        if (to === "DONE" && options.allowDone !== true) {
+            throw new ToolSurfaceError("ILLEGAL_TRANSITION", `task ${task.id} may only reach DONE via deliver_task (clean tree, no deliveryBlocked, leases released)`);
+        }
+        if (to === "DONE") {
+            this.assertDoneInvariant(current);
+        }
+        // Derive red-baseline policy from config + task overrides when the caller
+        // omits it, so every path (including advance_phase) honours the same edges.
+        const redBaselineRequired = options.redBaselineRequired ??
+            (this.cfg().policies.redBaselineGateRequired && !this.hasRedBaselineOverride(current));
+        assertTransition(task.id, from, to, { redBaselineRequired });
+        // Terminal exit choke point: halt every live session, then release leases
+        // (stamp deliveryBlocked on dirty quarantine). No-op when deliver_task
+        // already halted/released for DONE.
+        if (isTerminalPhase(to)) {
+            this.haltAndReleaseTask(task.id, reason ?? `phase ${to}`);
+        }
+        // Phase-only delta on fresh store state (halt/release may have mutated
+        // sessions, worktree refs, deliveryBlocked). deliveryBlocked is never
+        // cleared here — only resolve_delivery_block or successful deliver_task.
+        const base = this.tasks.get(task.id) ?? current;
+        const updated = {
+            ...base,
+            phase: to,
+            failureCause: to === "FAILED" ? (base.failureCause ?? "UNKNOWN") : base.failureCause,
+            needsCaptainSummary: to === "NEEDS_CAPTAIN" ? (reason ?? base.needsCaptainSummary) : base.needsCaptainSummary,
+            updatedAt: new Date().toISOString(),
+        };
+        this.saveTask(updated);
+        this.sink({
+            type: "task.phase_changed",
+            payload: { taskId: task.id, from, to, reason },
+        });
+        return updated;
+    }
+    saveTask(task) {
+        this.tasks.set(task.id, task);
+        if (task.idempotencyKey !== null) {
+            this.idempotency.set(task.idempotencyKey, task);
+        }
+        this.persistTask(task);
+    }
+    persistTask(task) {
+        const dir = join(this.deps.home, "runs", task.id);
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        writeFileSync(join(dir, "task.json"), `${JSON.stringify(task, null, 2)}\n`, {
+            mode: 0o600,
+        });
+    }
+    /** Record a session status reported by its extension (running → settled). */
+    markSessionStatus(sessionId, status) {
+        const session = this.sessions.get(sessionId);
+        if (session === undefined)
+            return;
+        // Terminal is terminal: late agent_settled / running frames after stop or
+        // lost must not resurrect the session (and must not inflate healthyLeft).
+        if (session.status === "stopped" || session.status === "lost")
+            return;
+        this.sessions.set(sessionId, { ...session, status });
+        const task = session.taskId !== null ? this.tasks.get(session.taskId) : undefined;
+        if (task !== undefined) {
+            this.saveTask({
+                ...task,
+                sessions: task.sessions.map((s) => s.sessionId === sessionId
+                    ? { ...s, status, lastEventAt: new Date().toISOString() }
+                    : s),
+                updatedAt: new Date().toISOString(),
+            });
+        }
+        if (status === "settled" && session.role === "scout") {
+            this.auditScoutSession(sessionId);
+        }
+        if (status === "settled") {
+            this.completeFusionSide(sessionId);
+        }
+    }
+    /** Mark a session lost (pane-died / reconcile). */
+    markSessionLost(sessionId, reason) {
+        const session = this.sessions.get(sessionId);
+        if (session === undefined)
+            return;
+        if (session.status === "lost" || session.status === "stopped")
+            return;
+        // Finalize any in-flight fusion side so a pane-lost side cannot leave the
+        // run stranded on fusion.dispatched. Pass reason so a lost last side is
+        // not reported as a clean success. Ownership stays until the whole run
+        // completes. Suppress releaseSettled's session.stopped — session.lost is
+        // the single terminal lifecycle event for this path.
+        this.completeFusionSide(sessionId, reason, { suppressStopEvent: true });
+        // Kill a still-live pane so reconcile/respawn cannot share
+        // AGENTOS_SESSION_DIR/outputs with an orphan process.
+        const afterFusion = this.sessions.get(sessionId) ?? session;
+        if (afterFusion.status !== "stopped" && afterFusion.status !== "lost") {
+            try {
+                this.deps.tmux.killWindow(afterFusion.tmuxWindow);
+            }
+            catch {
+                // Pane may already be gone.
+            }
+        }
+        void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
+        this.releaseWorktreeLeases({ sessionId });
+        const released = this.sessions.get(sessionId) ?? session;
+        this.sessions.set(sessionId, { ...released, status: "lost" });
+        this.clearFusionSession(sessionId);
+        this.sink({
+            type: "session.lost",
+            payload: { sessionId, taskId: session.taskId, reason },
+        });
+        if (session.taskId !== null) {
+            const task = this.tasks.get(session.taskId);
+            if (task !== undefined) {
+                const withSession = {
+                    ...task,
+                    sessions: task.sessions.map((s) => s.sessionId === sessionId
+                        ? { ...s, status: "lost", lastEventAt: new Date().toISOString() }
+                        : s),
+                    updatedAt: new Date().toISOString(),
+                };
+                this.saveTask(withSession);
+                // Losing one cast side must not declare the whole task lost while
+                // siblings are still healthy — only promote when nothing healthy remains.
+                const healthyLeft = [...this.sessions.values()].some((s) => s.taskId === session.taskId &&
+                    (s.status === "starting" ||
+                        s.status === "running" ||
+                        s.status === "settled"));
+                if (!healthyLeft &&
+                    !isTerminalPhase(withSession.phase) &&
+                    withSession.phase !== "SESSION_LOST" &&
+                    canTransition(withSession.phase, "SESSION_LOST")) {
+                    this.transition(withSession, "SESSION_LOST", reason);
+                }
+            }
+        }
+    }
+    /**
+     * Clean Pi exit (ext.lifecycle session_end): release the worktree lease so
+     * settle-and-exit does not exhaust the pool. Reuses the shared release helper
+     * (verified-reset when clean, quarantine + deliveryBlocked when dirty).
+     * Also settles any fusion side still waiting on this session. Ownership stays
+     * until the whole fusion run completes so late ext.usage still attributes.
+     */
+    releaseSessionOnEnd(sessionId) {
+        // session_end without a prior agent_settled still finalizes fusion sides.
+        this.completeFusionSide(sessionId);
+        this.clearFusionSession(sessionId);
+        this.releaseWorktreeLeases({ sessionId });
+    }
+    /**
+     * Builder/delivery worktree for candidate gates. Prefer a live builder session
+     * path, then task.worktreePath (builder-only field). Never the primary checkout.
+     */
+    resolveBuilderWorktreePath(task) {
+        const liveBuilders = [...this.sessions.values()].filter((s) => s.taskId === task.id &&
+            s.role === "builder" &&
+            s.worktreePath !== null &&
+            s.status !== "stopped" &&
+            s.status !== "lost");
+        if (liveBuilders.length > 0) {
+            const path = liveBuilders[liveBuilders.length - 1].worktreePath;
+            if (path !== null)
+                return path;
+        }
+        if (task.worktreePath !== null)
+            return task.worktreePath;
+        const fromHistory = [...task.sessions]
+            .reverse()
+            .find((s) => s.role === "builder" && s.worktreePath !== null);
+        return fromHistory?.worktreePath ?? null;
+    }
+}
+class ToolSurfaceError extends Error {
+    code;
+    details;
+    constructor(code, message, details) {
+        super(message);
+        this.code = code;
+        this.details = details;
+        this.name = "ToolSurfaceError";
+    }
+}
+function err(code, message, details) {
+    return details !== undefined ? { code, message, details } : { code, message };
+}
+function extractTaskId(raw) {
+    const id = raw.taskId;
+    return typeof id === "string" ? id : null;
+}
+function hashConfig(config) {
+    return createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 16);
+}
+function sha256(text) {
+    return createHash("sha256").update(text).digest("hex");
+}
+/**
+ * Accumulate distinct fusion failure reasons. A later clean settle must not
+ * erase an earlier stop/lost/abort; duplicate segments (exact equality after
+ * splitting on "; ") are not repeated. Substring matches are not de-duped —
+ * "stop" after "test stop" is a distinct reason.
+ */
+function mergeFusionErrors(existing, next) {
+    const trimmed = next.trim();
+    if (trimmed.length === 0)
+        return existing ?? "";
+    if (existing == null || existing.length === 0)
+        return trimmed;
+    if (existing === trimmed)
+        return existing;
+    const segments = existing
+        .split("; ")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    if (segments.includes(trimmed))
+        return existing;
+    return `${existing}; ${trimmed}`;
+}
+/** Repo-relative listing of everything durable under a run directory. */
+function listFilesRecursive(dir, prefix = "") {
+    if (!existsSync(dir))
+        return [];
+    const out = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+        if (entry.isDirectory()) {
+            out.push(...listFilesRecursive(join(dir, entry.name), rel));
+        }
+        else {
+            out.push(rel);
+        }
+    }
+    return out.sort();
+}
