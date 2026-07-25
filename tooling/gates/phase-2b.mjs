@@ -11,10 +11,10 @@
  *   P5  onboarding detection auto-enables probes for exactly the detected
  *       providers, and leaves the others off
  *
- * Broker-lock coverage (login exclusive, steady state concurrent) lives in
- * tooling/gates/phase-7.mjs, where the cross-process broker was built — it does
- * not exist on this branch, so asserting it here could only fail for the wrong
- * reason.
+ * Broker-lock coverage (login exclusive, steady-state concurrent, abandoned-lock
+ * reclaim) lives in tooling/gates/phase-7.mjs, where the cross-process broker was
+ * built — that gate is not on this branch, so this suite does not claim broker
+ * locks or any holder wait/exit-race fix.
  *
  * What this file deliberately does NOT claim: anything needing the Captain's own
  * live provider credentials — a real `/login` OAuth round trip, or "each
