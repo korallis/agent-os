@@ -60,7 +60,7 @@ export class SecondmateRegistry {
   private readonly root: string;
   private readonly runtimeRoot: string;
   private readonly primaryHome: string;
-  private readonly primaryPort: number | null;
+  private primaryPort: number | null;
   private sink: SecondmateEventSink = () => undefined;
   private readonly children = new Map<string, ChildProcess>();
   /** Per-name start chain — concurrent start() must not double-spawn. */
@@ -73,6 +73,14 @@ export class SecondmateRegistry {
     this.runtimeRoot = join(agentosHome, "runtime", "secondmates");
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
     mkdirSync(this.runtimeRoot, { recursive: true, mode: 0o700 });
+  }
+
+  /** Record the primary daemon's actual bound listen port (after listen). */
+  setPrimaryPort(port: number): void {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`invalid primary port: ${port}`);
+    }
+    this.primaryPort = port;
   }
 
   onEvent(sink: SecondmateEventSink): void {

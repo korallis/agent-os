@@ -8,7 +8,7 @@ import { SecondmateRegistry } from "../src/fleet/secondmates.js";
 import { SecondmateFleet } from "../src/fleet/secondmate-fleet.js";
 import { FleetService } from "../src/fleet/service.js";
 import { ConfigService } from "../src/config/service.js";
-import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
+import { SHIPPED_DEFAULTS_DIR, startDaemon, type RunningDaemon } from "../src/daemon.js";
 
 /**
  * Phase 7 units: the cross-process auth lock that orders a primary against a
@@ -412,6 +412,38 @@ describe("secondmate provision constraints", () => {
     expect(() =>
       registry.provision({ name: "clash", domain: "x", port: 4700 }),
     ).toThrow(/collides with the primary/);
+  });
+
+  it("production daemon refuses secondmate on its bound port without AGENTOS_PORT", async () => {
+    const prev = process.env.AGENTOS_PORT;
+    delete process.env.AGENTOS_PORT;
+    const home = temp("agentos-p7-bound-port-");
+    let daemon: RunningDaemon | undefined;
+    try {
+      daemon = await startDaemon({ home, port: 0 });
+      expect(process.env.AGENTOS_PORT).toBeUndefined();
+      expect(daemon.port).toBeGreaterThan(0);
+
+      const res = await fetch(`http://127.0.0.1:${daemon.port}/v1/secondmates`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${daemon.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "clash",
+          domain: "x",
+          port: daemon.port,
+        }),
+      });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error?: { message?: string } };
+      expect(body.error?.message ?? JSON.stringify(body)).toMatch(/collides with the primary/i);
+    } finally {
+      await daemon?.close();
+      if (prev !== undefined) process.env.AGENTOS_PORT = prev;
+      else delete process.env.AGENTOS_PORT;
+    }
   });
 
   it("persists maxConcurrentTasks on the provision record for charter fallback", () => {

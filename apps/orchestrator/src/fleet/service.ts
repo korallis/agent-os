@@ -52,6 +52,11 @@ export interface FleetServiceOptions {
   quotaSamples?: () => QuotaSample[];
   /** Absolute path to agentosd.js for spawning secondmate processes. */
   agentosdBin?: string;
+  /**
+   * Primary daemon listen port when known at construction. Prefer
+   * {@link setPrimaryPort} after bind when the port is ephemeral (0).
+   */
+  primaryPort?: number;
 }
 
 /**
@@ -130,7 +135,10 @@ export class FleetService {
     this.fusionRuns = new FusionRunStore(options.home);
     this.sessionKeys = new SessionKeyStore(options.home);
     this.afk = new AfkService(join(options.home, "afk"));
-    this.secondmates = new SecondmateRegistry(options.home);
+    this.secondmates = new SecondmateRegistry(
+      options.home,
+      options.primaryPort !== undefined ? { primaryPort: options.primaryPort } : undefined,
+    );
     this.secondmateFleet = new SecondmateFleet(this.secondmates);
     this.tools = new ToolSurface({
       home: options.home,
@@ -202,6 +210,11 @@ export class FleetService {
     this.afk.onEvent(fanout);
     this.secondmates.onEvent(fanout);
     this.secondmateFleet.onEvent(fanout);
+  }
+
+  /** Wire the primary's actual bound port into secondmate port-collision checks. */
+  setPrimaryPort(port: number): void {
+    this.secondmates.setPrimaryPort(port);
   }
 
   /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */

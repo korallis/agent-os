@@ -13,6 +13,7 @@
  *   G8  provision through REST (not out-of-band modules); start waits for ready
  *   G9  maxConcurrentTasks is enforced on the routing path
  *   G10 secondmate api-key grants resolve from primary secrets without copying
+ *   G11 primary bound port blocks secondmate provision without AGENTOS_PORT
  *
  * Real daemons on real homes; only the model is simulated.
  * Usage: node tooling/gates/phase-7.mjs
@@ -634,6 +635,74 @@ try {
       "dual restart reconciles without duplicate secondmate records",
       res.ok && names.length === unique.length && unique.join(",") === "docs,infra",
       `names=${names.join(",")} unique=${unique.length}`,
+    );
+  }
+
+  // G11 — production path wires the bound port into SecondmateRegistry.
+  // Start without AGENTOS_PORT so resolvePrimaryPortFromEnv cannot supply the
+  // value; only setPrimaryPort(boundPort) after listen can refuse the clash.
+  {
+    try {
+      child?.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+    await sleep(300);
+    const boundHome = mkdtempSync(join(tmpdir(), "agentos-p7-bound-"));
+    cleanups.push(boundHome);
+    const boundEnv = { ...process.env };
+    delete boundEnv.AGENTOS_PORT;
+    // Default bind (no AGENTOS_PORT) is DEFAULT_PORT 4700 — the production path
+    // the unit tests with explicit primaryPort never exercise.
+    const defaultPort = 4700;
+    child = spawn(process.execPath, [DAEMON_BIN], {
+      env: {
+        ...boundEnv,
+        AGENTOS_HOME: boundHome,
+        AGENTOS_TMUX_SOCKET: TMUX_SOCKET,
+        AGENTOS_FAKE_PI: "1",
+        AGENTOS_FAKE_BRAIN: "1",
+        AGENTOS_FAKE_GATE: "1",
+        AGENTOS_FAKE_GIT: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let boundOk = false;
+    let boundDetail = "daemon did not start";
+    try {
+      const boundToken = await waitForHealth(boundHome, defaultPort, 20000);
+      const statusRes = await fetch(`http://127.0.0.1:${defaultPort}/v1/status`, {
+        headers: { authorization: `Bearer ${boundToken}` },
+      });
+      const statusBody = statusRes.ok ? await statusRes.json() : {};
+      const reportedPort = statusBody.daemon?.port;
+      const clashRes = await fetch(`http://127.0.0.1:${defaultPort}/v1/secondmates`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${boundToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "clash",
+          domain: "x",
+          port: reportedPort ?? defaultPort,
+        }),
+      });
+      const clashBody = await clashRes.json().catch(() => ({}));
+      const msg = clashBody.error?.message ?? JSON.stringify(clashBody);
+      boundOk =
+        clashRes.status === 400 &&
+        /collides with the primary/i.test(msg) &&
+        reportedPort === defaultPort;
+      boundDetail = `status=${clashRes.status} port=${reportedPort} msg=${msg}`;
+    } catch (error) {
+      boundDetail = error instanceof Error ? error.message : String(error);
+    }
+    gate(
+      "G11",
+      "bound primary port refuses secondmate provision without AGENTOS_PORT",
+      boundOk,
+      boundDetail,
     );
   }
 

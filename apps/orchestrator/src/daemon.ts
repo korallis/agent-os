@@ -311,6 +311,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       typeof address === "object" && address !== null ? address.port : port;
     // With port 0 (tests) the real port is only known after listen.
     deps.port = boundPort;
+    fleet.setPrimaryPort(boundPort);
 
     const pty = attachPtyServer({
       server: server.server,
