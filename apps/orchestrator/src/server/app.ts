@@ -478,6 +478,35 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       };
     },
   );
+  // ── Secondmates (master plan §5.9, Phase 7) ─────────────────────────────
+  app.get("/v1/secondmates", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { secondmates: deps.fleet.secondmates.list() };
+  });
+
+  /**
+   * Live status of every secondmate. This probes each one rather than reading a
+   * cache: a stale "healthy" is the single most misleading answer this endpoint
+   * could give, so an unreachable secondmate is reported as unreachable.
+   */
+  app.get("/v1/secondmates/bearings", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { bearings: await deps.fleet.secondmateFleet.bearings() };
+  });
+
+  app.get("/v1/secondmates/audit", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return deps.fleet.secondmates.auditNoAuthMaterial();
+  });
 
   // ── Analytics (master plan §7 Token Usage / §8.2) ───────────────────────
   app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {

@@ -19,7 +19,9 @@ import {
   readTaskInputSchema,
   resolveCastInputSchema,
   resolveDeliveryBlockInputSchema,
+  readSecondmateBearingsInputSchema,
   respawnCrewmateInputSchema,
+  routeToSecondmateInputSchema,
   runGateInputSchema,
   sendToCrewInputSchema,
   spawnCrewmateInputSchema,
@@ -37,6 +39,7 @@ import {
   type FusionRun,
   type FusionSide,
   type PromptTemplateInfo,
+  type SecondmateBearings,
   type OrchestratorEvent,
   type RoleCast,
   type TaskPhase,
@@ -66,6 +69,8 @@ import type { TmuxController } from "./tmux.js";
 import type { WakeWatcher } from "./watcher.js";
 import { GateRunner } from "./gate-runner.js";
 import type { FusionRunStore } from "./fusion-runs.js";
+import type { SecondmateRegistry } from "./secondmates.js";
+import type { SecondmateFleet } from "./secondmate-fleet.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
 
@@ -140,6 +145,8 @@ export interface ToolSurfaceDeps {
   sessionKeys: SessionKeyStore;
   /** Layered prompt packs; absent only in fixtures that never dispatch fusion. */
   prompts?: PromptService;
+  /** Phase 7 secondmate fleet: registry + routing/bearings operations. */
+  secondmates?: { registry: SecondmateRegistry; fleet: SecondmateFleet };
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
@@ -181,6 +188,7 @@ export class ToolSurface {
   private brainDown = false;
   private readonly questions = new Map<string, PendingQuestion>();
   private brainSessionId: string | null = null;
+  private latestBearings: SecondmateBearings[] = [];
   /**
    * sessionId → fusion side ownership for O(1) usage attribution and settle
    * completion. Lifetime is owned by clearFusionRunSessionState only: entries
@@ -710,9 +718,9 @@ export class ToolSurface {
       case "notify_captain":
         return this.notify(raw);
       case "route_to_secondmate":
-        throw new ToolSurfaceError("NOT_FOUND", "secondmates are Phase 7 — not provisioned");
+        return this.routeToSecondmate(raw);
       case "read_secondmate_bearings":
-        throw new ToolSurfaceError("NOT_FOUND", "secondmates are Phase 7 — not provisioned");
+        return this.readSecondmateBearings(raw);
       case "stow_knowledge":
         return this.stowKnowledge(raw);
       case "read_policy":
@@ -3079,6 +3087,94 @@ export class ToolSurface {
       },
     });
     return { ok: true };
+  }
+
+  /**
+   * Hand a task to a secondmate. The task LEAVES this fleet — it is cancelled
+   * here with a routed reason rather than left running in both places, because
+   * two Brains owning one task is how duplicate work and conflicting deliveries
+   * happen. Refuses when no secondmate accepts the domain: inventing a
+   * destination would strand the task.
+   */
+  private routeToSecondmate(raw: Record<string, unknown>): {
+    name: string;
+    taskId: string;
+    accepted: boolean;
+  } {
+    const input = routeToSecondmateInputSchema.parse(raw);
+    if (this.deps.secondmates === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
+    }
+    const task = this.requireTask(input.taskId);
+    if (isTerminalPhase(task.phase)) {
+      throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
+    }
+    const record = this.deps.secondmates.registry
+      .list()
+      .find((s) => s.name === input.name);
+    if (record === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
+    }
+    const { charter } = this.deps.secondmates.fleet.readCharter(record);
+    if (!charter.acceptsRouting) {
+      this.sink({
+        type: "secondmate.routed",
+        payload: {
+          name: record.name,
+          taskId: task.id,
+          domain: charter.domains[0] ?? "",
+          accepted: false,
+          reason: "charter declines routing",
+        },
+      });
+      throw new ToolSurfaceError(
+        "POLICY_VIOLATION",
+        `secondmate ${record.name} declines routing (charter acceptsRouting=false)`,
+      );
+    }
+
+    // Halt anything running here before handing ownership over, so the task
+    // cannot be live on two daemons at once.
+    this.haltAndReleaseTask(task.id, `routed to secondmate ${record.name}`);
+    this.transition(this.requireTask(task.id), "CANCELLED", `routed to secondmate ${record.name}`);
+    this.sink({
+      type: "secondmate.routed",
+      payload: {
+        name: record.name,
+        taskId: task.id,
+        domain: charter.domains[0] ?? "",
+        accepted: true,
+        reason: null,
+      },
+    });
+    return { name: record.name, taskId: task.id, accepted: true };
+  }
+
+  /** Live status of every secondmate; unreachable is reported as a fact. */
+  private readSecondmateBearings(raw: Record<string, unknown>): {
+    pending: true;
+    name: string | null;
+  } {
+    const input = readSecondmateBearingsInputSchema.parse(raw);
+    if (this.deps.secondmates === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
+    }
+    // The tool surface is synchronous; bearings are an I/O probe, so the REST
+    // surface owns the await and the Brain reads the result from fleet state.
+    void this.deps.secondmates.fleet
+      .bearings()
+      .then((all) => {
+        this.latestBearings = input.name === undefined
+          ? all
+          : all.filter((b) => b.name === input.name);
+      })
+      .catch(() => undefined);
+    return { pending: true, name: input.name ?? null };
+  }
+
+  /** Most recent bearings probe result, for fleet state and REST. */
+  getLatestBearings(): SecondmateBearings[] {
+    return this.latestBearings;
   }
 
   private stowKnowledge(raw: Record<string, unknown>): { path: string } {

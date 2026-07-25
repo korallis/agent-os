@@ -183,3 +183,40 @@ export const afkRequestSchema = z.strictObject({
   faq: z.array(afkFaqEntrySchema).optional(),
 });
 export type AfkRequest = z.infer<typeof afkRequestSchema>;
+
+/**
+ * Secondmate charter (master plan §5.9) — CONFIG, not code. Editing this file
+ * changes which domains a secondmate accepts and which Brain it runs.
+ */
+export const secondmateCharterSchema = z.strictObject({
+  name: z.string().min(1).max(64),
+  /** Task domains this secondmate accepts routing for. */
+  domains: z.array(z.string().min(1).max(64)),
+  /** Fully-qualified provider/model for this secondmate's Brain, or null for auto. */
+  brainModel: z.string().min(3).nullable(),
+  maxConcurrentTasks: z.number().int().min(1).max(32),
+  /** A secondmate may decline all routing without being deprovisioned. */
+  acceptsRouting: z.boolean(),
+});
+export type SecondmateCharter = z.infer<typeof secondmateCharterSchema>;
+
+/**
+ * What a secondmate says about itself right now. `reachable: false` is a fact,
+ * never a cached previous value — a stale "healthy" is the worst possible
+ * answer here.
+ */
+export const secondmateBearingsSchema = z.strictObject({
+  name: z.string(),
+  home: z.string(),
+  port: z.number().int().positive(),
+  domains: z.array(z.string()),
+  brainModel: z.string().nullable(),
+  charterSource: z.enum(["charter-file", "provision-record"]),
+  charterError: z.string().nullable(),
+  reachable: z.boolean(),
+  reason: z.string().nullable(),
+  active: z.number().int().min(0).nullable(),
+  queued: z.number().int().min(0).nullable(),
+  brainStatus: z.string().nullable(),
+});
+export type SecondmateBearings = z.infer<typeof secondmateBearingsSchema>;

@@ -22,6 +22,8 @@ import { ToolSurface, type SessionChannel } from "./tool-surface.js";
 import { BrainManager } from "./brain.js";
 import { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
+import { SecondmateRegistry } from "./secondmates.js";
+import { SecondmateFleet } from "./secondmate-fleet.js";
 import type { PromptService } from "../prompts/service.js";
 import { AfkService } from "./afk.js";
 import {
@@ -95,6 +97,8 @@ export class FleetService {
   readonly gates: GateRunner;
   readonly fusionRuns: FusionRunStore;
   readonly sessionKeys: SessionKeyStore;
+  readonly secondmates: SecondmateRegistry;
+  readonly secondmateFleet: SecondmateFleet;
   readonly tools: ToolSurface;
   readonly brain: BrainManager;
   readonly afk: AfkService;
@@ -121,6 +125,8 @@ export class FleetService {
     this.fusionRuns = new FusionRunStore(options.home);
     this.sessionKeys = new SessionKeyStore(options.home);
     this.afk = new AfkService(join(options.home, "afk"));
+    this.secondmates = new SecondmateRegistry(options.home);
+    this.secondmateFleet = new SecondmateFleet(this.secondmates);
     this.tools = new ToolSurface({
       home: options.home,
       config: options.config,
@@ -131,6 +137,7 @@ export class FleetService {
       gates: this.gates,
       fusionRuns: this.fusionRuns,
       sessionKeys: this.sessionKeys,
+      secondmates: { registry: this.secondmates, fleet: this.secondmateFleet },
       ...(options.prompts !== undefined ? { prompts: options.prompts } : {}),
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
@@ -186,6 +193,8 @@ export class FleetService {
     this.tools.onEvent(fanout);
     this.brain.onEvent(fanout);
     this.afk.onEvent(fanout);
+    this.secondmates.onEvent(fanout);
+    this.secondmateFleet.onEvent(fanout);
   }
 
   /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */

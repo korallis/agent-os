@@ -62,7 +62,10 @@ function levelOf(envelope: EventEnvelope): Level {
     case "afk.auto_answered":
     case "brain.handoff_triggered":
     case "brain.handoff_completed":
+    case "secondmate.charter_changed":
       return "INFO";
+    case "secondmate.routed":
+      return envelope.event.payload.accepted ? "INFO" : "WARN";
     case "net.request":
       return envelope.event.payload.error !== null ||
         (envelope.event.payload.status ?? 200) >= 400
@@ -133,6 +136,9 @@ function sourceOf(envelope: EventEnvelope): string {
       return "brain";
     case "net.request":
       return "net";
+    case "secondmate.charter_changed":
+    case "secondmate.routed":
+      return "secondmates";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -274,6 +280,12 @@ function messageOf(envelope: EventEnvelope): string {
       return event.payload.error !== null
         ? `${event.payload.method} ${event.payload.url} failed — ${event.payload.error}`
         : `${event.payload.method} ${event.payload.url} → ${event.payload.status ?? "—"} in ${Math.round(event.payload.durationMs)}ms`;
+    case "secondmate.charter_changed":
+      return `Secondmate ${event.payload.name} charter — brain ${event.payload.brainModel ?? "auto"}, domains ${event.payload.domains.join(", ") || "none"}`;
+    case "secondmate.routed":
+      return event.payload.accepted
+        ? `Task ${event.payload.taskId.slice(0, 8)} routed to secondmate ${event.payload.name}`
+        : `Routing to ${event.payload.name} REFUSED — ${event.payload.reason ?? "unknown"}`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {
