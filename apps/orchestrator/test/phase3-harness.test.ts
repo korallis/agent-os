@@ -1116,6 +1116,7 @@ describe("worktree verified-reset fail-closed", () => {
     const pool = new WorktreePool(home, {
       poolSize: 4,
       reclaimPolicy: "verified-reset",
+      networkPolicy: "fetch-allowed",
     });
     const projectId = "01JPROJ0000000000000000001";
     const taskId = "01JTASK0000000000000000001";
