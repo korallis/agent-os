@@ -79,14 +79,18 @@ function Sparkline({ points }: { points: number[] }) {
   );
 }
 
+type LoadStatus = "loading" | "ready" | "unavailable";
+
 function SwarmActivityCard({
   analytics,
+  status,
   lastEventAt,
 }: {
   analytics: AnalyticsSnapshot | null;
+  status: LoadStatus;
   lastEventAt: string | null;
 }) {
-  const ready = analytics !== null;
+  const ready = status === "ready" && analytics !== null;
   const daily = analytics?.daily ?? [];
   const completed = daily.map((d) => d.tasksCompleted);
   const totalCompleted = ready ? completed.reduce((a, b) => a + b, 0) : null;
@@ -100,6 +104,15 @@ function SwarmActivityCard({
   const axis = [0, Math.floor(daily.length / 3), Math.floor((daily.length * 2) / 3), daily.length - 1]
     .map((i) => daily[i])
     .filter((d): d is NonNullable<typeof d> => d !== undefined);
+
+  const windowLabel =
+    status === "loading"
+      ? "loading…"
+      : status === "unavailable"
+        ? "unavailable"
+        : ready
+          ? `last ${analytics.windowDays} days`
+          : "unavailable";
 
   return (
     <div
@@ -116,9 +129,7 @@ function SwarmActivityCard({
         </div>
         <div className="flex items-start justify-between">
           <span className="text-[13px] text-fg-2">Tasks completed</span>
-          <span className="text-[13px] text-fg-2">
-            {ready ? `last ${analytics.windowDays} days` : "unavailable"}
-          </span>
+          <span className="text-[13px] text-fg-2">{windowLabel}</span>
         </div>
         <div className="flex items-start justify-between">
           <span className="text-xs text-fg-3">Total</span>
@@ -131,7 +142,9 @@ function SwarmActivityCard({
         <Sparkline points={ready ? completed : []} />
       </div>
       <div className="flex items-start justify-between text-[11px] text-fg-3">
-        {!ready ? (
+        {status === "loading" ? (
+          <span>Loading usage snapshot…</span>
+        ) : status === "unavailable" ? (
           <span>Usage snapshot unavailable</span>
         ) : axis.length > 0 ? (
           axis.map((d, i) => <span key={`${d.day}-${i}`}>{d.day.slice(5)}</span>)
@@ -156,11 +169,17 @@ function SwarmActivityCard({
   );
 }
 
-function TokenConsumptionCard({ analytics }: { analytics: AnalyticsSnapshot | null }) {
+function TokenConsumptionCard({
+  analytics,
+  status,
+}: {
+  analytics: AnalyticsSnapshot | null;
+  status: LoadStatus;
+}) {
   const totals = analytics?.totals;
-  const ready = analytics !== null;
+  const ready = status === "ready" && analytics !== null;
   const tokens =
-    totals === undefined ? null : totals.inputTokens + totals.outputTokens;
+    !ready || totals === undefined ? null : totals.inputTokens + totals.outputTokens;
   const cost = totals?.costUsd ?? null;
   const topModels = (analytics?.models ?? []).slice(0, 4);
   const modelMax = Math.max(...topModels.map((m) => m.inputTokens + m.outputTokens), 1);
@@ -173,21 +192,22 @@ function TokenConsumptionCard({ analytics }: { analytics: AnalyticsSnapshot | nu
           <p className="text-[13px] text-fg-2">The sum of all token usage</p>
         </div>
         <span className="flex items-center gap-2 h-9 rounded-lg bg-panel-2 px-3 text-xs font-medium text-fg-2">
-          {analytics?.windowDays ?? "—"}
-          {analytics !== null ? "d" : ""}
+          {ready ? `${analytics.windowDays}d` : "—"}
         </span>
       </div>
       <p className="mt-4 text-4xl font-medium text-fg-1">
         {tokens === null ? "—" : compactNumber(tokens)}
       </p>
       <p className="mt-4 text-[11px] text-fg-3">
-        {!ready
-          ? "Usage snapshot unavailable"
-          : totals?.costCoverage === "partial"
-            ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost ($${cost?.toFixed(2) ?? "0.00"})`
-            : cost !== null
-              ? `$${cost.toFixed(2)} reported by providers`
-              : "Cost not reported by any connected provider"}
+        {status === "loading"
+          ? "Loading usage snapshot…"
+          : status === "unavailable"
+            ? "Usage snapshot unavailable"
+            : totals?.costCoverage === "partial"
+              ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost ($${cost?.toFixed(2) ?? "0.00"})`
+              : cost !== null
+                ? `$${cost.toFixed(2)} reported by providers`
+                : "Cost not reported by any connected provider"}
       </p>
       <p className="mt-2 text-xs text-fg-3">
         {!ready
@@ -195,11 +215,13 @@ function TokenConsumptionCard({ analytics }: { analytics: AnalyticsSnapshot | nu
           : `${totals?.requests ?? 0} requests · in ${compactNumber(totals?.inputTokens ?? 0)} / out ${compactNumber(totals?.outputTokens ?? 0)}`}
       </p>
       <div className="mt-3 flex-1 rounded-2xl bg-panel-2 p-4 flex flex-col gap-3">
-        {!ready ? (
+        {status === "loading" ? (
+          <p className="my-auto py-6 text-center text-[13px] text-fg-3">Loading usage…</p>
+        ) : status === "unavailable" ? (
           <EmptyState
-            kind="no-data"
+            kind="server-error"
             title="Usage unavailable"
-            body="Token consumption appears once the analytics snapshot loads."
+            body="Token consumption could not be loaded from the daemon."
             className="border-0 bg-transparent my-auto py-6"
           />
         ) : topModels.length === 0 ? (
@@ -274,8 +296,14 @@ function QuickActionsCard({ needsCaptain }: { needsCaptain: number }) {
   );
 }
 
-function TopAgentsCard({ analytics }: { analytics: AnalyticsSnapshot | null }) {
-  const ready = analytics !== null;
+function TopAgentsCard({
+  analytics,
+  status,
+}: {
+  analytics: AnalyticsSnapshot | null;
+  status: LoadStatus;
+}) {
+  const ready = status === "ready" && analytics !== null;
   const agents = (analytics?.agents ?? []).slice(0, 5);
   return (
     <Card className="w-[420px] shrink-0 flex flex-col">
@@ -286,11 +314,13 @@ function TopAgentsCard({ analytics }: { analytics: AnalyticsSnapshot | null }) {
         </span>
       </div>
       <div className="flex flex-col gap-2 px-4 pb-4">
-        {!ready ? (
+        {status === "loading" ? (
+          <p className="py-6 text-center text-[13px] text-fg-3">Loading usage…</p>
+        ) : status === "unavailable" ? (
           <EmptyState
-            kind="no-data"
+            kind="server-error"
             title="Usage unavailable"
-            body="Per-role usage appears once the analytics snapshot loads."
+            body="Per-role usage could not be loaded from the daemon."
             className="border-0 bg-transparent py-6"
           />
         ) : agents.length === 0 ? (
@@ -347,7 +377,7 @@ function RecentTasksTable({
   status,
 }: {
   tasks: TaskListItem[];
-  status: "loading" | "ready" | "unavailable";
+  status: LoadStatus;
 }) {
   const recent = tasks.slice(0, 8);
   return (
@@ -440,11 +470,11 @@ export function FleetDashboard() {
   const { events, lastEvent } = useEventStream();
   const refreshKey = lastEvent?.id ?? "init";
   const [summary, setSummary] = useState<FleetSummaryView | null>(null);
+  const [summaryStatus, setSummaryStatus] = useState<LoadStatus>("loading");
   const [analytics, setAnalytics] = useState<AnalyticsSnapshot | null>(null);
+  const [analyticsStatus, setAnalyticsStatus] = useState<LoadStatus>("loading");
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
-  const [tasksStatus, setTasksStatus] = useState<"loading" | "ready" | "unavailable">(
-    "loading",
-  );
+  const [tasksStatus, setTasksStatus] = useState<LoadStatus>("loading");
 
   useEffect(() => {
     let cancelled = false;
@@ -468,9 +498,15 @@ export function FleetDashboard() {
           brainDown: body.summary.brainDown,
           brainStatus: body.summary.brain.status,
         });
+        setSummaryStatus("ready");
+      } else {
+        setSummaryStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
       if (analyticsRes.status === "fulfilled" && analyticsRes.value.ok) {
         setAnalytics((await analyticsRes.value.json()) as AnalyticsSnapshot);
+        setAnalyticsStatus("ready");
+      } else {
+        setAnalyticsStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
       if (tasksRes.status === "fulfilled" && tasksRes.value.ok) {
         const body = (await tasksRes.value.json()) as { tasks: TaskListItem[] };
@@ -501,7 +537,14 @@ export function FleetDashboard() {
           ones inside the {analytics.windowDays}-day range.
         </div>
       )}
-      {summary !== null && (
+      {summaryStatus === "loading" && summary === null ? (
+        <p className="text-[13px] text-fg-3">Loading fleet summary…</p>
+      ) : summaryStatus === "unavailable" && summary === null ? (
+        <div className="rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-[13px] text-danger">
+          Fleet summary unavailable — the daemon could not be reached. Brain status
+          unknown; do not assume the fleet is healthy.
+        </div>
+      ) : summary !== null ? (
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
           {[
             { label: "Active", value: summary.active },
@@ -526,19 +569,23 @@ export function FleetDashboard() {
             </div>
           ))}
         </div>
-      )}
+      ) : null}
       {summary?.brainDown === true && (
         <div className="rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-[13px] text-danger">
           BRAIN DOWN — sessions alive · wakes queued · no orchestration until restart
         </div>
       )}
       <div className="grid grid-cols-1 xl:grid-cols-[1fr_1fr_260px] gap-4">
-        <SwarmActivityCard analytics={analytics} lastEventAt={lastEventAt} />
-        <TokenConsumptionCard analytics={analytics} />
+        <SwarmActivityCard
+          analytics={analytics}
+          status={analyticsStatus}
+          lastEventAt={lastEventAt}
+        />
+        <TokenConsumptionCard analytics={analytics} status={analyticsStatus} />
         <QuickActionsCard needsCaptain={summary?.needsCaptain ?? 0} />
       </div>
       <div className="flex gap-4 items-start">
-        <TopAgentsCard analytics={analytics} />
+        <TopAgentsCard analytics={analytics} status={analyticsStatus} />
         <RecentTasksTable tasks={tasks} status={tasksStatus} />
       </div>
     </div>

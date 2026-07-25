@@ -6,7 +6,14 @@ import type { EventEnvelope } from "@agent-os/protocol";
  * Hits GET /v1/tasks/:id/events so truncation is meaningful for this task
  * alone — a task that never ran tools is empty (not "history truncated"),
  * and a large global log does not hide recent task frames.
+ *
+ * Always request only tool.invoked + gate.result server-side so chatty
+ * wake/session/fusion frames do not consume the page budget and falsely
+ * trigger truncation for the evidence panels.
  */
+
+/** Event types the Brain decision lane and validation evidence need. */
+export const EVIDENCE_EVENT_TYPES = "tool.invoked,gate.result" as const;
 
 export type TaskEventsResult = {
   events: EventEnvelope[];
@@ -18,9 +25,11 @@ export type TaskEventsResult = {
 
 export async function fetchTaskEvents(taskId: string): Promise<TaskEventsResult> {
   try {
-    const res = await fetch(`/api/agentos/tasks/${encodeURIComponent(taskId)}/events`, {
-      cache: "no-store",
-    });
+    const params = new URLSearchParams({ types: EVIDENCE_EVENT_TYPES });
+    const res = await fetch(
+      `/api/agentos/tasks/${encodeURIComponent(taskId)}/events?${params.toString()}`,
+      { cache: "no-store" },
+    );
     if (!res.ok) {
       return { events: [], truncated: false, unavailable: true };
     }

@@ -47,7 +47,19 @@ export function BrainDecisionLane({
     return mine;
   }, [events]);
 
-  if (!loaded && calls.length === 0) return null;
+  if (!loaded) {
+    return (
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-fg-1">Brain decisions</h3>
+          <span className="text-[11px] text-fg-3">loading…</span>
+        </div>
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">Loading decision history…</p>
+        </div>
+      </section>
+    );
+  }
   if (!unavailable && calls.length === 0 && !truncated) return null;
 
   const refused = calls.filter((c) => !c.ok).length;

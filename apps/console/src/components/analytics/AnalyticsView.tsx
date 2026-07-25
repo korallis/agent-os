@@ -55,11 +55,15 @@ function Card({ className, children }: { className?: string; children: React.Rea
   );
 }
 
+type LoadStatus = "loading" | "ready" | "unavailable";
+
 export function AnalyticsView() {
   const { lastEvent } = useEventStream();
   const refreshKey = lastEvent?.id ?? "init";
   const [snapshot, setSnapshot] = useState<AnalyticsSnapshot | null>(null);
+  const [snapshotStatus, setSnapshotStatus] = useState<LoadStatus>("loading");
   const [budgets, setBudgets] = useState<BudgetsConfig | null>(null);
+  const [budgetsStatus, setBudgetsStatus] = useState<LoadStatus>("loading");
 
   useEffect(() => {
     let cancelled = false;
@@ -71,10 +75,16 @@ export function AnalyticsView() {
       if (cancelled) return;
       if (analyticsRes.status === "fulfilled" && analyticsRes.value.ok) {
         setSnapshot((await analyticsRes.value.json()) as AnalyticsSnapshot);
+        setSnapshotStatus("ready");
+      } else {
+        setSnapshotStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
       if (configRes.status === "fulfilled" && configRes.value.ok) {
         const body = (await configRes.value.json()) as { config: { budgets: BudgetsConfig } };
         setBudgets(body.config.budgets);
+        setBudgetsStatus("ready");
+      } else {
+        setBudgetsStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
     };
     void load();
@@ -84,9 +94,10 @@ export function AnalyticsView() {
   }, [refreshKey]);
 
   const totals = snapshot?.totals;
+  const snapshotReady = snapshotStatus === "ready" && snapshot !== null;
   const tokensUsed =
-    totals === undefined ? null : totals.inputTokens + totals.outputTokens;
-  const cost = totals?.costUsd ?? null;
+    !snapshotReady || totals === undefined ? null : totals.inputTokens + totals.outputTokens;
+  const cost = snapshotReady ? (totals?.costUsd ?? null) : null;
   const daily = snapshot?.daily ?? [];
   const maxDaily = Math.max(...daily.map((d) => d.inputTokens + d.outputTokens), 1);
   const models = snapshot?.models ?? [];
@@ -97,20 +108,21 @@ export function AnalyticsView() {
   );
   const anyModelCost = models.some((m) => m.costUsd !== null);
   const windowDays = snapshot?.windowDays ?? 14;
-  const snapshotReady = snapshot !== null;
+
+  const pendingNote = snapshotStatus === "loading" ? "loading…" : "unavailable";
 
   const stats = [
     {
       label: "Total Spend",
       value: !snapshotReady ? "—" : cost === null ? "—" : `$${cost.toFixed(2)}`,
-      note: !snapshotReady ? "unavailable" : costNote(totals, windowDays),
+      note: !snapshotReady ? pendingNote : costNote(totals, windowDays),
       noteClass: totals?.costCoverage === "partial" ? "text-warn" : "text-fg-3",
     },
     {
       label: "Tokens Used",
       value: tokensUsed === null ? "—" : compact(tokensUsed),
       note: !snapshotReady
-        ? "unavailable"
+        ? pendingNote
         : `${totals?.requests ?? 0} requests · last ${windowDays}d`,
       noteClass: "text-fg-3",
     },
@@ -118,7 +130,7 @@ export function AnalyticsView() {
       label: "Tasks Done",
       value: !snapshotReady ? "—" : String(totals?.tasksDone ?? 0),
       note: !snapshotReady
-        ? "unavailable"
+        ? pendingNote
         : `${totals?.tasksTotal ?? 0} created · last ${windowDays}d`,
       noteClass: "text-fg-3",
     },
@@ -129,7 +141,7 @@ export function AnalyticsView() {
           ? "—"
           : `${totals.successRatePct}%`,
       note: !snapshotReady
-        ? "unavailable"
+        ? pendingNote
         : totals?.successRatePct === null
           ? "no terminal tasks yet"
           : `${totals?.tasksFailed ?? 0} failed`,
@@ -139,7 +151,8 @@ export function AnalyticsView() {
 
   // Only a genuine fleet-wide ceiling may drive the bar — never per-task.
   // Three distinct states: budgets not loaded, loaded with zero ceiling, configured.
-  const fleetCeiling = budgets === null ? null : budgets.gatewayHardUsd;
+  const fleetCeiling =
+    budgetsStatus === "ready" && budgets !== null ? budgets.gatewayHardUsd : null;
   const budgetPct =
     cost !== null && fleetCeiling !== null && fleetCeiling > 0
       ? Math.min(100, (cost / fleetCeiling) * 100)
@@ -192,11 +205,13 @@ export function AnalyticsView() {
               <h3 className="text-[15px] font-semibold text-fg-1">Daily Token Consumption</h3>
               <span className="text-[11px] text-fg-3">input + output</span>
             </div>
-            {!snapshotReady ? (
+            {snapshotStatus === "loading" ? (
+              <p className="py-10 text-center text-[13px] text-fg-3">Loading usage snapshot…</p>
+            ) : snapshotStatus === "unavailable" ? (
               <EmptyState
-                kind="no-data"
+                kind="server-error"
                 title="Usage unavailable"
-                body="Daily token consumption appears once the analytics snapshot loads."
+                body="Daily token consumption could not be loaded from the daemon."
                 className="border-0 bg-transparent py-10"
               />
             ) : daily.every((d) => d.inputTokens + d.outputTokens === 0) ? (
@@ -230,11 +245,13 @@ export function AnalyticsView() {
 
           <Card className="p-6 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Usage by Agent</h3>
-            {!snapshotReady ? (
+            {snapshotStatus === "loading" ? (
+              <p className="py-6 text-center text-[13px] text-fg-3">Loading usage…</p>
+            ) : snapshotStatus === "unavailable" ? (
               <EmptyState
-                kind="no-data"
+                kind="server-error"
                 title="Usage unavailable"
-                body="Per-role usage appears once the analytics snapshot loads."
+                body="Per-role usage could not be loaded from the daemon."
                 className="border-0 bg-transparent py-6"
               />
             ) : agents.length === 0 ? (
@@ -281,11 +298,13 @@ export function AnalyticsView() {
         <div className="flex flex-col gap-4">
           <Card className="p-5 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Cost by Model</h3>
-            {!snapshotReady ? (
+            {snapshotStatus === "loading" ? (
+              <p className="py-6 text-center text-[13px] text-fg-3">Loading usage…</p>
+            ) : snapshotStatus === "unavailable" ? (
               <EmptyState
-                kind="no-data"
+                kind="server-error"
                 title="Usage unavailable"
-                body="Per-model cost and tokens appear once the analytics snapshot loads."
+                body="Per-model cost and tokens could not be loaded from the daemon."
                 className="border-0 bg-transparent py-6"
               />
             ) : models.length === 0 ? (
@@ -339,7 +358,9 @@ export function AnalyticsView() {
 
           <Card className="p-5 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Budget &amp; Limits</h3>
-            {budgets === null ? (
+            {budgetsStatus === "loading" ? (
+              <p className="text-[11px] text-fg-3">Loading budget configuration…</p>
+            ) : budgetsStatus === "unavailable" || budgets === null ? (
               <p className="text-[11px] text-fg-3">Budget configuration unavailable</p>
             ) : budgetPct === null ? (
               <p className="text-[11px] text-fg-3">
