@@ -10,6 +10,8 @@
  *   G5  routing hands the task over — present on secondmate, released on primary
  *   G5b concurrent route_to_secondmate: task exists once; loser is already-routing
  *   G5c crash window: durable accept + non-terminal primary → boot finishes CANCELLED once
+ *   G5d pending handover re-driven by reconcile tick (not boot-only); dual ownership recovers
+ *   G5e definite capacity refusal clears pending; ambiguous failure would keep it (unit-covered)
  *   G6  /bearings answers within 5 s; tool returns real results; unreachable is fact
  *   G7  dual-restart reconcile produces no duplicate secondmate records
  *   G8  provision through REST (not out-of-band modules); start waits for ready
@@ -687,15 +689,116 @@ try {
       })
     ).json();
     const task2After = await (await api(`/v1/tasks/${task2.task.id}`)).json();
+    const task2HandoverGone = !existsSync(
+      join(home, "runs", task2.task.id, "handover.json"),
+    );
     const capacityRefused =
       capacity.ok === false &&
       /capacity|concurrent/i.test(capacity.error?.message ?? "") &&
-      task2After.task?.phase !== "CANCELLED";
+      task2After.task?.phase !== "CANCELLED" &&
+      task2HandoverGone;
     gate(
       "G9",
       "maxConcurrentTasks refuses routing when secondmate is at capacity",
       capacityRefused,
-      `ok=${capacity.ok} msg=${capacity.error?.message ?? ""} phase=${task2After.task?.phase}`,
+      `ok=${capacity.ok} msg=${capacity.error?.message ?? ""} phase=${task2After.task?.phase} pendingCleared=${task2HandoverGone}`,
+    );
+    gate(
+      "G5e",
+      "definite capacity refusal clears pending handover (no dual-ownership ghost)",
+      capacityRefused && task2HandoverGone,
+      `pendingCleared=${task2HandoverGone} phase=${task2After.task?.phase}`,
+    );
+
+    // G5d — durable pending re-driven by the reconcile tick (not only on boot).
+    // Raise capacity + speed heartbeat so a planted pending intent is finished
+    // without restarting the primary daemon.
+    let g5dOk = false;
+    let g5dDetail = "skipped";
+    if (smToken) {
+      await api("/v1/secondmates/infra/charter", {
+        method: "PUT",
+        body: JSON.stringify({ maxConcurrentTasks: 2 }),
+      });
+      await api("/v1/config/global/supervision", {
+        method: "PUT",
+        body: JSON.stringify({
+          heartbeatSeconds: 1,
+          staleMinutes: { api: 5, build: 12 },
+          escalationLadderSteps: 3,
+          respawnPerStage: 1,
+          absorb: ["PROGRESS", "TURN_SETTLED_MID_STAGE", "CONTEXT_PRESSURE_LT_70"],
+        }),
+      });
+      const pendingTask = await (
+        await api("/v1/tasks", {
+          method: "POST",
+          body: JSON.stringify({
+            spec: {
+              shape: "SHIP",
+              title: "Pending redrive",
+              intent: "reconcile tick must finish handover",
+              projectId: project.project.id,
+              mode: "local-only",
+              yolo: true,
+            },
+          }),
+        })
+      ).json();
+      const pendingTaskId = pendingTask.task?.id;
+      const pendingDir = join(home, "runs", pendingTaskId);
+      mkdirSync(pendingDir, { recursive: true });
+      writeFileSync(
+        join(pendingDir, "handover.json"),
+        `${JSON.stringify({
+          taskId: pendingTaskId,
+          secondmateName: "infra",
+          domain: "infra",
+          status: "pending",
+          remoteTaskId: null,
+          updatedAt: new Date().toISOString(),
+        })}\n`,
+        { mode: 0o600 },
+      );
+      let afterPhase = null;
+      let remoteCount = -1;
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        const mid = await (await api(`/v1/tasks/${pendingTaskId}`)).json().catch(() => ({}));
+        afterPhase = mid.task?.phase ?? null;
+        if (afterPhase === "CANCELLED") break;
+        await sleep(250);
+      }
+      try {
+        const listRes = await fetch(`http://127.0.0.1:${SM_PORT}/v1/tasks`, {
+          headers: { authorization: `Bearer ${smToken}` },
+        });
+        const listBody = listRes.ok ? await listRes.json() : {};
+        const tasks = listBody.tasks ?? listBody.items ?? [];
+        remoteCount = Array.isArray(tasks) ? tasks.length : -1;
+      } catch {
+        remoteCount = -1;
+      }
+      let pendingStatus = null;
+      try {
+        const raw = JSON.parse(
+          readFileSync(join(pendingDir, "handover.json"), "utf8"),
+        );
+        pendingStatus = raw.status ?? null;
+      } catch {
+        pendingStatus = null;
+      }
+      g5dOk =
+        afterPhase === "CANCELLED" &&
+        pendingStatus === "accepted" &&
+        remoteCount >= 2;
+      g5dDetail = `phase=${afterPhase} handover=${pendingStatus} remoteCount=${remoteCount}`;
+    }
+    gate(
+      "G5d",
+      "pending handover re-driven by reconcile tick without daemon restart",
+      g5dOk,
+      g5dDetail,
     );
   }
 

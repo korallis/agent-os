@@ -150,8 +150,14 @@ export interface ToolCallResult {
 
 /**
  * Durable secondmate handover intent/acceptance under runs/<taskId>/handover.json.
- * Written before (pending) and immediately after (accepted) the remote POST so a
- * crash between remote accept and primary CANCELLED cannot leave dual ownership.
+ *
+ * Invariant: from the moment remote acceptance is possible until the primary is
+ * durably terminal, a periodic pass must always have a durable record to act on.
+ * - pending: written before the remote POST; kept on ambiguous POST failure
+ *   (timeout/network/200-without-id) so reconcile can re-drive with the remote
+ *   idempotency key; cleared only on definite refusal (clean 4xx / capacity).
+ * - accepted: written with remoteTaskId before primary CANCELLED; survives kill-9
+ *   between those steps so reconcile can finish primary release.
  */
 export type HandoverRecord = {
   taskId: string;
@@ -3597,8 +3603,9 @@ export class ToolSurface {
    * Capacity (maxConcurrentTasks) is enforced on the live secondmate.
    *
    * Crash-safety: write pending intent before the remote POST, then durable
-   * acceptance (with remoteTaskId) before primary CANCELLED. Boot reconcile
-   * finishes incomplete releases; re-drive uses the remote idempotency key.
+   * acceptance (with remoteTaskId) before primary CANCELLED. Pending is cleared
+   * only on definite remote refusal; ambiguous failures keep pending so the
+   * reconcile tick (and boot) can re-drive with the remote idempotency key.
    */
   private async routeToSecondmate(raw: Record<string, unknown>): Promise<{
     name: string;
@@ -3703,6 +3710,12 @@ export class ToolSurface {
       }
 
       // Durable intent before the remote POST so a crash can re-drive safely.
+      // Existing pending (retry after ambiguous failure) uses redrive so capacity
+      // admission cannot refuse before the idempotent POST resolves remote ownership.
+      const hadPending =
+        prior !== null &&
+        prior.status === "pending" &&
+        prior.secondmateName === record.name;
       this.writeHandoverRecord({
         taskId: task.id,
         secondmateName: record.name,
@@ -3725,10 +3738,19 @@ export class ToolSurface {
             yolo: project.yolo,
           },
           domain: input.domain,
+          ...(hadPending ? { redrive: true as const } : {}),
         });
         remoteTaskId = handed.remoteTaskId;
       } catch (error) {
-        this.clearHandoverRecord(task.id);
+        // Only erase pending on definite refusal. Ambiguous failures leave the
+        // durable record so reconcilePendingHandoversAsync can recover dual ownership.
+        // On redrive, never clear capacity (remote may already own the task).
+        if (
+          this.isDefiniteHandoverFailure(error) &&
+          !(hadPending && error instanceof SecondmateCapacityError)
+        ) {
+          this.clearHandoverRecord(task.id);
+        }
         const message =
           error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError
             ? error.message
@@ -3752,7 +3774,8 @@ export class ToolSurface {
         ) {
           throw error;
         }
-        throw new SecondmateHandoverError(message);
+        // Unknown errors after pending was written are treated as ambiguous.
+        throw new SecondmateHandoverError(message, undefined, false);
       }
 
       // Remote accept is durable before primary release (crash window closed).
@@ -3769,6 +3792,16 @@ export class ToolSurface {
     } finally {
       this.routingInProgress.delete(task.id);
     }
+  }
+
+  /**
+   * True when the secondmate certainly did not create the task — pending may be cleared.
+   * Capacity and clean 4xx are definite; timeouts / network / 5xx / 200-without-id are not.
+   */
+  private isDefiniteHandoverFailure(error: unknown): boolean {
+    if (error instanceof SecondmateCapacityError) return true;
+    if (error instanceof SecondmateHandoverError) return error.definiteRefusal;
+    return false;
   }
 
   /**
@@ -3819,8 +3852,9 @@ export class ToolSurface {
   }
 
   /**
-   * Boot: finish handovers whose remote accept was durable but primary release
-   * did not complete (kill -9 between acceptance write and CANCELLED).
+   * Finish handovers whose remote accept was durable but primary release did
+   * not complete (kill -9 between acceptance write and CANCELLED). Called from
+   * boot rehydrate and every reconcile tick.
    */
   reconcileAcceptedHandovers(): string[] {
     const finished: string[] = [];
@@ -3835,8 +3869,13 @@ export class ToolSurface {
   }
 
   /**
-   * Boot: re-drive handovers that crashed after pending intent (remote POST uses
-   * idempotency key routed-from-primary:<taskId>) then finalize primary release.
+   * Re-drive handovers that crashed or failed ambiguously after pending intent
+   * was durable (remote POST uses idempotency key routed-from-primary:<taskId>)
+   * then finalize primary release. Called from boot start and every reconcile
+   * tick so dual ownership cannot wait for the next daemon restart.
+   *
+   * On definite remote refusal during redrive, clear pending (same rule as
+   * routeToSecondmate). On ambiguous failure, leave pending for the next tick.
    */
   async reconcilePendingHandoversAsync(): Promise<string[]> {
     if (this.deps.secondmates === undefined) return [];
@@ -3864,6 +3903,7 @@ export class ToolSurface {
               yolo: project.yolo,
             },
             domain: rec.domain,
+            redrive: true,
           });
           const acceptance: HandoverRecord = {
             taskId: task.id,
@@ -3876,8 +3916,16 @@ export class ToolSurface {
           this.writeHandoverRecord(acceptance);
           this.finalizeAcceptedHandover(acceptance);
           finished.push(task.id);
-        } catch {
-          // Leave pending for a later pass; never cancel without remote accept.
+        } catch (error) {
+          // Redrive never erases pending on capacity — remote may already own the
+          // task from an ambiguous prior POST. Only clear clean non-capacity 4xx.
+          if (
+            error instanceof SecondmateHandoverError &&
+            error.definiteRefusal
+          ) {
+            this.clearHandoverRecord(task.id);
+          }
+          // Capacity / ambiguous: leave pending for a later tick.
         }
       } finally {
         this.routingInProgress.delete(task.id);

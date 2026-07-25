@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,7 +8,11 @@ import {
   SecondmateRegistry,
   secondmateTmuxSocket,
 } from "../src/fleet/secondmates.js";
-import { SecondmateFleet } from "../src/fleet/secondmate-fleet.js";
+import {
+  SecondmateCapacityError,
+  SecondmateFleet,
+  SecondmateHandoverError,
+} from "../src/fleet/secondmate-fleet.js";
 import { FleetService } from "../src/fleet/service.js";
 import { ConfigService } from "../src/config/service.js";
 import { SHIPPED_DEFAULTS_DIR, startDaemon, type RunningDaemon } from "../src/daemon.js";
@@ -969,6 +973,184 @@ describe("handover crash recovery and post-accept finalization", () => {
     const after = restarted.tools.invoke("read_task", { taskId });
     expect(after.ok).toBe(true);
     expect((after.data as { phase: string }).phase).toBe("CANCELLED");
+  });
+
+  it("keeps pending handover on ambiguous POST failure; clears on definite refusal", async () => {
+    const home = temp("agentos-p7-handover-pending-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await service.start();
+    service.provisionSecondmate({ name: "infra", domain: "infra" });
+    const project = service.projects.register({
+      name: "ambig",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "ambiguous fail",
+        intent: "keep pending",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    const handoverPath = join(home, "runs", taskId, "handover.json");
+
+    const original = service.secondmateFleet.handoverTask.bind(service.secondmateFleet);
+    service.secondmateFleet.handoverTask = async () => {
+      throw new SecondmateHandoverError("simulated timeout after possible accept", undefined, false);
+    };
+    const ambiguous = await service.tools.invokeAsync("route_to_secondmate", {
+      name: "infra",
+      taskId,
+      domain: "infra",
+    });
+    expect(ambiguous.ok).toBe(false);
+    expect(existsSync(handoverPath)).toBe(true);
+    const pending = JSON.parse(readFileSync(handoverPath, "utf8")) as {
+      status: string;
+      remoteTaskId: string | null;
+    };
+    expect(pending.status).toBe("pending");
+    expect(pending.remoteTaskId).toBeNull();
+    const afterAmbig = service.tools.invoke("read_task", { taskId });
+    expect((afterAmbig.data as { phase: string }).phase).not.toBe("CANCELLED");
+
+    // Capacity during redrive must NOT erase pending (remote may already own it).
+    service.secondmateFleet.handoverTask = async () => {
+      throw new SecondmateCapacityError("secondmate infra is at capacity (1/1 concurrent tasks)");
+    };
+    const capacityRedrive = await service.tools.invokeAsync("route_to_secondmate", {
+      name: "infra",
+      taskId,
+      domain: "infra",
+    });
+    expect(capacityRedrive.ok).toBe(false);
+    expect(existsSync(handoverPath)).toBe(true);
+
+    // Clean 4xx on redrive is definite — clear pending.
+    service.secondmateFleet.handoverTask = async () => {
+      throw new SecondmateHandoverError("refused (HTTP 400)", { status: 400 }, true);
+    };
+    const refused = await service.tools.invokeAsync("route_to_secondmate", {
+      name: "infra",
+      taskId,
+      domain: "infra",
+    });
+    expect(refused.ok).toBe(false);
+    expect(existsSync(handoverPath)).toBe(false);
+
+    // Fresh route capacity (no prior pending) clears the newly written pending.
+    const created2 = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "fresh capacity",
+        intent: "clear on definite capacity",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(created2.ok).toBe(true);
+    const taskId2 = (created2.data as { id: string }).id;
+    const handoverPath2 = join(home, "runs", taskId2, "handover.json");
+    service.secondmateFleet.handoverTask = async () => {
+      throw new SecondmateCapacityError("secondmate infra is at capacity (1/1 concurrent tasks)");
+    };
+    const capacityFresh = await service.tools.invokeAsync("route_to_secondmate", {
+      name: "infra",
+      taskId: taskId2,
+      domain: "infra",
+    });
+    expect(capacityFresh.ok).toBe(false);
+    expect(existsSync(handoverPath2)).toBe(false);
+
+    service.secondmateFleet.handoverTask = original;
+  });
+
+  it("reconcile tick re-drives pending handovers (not boot-only)", async () => {
+    const home = temp("agentos-p7-handover-tick-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await service.start();
+    service.provisionSecondmate({ name: "infra", domain: "infra" });
+    const project = service.projects.register({
+      name: "tick",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "pending redrive",
+        intent: "tick redrive",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    const remoteTaskId = "01ARZ3NDEKTSV4RRFFQ69G5FHD";
+    mkdirSync(join(home, "runs", taskId), { recursive: true });
+    writeFileSync(
+      join(home, "runs", taskId, "handover.json"),
+      `${JSON.stringify({
+        taskId,
+        secondmateName: "infra",
+        domain: "infra",
+        status: "pending",
+        remoteTaskId: null,
+        updatedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    let posts = 0;
+    service.secondmateFleet.handoverTask = async () => {
+      posts += 1;
+      return { remoteTaskId };
+    };
+
+    // Public reconcile (same path as the heartbeat tick) must re-drive pending.
+    service.reconcile();
+    // Fire-and-forget on the tick — wait for the async redrive.
+    for (let i = 0; i < 40; i++) {
+      const phase = (service.tools.invoke("read_task", { taskId }).data as { phase: string })
+        .phase;
+      if (phase === "CANCELLED") break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(posts).toBeGreaterThanOrEqual(1);
+    const after = service.tools.invoke("read_task", { taskId });
+    expect((after.data as { phase: string }).phase).toBe("CANCELLED");
+    const rec = JSON.parse(
+      readFileSync(join(home, "runs", taskId, "handover.json"), "utf8"),
+    ) as { status: string; remoteTaskId: string };
+    expect(rec.status).toBe("accepted");
+    expect(rec.remoteTaskId).toBe(remoteTaskId);
   });
 });
 

@@ -567,11 +567,17 @@ export class FleetService {
    * Covers both crewmate sessions and the Brain (which is not a FleetSession).
    * Also reclaims worktree leases whose sessions are all terminal (stopped/lost
    * / missing pane) so a missed release path cannot exhaust the pool until reboot.
+   * Re-drives durable secondmate handovers (accepted → primary release; pending →
+   * idempotent remote POST) so dual ownership cannot wait for the next restart.
    */
   reconcile(): string[] {
     const lost = this.tools.reconcileDeadPanes();
     this.reconcileBrainPane();
     this.reclaimOrphanedWorktreeLeases();
+    // Accepted: finish primary release without remote I/O.
+    this.tools.reconcileAcceptedHandovers();
+    // Pending: re-drive remote POST (idempotency key); fire-and-forget on tick.
+    void this.tools.reconcilePendingHandoversAsync().catch(() => undefined);
     return lost;
   }
 

@@ -38,13 +38,21 @@ const SYNC_TIMEOUT_MS = 10_000;
 
 export class SecondmateHandoverError extends Error {
   readonly code = "SECONDMATE_HANDOVER_FAILED" as const;
+  /**
+   * When true, the secondmate certainly did not create the task (pre-POST
+   * failure or clean 4xx). Pending handover intent may be cleared.
+   * When false, remote may already own the task — pending must survive for redrive.
+   */
+  readonly definiteRefusal: boolean;
 
   constructor(
     message: string,
     readonly details?: Record<string, unknown>,
+    definiteRefusal = false,
   ) {
     super(message);
     this.name = "SecondmateHandoverError";
+    this.definiteRefusal = definiteRefusal;
   }
 }
 
@@ -79,18 +87,29 @@ export class SecondmateFleet {
     task: TaskSnapshot;
     project: { name: string; path: string; mode: ProjectMode; trusted: boolean; yolo: boolean };
     domain: string;
+    /**
+     * Re-drive of durable pending intent. Skips admission capacity so a task
+     * that may already exist remotely (ambiguous prior POST) is not refused
+     * before the idempotent create can resolve the remote id.
+     */
+    redrive?: boolean;
   }): Promise<{ remoteTaskId: string }> {
     const token = this.registry.readRuntimeToken(input.record.name);
     if (token === null) {
       throw new SecondmateHandoverError(
         `secondmate ${input.record.name} has no runtime token — start it first`,
+        undefined,
+        true,
       );
     }
     const baseUrl = `http://127.0.0.1:${input.record.port}`;
     const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
-    await this.assertAdmissionCapacity(input.record, baseUrl, auth);
-
+    // Pre-POST failures are definite: the task create request never left.
+    // Redrive skips capacity — remote may already count this task toward the cap.
+    if (input.redrive !== true) {
+      await this.assertAdmissionCapacity(input.record, baseUrl, auth);
+    }
     const remoteProjectId = await this.ensureRemoteProject(baseUrl, auth, input.project);
 
     try {
@@ -124,25 +143,45 @@ export class SecondmateFleet {
             { status: response.status, body: text.slice(0, 500) },
           );
         }
+        // Clean 4xx: server refused create. 5xx/other: may have accepted.
+        const definiteRefusal = response.status >= 400 && response.status < 500;
         throw new SecondmateHandoverError(
           `secondmate ${input.record.name} refused task (HTTP ${response.status})`,
           { status: response.status, body: text.slice(0, 500) },
+          definiteRefusal,
         );
       }
-      const body = (await response.json()) as { task?: { id?: string } };
+      let body: { task?: { id?: string } };
+      try {
+        body = (await response.json()) as { task?: { id?: string } };
+      } catch (error) {
+        // HTTP 200 but body unreadable — remote may own the task.
+        throw new SecondmateHandoverError(
+          error instanceof Error
+            ? `secondmate ${input.record.name} accepted with unreadable body: ${error.message}`
+            : `secondmate ${input.record.name} accepted with unreadable body`,
+          { status: 200 },
+          false,
+        );
+      }
       const remoteTaskId = body.task?.id;
       if (typeof remoteTaskId !== "string" || remoteTaskId.length === 0) {
+        // HTTP 200 without id — treat as ambiguous (may still have created).
         throw new SecondmateHandoverError(
           `secondmate ${input.record.name} accepted without a task id`,
+          { status: 200 },
+          false,
         );
       }
       return { remoteTaskId };
     } catch (error) {
       if (error instanceof SecondmateHandoverError) throw error;
       if (error instanceof SecondmateCapacityError) throw error;
+      // Network drop / abort after POST may have been accepted remotely.
       throw new SecondmateHandoverError(
         error instanceof Error ? error.message : "handover failed",
         { domain: input.domain },
+        false,
       );
     }
   }
@@ -168,6 +207,7 @@ export class SecondmateFleet {
         throw new SecondmateHandoverError(
           `secondmate ${record.name} fleet probe failed (HTTP ${response.status}) — cannot admit`,
           { status: response.status },
+          true,
         );
       }
       const body = (await response.json()) as {
@@ -183,13 +223,18 @@ export class SecondmateFleet {
         );
       }
     } catch (error) {
-      if (error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError) {
-        throw error;
+      if (error instanceof SecondmateCapacityError) throw error;
+      if (error instanceof SecondmateHandoverError) {
+        // Pre-POST: even timeouts are definite (task create never sent).
+        if (error.definiteRefusal) throw error;
+        throw new SecondmateHandoverError(error.message, error.details, true);
       }
       throw new SecondmateHandoverError(
         error instanceof Error
           ? error.message
           : `secondmate ${record.name} capacity probe failed`,
+        undefined,
+        true,
       );
     }
   }
@@ -199,46 +244,66 @@ export class SecondmateFleet {
     auth: Record<string, string>,
     project: { name: string; path: string; mode: ProjectMode; trusted: boolean; yolo: boolean },
   ): Promise<string> {
-    const listRes = await fetchWithTimeout(
-      `${baseUrl}/v1/projects`,
-      { headers: auth },
-      HANDOVER_TIMEOUT_MS,
-    );
-    if (listRes.ok) {
-      const listBody = (await listRes.json()) as {
-        projects?: Array<{ id: string; path: string }>;
-      };
-      const match = (listBody.projects ?? []).find((p) => p.path === project.path);
-      if (match !== undefined) return match.id;
-    }
-    const createRes = await fetchWithTimeout(
-      `${baseUrl}/v1/projects`,
-      {
-        method: "POST",
-        headers: auth,
-        body: JSON.stringify({
-          name: project.name,
-          path: project.path,
-          mode: project.mode,
-          trusted: project.trusted,
-          yolo: project.yolo,
-        }),
-      },
-      HANDOVER_TIMEOUT_MS,
-    );
-    if (!createRes.ok) {
-      const text = await createRes.text().catch(() => "");
+    try {
+      const listRes = await fetchWithTimeout(
+        `${baseUrl}/v1/projects`,
+        { headers: auth },
+        HANDOVER_TIMEOUT_MS,
+      );
+      if (listRes.ok) {
+        const listBody = (await listRes.json()) as {
+          projects?: Array<{ id: string; path: string }>;
+        };
+        const match = (listBody.projects ?? []).find((p) => p.path === project.path);
+        if (match !== undefined) return match.id;
+      }
+      const createRes = await fetchWithTimeout(
+        `${baseUrl}/v1/projects`,
+        {
+          method: "POST",
+          headers: auth,
+          body: JSON.stringify({
+            name: project.name,
+            path: project.path,
+            mode: project.mode,
+            trusted: project.trusted,
+            yolo: project.yolo,
+          }),
+        },
+        HANDOVER_TIMEOUT_MS,
+      );
+      if (!createRes.ok) {
+        const text = await createRes.text().catch(() => "");
+        throw new SecondmateHandoverError(
+          `could not register project on secondmate (HTTP ${createRes.status})`,
+          { status: createRes.status, body: text.slice(0, 500) },
+          true,
+        );
+      }
+      const created = (await createRes.json()) as { project?: { id?: string } };
+      const id = created.project?.id;
+      if (typeof id !== "string" || id.length === 0) {
+        throw new SecondmateHandoverError(
+          "secondmate project create returned no id",
+          undefined,
+          true,
+        );
+      }
+      return id;
+    } catch (error) {
+      if (error instanceof SecondmateHandoverError) {
+        // Pre-POST: task create never sent — always a definite refusal for handover.
+        if (error.definiteRefusal) throw error;
+        throw new SecondmateHandoverError(error.message, error.details, true);
+      }
       throw new SecondmateHandoverError(
-        `could not register project on secondmate (HTTP ${createRes.status})`,
-        { body: text.slice(0, 500) },
+        error instanceof Error
+          ? error.message
+          : "could not register project on secondmate",
+        undefined,
+        true,
       );
     }
-    const created = (await createRes.json()) as { project?: { id?: string } };
-    const id = created.project?.id;
-    if (typeof id !== "string" || id.length === 0) {
-      throw new SecondmateHandoverError("secondmate project create returned no id");
-    }
-    return id;
   }
 
   private charterPath(record: SecondmateRecord): string {
