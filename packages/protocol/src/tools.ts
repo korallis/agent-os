@@ -206,8 +206,9 @@ export const routeToSecondmateInputSchema = z.strictObject({
   name: z.string().min(1).max(64),
   taskId: ulidSchema,
   /**
-   * Domain being handed over. Must be in the target secondmate's charter.domains
-   * (enforced via SecondmateFleet.routeFor).
+   * Domain being handed over. Must be in the named target secondmate's
+   * charter.domains (enforced via SecondmateFleet.acceptsDomain on that
+   * charter). routeFor is first-wins auto-pick only and is not used here.
    */
   domain: z.string().min(1).max(64),
 });

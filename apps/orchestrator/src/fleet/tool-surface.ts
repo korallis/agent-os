@@ -22,6 +22,7 @@ import {
   resolveDeliveryBlockInputSchema,
   readSecondmateBearingsInputSchema,
   respawnCrewmateInputSchema,
+  provisionSecondmateInputSchema,
   routeToSecondmateInputSchema,
   runGateInputSchema,
   sendToCrewInputSchema,
@@ -217,6 +218,12 @@ export class ToolSurface {
    * the section is synchronous (no await).
    */
   private admissionDepth = 0;
+  /**
+   * Per-task exclusive claim for route_to_secondmate. Taken before the remote
+   * POST so overlapping routes for one taskId cannot both hand work over.
+   * Cleared in finally; terminal phase then blocks any later retry.
+   */
+  private readonly routingInProgress = new Set<string>();
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -3547,25 +3554,12 @@ export class ToolSurface {
     if (this.deps.secondmates === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
     }
-    const name = typeof raw.name === "string" ? raw.name : "";
-    const domain = typeof raw.domain === "string" ? raw.domain : "";
-    if (name.length === 0 || domain.length === 0) {
-      throw new ToolSurfaceError("VALIDATION_ERROR", "name and domain are required");
-    }
-    const port = typeof raw.port === "number" ? raw.port : undefined;
-    const brainModel = typeof raw.brainModel === "string" ? raw.brainModel : undefined;
-    const maxConcurrentTasks =
-      typeof raw.maxConcurrentTasks === "number" ? raw.maxConcurrentTasks : undefined;
+    const input = provisionSecondmateInputSchema.parse(raw);
     try {
-      const secondmate = this.deps.secondmates.registry.provision({
-        name,
-        domain,
-        ...(port !== undefined ? { port } : {}),
-        ...(brainModel !== undefined ? { brainModel } : {}),
-        ...(maxConcurrentTasks !== undefined ? { maxConcurrentTasks } : {}),
-      });
+      const secondmate = this.deps.secondmates.registry.provision(input);
       return { secondmate };
     } catch (error) {
+      if (error instanceof ZodError) throw error;
       throw new ToolSurfaceError(
         "CONFLICT",
         error instanceof Error ? error.message : "provision failed",
@@ -3596,131 +3590,147 @@ export class ToolSurface {
     if (isTerminalPhase(task.phase)) {
       throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
     }
-
-    const record = this.deps.secondmates.registry.get(input.name);
-    if (record === null) {
-      this.sink({
-        type: "secondmate.routed",
-        payload: {
-          name: input.name,
-          taskId: task.id,
-          domain: input.domain,
-          accepted: false,
-          reason: `no secondmate named ${input.name}`,
-          remoteTaskId: null,
-        },
-      });
-      throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
-    }
-    const { charter } = this.deps.secondmates.fleet.readCharter(record);
-    if (!charter.acceptsRouting) {
-      this.sink({
-        type: "secondmate.routed",
-        payload: {
-          name: record.name,
-          taskId: task.id,
-          domain: input.domain,
-          accepted: false,
-          reason: "charter declines routing",
-          remoteTaskId: null,
-        },
-      });
+    if (this.routingInProgress.has(task.id)) {
       throw new ToolSurfaceError(
-        "POLICY_VIOLATION",
-        `secondmate ${record.name} declines routing (charter acceptsRouting=false)`,
+        "CONFLICT",
+        `task ${task.id} is already being routed`,
       );
     }
-    // Named target's own charter — not routeFor first-wins across the fleet.
-    if (!this.deps.secondmates.fleet.acceptsDomain(record, input.domain)) {
-      this.sink({
-        type: "secondmate.routed",
-        payload: {
-          name: record.name,
-          taskId: task.id,
-          domain: input.domain,
-          accepted: false,
-          reason: `secondmate ${record.name} does not accept domain ${input.domain}`,
-          remoteTaskId: null,
-        },
-      });
-      throw new ToolSurfaceError(
-        "POLICY_VIOLATION",
-        `secondmate ${record.name} does not accept domain ${input.domain}`,
-      );
-    }
+    this.routingInProgress.add(task.id);
 
-    const project = this.deps.projects.get(task.projectId);
-    if (project === null) {
-      throw new ToolSurfaceError("NOT_FOUND", `project not found: ${task.projectId}`);
-    }
-
-    let remoteTaskId: string;
     try {
-      const handed = await this.deps.secondmates.fleet.handoverTask({
-        record,
-        task,
-        project: {
-          name: project.name,
-          path: project.path,
-          mode: project.mode,
-          trusted: project.trusted,
-          yolo: project.yolo,
-        },
-        domain: input.domain,
-      });
-      remoteTaskId = handed.remoteTaskId;
-    } catch (error) {
-      const message =
-        error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError
-          ? error.message
-          : error instanceof Error
+      const live = this.requireTask(input.taskId);
+      if (isTerminalPhase(live.phase)) {
+        throw new ToolSurfaceError("CONFLICT", `task ${live.id} is terminal (${live.phase})`);
+      }
+
+      const record = this.deps.secondmates.registry.get(input.name);
+      if (record === null) {
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: input.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: `no secondmate named ${input.name}`,
+            remoteTaskId: null,
+          },
+        });
+        throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
+      }
+      const { charter } = this.deps.secondmates.fleet.readCharter(record);
+      if (!charter.acceptsRouting) {
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: record.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: "charter declines routing",
+            remoteTaskId: null,
+          },
+        });
+        throw new ToolSurfaceError(
+          "POLICY_VIOLATION",
+          `secondmate ${record.name} declines routing (charter acceptsRouting=false)`,
+        );
+      }
+      // Named target's own charter — not routeFor first-wins across the fleet.
+      if (!this.deps.secondmates.fleet.acceptsDomain(record, input.domain)) {
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: record.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: `secondmate ${record.name} does not accept domain ${input.domain}`,
+            remoteTaskId: null,
+          },
+        });
+        throw new ToolSurfaceError(
+          "POLICY_VIOLATION",
+          `secondmate ${record.name} does not accept domain ${input.domain}`,
+        );
+      }
+
+      const project = this.deps.projects.get(task.projectId);
+      if (project === null) {
+        throw new ToolSurfaceError("NOT_FOUND", `project not found: ${task.projectId}`);
+      }
+
+      let remoteTaskId: string;
+      try {
+        const handed = await this.deps.secondmates.fleet.handoverTask({
+          record,
+          task: live,
+          project: {
+            name: project.name,
+            path: project.path,
+            mode: project.mode,
+            trusted: project.trusted,
+            yolo: project.yolo,
+          },
+          domain: input.domain,
+        });
+        remoteTaskId = handed.remoteTaskId;
+      } catch (error) {
+        const message =
+          error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError
             ? error.message
-            : "handover failed";
+            : error instanceof Error
+              ? error.message
+              : "handover failed";
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: record.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: message,
+            remoteTaskId: null,
+          },
+        });
+        if (
+          error instanceof SecondmateHandoverError ||
+          error instanceof SecondmateCapacityError
+        ) {
+          throw error;
+        }
+        throw new SecondmateHandoverError(message);
+      }
+
+      // Accepted on the secondmate — only now release ownership on the primary.
+      this.haltAndReleaseTask(task.id, `routed to secondmate ${record.name}`);
+      this.transition(
+        this.requireTask(task.id),
+        "CANCELLED",
+        `routed to secondmate ${record.name} as ${remoteTaskId}`,
+      );
       this.sink({
         type: "secondmate.routed",
         payload: {
           name: record.name,
           taskId: task.id,
           domain: input.domain,
-          accepted: false,
-          reason: message,
-          remoteTaskId: null,
+          accepted: true,
+          reason: null,
+          remoteTaskId,
         },
       });
-      if (
-        error instanceof SecondmateHandoverError ||
-        error instanceof SecondmateCapacityError
-      ) {
-        throw error;
-      }
-      throw new SecondmateHandoverError(message);
-    }
-
-    // Accepted on the secondmate — only now release ownership on the primary.
-    this.haltAndReleaseTask(task.id, `routed to secondmate ${record.name}`);
-    this.transition(
-      this.requireTask(task.id),
-      "CANCELLED",
-      `routed to secondmate ${record.name} as ${remoteTaskId}`,
-    );
-    this.sink({
-      type: "secondmate.routed",
-      payload: {
+      return {
         name: record.name,
         taskId: task.id,
-        domain: input.domain,
-        accepted: true,
-        reason: null,
         remoteTaskId,
-      },
-    });
-    return {
-      name: record.name,
-      taskId: task.id,
-      remoteTaskId,
-      accepted: true,
-      domain: input.domain,
-    };
+        accepted: true,
+        domain: input.domain,
+      };
+    } finally {
+      this.routingInProgress.delete(task.id);
+    }
   }
 
   /** Live status of secondmates; awaits the probe and surfaces unreachable as fact. */

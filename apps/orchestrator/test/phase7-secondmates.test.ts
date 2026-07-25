@@ -744,6 +744,19 @@ describe("secondmate provision constraints", () => {
     expect(charter.acceptsRouting).toBe(true);
   });
 
+  it("rejects out-of-range maxConcurrentTasks at provision (schema boundary)", () => {
+    const home = temp("agentos-p7-cap-schema-");
+    const registry = new SecondmateRegistry(home);
+    expect(() =>
+      registry.provision({ name: "zero", domain: "x", maxConcurrentTasks: 0 }),
+    ).toThrow();
+    expect(() =>
+      registry.provision({ name: "high", domain: "x", maxConcurrentTasks: 99 }),
+    ).toThrow();
+    expect(existsSync(join(home, "secondmates", "zero"))).toBe(false);
+    expect(existsSync(join(home, "secondmates", "high"))).toBe(false);
+  });
+
   it("fails closed on capacity when the provision record has no durable cap", () => {
     const home = temp("agentos-p7-cap-missing-");
     const registry = new SecondmateRegistry(home);

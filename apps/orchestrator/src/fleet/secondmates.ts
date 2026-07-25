@@ -8,7 +8,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import type { OrchestratorEvent } from "@agent-os/protocol";
+import {
+  provisionSecondmateInputSchema,
+  type OrchestratorEvent,
+  type ProvisionSecondmateInput,
+} from "@agent-os/protocol";
 
 /**
  * Secondmates registry (Phase 7 — master plan §5.9).
@@ -158,15 +162,12 @@ export class SecondmateRegistry {
   /**
    * Provision an isolated secondmate home. Refuses if name exists.
    * Does NOT copy auth material (fs scan gate).
+   * Validates with provisionSecondmateInputSchema so charter fields
+   * (e.g. maxConcurrentTasks 1..32) cannot fail-close admission later.
    */
-  provision(input: {
-    name: string;
-    domain: string;
-    port?: number;
-    brainModel?: string;
-    maxConcurrentTasks?: number;
-  }): SecondmateRecord {
-    const safe = input.name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
+  provision(input: ProvisionSecondmateInput): SecondmateRecord {
+    const validated = provisionSecondmateInputSchema.parse(input);
+    const safe = validated.name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
     if (safe.length === 0) {
       throw new Error("invalid secondmate name");
     }
@@ -175,9 +176,9 @@ export class SecondmateRegistry {
       throw new Error(`secondmate already exists: ${safe}`);
     }
     const existing = this.list();
-    const port = input.port ?? this.nextFreePort(existing);
+    const port = validated.port ?? this.nextFreePort(existing);
     this.assertPortAvailable(port, existing);
-    const maxConcurrentTasks = input.maxConcurrentTasks ?? 2;
+    const maxConcurrentTasks = validated.maxConcurrentTasks ?? 2;
     mkdirSync(home, { recursive: true, mode: 0o700 });
     mkdirSync(join(home, "config"), { recursive: true, mode: 0o700 });
     mkdirSync(join(home, "runs"), { recursive: true, mode: 0o700 });
@@ -185,8 +186,8 @@ export class SecondmateRegistry {
       name: safe,
       home,
       port,
-      domain: input.domain,
-      brainModel: input.brainModel ?? null,
+      domain: validated.domain,
+      brainModel: validated.brainModel ?? null,
       maxConcurrentTasks,
       createdAt: new Date().toISOString(),
     };
@@ -197,8 +198,8 @@ export class SecondmateRegistry {
     const charterPath = join(home, "config", "charter.json5");
     const charter = {
       name: safe,
-      domains: [input.domain],
-      brainModel: input.brainModel ?? null,
+      domains: [validated.domain],
+      brainModel: validated.brainModel ?? null,
       maxConcurrentTasks,
       acceptsRouting: true,
     };
@@ -207,7 +208,7 @@ export class SecondmateRegistry {
       `// charter.json5 — secondmate ${safe} (master plan §5.9)\n${JSON.stringify(charter, null, 2)}\n`,
       { mode: 0o600 },
     );
-    const cast = input.brainModel ?? "auto";
+    const cast = validated.brainModel ?? "auto";
     writeFileSync(
       join(home, "config", "brain.json5"),
       `// brain.json5 — driven by secondmate charter\n{\n  cast: ${JSON.stringify(cast)},\n}\n`,

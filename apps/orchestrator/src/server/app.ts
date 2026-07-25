@@ -21,6 +21,7 @@ import {
   onboardingAdvanceRequestSchema,
   PI_PINNED_VERSION,
   projectRegisterRequestSchema,
+  provisionSecondmateInputSchema,
   SAFETY_CONFIRM_HEADER,
   safetyPoliciesConfigSchema,
   taskCreateRequestSchema,
@@ -519,29 +520,20 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
       return;
     }
-    const body = request.body as {
-      name?: unknown;
-      domain?: unknown;
-      port?: unknown;
-      brainModel?: unknown;
-      maxConcurrentTasks?: unknown;
-    } | null;
-    const name = typeof body?.name === "string" ? body.name : "";
-    const domain = typeof body?.domain === "string" ? body.domain : "";
-    if (name.length === 0 || domain.length === 0) {
-      sendError(reply, 400, "BAD_REQUEST", "name and domain are required");
+    const parsed = provisionSecondmateInputSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const path = issue?.path.join(".") || "body";
+      sendError(
+        reply,
+        400,
+        "BAD_REQUEST",
+        issue !== undefined ? `${path}: ${issue.message}` : "invalid provision body",
+      );
       return;
     }
     try {
-      const secondmate = deps.fleet.provisionSecondmate({
-        name,
-        domain,
-        ...(typeof body?.port === "number" ? { port: body.port } : {}),
-        ...(typeof body?.brainModel === "string" ? { brainModel: body.brainModel } : {}),
-        ...(typeof body?.maxConcurrentTasks === "number"
-          ? { maxConcurrentTasks: body.maxConcurrentTasks }
-          : {}),
-      });
+      const secondmate = deps.fleet.provisionSecondmate(parsed.data);
       return { secondmate };
     } catch (error) {
       const message = error instanceof Error ? error.message : "provision failed";

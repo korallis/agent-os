@@ -8,6 +8,7 @@
  *   G3  charter config drives the LIVE secondmate Brain model (edit → observed)
  *   G4  broker serialises across PROCESSES, and production PiAuthBroker holds it
  *   G5  routing hands the task over — present on secondmate, released on primary
+ *   G5b concurrent route_to_secondmate: task exists once; loser is already-routing
  *   G6  /bearings answers within 5 s; tool returns real results; unreachable is fact
  *   G7  dual-restart reconcile produces no duplicate secondmate records
  *   G8  provision through REST (not out-of-band modules); start waits for ready
@@ -16,6 +17,7 @@
  *   G11 primary bound port blocks secondmate provision without AGENTOS_PORT
  *   G12 secondmate own tmux server; primary Brain survives secondmate start
  *   G13 concurrent stop+start leaves exactly one live process matching registry
+ *   G14 provision rejects out-of-range maxConcurrentTasks at the REST boundary
  *
  * Real daemons on real homes; only the model is simulated.
  * Usage: node tooling/gates/phase-7.mjs
@@ -473,7 +475,7 @@ try {
     );
   }
 
-  // G5 — routing hands the task over (exists on secondmate, released on primary)
+  // G5 / G5b — routing hands the task over once under concurrency
   // G9 — maxConcurrentTasks enforced (infra capped at 1)
   {
     const repo = mkdtempSync(join(tmpdir(), "agentos-p7-repo-"));
@@ -510,18 +512,24 @@ try {
       })
     ).json();
     const stillThere = await (await api(`/v1/tasks/${task.task.id}`)).json();
-    const routed = await (
-      await api("/v1/tools/call", {
-        method: "POST",
-        body: JSON.stringify({
-          tool: "route_to_secondmate",
-          input: { name: "infra", taskId: task.task.id, domain: "infra" },
-        }),
-      })
-    ).json();
+
+    // G5b — two concurrent routes for one task: exactly one handover wins.
+    const routeBody = JSON.stringify({
+      tool: "route_to_secondmate",
+      input: { name: "infra", taskId: task.task.id, domain: "infra" },
+    });
+    const [raceA, raceB] = await Promise.all([
+      api("/v1/tools/call", { method: "POST", body: routeBody }).then((r) => r.json()),
+      api("/v1/tools/call", { method: "POST", body: routeBody }).then((r) => r.json()),
+    ]);
+    const winners = [raceA, raceB].filter((r) => r.ok === true);
+    const losers = [raceA, raceB].filter((r) => r.ok === false);
+    const routed = winners[0] ?? { ok: false, data: {} };
+    const loser = losers[0] ?? { ok: true, error: {} };
     const after = await (await api(`/v1/tasks/${task.task.id}`)).json();
     let remotePresent = false;
     let remotePhase = null;
+    let remoteTaskCount = 0;
     if (routed.ok && routed.data?.remoteTaskId && smToken) {
       try {
         const remote = await fetch(
@@ -533,10 +541,20 @@ try {
           remotePresent = remoteBody.task?.id === routed.data.remoteTaskId;
           remotePhase = remoteBody.task?.phase ?? null;
         }
+        const listRes = await fetch(`http://127.0.0.1:${SM_PORT}/v1/tasks`, {
+          headers: { authorization: `Bearer ${smToken}` },
+        });
+        if (listRes.ok) {
+          const listBody = await listRes.json();
+          const tasks = listBody.tasks ?? listBody.items ?? [];
+          remoteTaskCount = Array.isArray(tasks) ? tasks.length : 0;
+        }
       } catch {
         remotePresent = false;
       }
     }
+    const loserMsg = loser.error?.message ?? "";
+    const loserAlreadyRouting = /already being routed/i.test(loserMsg);
     gate(
       "G5",
       "routing hands the task over once — present on secondmate, released on primary",
@@ -548,6 +566,17 @@ try {
         after.task?.phase === "CANCELLED" &&
         remotePresent === true,
       `domainRefuse=${badDomain.ok === false} keptOnFail=${stillThere.task?.phase} accepted=${routed.data?.accepted} remote=${routed.data?.remoteTaskId} primaryPhase=${after.task?.phase} remotePresent=${remotePresent} remotePhase=${remotePhase}`,
+    );
+    gate(
+      "G5b",
+      "concurrent route_to_secondmate: task once; loser already-routing",
+      winners.length === 1 &&
+        losers.length === 1 &&
+        loserAlreadyRouting &&
+        after.task?.phase === "CANCELLED" &&
+        remotePresent === true &&
+        remoteTaskCount === 1,
+      `winners=${winners.length} losers=${losers.length} loserMsg=${loserMsg} primaryPhase=${after.task?.phase} remoteCount=${remoteTaskCount}`,
     );
 
     // G9 — second route while at capacity (maxConcurrentTasks: 1) must refuse
@@ -585,6 +614,36 @@ try {
       "maxConcurrentTasks refuses routing when secondmate is at capacity",
       capacityRefused,
       `ok=${capacity.ok} msg=${capacity.error?.message ?? ""} phase=${task2After.task?.phase}`,
+    );
+  }
+
+  // G14 — provision schema applied at REST boundary (out-of-range capacity)
+  {
+    const badCap = await api("/v1/secondmates", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "badcap",
+        domain: "bad",
+        maxConcurrentTasks: 0,
+      }),
+    });
+    const badCapBody = await badCap.json().catch(() => ({}));
+    const highCap = await api("/v1/secondmates", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "highcap",
+        domain: "bad",
+        maxConcurrentTasks: 99,
+      }),
+    });
+    gate(
+      "G14",
+      "provision rejects out-of-range maxConcurrentTasks at REST boundary",
+      badCap.ok === false &&
+        highCap.ok === false &&
+        !existsSync(join(home, "secondmates", "badcap")) &&
+        !existsSync(join(home, "secondmates", "highcap")),
+      `zero=${badCap.status} high=${highCap.status} msg=${badCapBody.error?.message ?? ""}`,
     );
   }
 

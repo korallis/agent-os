@@ -6,6 +6,7 @@ import type {
   ExtensionToDaemonFrame,
   FleetSummary,
   OrchestratorEvent,
+  ProvisionSecondmateInput,
   TaskListItem,
   TaskSnapshot,
 } from "@agent-os/protocol";
@@ -414,13 +415,9 @@ export class FleetService {
    * Provision a secondmate through the fleet surface (REST / tools / CLI).
    * Seeds charter + brain cast under the isolated home.
    */
-  provisionSecondmate(input: {
-    name: string;
-    domain: string;
-    port?: number;
-    brainModel?: string;
-    maxConcurrentTasks?: number;
-  }): ReturnType<SecondmateRegistry["provision"]> {
+  provisionSecondmate(
+    input: ProvisionSecondmateInput,
+  ): ReturnType<SecondmateRegistry["provision"]> {
     return this.secondmates.provision(input);
   }
 
