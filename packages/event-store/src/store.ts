@@ -158,6 +158,22 @@ export class EventStore {
     return { events: truncated ? events.slice(0, limit) : events, truncated };
   }
 
+  /**
+   * Task-scoped history for evidence surfaces.
+   * `truncated` means this task has more matching events than `limit` —
+   * independent of global log size. Returns chronological order (oldest first).
+   */
+  eventsForTask(
+    taskId: string,
+    types: readonly string[] | null,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const total = this.projection.countForTask(taskId, types);
+    const newestFirst = this.projection.eventsForTask(taskId, types, limit);
+    const truncated = total > newestFirst.length;
+    return { events: newestFirst.reverse(), truncated };
+  }
+
   count(): number {
     return this.projection.count();
   }

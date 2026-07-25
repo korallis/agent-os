@@ -30,6 +30,7 @@ import {
   type OnboardingState,
   type QuotaSample,
   type StatusResponse,
+  type TaskEventsResponse,
 } from "@agent-os/protocol";
 import type { EventStore } from "@agent-os/event-store";
 import { ConfigService, ConfigWriteError } from "../config/service.js";
@@ -321,6 +322,43 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     }
     return { task };
   });
+
+  /**
+   * Task-scoped event history for Task Detail evidence (tool.invoked, gate.result,
+   * session/fusion frames). Truncation is meaningful for THIS task only.
+   */
+  const taskEventsQuerySchema = z.object({
+    types: z.string().optional(),
+    limit: z.coerce.number().int().min(1).max(10_000).default(5_000),
+  });
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/tasks/:id/events",
+    (request, reply): TaskEventsResponse | undefined => {
+      const query = taskEventsQuerySchema.safeParse(request.query);
+      if (!query.success) {
+        sendError(reply, 400, "BAD_REQUEST", "invalid task events query");
+        return undefined;
+      }
+      const types =
+        query.data.types === undefined || query.data.types.trim() === ""
+          ? null
+          : query.data.types
+              .split(",")
+              .map((t) => t.trim())
+              .filter((t) => t.length > 0);
+      if (types !== null && types.length === 0) {
+        sendError(reply, 400, "BAD_REQUEST", "empty types filter");
+        return undefined;
+      }
+      const { events, truncated } = deps.store.eventsForTask(
+        request.params.id,
+        types,
+        query.data.limit,
+      );
+      return { taskId: request.params.id, events, truncated };
+    },
+  );
 
   // ── Analytics (master plan §7.6) ────────────────────────────────────────
   app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {

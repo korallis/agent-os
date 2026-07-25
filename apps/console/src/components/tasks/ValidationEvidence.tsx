@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo } from "react";
 import { cn } from "@agent-os/ui";
-import { useEventStream } from "@/lib/useEventStream";
-import { fetchTaskEvents } from "@/lib/fetchTaskEvents";
+import type { TaskEventsState } from "@/lib/useTaskEvents";
 
 /**
  * Auto-validate evidence (master plan §7.2).
@@ -40,60 +39,33 @@ const OUTCOME_MEANING: Record<string, string> = {
   GATE_ERROR: "The gate could not run — infrastructure error, not a verdict, no attempt consumed",
 };
 
-const GATE_TYPES = new Set(["gate.result"]);
-
 export function ValidationEvidence({
-  taskId,
+  taskEvents,
   validationAttempt,
   maxValidations,
 }: {
-  taskId: string;
+  taskEvents: TaskEventsState;
   validationAttempt: number;
   maxValidations: number;
 }) {
-  const { lastEvent } = useEventStream();
-  const refreshKey =
-    lastEvent !== null && lastEvent.event.type === "gate.result" ? lastEvent.id : "init";
-  const [results, setResults] = useState<GateResult[]>([]);
-  const [truncated, setTruncated] = useState(false);
-  const [unavailable, setUnavailable] = useState(false);
-  const [loaded, setLoaded] = useState(false);
+  const { events, truncated, unavailable, loaded } = taskEvents;
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoaded(false);
-    fetchTaskEvents(taskId, GATE_TYPES)
-      .then((result) => {
-        if (cancelled) return;
-        const mine: GateResult[] = [];
-        for (const envelope of result.events) {
-          if (envelope.event.type !== "gate.result") continue;
-          mine.push({
-            target: envelope.event.payload.target,
-            outcome: envelope.event.payload.outcome,
-            attempt: envelope.event.payload.attempt,
-            outputHash: envelope.event.payload.outputHash,
-            ts: envelope.ts,
-          });
-        }
-        setResults(mine);
-        setTruncated(result.truncated);
-        setUnavailable(result.unavailable);
-        setLoaded(true);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setResults([]);
-        setTruncated(false);
-        setUnavailable(true);
-        setLoaded(true);
+  const results = useMemo(() => {
+    const mine: GateResult[] = [];
+    for (const envelope of events) {
+      if (envelope.event.type !== "gate.result") continue;
+      mine.push({
+        target: envelope.event.payload.target,
+        outcome: envelope.event.payload.outcome,
+        attempt: envelope.event.payload.attempt,
+        outputHash: envelope.event.payload.outputHash,
+        ts: envelope.ts,
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [taskId, refreshKey]);
+    }
+    return mine;
+  }, [events]);
 
-  if (!loaded) return null;
+  if (!loaded && results.length === 0) return null;
   if (!unavailable && results.length === 0 && !truncated) return null;
 
   const exhausted = validationAttempt >= maxValidations;

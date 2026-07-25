@@ -275,25 +275,34 @@ function QuickActionsCard({ needsCaptain }: { needsCaptain: number }) {
 }
 
 function TopAgentsCard({ analytics }: { analytics: AnalyticsSnapshot | null }) {
+  const ready = analytics !== null;
   const agents = (analytics?.agents ?? []).slice(0, 5);
   return (
     <Card className="w-[420px] shrink-0 flex flex-col">
       <div className="flex items-center justify-between px-4 py-2">
         <h3 className="text-base font-semibold text-fg-1 py-1.5">Top Agents</h3>
         <span className="text-xs font-medium text-fg-3">
-          {agents.length} role{agents.length === 1 ? "" : "s"}
+          {!ready ? "—" : `${agents.length} role${agents.length === 1 ? "" : "s"}`}
         </span>
       </div>
       <div className="flex flex-col gap-2 px-4 pb-4">
-        {agents.length === 0 && (
+        {!ready ? (
+          <EmptyState
+            kind="no-data"
+            title="Usage unavailable"
+            body="Per-role usage appears once the analytics snapshot loads."
+            className="border-0 bg-transparent py-6"
+          />
+        ) : agents.length === 0 ? (
           <EmptyState
             kind="no-data"
             title="No agent telemetry yet"
             body="Per-role usage appears as crewmates report tokens."
             className="border-0 bg-transparent py-6"
           />
-        )}
-        {agents.map((agent) => (
+        ) : null}
+        {ready &&
+          agents.map((agent) => (
           <div
             key={agent.role}
             className="rounded-[14px] bg-panel-2 border border-line-1 p-3.5 flex flex-col gap-2"
@@ -333,7 +342,13 @@ function TopAgentsCard({ analytics }: { analytics: AnalyticsSnapshot | null }) {
   );
 }
 
-function RecentTasksTable({ tasks }: { tasks: TaskListItem[] }) {
+function RecentTasksTable({
+  tasks,
+  status,
+}: {
+  tasks: TaskListItem[];
+  status: "loading" | "ready" | "unavailable";
+}) {
   const recent = tasks.slice(0, 8);
   return (
     <Card className="flex-1 min-w-0 flex flex-col">
@@ -343,13 +358,22 @@ function RecentTasksTable({ tasks }: { tasks: TaskListItem[] }) {
           View all →
         </Link>
       </div>
-      {recent.length === 0 ? (
+      {status === "unavailable" && recent.length === 0 ? (
+        <EmptyState
+          kind="server-error"
+          title="Tasks unavailable"
+          body="The task list could not be loaded from the daemon."
+          className="border-0 bg-transparent mx-4 my-6"
+        />
+      ) : recent.length === 0 && status !== "loading" ? (
         <EmptyState
           kind="no-data"
           title="No tasks yet"
           body="Register a project and dispatch one to see it here."
           className="border-0 bg-transparent mx-4 my-6"
         />
+      ) : recent.length === 0 ? (
+        <p className="px-4 py-6 text-[13px] text-fg-3">Loading tasks…</p>
       ) : (
         <table className="w-full text-left">
           <thead>
@@ -418,6 +442,9 @@ export function FleetDashboard() {
   const [summary, setSummary] = useState<FleetSummaryView | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsSnapshot | null>(null);
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
+  const [tasksStatus, setTasksStatus] = useState<"loading" | "ready" | "unavailable">(
+    "loading",
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -448,6 +475,9 @@ export function FleetDashboard() {
       if (tasksRes.status === "fulfilled" && tasksRes.value.ok) {
         const body = (await tasksRes.value.json()) as { tasks: TaskListItem[] };
         setTasks(body.tasks);
+        setTasksStatus("ready");
+      } else {
+        setTasksStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
     };
     void load();
@@ -509,7 +539,7 @@ export function FleetDashboard() {
       </div>
       <div className="flex gap-4 items-start">
         <TopAgentsCard analytics={analytics} />
-        <RecentTasksTable tasks={tasks} />
+        <RecentTasksTable tasks={tasks} status={tasksStatus} />
       </div>
     </div>
   );

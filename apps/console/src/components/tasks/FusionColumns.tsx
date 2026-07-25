@@ -34,20 +34,30 @@ export function FusionColumns({ taskId }: { taskId: string }) {
   const [runs, setRuns] = useState<FusionRun[]>([]);
   const [detail, setDetail] = useState<FusionRunDetailResponse | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [listStatus, setListStatus] = useState<"loading" | "ready" | "unavailable">("loading");
 
   useEffect(() => {
     let cancelled = false;
     fetch(`/api/agentos/tasks/${taskId}/fusion`, { cache: "no-store" })
       .then(async (res) => {
-        if (cancelled || !res.ok) return;
+        if (cancelled) return;
+        if (!res.ok) {
+          setListStatus((prev) => (prev === "ready" ? prev : "unavailable"));
+          return;
+        }
         const body = (await res.json()) as { runs: FusionRun[] };
         setRuns(body.runs);
+        setListStatus("ready");
         setSelected((prev) => {
           if (prev !== null && body.runs.some((r) => r.runId === prev)) return prev;
           return body.runs[0]?.runId ?? null;
         });
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (!cancelled) {
+          setListStatus((prev) => (prev === "ready" ? prev : "unavailable"));
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -66,6 +76,22 @@ export function FusionColumns({ taskId }: { taskId: string }) {
       cancelled = true;
     };
   }, [taskId, selected, refreshKey]);
+
+  if (listStatus === "unavailable" && runs.length === 0) {
+    return (
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-fg-1">Fusion</h3>
+          <span className="text-[11px] text-fg-3">unavailable</span>
+        </div>
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            Fusion runs unavailable — the daemon could not be reached.
+          </p>
+        </div>
+      </section>
+    );
+  }
 
   if (runs.length === 0) return null;
 

@@ -19,6 +19,7 @@ import { useEventStream } from "@/lib/useEventStream";
  */
 
 type Filter = "All" | "Needs you" | "Delivered" | "Absorbed";
+type LoadStatus = "loading" | "ready" | "unavailable";
 
 const SEVERITY: Record<string, { className: string; label: string }> = {
   SECURITY: { className: "bg-danger/10 text-danger border-danger/30", label: "Security" },
@@ -43,12 +44,21 @@ function chipFor(wake: WakeDigest): { className: string; label: string } {
   );
 }
 
+function chipValue(status: LoadStatus, value: number): string {
+  if (status === "loading") return "—";
+  if (status === "unavailable") return "—";
+  return String(value);
+}
+
 export function NotificationsView() {
   const { lastEvent } = useEventStream();
   const refreshKey = lastEvent?.id ?? "init";
   const [wakes, setWakes] = useState<WakeDigest[]>([]);
   const [queue, setQueue] = useState<WakeDigest[]>([]);
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
+  const [wakesStatus, setWakesStatus] = useState<LoadStatus>("loading");
+  const [queueStatus, setQueueStatus] = useState<LoadStatus>("loading");
+  const [tasksStatus, setTasksStatus] = useState<LoadStatus>("loading");
   const [filter, setFilter] = useState<Filter>("All");
 
   useEffect(() => {
@@ -63,14 +73,23 @@ export function NotificationsView() {
       if (wakesRes.status === "fulfilled" && wakesRes.value.ok) {
         const body = (await wakesRes.value.json()) as { wakes: WakeDigest[] };
         setWakes([...body.wakes].reverse());
+        setWakesStatus("ready");
+      } else {
+        setWakesStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
       if (stateRes.status === "fulfilled" && stateRes.value.ok) {
         const body = (await stateRes.value.json()) as { state: FleetStateSnapshot };
         setQueue(body.state.wakeQueue);
+        setQueueStatus("ready");
+      } else {
+        setQueueStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
       if (tasksRes.status === "fulfilled" && tasksRes.value.ok) {
         const body = (await tasksRes.value.json()) as { tasks: TaskListItem[] };
         setTasks(body.tasks);
+        setTasksStatus("ready");
+      } else {
+        setTasksStatus((prev) => (prev === "ready" ? prev : "unavailable"));
       }
     };
     void load();
@@ -138,10 +157,26 @@ export function NotificationsView() {
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {[
-          { label: "Needs you", value: needsCaptain.length, danger: needsCaptain.length > 0 },
-          { label: "Queued for Brain", value: queue.length, danger: false },
-          { label: "Delivered", value: counts.delivered, danger: false },
-          { label: "Absorbed (zero-token)", value: counts.absorbed, danger: false },
+          {
+            label: "Needs you",
+            value: chipValue(tasksStatus, needsCaptain.length),
+            danger: tasksStatus === "ready" && needsCaptain.length > 0,
+          },
+          {
+            label: "Queued for Brain",
+            value: chipValue(queueStatus, queue.length),
+            danger: false,
+          },
+          {
+            label: "Delivered",
+            value: chipValue(wakesStatus, counts.delivered),
+            danger: false,
+          },
+          {
+            label: "Absorbed (zero-token)",
+            value: chipValue(wakesStatus, counts.absorbed),
+            danger: false,
+          },
         ].map((chip) => (
           <div
             key={chip.label}
@@ -160,7 +195,7 @@ export function NotificationsView() {
         ))}
       </div>
 
-      {needsCaptain.length > 0 && (
+      {tasksStatus === "ready" && needsCaptain.length > 0 && (
         <div className="rounded-2xl border border-warn/30 bg-warn/[0.06] p-5 flex flex-col gap-3">
           <h3 className="text-[15px] font-semibold text-warn">Waiting on you</h3>
           {needsCaptain.map((task) => (
@@ -184,9 +219,20 @@ export function NotificationsView() {
       <div className="bg-panel border border-line-2 rounded-2xl overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-line-1">
           <h3 className="text-base font-semibold text-fg-1">Wake feed</h3>
-          <span className="text-[11px] text-fg-3">{visible.length} shown</span>
+          <span className="text-[11px] text-fg-3">
+            {wakesStatus === "ready" ? `${visible.length} shown` : "—"}
+          </span>
         </div>
-        {visible.length === 0 ? (
+        {wakesStatus === "loading" && wakes.length === 0 ? (
+          <p className="px-4 py-6 text-[13px] text-fg-3">Loading wakes…</p>
+        ) : wakesStatus === "unavailable" && wakes.length === 0 ? (
+          <EmptyState
+            kind="server-error"
+            title="Wakes unavailable"
+            body="The wake queue could not be loaded from the daemon."
+            className="border-0 bg-transparent m-4"
+          />
+        ) : visible.length === 0 ? (
           wakes.length === 0 ? (
             <EmptyState
               kind="no-data"

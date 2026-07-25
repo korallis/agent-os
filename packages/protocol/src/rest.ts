@@ -63,6 +63,18 @@ export const eventsReplayResponseSchema = z.strictObject({
 });
 export type EventsReplayResponse = z.infer<typeof eventsReplayResponseSchema>;
 
+/**
+ * GET `/v1/tasks/:id/events` — task-scoped frames for evidence surfaces.
+ * `truncated` is true only when this task has more matching events than the limit
+ * (not when the global log is large).
+ */
+export const taskEventsResponseSchema = z.strictObject({
+  taskId: ulidSchema,
+  events: z.array(eventEnvelopeSchema),
+  truncated: z.boolean(),
+});
+export type TaskEventsResponse = z.infer<typeof taskEventsResponseSchema>;
+
 export const apiErrorCodeSchema = z.enum([
   "UNAUTHORIZED",
   "FORBIDDEN",

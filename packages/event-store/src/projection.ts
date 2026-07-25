@@ -205,6 +205,46 @@ export class SqliteProjection {
     return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
   }
 
+  /**
+   * Events whose payload.taskId matches, optionally filtered by type.
+   * Newest-first page so truncation drops the oldest frames for this task.
+   */
+  eventsForTask(taskId: string, types: readonly string[] | null, limit: number): EventEnvelope[] {
+    if (types !== null && types.length === 0) return [];
+    const typeFilter =
+      types === null
+        ? ""
+        : ` AND type IN (${types.map(() => "?").join(", ")})`;
+    const params: unknown[] =
+      types === null ? [taskId, limit] : [taskId, ...types, limit];
+    const rows = this.sqlite
+      .prepare(
+        `SELECT envelope FROM events
+         WHERE json_extract(envelope, '$.event.payload.taskId') = ?${typeFilter}
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(...params) as { envelope: string }[];
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /** Count of events whose payload.taskId matches (optional type filter). */
+  countForTask(taskId: string, types: readonly string[] | null): number {
+    if (types !== null && types.length === 0) return 0;
+    const typeFilter =
+      types === null
+        ? ""
+        : ` AND type IN (${types.map(() => "?").join(", ")})`;
+    const params: unknown[] = types === null ? [taskId] : [taskId, ...types];
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM events
+         WHERE json_extract(envelope, '$.event.payload.taskId') = ?${typeFilter}`,
+      )
+      .get(...params) as { n: number };
+    return row.n;
+  }
+
   seqOfEventId(id: string): number | null {
     const rows = this.db.select({ seq: events.seq }).from(events).where(eq(events.id, id)).limit(1).all();
     return rows[0]?.seq ?? null;

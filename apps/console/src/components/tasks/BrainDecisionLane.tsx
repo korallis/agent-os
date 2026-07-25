@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo } from "react";
 import { cn } from "@agent-os/ui";
-import { useEventStream } from "@/lib/useEventStream";
-import { fetchTaskEvents } from "@/lib/fetchTaskEvents";
+import type { TaskEventsState } from "@/lib/useTaskEvents";
 
 /**
  * Brain decision lane (master plan §7.2).
@@ -26,52 +25,29 @@ interface Invocation {
   ts: string;
 }
 
-const TOOL_TYPES = new Set(["tool.invoked"]);
+export function BrainDecisionLane({
+  taskEvents,
+}: {
+  taskEvents: TaskEventsState;
+}) {
+  const { events, truncated, unavailable, loaded } = taskEvents;
 
-export function BrainDecisionLane({ taskId }: { taskId: string }) {
-  const { lastEvent } = useEventStream();
-  const refreshKey =
-    lastEvent !== null && lastEvent.event.type === "tool.invoked" ? lastEvent.id : "init";
-  const [calls, setCalls] = useState<Invocation[]>([]);
-  const [truncated, setTruncated] = useState(false);
-  const [unavailable, setUnavailable] = useState(false);
-  const [loaded, setLoaded] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoaded(false);
-    fetchTaskEvents(taskId, TOOL_TYPES)
-      .then((result) => {
-        if (cancelled) return;
-        const mine: Invocation[] = [];
-        for (const envelope of result.events) {
-          if (envelope.event.type !== "tool.invoked") continue;
-          mine.push({
-            tool: envelope.event.payload.tool,
-            ok: envelope.event.payload.ok,
-            errorCode: envelope.event.payload.errorCode,
-            durationMs: envelope.event.payload.durationMs,
-            ts: envelope.ts,
-          });
-        }
-        setCalls(mine);
-        setTruncated(result.truncated);
-        setUnavailable(result.unavailable);
-        setLoaded(true);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setCalls([]);
-        setTruncated(false);
-        setUnavailable(true);
-        setLoaded(true);
+  const calls = useMemo(() => {
+    const mine: Invocation[] = [];
+    for (const envelope of events) {
+      if (envelope.event.type !== "tool.invoked") continue;
+      mine.push({
+        tool: envelope.event.payload.tool,
+        ok: envelope.event.payload.ok,
+        errorCode: envelope.event.payload.errorCode,
+        durationMs: envelope.event.payload.durationMs,
+        ts: envelope.ts,
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [taskId, refreshKey]);
+    }
+    return mine;
+  }, [events]);
 
-  if (!loaded) return null;
+  if (!loaded && calls.length === 0) return null;
   if (!unavailable && calls.length === 0 && !truncated) return null;
 
   const refused = calls.filter((c) => !c.ok).length;

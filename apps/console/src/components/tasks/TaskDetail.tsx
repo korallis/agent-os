@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import { useEventStream } from "@/lib/useEventStream";
+import { useTaskEvents } from "@/lib/useTaskEvents";
 import { FusionColumns } from "@/components/tasks/FusionColumns";
 import { ValidationEvidence } from "@/components/tasks/ValidationEvidence";
 import { BrainDecisionLane } from "@/components/tasks/BrainDecisionLane";
@@ -39,6 +40,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
   const [task, setTask] = useState<TaskSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { lastEvent } = useEventStream();
+  const taskEvents = useTaskEvents(taskId);
   const refreshKey =
     lastEvent !== null &&
     (lastEvent.event.type.startsWith("task.") ||
@@ -182,12 +184,12 @@ export function TaskDetail({ taskId }: { taskId: string }) {
       <FusionColumns taskId={task.id} />
 
       <ValidationEvidence
-        taskId={task.id}
+        taskEvents={taskEvents}
         validationAttempt={task.validationAttempt}
         maxValidations={task.maxValidations}
       />
 
-      <BrainDecisionLane taskId={task.id} />
+      <BrainDecisionLane taskEvents={taskEvents} />
     </main>
   );
 }
