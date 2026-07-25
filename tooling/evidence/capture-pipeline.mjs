@@ -40,11 +40,12 @@ try {
   const logPath = join(gateHome, "logs", "review.log");
   writeFileSync(logPath, "");
   const seed = (id, branch, status, steps) => {
-    const now = Date.now();
+    // Real no-mistakes stores unix seconds — keep the evidence fixture honest.
+    const now = Math.floor(Date.now() / 1000);
     db.prepare(`INSERT OR REPLACE INTO runs (id,repo_id,branch,head_sha,base_sha,status,pr_url,created_at,updated_at,intent) VALUES (?,'r',?,'8c4938f0a1',' ',?,?,?,?,?)`)
       .run(id, branch, status, branch.includes("hardening") ? "https://github.com/korallis/agent-os/pull/12" : null, now, now, "phase intent");
     steps.forEach((st, i) => db.prepare(`INSERT OR REPLACE INTO step_results (id,run_id,step_name,step_order,status,findings_json,log_path,last_activity,last_activity_at) VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(`${id}-${st.n}`, id, st.n, i, st.s, st.f ?? null, st.log ?? null, st.a ?? null, st.a ? Date.now() : null));
+      .run(`${id}-${st.n}`, id, st.n, i, st.s, st.f ?? null, st.log ?? null, st.a ?? null, st.a ? now : null));
   };
 
   seed("01EVRUN0000000000000000001", "phase-9/live-pipeline-visibility", "running", [
@@ -85,7 +86,7 @@ try {
   ]) {
     appendFileSync(logPath, `${line}\n`);
     db.prepare("UPDATE step_results SET last_activity=? WHERE run_id=? AND step_name='review'").run(line, "01EVRUN0000000000000000001");
-    db.prepare("UPDATE runs SET updated_at=? WHERE id=?").run(Date.now(), "01EVRUN0000000000000000001");
+    db.prepare("UPDATE runs SET updated_at=? WHERE id=?").run(Math.floor(Date.now() / 1000), "01EVRUN0000000000000000001");
     await sleep(400);
   }
   await page.goto(`http://127.0.0.1:${CONSOLE_PORT}/pipeline`, { waitUntil: "networkidle" });

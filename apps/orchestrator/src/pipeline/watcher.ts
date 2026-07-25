@@ -97,6 +97,25 @@ const MAX_STRUCTURED_READ_FAILURES = 3;
 const LOG_CHUNK_MAX = 16_384;
 /** Floor between WAL-driven ticks so dense notifications cannot storm the loop. */
 const WAL_TICK_COALESCE_MS = 75;
+/** Recency window for completed/failed runs (seconds — matches no-mistakes storage). */
+const RECENT_RUN_WINDOW_SEC = 6 * 60 * 60;
+
+/**
+ * no-mistakes stores unix epoch *seconds* in INTEGER timestamp columns.
+ * Convert once at the SQLite boundary; never treat the raw column as ms.
+ */
+function secondsToIso(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+type OpenResult =
+  | { kind: "ok"; db: Database.Database }
+  | { kind: "missing" }
+  | { kind: "error"; error: unknown };
 
 export class PipelineWatcher {
   private readonly home: string;
@@ -140,14 +159,18 @@ export class PipelineWatcher {
     return join(this.home, "state.sqlite");
   }
 
-  /** Open the state DB read-only. Never creates a file that is not there. */
-  private open(): Database.Database | null {
+  /**
+   * Open the state DB read-only. Never creates a file that is not there.
+   * Distinguishes missing path from a transient open failure so a busy or
+   * permission blip cannot be reported as "state not found".
+   */
+  private tryOpen(): OpenResult {
     const path = this.dbPath();
-    if (!existsSync(path)) return null;
+    if (!existsSync(path)) return { kind: "missing" };
     try {
-      return new Database(path, { readonly: true, fileMustExist: true });
-    } catch {
-      return null;
+      return { kind: "ok", db: new Database(path, { readonly: true, fileMustExist: true }) };
+    } catch (error) {
+      return { kind: "error", error };
     }
   }
 
@@ -156,8 +179,8 @@ export class PipelineWatcher {
    * "no runs" into an honest "unreadable on this version".
    */
   checkCompatibility(): PipelineCompatibility {
-    const db = this.open();
-    if (db === null) {
+    const opened = this.tryOpen();
+    if (opened.kind === "missing") {
       this.compatibility = {
         ok: false,
         reason: `no-mistakes state not found at ${this.dbPath()}`,
@@ -165,6 +188,18 @@ export class PipelineWatcher {
       };
       return this.compatibility;
     }
+    if (opened.kind === "error") {
+      this.compatibility = {
+        ok: false,
+        reason:
+          opened.error instanceof Error
+            ? `could not open no-mistakes state at ${this.dbPath()}: ${opened.error.message}`
+            : `could not open no-mistakes state at ${this.dbPath()}`,
+        missingColumns: [],
+      };
+      return this.compatibility;
+    }
+    const db = opened.db;
     try {
       const runCols = new Set(
         (db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((c) => c.name),
@@ -394,14 +429,19 @@ export class PipelineWatcher {
         this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
         this.restartTimer();
       }
-      db = this.open();
-      if (db === null) {
-        // After a healthy period, a missing or unopenable DB must not leave
-        // last-known rows serving under a quietly growing lag.
+      const opened = this.tryOpen();
+      if (opened.kind === "missing") {
+        // File truly gone — blank the view. Open blips use the 3-strike path.
         this.markUnavailable(`no-mistakes state not found at ${this.dbPath()}`);
         return;
       }
+      if (opened.kind === "error") {
+        this.markStructuredReadFailed(opened.error);
+        return;
+      }
+      db = opened.db;
 
+      // updated_at is unix seconds (real no-mistakes schema), not ms.
       const runs = db
         .prepare(
           `SELECT id, branch, status, head_sha, pr_url, error, intent, updated_at
@@ -411,7 +451,7 @@ export class PipelineWatcher {
             ORDER BY updated_at DESC
             LIMIT 20`,
         )
-        .all(Date.now() - 6 * 60 * 60 * 1000) as Array<{
+        .all(nowUnixSeconds() - RECENT_RUN_WINDOW_SEC) as Array<{
         id: string;
         branch: string;
         status: string;
@@ -455,7 +495,7 @@ export class PipelineWatcher {
             findings,
             lastActivity: row.last_activity,
             lastActivityAt:
-              row.last_activity_at === null ? null : new Date(row.last_activity_at).toISOString(),
+              row.last_activity_at === null ? null : secondsToIso(row.last_activity_at),
             durationMs: row.duration_ms,
             agentPid: row.agent_pid,
           };
@@ -470,7 +510,7 @@ export class PipelineWatcher {
           error: run.error,
           intent: run.intent,
           steps,
-          updatedAt: new Date(run.updated_at).toISOString(),
+          updatedAt: secondsToIso(run.updated_at),
         };
 
         // Emit only on genuine change — a per-tick event for unchanged state
@@ -481,10 +521,12 @@ export class PipelineWatcher {
           this.sink({ type: "pipeline.run_updated", payload: snapshot });
         }
 
-        // Pure log appends must stream even when structured columns are unchanged.
-        if (streamLogs) {
-          const active = rows.find((r) => r.status === "running" || r.status === "fixing");
-          if (active?.log_path != null) this.emitLogTail(run.id, active.step_name, active.log_path);
+        // Always advance log offsets on the active step; streamPipelineLogs
+        // only gates emission so a quiet→working flip does not re-seed and
+        // swallow bytes appended while quiet.
+        const active = rows.find((r) => r.status === "running" || r.status === "fixing");
+        if (active?.log_path != null) {
+          this.emitLogTail(run.id, active.step_name, active.log_path, streamLogs);
         }
       }
 
@@ -510,8 +552,12 @@ export class PipelineWatcher {
     }
   }
 
-  /** Emit only the bytes appended since the last read of this step's log. */
-  private emitLogTail(runId: string, step: string, logPath: string): void {
+  /**
+   * Track the active step log offset every tick. When `emit` is false (quiet
+   * profile), still advance the offset so a later profile flip does not
+   * first-sight-seed past everything written while quiet.
+   */
+  private emitLogTail(runId: string, step: string, logPath: string, emit: boolean): void {
     try {
       if (!existsSync(logPath)) return;
       const size = statSync(logPath).size;
@@ -539,7 +585,7 @@ export class PipelineWatcher {
       }
       const chunk = buffer.toString("utf8");
       this.logOffsets.set(key, known + toRead);
-      if (chunk.trim().length === 0) return;
+      if (!emit || chunk.trim().length === 0) return;
       this.sink({
         type: "pipeline.log_appended",
         payload: { runId, step, chunk },

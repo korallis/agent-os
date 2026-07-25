@@ -18,6 +18,11 @@ import {
   wakeClassForEvent,
 } from "../src/observability/profile.js";
 
+/** Real no-mistakes stores unix epoch seconds — fixtures must match or unit bugs pass. */
+function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
 function buildGate(dir: string): Database.Database {
   mkdirSync(join(dir, "logs"), { recursive: true });
   const db = new Database(join(dir, "state.sqlite"));
@@ -141,7 +146,7 @@ describe("PipelineWatcher", () => {
     const db = buildGate(gateHome);
     const logPath = join(gateHome, "logs", "review.log");
     writeFileSync(logPath, "line-one-preexisting\n");
-    const now = Date.now();
+    const now = nowUnixSeconds();
     db.prepare(
       `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
        VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
@@ -169,6 +174,8 @@ describe("PipelineWatcher", () => {
     expect(snap.payload.steps[0]?.findings).toEqual([
       { id: "f1", severity: "error", action: "ask-user", description: "decide" },
     ]);
+    // Seconds-based timestamps must not render as 1970.
+    expect(new Date(snap.payload.updatedAt).getUTCFullYear()).toBeGreaterThanOrEqual(2020);
     expect(watcher.status().transport === "wal-assisted" || watcher.status().transport === "interval-only").toBe(
       true,
     );
@@ -197,6 +204,59 @@ describe("PipelineWatcher", () => {
     watcher.tick();
     expect(events.filter((e) => e.type === "pipeline.log_appended")).toHaveLength(0);
 
+    // After quiet advances the offset, re-enabling stream must emit only new
+    // bytes — not re-seed to EOF and swallow the first post-flip append.
+    events.length = 0;
+    streamLogs = true;
+    appendFileSync(logPath, "post-quiet-stream\n");
+    watcher.tick();
+    const resumed = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(resumed.length).toBe(1);
+    if (resumed[0]?.type === "pipeline.log_appended") {
+      expect(resumed[0].payload.chunk).toContain("post-quiet-stream");
+      expect(resumed[0].payload.chunk).not.toContain("quiet-should-not-stream");
+    }
+
+    watcher.stop();
+  });
+
+  it("surfaces a recently completed run using unix-second timestamps", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-completed-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    // Completed (not running/pending) — only the 6h recency branch can surface it.
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('done1', 'r', 'b', 'abc', 'base', 'completed', ?, ?, 'shipped')`,
+    ).run(now - 60, now - 30);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'done1', 'review', 0, 'passed', '[]', NULL, 'done', ?, 1200, NULL)`,
+    ).run(now - 30);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+    });
+    watcher.start();
+    const runs = events.filter((e) => e.type === "pipeline.run_updated");
+    expect(runs.length).toBe(1);
+    if (runs[0]?.type === "pipeline.run_updated") {
+      expect(runs[0].payload.runId).toBe("done1");
+      expect(runs[0].payload.status).toBe("completed");
+      const updatedMs = Date.parse(runs[0].payload.updatedAt);
+      expect(Number.isNaN(updatedMs)).toBe(false);
+      expect(updatedMs).toBeGreaterThan(Date.now() - 60_000);
+      expect(updatedMs).toBeLessThanOrEqual(Date.now() + 5_000);
+      expect(runs[0].payload.steps[0]?.lastActivityAt).not.toBeNull();
+      const activityMs = Date.parse(runs[0].payload.steps[0]!.lastActivityAt!);
+      expect(activityMs).toBeGreaterThan(Date.now() - 60_000);
+    }
     watcher.stop();
   });
 
@@ -226,7 +286,7 @@ describe("PipelineWatcher", () => {
     const gateHome = mkdtempSync(join(tmpdir(), "p9-missing-db-"));
     homes.push(gateHome);
     const db = buildGate(gateHome);
-    const now = Date.now();
+    const now = nowUnixSeconds();
     db.prepare(
       `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
        VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
@@ -259,7 +319,7 @@ describe("PipelineWatcher", () => {
     const gateHome = mkdtempSync(join(tmpdir(), "p9-recover-"));
     homes.push(gateHome);
     let db = buildGate(gateHome);
-    const now = Date.now();
+    const now = nowUnixSeconds();
     db.prepare(
       `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
        VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
@@ -315,7 +375,7 @@ describe("PipelineWatcher", () => {
     const gateHome = mkdtempSync(join(tmpdir(), "p9-watch-off-"));
     homes.push(gateHome);
     const db = buildGate(gateHome);
-    const now = Date.now();
+    const now = nowUnixSeconds();
     db.prepare(
       `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
        VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
@@ -381,7 +441,7 @@ describe("PipelineWatcher", () => {
         last_activity_at INTEGER, last_activity TEXT, agent_pid INTEGER, auto_fix_limit INTEGER
       );
     `);
-    const now = Date.now();
+    const now = nowUnixSeconds();
     db.prepare(
       `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
        VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
@@ -401,7 +461,7 @@ describe("PipelineWatcher", () => {
     writer.pragma("journal_mode = WAL");
     writer
       .prepare(`UPDATE runs SET updated_at = ? WHERE id = 'run1'`)
-      .run(Date.now());
+      .run(nowUnixSeconds());
     writer.close();
 
     watcher.tick();

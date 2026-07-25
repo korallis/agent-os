@@ -117,7 +117,10 @@ export function PipelineView() {
   /** Whether we have ever painted a successful pipeline status response. */
   const hasLastKnown = useRef(false);
 
-  const logChars = status?.profile?.pipelineLogChars ?? 20_000;
+  // Hold retention at 0 until /v1/pipeline/status lands the real profile
+  // budget — a provisional 20k window permanently discards middle text when
+  // the active profile allows more (e.g. firehose 200k).
+  const logChars = status?.profile?.pipelineLogChars ?? 0;
 
   // Profile / watch knobs land as config.changed and must re-fetch status so
   // pipelineLogChars and transport updates take effect without waiting a poll.
