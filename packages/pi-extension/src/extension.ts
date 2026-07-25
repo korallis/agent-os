@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import {
   agentRoleSchema,
   BRAIN_TOOL_NAMES,
+  daemonControlFrameSchema,
   type DaemonControlFrame,
   type ExtensionToDaemonFrame,
   type AgentRole,
@@ -85,10 +86,26 @@ export interface PiExtensionApi {
   ) => void;
 }
 
+/**
+ * Cap on frames buffered while the daemon is unreachable.
+ *
+ * Sized to cover a normal daemon restart without loss, while ensuring a daemon
+ * that never returns cannot grow the Pi process without bound.
+ */
+const MAX_PENDING_FRAMES = 1000;
+
+/** Hard cap on the un-newlined read buffer; a frame this large is malformed. */
+const MAX_BUFFER_CHARS = 1_000_000;
+
 export class AgentOsExtensionHost {
   private socket: Socket | null = null;
   private buffer = "";
+  /** Optional reporter for frames dropped while disconnected. */
+  onDroppedFrames?: (count: number) => void;
   private readonly pending: ExtensionToDaemonFrame[] = [];
+  /** Frames discarded while disconnected — reported on reconnect, never hidden. */
+  private droppedFrames = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly inflight = new Map<string, PendingToolCall>();
   private attempts = 0;
   private closed = false;
@@ -109,6 +126,12 @@ export class AgentOsExtensionHost {
           this.write(frame);
         }
         this.pending.length = 0;
+        if (this.droppedFrames > 0) {
+          // Say what was lost. A silently short buffer would make the analytics
+          // downstream look like a quiet seat rather than a dropped one.
+          this.onDroppedFrames?.(this.droppedFrames);
+          this.droppedFrames = 0;
+        }
         resolve();
       });
       socket.on("error", (error) => {
@@ -117,10 +140,12 @@ export class AgentOsExtensionHost {
         }
       });
       socket.on("close", () => {
-        if (this.socket === socket) {
-          this.socket = null;
-          this.scheduleReconnect();
-        }
+        // A socket that never connected is never assigned to this.socket, so
+        // an identity check alone would skip the retry for exactly the case
+        // that needs it: the FAILED reconnect. That left a single >retryMs
+        // daemon outage ending telemetry for the life of the process.
+        if (this.socket === socket) this.socket = null;
+        this.scheduleReconnect();
       });
       socket.on("data", (chunk) => this.onData(chunk.toString("utf8")));
     });
@@ -147,25 +172,45 @@ export class AgentOsExtensionHost {
 
   private scheduleReconnect(): void {
     if (this.closed) return;
+    // Already connected, or a retry is already pending — never stack timers.
+    if (this.socket !== null || this.reconnectTimer !== null) return;
     const retryMs = this.options.retryMs ?? 250;
     if (retryMs === 0) return;
     this.attempts += 1;
-    if (this.attempts > (this.options.maxRetries ?? 20)) return;
-    setTimeout(() => {
+    const maxRetries = this.options.maxRetries ?? 20;
+    if (this.attempts > maxRetries) return;
+    // Back off so a daemon that is down for minutes is not hammered every
+    // 250ms, while a quick restart is still picked up almost immediately.
+    const delay = Math.min(retryMs * 2 ** Math.min(this.attempts - 1, 6), 30_000);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       void this.connect().catch(() => undefined);
-    }, retryMs);
+    }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   private onData(chunk: string): void {
     this.buffer += chunk;
+    // A peer that writes bytes without a newline would otherwise grow this
+    // string without limit. Drop a pathological buffer rather than accumulate.
+    if (this.buffer.length > MAX_BUFFER_CHARS) {
+      this.buffer = "";
+      return;
+    }
     let nl: number;
     while ((nl = this.buffer.indexOf("\n")) !== -1) {
       const line = this.buffer.slice(0, nl).trim();
       this.buffer = this.buffer.slice(nl + 1);
       if (line.length === 0) continue;
+      // Validate inbound control frames instead of casting. The protocol doc
+      // claimed frames were "zod-validated both ways" while this side was a
+      // bare cast — a security-weighted comment that was not true.
       let frame: DaemonControlFrame;
       try {
-        frame = JSON.parse(line) as DaemonControlFrame;
+        const parsed: unknown = JSON.parse(line);
+        const validated = daemonControlFrameSchema.safeParse(parsed);
+        if (!validated.success) continue;
+        frame = validated.data;
       } catch {
         continue;
       }
@@ -188,7 +233,14 @@ export class AgentOsExtensionHost {
 
   private write(frame: ExtensionToDaemonFrame): void {
     if (this.socket === null) {
+      // Bounded: an unbounded queue turns a disconnected daemon into unbounded
+      // memory growth inside the Captain's Pi process. Drop the OLDEST frames
+      // and count them, so the loss is reported rather than silent.
       this.pending.push(frame);
+      if (this.pending.length > MAX_PENDING_FRAMES) {
+        this.pending.splice(0, this.pending.length - MAX_PENDING_FRAMES);
+        this.droppedFrames += 1;
+      }
       return;
     }
     this.socket.write(`${JSON.stringify(frame)}\n`);

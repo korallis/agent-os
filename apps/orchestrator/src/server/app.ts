@@ -15,6 +15,7 @@ import {
   brainToolNameSchema,
   afkRequestSchema,
   configDomainSchema,
+  ulidSchema,
   configLayerSchema,
   oauthStartRequestSchema,
   onboardingAdvanceRequestSchema,
@@ -505,7 +506,17 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
         return;
       }
-      const detail = deps.fleet.fusionRuns.detail(request.params.id, request.params.runId);
+      // Validate at the edge: these params are joined into a filesystem path,
+      // and `join` collapses `..`. Every sibling tool input is ULID-validated;
+      // this route was the one that was not.
+      const ids = z
+        .object({ id: ulidSchema, runId: ulidSchema })
+        .safeParse(request.params);
+      if (!ids.success) {
+        sendError(reply, 400, "BAD_REQUEST", "invalid task or run id");
+        return;
+      }
+      const detail = deps.fleet.fusionRuns.detail(ids.data.id, ids.data.runId);
       if (detail === null) {
         sendError(reply, 404, "NOT_FOUND", "fusion run not found");
         return;
@@ -554,7 +565,12 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
    * traffic rather than a synthesized list.
    */
   app.get<{ Querystring: { limit?: string } }>("/v1/network", async (request, reply) => {
-    const limit = Math.min(Number(request.query.limit ?? 200) || 200, 1000);
+    // A negative limit is not merely odd: SQLite treats a negative LIMIT as
+    // UNLIMITED, so `?limit=-5` would JSON-parse and serialise every matching
+    // envelope in the log from a single request. Clamp to a positive range.
+    const requested = Number(request.query.limit ?? 200);
+    const limit =
+      Number.isFinite(requested) && requested >= 1 ? Math.min(Math.floor(requested), 1000) : 200;
     const { events, truncated } = deps.store.eventsOfTypes(["net.request"], limit);
     void reply;
     return {

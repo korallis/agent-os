@@ -26,4 +26,4 @@ export const protocolVersionSchema = z.strictObject({
 });
 export type ProtocolVersion = z.infer<typeof protocolVersionSchema>;
 
-export const PROTOCOL_VERSION = "1.2.0-phase3";
+export const PROTOCOL_VERSION = "1.3.0";

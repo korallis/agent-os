@@ -4,7 +4,8 @@ import { agentRoleSchema } from "./providers.js";
 
 /**
  * Daemon ⇄ Pi extension Unix-socket frames (master plan §2.1, §5).
- * NDJSON lines, zod-validated both ways. Telemetry + control (Phase 2) plus
+ * NDJSON lines, zod-validated on both sides: the daemon validates inbound
+ * extension frames, and the extension validates inbound control frames. Telemetry + control (Phase 2) plus
  * the Brain tool bridge (`ext.tool_call` / `ctl.tool_result`, Phase 3).
  */
 
