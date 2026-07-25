@@ -173,6 +173,21 @@ try {
   const post = async (path, body) =>
     (await fetch(`${BASE}${path}`, { method: "POST", headers: auth, body: JSON.stringify(body) })).json();
   const tool = (name, input) => post("/v1/tools/call", { tool: name, input });
+  const put = async (path, body) =>
+    (await fetch(`${BASE}${path}`, { method: "PUT", headers: auth, body: JSON.stringify(body) })).json();
+
+  // Customize a shipped prompt template on disk, the way a Captain would, so
+  // the three-way diff has a real customized side to render.
+  {
+    const templates = (await (await fetch(`${BASE}/v1/prompts`, { headers: auth })).json())
+      .templates ?? [];
+    const target = templates.find((t) => t.ref.includes("fusion")) ?? templates[0];
+    if (target !== undefined) {
+      const globalPath = join(home, "prompts", target.ref);
+      const original = readFileSync(globalPath, "utf8");
+      writeFileSync(globalPath, `CAPTAIN EDIT — do not overwrite\n\n${original}`);
+    }
+  }
 
   // Seed real fleet state.
   const projectId = (
@@ -612,6 +627,94 @@ try {
       detail = `url=${realCall} logLeak=${leaked} headerRedacted=${redacted} rendersUrl=${rendersUrl} uiLeak=${!rendersNoSecret}`;
     }
     gate("G12", "Network I/O records a real outbound call with the credential redacted", ok, detail);
+  }
+
+  // G13 — Policies: accurate ◆ diff-from-default, safety toggle refuses an
+  // unconfirmed write, and the three-way prompt diff renders for a customized
+  // template with a shipped update.
+  {
+    // Make one key genuinely deviate from its shipped default, and set another
+    // to the SAME value the default already has. Only the first may show ◆ —
+    // a mark that fires on "some layer mentions this key" is not a diff mark.
+    const shipped = await (
+      await fetch(`${BASE}/v1/config/shipped/supervision`, { headers: auth })
+    ).json();
+    const shippedHeartbeat = shipped.value?.heartbeatSeconds;
+    const deviated = Number(shippedHeartbeat) + 7;
+    await put("/v1/config/global/supervision", { ...shipped.value, heartbeatSeconds: deviated });
+    await sleep(600);
+
+    await page.goto(`${CONSOLE}/policies`, { waitUntil: "networkidle" });
+    await sleep(900);
+    // Land on the supervision domain.
+    const supervisionTab = page.getByRole("button", { name: /^supervision$/i }).first();
+    if ((await supervisionTab.count()) > 0) {
+      await supervisionTab.click();
+      await sleep(700);
+    }
+    const policiesText = (await page.textContent("body")) ?? "";
+    // The changed key must be marked AND state the shipped value it differs from.
+    const marksDeviation =
+      policiesText.includes("◆") &&
+      policiesText.includes(String(deviated)) &&
+      policiesText.includes(`differs from shipped default`);
+
+    // Safety write without the confirmation header must be refused by the daemon.
+    const effective = await (
+      await fetch(`${BASE}/v1/config/effective`, { headers: auth })
+    ).json();
+    const unconfirmed = await fetch(`${BASE}/v1/config/global/policies`, {
+      method: "PUT",
+      headers: { authorization: auth.authorization, "content-type": "application/json" },
+      body: JSON.stringify({ ...effective.config.policies, scoutReadOnly: false }),
+    });
+    const confirmed = await fetch(`${BASE}/v1/config/global/policies`, {
+      method: "PUT",
+      headers: {
+        authorization: auth.authorization,
+        "content-type": "application/json",
+        "x-agentos-confirm-safety": "true",
+      },
+      body: JSON.stringify({ ...effective.config.policies, scoutReadOnly: false }),
+    });
+    await sleep(700);
+
+    // With a policy off, the persistent override badge must be on the page.
+    await page.goto(`${CONSOLE}/policies`, { waitUntil: "networkidle" });
+    await sleep(600);
+    const safetyTab = page.getByRole("button", { name: /^safety$/i }).first();
+    let badgeShown = false;
+    if ((await safetyTab.count()) > 0) {
+      await safetyTab.click();
+      await sleep(800);
+      const safetyText = (await page.textContent("body")) ?? "";
+      badgeShown = /SAFETY OVERRIDE/i.test(safetyText) && safetyText.includes("SCOUT read-only");
+    }
+
+    // Three-way prompt diff for a customized template with a shipped update.
+    const promptsTab = page.getByRole("button", { name: /^prompts$/i }).first();
+    let diffShown = false;
+    if ((await promptsTab.count()) > 0) {
+      await promptsTab.click();
+      await sleep(900);
+      const promptText = (await page.textContent("body")) ?? "";
+      diffShown =
+        promptText.includes("Shipped at install") &&
+        promptText.includes("Shipped now") &&
+        promptText.includes("Your copy") &&
+        promptText.includes("CAPTAIN EDIT");
+    }
+
+    gate(
+      "G13",
+      "Policies marks real deviations, gates safety writes, and renders the three-way prompt diff",
+      marksDeviation &&
+        unconfirmed.status === 428 &&
+        confirmed.ok &&
+        badgeShown &&
+        diffShown,
+      `diamond=${marksDeviation} unconfirmed=${unconfirmed.status} confirmed=${confirmed.status} badge=${badgeShown} threeWay=${diffShown}`,
+    );
   }
 
   // G8 — unknown route renders the shared empty treatment
