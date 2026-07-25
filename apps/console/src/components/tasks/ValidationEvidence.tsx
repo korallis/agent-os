@@ -79,7 +79,7 @@ export function ValidationEvidence({
     };
   }, [taskId, refreshKey]);
 
-  if (results.length === 0) return null;
+  if (results.length === 0 && !truncated) return null;
 
   const exhausted = validationAttempt >= maxValidations;
 
@@ -98,39 +98,47 @@ export function ValidationEvidence({
           {truncated && " · history truncated"}
         </span>
       </div>
-      <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">
-        <ul className="divide-y divide-line-1/60">
-          {results.map((r, i) => (
-            <li key={`${r.ts}-${i}`} className="flex items-start gap-3 px-4 py-3">
-              <span
-                className={cn(
-                  "mt-0.5 shrink-0 rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-                  OUTCOME_STYLE[r.outcome] ?? "border-line-2 bg-line-1 text-fg-2",
-                )}
-              >
-                {r.outcome}
-              </span>
-              <span className="flex-1 min-w-0 flex flex-col gap-0.5">
-                <span className="text-[13px] text-fg-1">
-                  {r.target === "baseline" ? "Baseline" : "Candidate"} run
-                  {r.target === "candidate" && ` · attempt ${r.attempt}`}
+      {results.length === 0 ? (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            Event history was truncated before this task&apos;s gate results were reached.
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">
+          <ul className="divide-y divide-line-1/60">
+            {results.map((r, i) => (
+              <li key={`${r.ts}-${i}`} className="flex items-start gap-3 px-4 py-3">
+                <span
+                  className={cn(
+                    "mt-0.5 shrink-0 rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                    OUTCOME_STYLE[r.outcome] ?? "border-line-2 bg-line-1 text-fg-2",
+                  )}
+                >
+                  {r.outcome}
                 </span>
-                <span className="text-[11px] text-fg-3">
-                  {OUTCOME_MEANING[r.outcome] ?? "Gate outcome"}
-                </span>
-              </span>
-              <span className="shrink-0 flex flex-col items-end gap-0.5 text-[11px] text-fg-3">
-                <span>{new Date(r.ts).toLocaleTimeString("en-GB")}</span>
-                {r.outputHash !== null && (
-                  <span className="font-mono" title="sha256 of the gate's stdout">
-                    {r.outputHash.slice(0, 10)}
+                <span className="flex-1 min-w-0 flex flex-col gap-0.5">
+                  <span className="text-[13px] text-fg-1">
+                    {r.target === "baseline" ? "Baseline" : "Candidate"} run
+                    {r.target === "candidate" && ` · attempt ${r.attempt}`}
                   </span>
-                )}
-              </span>
-            </li>
-          ))}
-        </ul>
-      </div>
+                  <span className="text-[11px] text-fg-3">
+                    {OUTCOME_MEANING[r.outcome] ?? "Gate outcome"}
+                  </span>
+                </span>
+                <span className="shrink-0 flex flex-col items-end gap-0.5 text-[11px] text-fg-3">
+                  <span>{new Date(r.ts).toLocaleTimeString("en-GB")}</span>
+                  {r.outputHash !== null && (
+                    <span className="font-mono" title="sha256 of the gate's stdout">
+                      {r.outputHash.slice(0, 10)}
+                    </span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </section>
   );
 }

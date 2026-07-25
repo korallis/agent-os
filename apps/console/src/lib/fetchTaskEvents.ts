@@ -23,7 +23,7 @@ export async function fetchTaskEvents(
 ): Promise<TaskEventsResult> {
   const mine: EventEnvelope[] = [];
   let before: string | null = null;
-  let truncated = false;
+  let moreRemain = false;
   let pages = 0;
 
   while (pages < MAX_PAGES) {
@@ -37,14 +37,21 @@ export async function fetchTaskEvents(
     const res = await fetch(`/api/agentos/events/replay?${params.toString()}`, {
       cache: "no-store",
     });
-    if (!res.ok) break;
+    if (!res.ok) {
+      if (before !== null) moreRemain = true;
+      break;
+    }
 
     const body = (await res.json()) as {
       events: EventEnvelope[];
       truncated: boolean;
     };
-    if (body.truncated) truncated = true;
-    if (body.events.length === 0) break;
+    moreRemain = body.truncated;
+
+    if (body.events.length === 0) {
+      moreRemain = false;
+      break;
+    }
 
     for (const envelope of body.events) {
       if (!types.has(envelope.event.type)) continue;
@@ -54,15 +61,15 @@ export async function fetchTaskEvents(
     }
 
     const oldest = body.events[body.events.length - 1];
-    if (oldest === undefined) break;
+    if (oldest === undefined) {
+      moreRemain = false;
+      break;
+    }
     before = oldest.id;
 
     if (!body.truncated) break;
   }
 
-  if (pages >= MAX_PAGES) truncated = true;
-
-  // Presentation is chronological (oldest → newest).
   mine.reverse();
-  return { events: mine, truncated };
+  return { events: mine, truncated: moreRemain };
 }
