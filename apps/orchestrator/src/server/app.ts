@@ -546,6 +546,38 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     }
   });
 
+  // ── Network I/O (§7 Network I/O Detail, Figma 41:4815) ────────────────
+
+  /**
+   * Every outbound HTTP call the daemon made, newest first. Backed by the
+   * `net.request` frames in the durable log, so this is a record of real
+   * traffic rather than a synthesized list.
+   */
+  app.get<{ Querystring: { limit?: string } }>("/v1/network", async (request, reply) => {
+    const limit = Math.min(Number(request.query.limit ?? 200) || 200, 1000);
+    const { events, truncated } = deps.store.eventsOfTypes(["net.request"], limit);
+    void reply;
+    return {
+      requests: events.flatMap((envelope) =>
+        envelope.event.type === "net.request"
+          ? [{ ...envelope.event.payload, ts: envelope.ts }]
+          : [],
+      ),
+      truncated,
+    };
+  });
+
+  app.get<{ Params: { id: string } }>("/v1/network/:id", async (request, reply) => {
+    const { events } = deps.store.eventsOfTypes(["net.request"], 1000);
+    for (const envelope of events) {
+      if (envelope.event.type !== "net.request") continue;
+      if (envelope.event.payload.requestId !== request.params.id) continue;
+      return { request: { ...envelope.event.payload, ts: envelope.ts } };
+    }
+    sendError(reply, 404, "NOT_FOUND", "network request not found");
+    return;
+  });
+
   // ── Phase 8: /afk posture, config doctor, Brain handoff ───────────────
 
   app.get("/v1/afk", async (_request, reply) => {

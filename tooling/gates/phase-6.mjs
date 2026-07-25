@@ -70,6 +70,7 @@ const PAGES = [
   "/notifications",
   "/runs",
   "/runs/history",
+  "/network",
   "/settings/billing",
   "/analytics/models",
   "/alerts",
@@ -557,6 +558,60 @@ try {
       detail = `wsUrl=${hasUrl} first=${openOnce} replay=${openTwice}`;
     }
     gate("G11", "attach ticket is single-use — a replayed ticket is refused", ok, detail);
+  }
+
+  // G12 — Network I/O renders a REAL outbound call, with the credential redacted.
+  // The redaction half matters most: the event log is append-only, so a key
+  // written there could never be taken back.
+  {
+    const CANARY_KEY = "phase6-net-canary-key-wxyz9876";
+    const connection = (
+      await post("/v1/connections/api-key", {
+        provider: "openrouter",
+        apiKey: CANARY_KEY,
+        label: "network gate fixture",
+      })
+    ).connection;
+    await post(`/v1/connections/${connection.id}/quota/refresh`, {});
+    await sleep(800);
+
+    const recorded = await (
+      await fetch(`${BASE}/v1/network?limit=50`, { headers: auth })
+    ).json();
+    const request = (recorded.requests ?? [])[0];
+
+    let ok = false;
+    let detail = "no outbound request recorded";
+    if (request !== undefined) {
+      // The daemon really called the provider: a live URL and a measured duration.
+      const realCall =
+        typeof request.url === "string" &&
+        request.url.startsWith("https://") &&
+        typeof request.durationMs === "number";
+
+      // The canary must not survive anywhere in the recorded frame.
+      const serialized = JSON.stringify(request);
+      const leaked = serialized.includes(CANARY_KEY);
+      const authHeader = (request.requestHeaders ?? []).find(
+        ([name]) => name.toLowerCase() === "authorization",
+      );
+      const redacted =
+        authHeader !== undefined &&
+        authHeader[1].includes("****") &&
+        !authHeader[1].includes(CANARY_KEY);
+
+      // And the detail page must render that same real call.
+      await page.goto(`${CONSOLE}/network/${request.requestId}`, { waitUntil: "networkidle" });
+      await sleep(500);
+      const body = (await page.textContent("body")) ?? "";
+      const rendersUrl = body.includes(request.url);
+      const rendersRedaction = body.includes("****");
+      const rendersNoSecret = !body.includes(CANARY_KEY);
+
+      ok = realCall && !leaked && redacted && rendersUrl && rendersRedaction && rendersNoSecret;
+      detail = `url=${realCall} logLeak=${leaked} headerRedacted=${redacted} rendersUrl=${rendersUrl} uiLeak=${!rendersNoSecret}`;
+    }
+    gate("G12", "Network I/O records a real outbound call with the credential redacted", ok, detail);
   }
 
   // G8 — unknown route renders the shared empty treatment
