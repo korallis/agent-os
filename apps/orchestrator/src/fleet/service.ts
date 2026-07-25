@@ -578,6 +578,10 @@ export class FleetService {
     this.tools.reconcileAcceptedHandovers();
     // Pending: re-drive remote POST (idempotency key); fire-and-forget on tick.
     void this.tools.reconcilePendingHandoversAsync().catch(() => undefined);
+    // A wedged seat passes every check above — its pane is alive — so it needs
+    // its own pass on EVERY tick, not just at boot where nothing is wedged yet.
+    this.tools.reconcileWedgedSessions();
+
     return lost;
   }
 

@@ -329,6 +329,71 @@ try {
     );
   }
 
+  // G14 — structural WEDGED: a seat whose pane is ALIVE but silent past the
+  // stale window is respawned ONCE, evidence-stamped, then escalated. Wedged is
+  // the nastiest failure mode precisely because every liveness check passes.
+  {
+    // Tighten the stale window so the gate need not wait 30 real minutes.
+    await api(BASE, "/v1/config/global/supervision", token, {
+      method: "PUT",
+      body: JSON.stringify({
+        staleMinutes: { api: 1, build: 1 },
+        escalationLadderSteps: 3,
+        respawnPerStage: 1,
+        absorb: ["PROGRESS"],
+        heartbeatSeconds: 2,
+      }),
+    });
+    await sleep(1500);
+
+    const wedgeTask = await createTask(BASE, token, projectId, { title: "wedge fixture" });
+    await callTool(BASE, token, "resolve_cast", {
+      taskId: wedgeTask,
+      roles: [{ role: "builder", model: "openai/gpt-5.6-sol", thinking: "medium", cleanRoom: true }],
+      familyCheckOverride: false,
+    });
+    await callTool(BASE, token, "spawn_crewmate", {
+      taskId: wedgeTask,
+      role: "builder",
+      model: "openai/gpt-5.6-sol",
+      thinking: "medium",
+      vars: {},
+      redBaselineOverride: true,
+    });
+
+    // Let the seat go silent past the 1-minute window while its pane stays up.
+    // The fake-pi pane is `sleep 86400`: genuinely alive, genuinely producing
+    // nothing — exactly the shape of a real wedge.
+    await sleep(75_000);
+
+    const deadline = Date.now() + 120_000;
+    let respawned = null;
+    let escalated = null;
+    while (Date.now() < deadline && (respawned === null || escalated === null)) {
+      const res = await api(BASE, "/v1/events/replay?types=session.wedged&limit=1000", token);
+      const body = await res.json();
+      for (const envelope of body.events ?? []) {
+        if (envelope.event?.type !== "session.wedged") continue;
+        const payload = envelope.event.payload;
+        if (payload.taskId !== wedgeTask) continue;
+        if (payload.action === "respawned" && respawned === null) respawned = payload;
+        if (payload.action === "escalated" && escalated === null) escalated = payload;
+      }
+      if (respawned === null || escalated === null) await sleep(2000);
+    }
+
+    gate(
+      "G14",
+      "a live-but-silent seat is WEDGED: respawned once with evidence, then escalated",
+      respawned !== null &&
+        escalated !== null &&
+        respawned.respawnsUsed === 0 &&
+        escalated.respawnsUsed === 1 &&
+        respawned.thresholdMinutes === 1,
+      `respawned=${respawned !== null ? `idle ${respawned.idleMinutes}m ${respawned.respawnsUsed}/${respawned.respawnCap}` : "none"} escalated=${escalated !== null ? `${escalated.respawnsUsed}/${escalated.respawnCap}` : "none"}`,
+    );
+  }
+
   // G8 — kill -9 mid-task → rehydrate + Brain reconcile
   {
     const liveTask = await createTask(BASE, token, projectId, { title: "Survives kill -9" });

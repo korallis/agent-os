@@ -592,6 +592,32 @@ export const secondmateRoutedEventSchema = z.strictObject({
   }),
 });
 
+/**
+ * A seat is structurally WEDGED: its pane is alive but it has produced nothing
+ * for longer than the configured stale window (§11 Phase 3).
+ *
+ * Distinct from SESSION_LOST, where the pane is gone. A wedged seat looks
+ * healthy from the outside, which is precisely why it needs saying out loud —
+ * left alone it consumes a worktree lease and a cast slot indefinitely.
+ */
+export const sessionWedgedEventSchema = z.strictObject({
+  type: z.literal("session.wedged"),
+  payload: z.strictObject({
+    sessionId: ulidSchema,
+    taskId: ulidSchema.nullable(),
+    role: z.string(),
+    /** Minutes of silence that tripped the detector. */
+    idleMinutes: z.number().min(0),
+    thresholdMinutes: z.number().min(0),
+    /** How many wedge respawns this task/role has already consumed. */
+    respawnsUsed: z.number().int().min(0),
+    respawnCap: z.number().int().min(0),
+    /** What the substrate did about it. */
+    action: z.enum(["respawned", "escalated"]),
+  }),
+});
+
+
 export const captainEscalationEventSchema = z.strictObject({
   type: z.literal("captain.escalation"),
   payload: z.strictObject({
@@ -662,6 +688,8 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   brainHandoffCompletedEventSchema,
   secondmateCharterChangedEventSchema,
   secondmateRoutedEventSchema,
+  sessionWedgedEventSchema,
+
   captainEscalationEventSchema,
   taskDeliveryBlockResolvedEventSchema,
 ]);

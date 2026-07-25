@@ -15,6 +15,8 @@ function levelOf(envelope: EventEnvelope): Level {
   switch (envelope.event.type) {
     case "config.rejected":
     case "provider.billing_mismatch":
+    case "session.wedged":
+      return "WARN";
     case "session.lost":
     case "brain.down":
     case "scout.write_violation":
@@ -119,6 +121,7 @@ function sourceOf(envelope: EventEnvelope): string {
       return "tasks";
     case "session.spawned":
     case "session.stopped":
+    case "session.wedged":
     case "session.lost":
       return "sessions";
     case "crew.question":
@@ -286,6 +289,9 @@ function messageOf(envelope: EventEnvelope): string {
       return event.payload.accepted
         ? `Task ${event.payload.taskId.slice(0, 8)} routed to secondmate ${event.payload.name}`
         : `Routing to ${event.payload.name} REFUSED — ${event.payload.reason ?? "unknown"}`;
+    case "session.wedged":
+      return `Seat ${event.payload.role} WEDGED — silent ${Math.round(event.payload.idleMinutes)}m (threshold ${event.payload.thresholdMinutes}m) → ${event.payload.action} (${event.payload.respawnsUsed}/${event.payload.respawnCap} respawns used)`;
+
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {

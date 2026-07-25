@@ -255,6 +255,9 @@ export class ToolSurface {
    * Cleared in finally; terminal phase then blocks any later retry.
    */
   private readonly routingInProgress = new Set<string>();
+  /** `${taskId}:${role}` → wedge respawns already consumed (ladder ledger). */
+  private readonly wedgeRespawns = new Map<string, number>();
+
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -477,6 +480,7 @@ export class ToolSurface {
         status: s.status,
         worktreePath: s.worktreePath,
         startedAt: s.startedAt,
+        lastActivityAt: s.lastEventAt ?? null,
       };
       this.sessions.set(s.sessionId, fleetSession);
     }
@@ -594,6 +598,88 @@ export class ToolSurface {
       lost.push(session.sessionId);
     }
     return lost;
+  }
+
+  /**
+   * Structural WEDGED detection and the respawn→escalate ladder
+   * (master plan §11 Phase 3).
+   *
+   * A wedged seat is the nastiest failure mode the fleet has: its pane is
+   * ALIVE, so every liveness check passes, but it has produced nothing for
+   * longer than the configured stale window. Left alone it holds a worktree
+   * lease and a cast slot forever while looking perfectly healthy — which is
+   * exactly why it has to be said out loud rather than waited on.
+   *
+   * The ladder is deliberately shallow and evidence-stamped: respawn ONCE per
+   * task+role (bounded by supervision.respawnPerStage), then escalate. A
+   * substrate that respawns forever converts a wedged model into an infinite
+   * spend, and the second wedge is far more likely to be the task than the seat.
+   */
+  reconcileWedgedSessions(now = Date.now()): Array<{ sessionId: string; action: string }> {
+    const supervision = this.deps.config.effective().config.supervision;
+    const thresholdMinutes = supervision.staleMinutes.build;
+    const respawnCap = supervision.respawnPerStage;
+    const acted: Array<{ sessionId: string; action: string }> = [];
+
+    for (const session of [...this.sessions.values()]) {
+      if (session.status !== "running" && session.status !== "starting") continue;
+      // A missing pane is SESSION_LOST, not wedged — that path already exists
+      // and means something different to the Captain.
+      if (!this.deps.tmux.hasWindow(session.tmuxWindow)) continue;
+
+      const since = session.lastActivityAt ?? session.startedAt;
+      const idleMs = now - Date.parse(since);
+      if (!Number.isFinite(idleMs)) continue;
+      const idleMinutes = idleMs / 60_000;
+      if (idleMinutes < thresholdMinutes) continue;
+
+      const ledgerKey = `${session.taskId ?? "none"}:${session.role}`;
+      const used = this.wedgeRespawns.get(ledgerKey) ?? 0;
+      const action = used < respawnCap ? "respawned" : "escalated";
+
+      this.sessions.set(session.sessionId, { ...session, status: "wedged" });
+      this.sink({
+        type: "session.wedged",
+        payload: {
+          sessionId: session.sessionId,
+          taskId: session.taskId,
+          role: session.role,
+          idleMinutes: Number(idleMinutes.toFixed(2)),
+          thresholdMinutes,
+          respawnsUsed: used,
+          respawnCap,
+          action,
+        },
+      });
+
+      if (action === "respawned") {
+        this.wedgeRespawns.set(ledgerKey, used + 1);
+        try {
+          this.respawnCrewmate({
+            sessionId: session.sessionId,
+            reason: `structural WEDGED — no activity for ${Math.round(idleMinutes)}m (threshold ${thresholdMinutes}m)`,
+          });
+        } catch {
+          // A failed respawn must not swallow the signal; escalate instead of
+          // leaving a wedged seat silently unattended.
+          this.escalate({
+            taskId: session.taskId ?? undefined,
+            summary: `Seat ${session.role} wedged and could not be respawned — no activity for ${Math.round(idleMinutes)}m`,
+            severity: "critical",
+          });
+        }
+      } else {
+        // Cap consumed: the Captain decides, because a second wedge on the same
+        // role is far more likely to be the task than the seat.
+        this.escalate({
+          taskId: session.taskId ?? undefined,
+          summary: `Seat ${session.role} wedged again after ${used} respawn${used === 1 ? "" : "s"} — no activity for ${Math.round(idleMinutes)}m. The task, not the model, is the likely cause.`,
+          severity: "critical",
+        });
+      }
+      acted.push({ sessionId: session.sessionId, action });
+    }
+    return acted;
   }
 
   /**
@@ -1849,6 +1935,7 @@ export class ToolSurface {
         status: "running",
         worktreePath,
         startedAt: now,
+        lastActivityAt: null,
       };
       this.sessions.set(sessionId, fleetSession);
 
@@ -4173,7 +4260,11 @@ export class ToolSurface {
     // Terminal is terminal: late agent_settled / running frames after stop or
     // lost must not resurrect the session (and must not inflate healthyLeft).
     if (session.status === "stopped" || session.status === "lost") return;
-    this.sessions.set(sessionId, { ...session, status });
+    this.sessions.set(sessionId, {
+      ...session,
+      status,
+      lastActivityAt: new Date().toISOString(),
+    });
     const task = session.taskId !== null ? this.tasks.get(session.taskId) : undefined;
     if (task !== undefined) {
       this.saveTask({
