@@ -212,7 +212,27 @@ try {
     { role: "builder", model: "xai/grok-4.5", thinking: "medium", cleanRoom: true },
   ]);
   // Complete a task so analytics tasksDone is a real non-zero figure.
-  await tool("deliver_task", { taskId: taskB });
+  // Stop the fake-pi crewmate first (sleep 86400 pane) — same pattern as
+  // phase-3 G5 — so deliver_task halt does not race a live tmux window.
+  const taskBState = await (await fetch(`${BASE}/v1/tasks/${taskB}`, { headers: auth })).json();
+  for (const session of taskBState.task?.sessions ?? []) {
+    if (
+      session.status === "running" ||
+      session.status === "starting" ||
+      session.status === "settled"
+    ) {
+      await tool("stop_crewmate", {
+        sessionId: session.sessionId,
+        reason: "phase-6 gate: free task for deliver",
+      });
+    }
+  }
+  const delivered = await tool("deliver_task", { taskId: taskB });
+  if (delivered.ok !== true || delivered.data?.phase !== "DONE") {
+    throw new Error(
+      `deliver_task seed failed: ok=${delivered.ok} phase=${delivered.data?.phase} err=${delivered.error?.message ?? ""}`,
+    );
+  }
 
   // Fake-pi spawn classifies a PROGRESS wake absorbed by the zero-token watcher.
   const absorbedSummary = `progress on ${taskATitle}`;
@@ -225,10 +245,12 @@ try {
       label: "p6-quota-fixture",
     })
   ).connection;
+  // POST with content-type application/json requires a body (Fastify rejects empty).
   const quotaRefresh = await (
     await fetch(`${BASE}/v1/connections/${quotaConnection.id}/quota/refresh`, {
       method: "POST",
       headers: auth,
+      body: "{}",
     })
   ).json();
   const seededQuotaSample = quotaRefresh.sample;
