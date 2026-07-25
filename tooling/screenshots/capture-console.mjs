@@ -33,11 +33,12 @@ const PAGES = [
   { path: "/tasks", name: "02-tasks-board" },
   { path: "/projects", name: "03-projects" },
   { path: "/providers", name: "04-providers-quota" },
-  { path: "/runs", name: "05-runs-live-log" },
-  { path: "/analytics", name: "06-analytics" },
-  { path: "/policies", name: "07-policies" },
-  { path: "/settings", name: "08-settings" },
-  { path: "/onboarding", name: "09-onboarding-wizard" },
+  { path: "/notifications", name: "05-notifications" },
+  { path: "/runs", name: "06-runs-live-log" },
+  { path: "/analytics", name: "07-analytics" },
+  { path: "/policies", name: "08-policies" },
+  { path: "/settings", name: "09-settings" },
+  { path: "/onboarding", name: "10-onboarding-wizard" },
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

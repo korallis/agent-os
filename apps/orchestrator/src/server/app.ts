@@ -45,6 +45,7 @@ import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
 import { resolveAuthJsonPathsWithFallback } from "../security/auth-store.js";
 import type { FleetService } from "../fleet/service.js";
 import type { PromptService } from "../prompts/service.js";
+import type { AnalyticsService } from "../analytics/service.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -69,6 +70,8 @@ export interface ServerDeps {
   fleet?: FleetService;
   /** Phase 4 layered prompt packs. */
   prompts?: PromptService;
+  /** Phase 6 usage & cost analytics derived from the event log. */
+  analytics?: AnalyticsService;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -308,6 +311,17 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       return;
     }
     return { task };
+  });
+
+  // ── Analytics (master plan §7.6) ────────────────────────────────────────
+  app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {
+    if (deps.analytics === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "analytics service unavailable");
+      return;
+    }
+    const parsed = Number(request.query.days ?? "14");
+    const days = Number.isInteger(parsed) && parsed >= 1 && parsed <= 365 ? parsed : 14;
+    return deps.analytics.snapshot({ days });
   });
 
   // ── Fusion runs (master plan §7.4) ──────────────────────────────────────

@@ -25,6 +25,7 @@ import { enableQuotaProviders } from "./quota-probes/enable.js";
 import type { QuotaSample } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
 import { PromptService } from "./prompts/service.js";
+import { AnalyticsService } from "./analytics/service.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
@@ -222,6 +223,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       }
     });
 
+    // Analytics is a pure reader over durable state — no separate accounting
+    // store to drift out of sync with the event log.
+    const analytics = new AnalyticsService(
+      (limit) => eventStore.eventsAfterId(null, limit).events,
+      () => fleet.tools.listTasks(),
+      () => [...quotaSamples.values()],
+    );
+
     const deps = {
       store,
       config,
@@ -236,6 +245,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       quotaSamples,
       fleet,
       prompts,
+      analytics,
     };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });
