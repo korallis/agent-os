@@ -417,7 +417,7 @@ export class FleetService {
    * Provision a secondmate through the fleet surface (REST / tools / CLI).
    * Seeds charter + brain cast under the isolated home.
    */
-  provisionSecondmate(
+  async provisionSecondmate(
     input: ProvisionSecondmateInput,
   ): ReturnType<SecondmateRegistry["provision"]> {
     return this.secondmates.provision(input);

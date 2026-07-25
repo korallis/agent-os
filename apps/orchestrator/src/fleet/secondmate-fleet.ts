@@ -374,7 +374,7 @@ export class SecondmateFleet {
   }
 
   /** Write a charter into the secondmate's own config layer (files are truth). */
-  writeCharter(record: SecondmateRecord, charter: SecondmateCharter): void {
+  async writeCharter(record: SecondmateRecord, charter: SecondmateCharter): Promise<void> {
     const validated = secondmateCharterSchema.parse(charter);
     const dir = join(record.home, "config");
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -384,7 +384,7 @@ export class SecondmateFleet {
       { mode: 0o600 },
     );
     this.applyCharterToBrainConfig(record, validated);
-    this.registry.updateRecord(record.name, {
+    await this.registry.updateRecord(record.name, {
       brainModel: validated.brainModel,
       domain: validated.domains[0] ?? record.domain,
       maxConcurrentTasks: validated.maxConcurrentTasks,
@@ -408,7 +408,7 @@ export class SecondmateFleet {
     record: SecondmateRecord,
     charter: SecondmateCharter,
   ): Promise<{ charter: SecondmateCharter; brainSynced: boolean; brainModel: string | null }> {
-    this.writeCharter(record, charter);
+    await this.writeCharter(record, charter);
     const validated = secondmateCharterSchema.parse(charter);
     const token = this.registry.readRuntimeToken(record.name);
     const runtime = this.registry.readRuntime(record.name);

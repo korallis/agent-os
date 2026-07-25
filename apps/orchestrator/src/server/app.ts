@@ -533,7 +533,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       return;
     }
     try {
-      const secondmate = deps.fleet.provisionSecondmate(parsed.data);
+      const secondmate = await deps.fleet.provisionSecondmate(parsed.data);
       return { secondmate };
     } catch (error) {
       const message = error instanceof Error ? error.message : "provision failed";

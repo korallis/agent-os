@@ -203,10 +203,10 @@ describe("secondmate homes", () => {
     expect(secondmateTmuxSocket("infra")).not.toBe("agentos");
   });
 
-  it("provisions an isolated home carrying no auth material", () => {
+  it("provisions an isolated home carrying no auth material", async () => {
     const home = temp("agentos-p7-home-");
     const registry = new SecondmateRegistry(home);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
 
     expect(record.home).toContain("secondmates");
     expect(existsSync(join(record.home, "config"))).toBe(true);
@@ -216,17 +216,17 @@ describe("secondmate homes", () => {
     expect(registry.auditNoAuthMaterial().ok).toBe(true);
   });
 
-  it("refuses a duplicate name rather than clobbering an existing home", () => {
+  it("refuses a duplicate name rather than clobbering an existing home", async () => {
     const home = temp("agentos-p7-dupe-");
     const registry = new SecondmateRegistry(home);
-    registry.provision({ name: "docs", domain: "docs" });
-    expect(() => registry.provision({ name: "docs", domain: "docs" })).toThrow(/already exists/);
+    await registry.provision({ name: "docs", domain: "docs" });
+    await expect(registry.provision({ name: "docs", domain: "docs" })).rejects.toThrow(/already exists/);
   });
 
-  it("fails the audit when auth material appears under a secondmate home", () => {
+  it("fails the audit when auth material appears under a secondmate home", async () => {
     const home = temp("agentos-p7-audit-");
     const registry = new SecondmateRegistry(home);
-    const record = registry.provision({ name: "leaky", domain: "x" });
+    const record = await registry.provision({ name: "leaky", domain: "x" });
     writeFileSync(join(record.home, "daemon.token"), "should-not-be-here\n");
 
     const audit = registry.auditNoAuthMaterial();
@@ -234,10 +234,10 @@ describe("secondmate homes", () => {
     expect(audit.offenders.join(" ")).toContain("daemon.token");
   });
 
-  it("keeps runtime tokens outside the audited secondmate home", () => {
+  it("keeps runtime tokens outside the audited secondmate home", async () => {
     const home = temp("agentos-p7-token-out-");
     const registry = new SecondmateRegistry(home);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
     const tokenPath = registry.runtimeTokenPath(record.name);
     expect(tokenPath.startsWith(record.home)).toBe(false);
     expect(tokenPath).toContain(join("runtime", "secondmates", "infra"));
@@ -250,20 +250,20 @@ describe("secondmate homes", () => {
 });
 
 describe("charter-driven routing", () => {
-  it("routes by domain and honours a charter that declines routing", () => {
+  it("routes by domain and honours a charter that declines routing", async () => {
     const home = temp("agentos-p7-route-");
     const registry = new SecondmateRegistry(home);
     const fleet = new SecondmateFleet(registry);
 
-    const infra = registry.provision({ name: "infra", domain: "infra" });
-    registry.provision({ name: "docs", domain: "docs" });
+    const infra = await registry.provision({ name: "infra", domain: "infra" });
+    await registry.provision({ name: "docs", domain: "docs" });
 
     expect(fleet.routeFor("infra")?.name).toBe("infra");
     expect(fleet.routeFor("docs")?.name).toBe("docs");
     // No destination is invented for an unknown domain.
     expect(fleet.routeFor("kernel")).toBeNull();
 
-    fleet.writeCharter(infra, {
+    await fleet.writeCharter(infra, {
       name: "infra",
       domains: ["infra"],
       brainModel: "anthropic/claude-fable-5",
@@ -273,22 +273,22 @@ describe("charter-driven routing", () => {
     expect(fleet.routeFor("infra")).toBeNull();
   });
 
-  it("named acceptsDomain checks the target charter, not first-wins routeFor", () => {
+  it("named acceptsDomain checks the target charter, not first-wins routeFor", async () => {
     const home = temp("agentos-p7-named-route-");
     const registry = new SecondmateRegistry(home);
     const fleet = new SecondmateFleet(registry);
 
     // Provision order: alpha first. Both accept "shared".
-    const alpha = registry.provision({ name: "alpha", domain: "shared" });
-    const beta = registry.provision({ name: "beta", domain: "other" });
-    fleet.writeCharter(alpha, {
+    const alpha = await registry.provision({ name: "alpha", domain: "shared" });
+    const beta = await registry.provision({ name: "beta", domain: "other" });
+    await fleet.writeCharter(alpha, {
       name: "alpha",
       domains: ["shared"],
       brainModel: null,
       maxConcurrentTasks: 2,
       acceptsRouting: true,
     });
-    fleet.writeCharter(beta, {
+    await fleet.writeCharter(beta, {
       name: "beta",
       domains: ["shared", "other"],
       brainModel: null,
@@ -304,13 +304,13 @@ describe("charter-driven routing", () => {
     expect(fleet.acceptsDomain(beta, "other")).toBe(true);
   });
 
-  it("reads a charter edit back — the charter is config, not code", () => {
+  it("reads a charter edit back — the charter is config, not code", async () => {
     const home = temp("agentos-p7-charter-");
     const registry = new SecondmateRegistry(home);
     const fleet = new SecondmateFleet(registry);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
 
-    fleet.writeCharter(record, {
+    await fleet.writeCharter(record, {
       name: "infra",
       domains: ["infra", "deploy"],
       brainModel: "openai/gpt-5.6-sol",
@@ -339,7 +339,7 @@ describe("charter-driven routing", () => {
       agentosdBin: process.execPath,
     });
     await service.start();
-    const record = service.provisionSecondmate({
+    const record = await service.provisionSecondmate({
       name: "infra",
       domain: "infra",
       brainModel: "openai/gpt-5.6-sol",
@@ -365,11 +365,11 @@ describe("charter-driven routing", () => {
     expect(charter.domains).toEqual(["infra", "deploy"]);
   });
 
-  it("falls back to the provision record when a charter is malformed", () => {
+  it("falls back to the provision record when a charter is malformed", async () => {
     const home = temp("agentos-p7-bad-charter-");
     const registry = new SecondmateRegistry(home);
     const fleet = new SecondmateFleet(registry);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
     writeFileSync(join(record.home, "config", "charter.json5"), "{ this is not valid");
 
     const { source, error } = fleet.readCharter(record);
@@ -382,7 +382,7 @@ describe("charter-driven routing", () => {
     const home = temp("agentos-p7-bearings-");
     const registry = new SecondmateRegistry(home);
     const fleet = new SecondmateFleet(registry);
-    registry.provision({ name: "infra", domain: "infra" });
+    await registry.provision({ name: "infra", domain: "infra" });
 
     const bearings = await fleet.bearings();
     expect(bearings).toHaveLength(1);
@@ -398,7 +398,7 @@ describe("secondmate stopAll reaps runtime orphans", () => {
   it("stops a secondmate known only via runtime.json after primary restart", async () => {
     const home = temp("agentos-p7-stopall-");
     const registry = new SecondmateRegistry(home);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
 
     // Simulate an orphaned daemon: runtime.json with a live pid, no children entry.
     const sleeper = await import("node:child_process").then((cp) =>
@@ -438,7 +438,7 @@ describe("secondmate stopAll reaps runtime orphans", () => {
   it("stop waits until the target pid is reaped before clearing runtime", async () => {
     const home = temp("agentos-p7-stop-reap-");
     const registry = new SecondmateRegistry(home);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
     const sleeper = await import("node:child_process").then((cp) =>
       cp.spawn("sleep", ["30"], { stdio: "ignore" }),
     );
@@ -472,7 +472,7 @@ describe("secondmate stopAll reaps runtime orphans", () => {
   it("stop leaves a live process alone when runtime names a dead pid", async () => {
     const home = temp("agentos-p7-stop-identity-");
     const registry = new SecondmateRegistry(home);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
     const live = await import("node:child_process").then((cp) =>
       cp.spawn("sleep", ["30"], { stdio: "ignore" }),
     );
@@ -512,7 +512,7 @@ describe("secondmate stopAll reaps runtime orphans", () => {
   it("concurrent stop calls serialize without orphaning a live pid", async () => {
     const home = temp("agentos-p7-stop-start-race-");
     const registry = new SecondmateRegistry(home);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
     const sleeper = await import("node:child_process").then((cp) =>
       cp.spawn("sleep", ["60"], { stdio: "ignore" }),
     );
@@ -531,8 +531,8 @@ describe("secondmate stopAll reaps runtime orphans", () => {
       { mode: 0o600 },
     );
 
-    // Concurrent stop (runtime orphan) + stop again: both share the lifecycle
-    // chain; after they settle, runtime matches reality (no live untracked pid).
+    // Concurrent stop (runtime orphan) + stop again: both share the registry
+    // mutation chain; after they settle, runtime matches reality (no live untracked pid).
     const [a, b] = await Promise.all([
       registry.stop("infra"),
       registry.stop("infra"),
@@ -546,6 +546,87 @@ describe("secondmate stopAll reaps runtime orphans", () => {
       alive = false;
     }
     expect(alive).toBe(false);
+  });
+
+  it("start failure reaps the child before clearing runtime bookkeeping", async () => {
+    const home = temp("agentos-p7-start-reap-");
+    const registry = new SecondmateRegistry(home);
+    const record = await registry.provision({ name: "infra", domain: "infra" });
+
+    // Spawn a long-lived process that never becomes ready (no token/status).
+    await expect(
+      registry.start(record.name, {
+        agentosdBin: join(home, "missing-agentosd-bin.js"),
+        sharedPiHome: join(home, "pi"),
+        readyTimeoutMs: 200,
+      }),
+    ).rejects.toThrow(/SECONDMATE_START_FAILED|failed to spawn|did not become ready|exited before ready|ENOENT|Cannot find module|secondmate/i);
+
+    // Either spawn failed before tracking, or bookkeeping was cleared only after reap.
+    const runtime = registry.readRuntime(record.name);
+    if (runtime !== null) {
+      // Still tracked only if process is actually alive (unreaped after hard kill window).
+      let alive = true;
+      try {
+        process.kill(runtime.pid, 0);
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(true);
+    }
+  });
+
+  it("start ready-timeout reaps a live child before dropping runtime.json", async () => {
+    const home = temp("agentos-p7-start-timeout-reap-");
+    const registry = new SecondmateRegistry(home);
+    const record = await registry.provision({ name: "infra", domain: "infra" });
+
+    // Stays alive but never writes a daemon token / never serves /v1/status.
+    const hangBin = join(home, "hang-agentosd.mjs");
+    const pidFile = join(home, "hang.pid");
+    writeFileSync(
+      hangBin,
+      `import { writeFileSync } from "node:fs";\n` +
+        `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
+        `setInterval(() => {}, 60_000);\n` +
+        `process.on("SIGTERM", () => process.exit(0));\n`,
+      { mode: 0o700 },
+    );
+
+    await expect(
+      registry.start(record.name, {
+        agentosdBin: hangBin,
+        sharedPiHome: join(home, "pi"),
+        readyTimeoutMs: 400,
+      }),
+    ).rejects.toThrow(/did not become ready/);
+
+    // Confirmed reaped → bookkeeping cleared (invariant: no erased record for a live pid).
+    expect(registry.readRuntime(record.name)).toBeNull();
+    expect(existsSync(pidFile)).toBe(true);
+    const hangPid = Number(readFileSync(pidFile, "utf8").trim());
+    expect(Number.isInteger(hangPid) && hangPid > 0).toBe(true);
+    let alive = true;
+    try {
+      process.kill(hangPid, 0);
+    } catch {
+      alive = false;
+    }
+    expect(alive).toBe(false);
+  });
+
+  it("concurrent provision serializes port allocation", async () => {
+    const home = temp("agentos-p7-prov-race-");
+    const registry = new SecondmateRegistry(home, { primaryPort: 4700 });
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        registry.provision({ name: `sm${i}`, domain: `d${i}` }),
+      ),
+    );
+    const ports = results.map((r) => r.port);
+    expect(new Set(ports).size).toBe(ports.length);
+    expect(ports.every((p) => p !== 4700)).toBe(true);
+    expect(registry.list()).toHaveLength(8);
   });
 });
 
@@ -684,17 +765,17 @@ describe("secondmate admission capacity", () => {
 });
 
 describe("secondmate provision constraints", () => {
-  it("refuses a port already recorded for another secondmate or the primary", () => {
+  it("refuses a port already recorded for another secondmate or the primary", async () => {
     const home = temp("agentos-p7-port-");
     const registry = new SecondmateRegistry(home, { primaryPort: 4700 });
-    const first = registry.provision({ name: "infra", domain: "infra", port: 4710 });
+    const first = await registry.provision({ name: "infra", domain: "infra", port: 4710 });
     expect(first.port).toBe(4710);
-    expect(() =>
+    await expect(
       registry.provision({ name: "docs", domain: "docs", port: 4710 }),
-    ).toThrow(/already used by infra/);
-    expect(() =>
+    ).rejects.toThrow(/already used by infra/);
+    await expect(
       registry.provision({ name: "clash", domain: "x", port: 4700 }),
-    ).toThrow(/collides with the primary/);
+    ).rejects.toThrow(/collides with the primary/);
   });
 
   it("production daemon refuses secondmate on its bound port without AGENTOS_PORT", async () => {
@@ -729,11 +810,11 @@ describe("secondmate provision constraints", () => {
     }
   });
 
-  it("persists maxConcurrentTasks on the provision record for charter fallback", () => {
+  it("persists maxConcurrentTasks on the provision record for charter fallback", async () => {
     const home = temp("agentos-p7-cap-record-");
     const registry = new SecondmateRegistry(home);
     const fleet = new SecondmateFleet(registry);
-    const record = registry.provision({
+    const record = await registry.provision({
       name: "infra",
       domain: "infra",
       maxConcurrentTasks: 7,
@@ -748,24 +829,24 @@ describe("secondmate provision constraints", () => {
     expect(charter.acceptsRouting).toBe(true);
   });
 
-  it("rejects out-of-range maxConcurrentTasks at provision (schema boundary)", () => {
+  it("rejects out-of-range maxConcurrentTasks at provision (schema boundary)", async () => {
     const home = temp("agentos-p7-cap-schema-");
     const registry = new SecondmateRegistry(home);
-    expect(() =>
+    await expect(
       registry.provision({ name: "zero", domain: "x", maxConcurrentTasks: 0 }),
-    ).toThrow();
-    expect(() =>
+    ).rejects.toThrow();
+    await expect(
       registry.provision({ name: "high", domain: "x", maxConcurrentTasks: 99 }),
-    ).toThrow();
+    ).rejects.toThrow();
     expect(existsSync(join(home, "secondmates", "zero"))).toBe(false);
     expect(existsSync(join(home, "secondmates", "high"))).toBe(false);
   });
 
-  it("fails closed on capacity when the provision record has no durable cap", () => {
+  it("fails closed on capacity when the provision record has no durable cap", async () => {
     const home = temp("agentos-p7-cap-missing-");
     const registry = new SecondmateRegistry(home);
     const fleet = new SecondmateFleet(registry);
-    const record = registry.provision({ name: "infra", domain: "infra" });
+    const record = await registry.provision({ name: "infra", domain: "infra" });
     // Simulate a pre-cap provision record without maxConcurrentTasks.
     writeFileSync(
       join(record.home, "charter.json"),
@@ -860,7 +941,7 @@ describe("handover crash recovery and post-accept finalization", () => {
       fakePi: true,
     });
     await service.start();
-    service.provisionSecondmate({ name: "infra", domain: "infra" });
+    await service.provisionSecondmate({ name: "infra", domain: "infra" });
     const project = service.projects.register({
       name: "h2",
       path: home,
@@ -988,7 +1069,7 @@ describe("handover crash recovery and post-accept finalization", () => {
       fakePi: true,
     });
     await service.start();
-    service.provisionSecondmate({ name: "infra", domain: "infra" });
+    await service.provisionSecondmate({ name: "infra", domain: "infra" });
     const project = service.projects.register({
       name: "ambig",
       path: home,
@@ -1094,8 +1175,8 @@ describe("handover crash recovery and post-accept finalization", () => {
       fakePi: true,
     });
     await service.start();
-    service.provisionSecondmate({ name: "infra", domain: "infra" });
-    service.provisionSecondmate({ name: "docs", domain: "docs" });
+    await service.provisionSecondmate({ name: "infra", domain: "infra" });
+    await service.provisionSecondmate({ name: "docs", domain: "docs" });
     const project = service.projects.register({
       name: "retarget",
       path: home,
@@ -1171,7 +1252,7 @@ describe("handover crash recovery and post-accept finalization", () => {
       fakePi: true,
     });
     await service.start();
-    service.provisionSecondmate({ name: "infra", domain: "infra" });
+    await service.provisionSecondmate({ name: "infra", domain: "infra" });
     const project = service.projects.register({
       name: "tick",
       path: home,

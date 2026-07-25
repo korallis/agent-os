@@ -27,8 +27,12 @@ import {
  *
  * Lifecycle invariant: runtime.json and the children map describe exactly the
  * process that is actually running, at every instant, and only the owner of a
- * pid may clear that pid's record. start/stop for one name share one serial
- * chain so they never interleave bookkeeping.
+ * pid may clear that pid's record.
+ *
+ * Registry mutation ownership: every check-then-act that mutates shared
+ * registry state (provision, updateRecord, start, stop) runs on one serial
+ * mutation chain. A fifth mutator must use the same owner — do not add a
+ * separate lock.
  */
 
 export interface SecondmateRecord {
@@ -90,10 +94,11 @@ export class SecondmateRegistry {
   private sink: SecondmateEventSink = () => undefined;
   private readonly children = new Map<string, ChildProcess>();
   /**
-   * Per-name lifecycle chain — concurrent start()/stop() for one secondmate
-   * must not interleave spawn, kill, or runtime bookkeeping.
+   * Single serial owner for all registry mutations (provision / updateRecord /
+   * start / stop). Concurrent ops never interleave port allocation, spawn,
+   * kill, or bookkeeping.
    */
-  private readonly lifecycleChains = new Map<string, Promise<void>>();
+  private mutationChain: Promise<void> = Promise.resolve();
 
   constructor(agentosHome: string, options?: { primaryPort?: number }) {
     this.primaryHome = agentosHome;
@@ -164,9 +169,14 @@ export class SecondmateRegistry {
    * Does NOT copy auth material (fs scan gate).
    * Validates with provisionSecondmateInputSchema so charter fields
    * (e.g. maxConcurrentTasks 1..32) cannot fail-close admission later.
+   * Serialized on the registry mutation chain (port allocation is exclusive).
    */
-  provision(input: ProvisionSecondmateInput): SecondmateRecord {
+  async provision(input: ProvisionSecondmateInput): Promise<SecondmateRecord> {
     const validated = provisionSecondmateInputSchema.parse(input);
+    return this.enqueueMutation(() => this.provisionExclusive(validated));
+  }
+
+  private provisionExclusive(validated: ProvisionSecondmateInput): SecondmateRecord {
     const safe = validated.name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
     if (safe.length === 0) {
       throw new Error("invalid secondmate name");
@@ -226,7 +236,16 @@ export class SecondmateRegistry {
   }
 
   /** Update persisted provision-record fields after a charter edit. */
-  updateRecord(
+  async updateRecord(
+    name: string,
+    patch: Partial<
+      Pick<SecondmateRecord, "brainModel" | "domain" | "port" | "maxConcurrentTasks">
+    >,
+  ): Promise<SecondmateRecord> {
+    return this.enqueueMutation(() => this.updateRecordExclusive(name, patch));
+  }
+
+  private updateRecordExclusive(
     name: string,
     patch: Partial<
       Pick<SecondmateRecord, "brainModel" | "domain" | "port" | "maxConcurrentTasks">
@@ -311,7 +330,7 @@ export class SecondmateRegistry {
    * Start a secondmate agentosd with AGENTOS_HOME set to its isolated home.
    * Waits until the runtime token exists and /v1/status is healthy before
    * returning. Daemon token is written under primary runtime/ (outside audit).
-   * Serialized per name with stop() so concurrent lifecycle ops cannot race.
+   * Serialized on the registry mutation chain with provision/stop.
    */
   async start(
     name: string,
@@ -323,22 +342,21 @@ export class SecondmateRegistry {
     },
   ): Promise<SecondmateRuntimeState> {
     const safe = name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
-    return this.enqueueLifecycle(safe, () => this.startExclusive(safe, options));
+    return this.enqueueMutation(() => this.startExclusive(safe, options));
   }
 
   /**
-   * Queue start/stop work for one secondmate name so only one lifecycle op
-   * runs at a time. Failures on prior ops do not block the next.
+   * Queue a registry mutation so only one runs at a time. Failures on prior
+   * ops do not block the next.
    */
-  private enqueueLifecycle<T>(name: string, op: () => Promise<T>): Promise<T> {
-    const prev = this.lifecycleChains.get(name) ?? Promise.resolve();
-    const run = prev.then(op, op);
-    this.lifecycleChains.set(
-      name,
-      run.then(
-        () => undefined,
-        () => undefined,
-      ),
+  private enqueueMutation<T>(op: () => Promise<T> | T): Promise<T> {
+    const run = this.mutationChain.then(
+      () => Promise.resolve().then(op),
+      () => Promise.resolve().then(op),
+    );
+    this.mutationChain = run.then(
+      () => undefined,
+      () => undefined,
     );
     return run;
   }
@@ -435,18 +453,28 @@ export class SecondmateRegistry {
       } catch {
         // ignore
       }
-      // Only clear bookkeeping owned by this child — a concurrent loser must
-      // not erase the winner's runtime.json / children entry.
-      const tracked = this.children.get(record.name);
-      if (tracked === child) {
-        this.children.delete(record.name);
+      // Reap before clearing bookkeeping — same as stopExclusive. Erasing
+      // runtime.json while the child still holds the home lock/port orphans it.
+      let reaped = false;
+      try {
+        await waitForExit(child.pid ?? null, child, STOP_EXIT_TIMEOUT_MS);
+        reaped = true;
+      } catch {
+        // Still alive after SIGKILL window — keep tracking so stop/stopAll can reap.
+        reaped = false;
       }
-      const runtime = this.readRuntime(record.name);
-      if (runtime !== null && runtime.pid === child.pid) {
-        try {
-          rmSync(this.runtimeStatePath(record.name), { force: true });
-        } catch {
-          // ignore
+      if (reaped) {
+        const tracked = this.children.get(record.name);
+        if (tracked === child) {
+          this.children.delete(record.name);
+        }
+        const runtime = this.readRuntime(record.name);
+        if (runtime !== null && runtime.pid === child.pid) {
+          try {
+            rmSync(this.runtimeStatePath(record.name), { force: true });
+          } catch {
+            // ignore
+          }
         }
       }
       throw error instanceof SecondmateStartError
@@ -502,12 +530,12 @@ export class SecondmateRegistry {
   /**
    * Stop a running secondmate process and wait for exit before clearing runtime
    * state, so a quick restart cannot race the still-held home lock. Serialized
-   * on the same per-name chain as start(); only clears bookkeeping that still
-   * names the pid this stop targeted.
+   * on the registry mutation chain with provision/start; only clears bookkeeping
+   * that still names the pid this stop targeted.
    */
   async stop(name: string): Promise<{ stopped: boolean; name: string }> {
     const safe = name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
-    return this.enqueueLifecycle(safe, () => this.stopExclusive(safe));
+    return this.enqueueMutation(() => this.stopExclusive(safe));
   }
 
   private async stopExclusive(name: string): Promise<{ stopped: boolean; name: string }> {

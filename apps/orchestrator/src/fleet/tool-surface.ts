@@ -3574,7 +3574,7 @@ export class ToolSurface {
     return { ok: true };
   }
 
-  private provisionSecondmate(raw: Record<string, unknown>): {
+  private async provisionSecondmate(raw: Record<string, unknown>): Promise<{
     secondmate: {
       name: string;
       home: string;
@@ -3583,13 +3583,13 @@ export class ToolSurface {
       brainModel: string | null;
       createdAt: string;
     };
-  } {
+  }> {
     if (this.deps.secondmates === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
     }
     const input = provisionSecondmateInputSchema.parse(raw);
     try {
-      const secondmate = this.deps.secondmates.registry.provision(input);
+      const secondmate = await this.deps.secondmates.registry.provision(input);
       return { secondmate };
     } catch (error) {
       if (error instanceof ZodError) throw error;
