@@ -156,8 +156,11 @@ export const observabilityConfigSchema = z.strictObject({
       streamPipelineLogs: z.boolean(),
       /** Max log characters retained per step in the Console. */
       pipelineLogChars: z.number().int().min(0).max(200_000),
-      /** Event prefixes that additionally raise a Captain wake. */
-      wakeOn: z.array(z.string()),
+      /**
+       * Event prefixes that additionally raise a Captain wake. Same non-empty
+       * rule as `surface` — a blank entry would match every event via startsWith.
+       */
+      wakeOn: z.array(z.string().min(1)),
     }),
   ),
   /** Watch the local no-mistakes gate. Read-only; never drives it. */

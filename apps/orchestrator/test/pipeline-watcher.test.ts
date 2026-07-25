@@ -9,12 +9,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import type { OrchestratorEvent } from "@agent-os/protocol";
+import { observabilityConfigSchema, type OrchestratorEvent } from "@agent-os/protocol";
 import { PipelineWatcher } from "../src/pipeline/watcher.js";
 import {
   eventMatchesSurface,
   eventMatchesWakeOn,
   resolveActiveProfile,
+  wakeClassForEvent,
 } from "../src/observability/profile.js";
 
 function buildGate(dir: string): Database.Database {
@@ -55,6 +56,66 @@ describe("observability profile matching", () => {
     expect(eventMatchesWakeOn("captain.escalation", ["captain.escalation"])).toBe(true);
   });
 
+  it("does not wake the Brain for informational escalations", () => {
+    expect(
+      wakeClassForEvent({
+        type: "captain.escalation",
+        payload: { taskId: null, summary: "provisioned", severity: "info" },
+      }),
+    ).toBeNull();
+    expect(
+      wakeClassForEvent({
+        type: "captain.escalation",
+        payload: { taskId: null, summary: "need a decision", severity: "warn" },
+      }),
+    ).toBe("NEEDS_INPUT");
+    expect(
+      wakeClassForEvent({
+        type: "captain.escalation",
+        payload: { taskId: null, summary: "blocked", severity: "critical" },
+      }),
+    ).toBe("BLOCKED");
+    expect(
+      wakeClassForEvent({
+        type: "pipeline.unavailable",
+        payload: { reason: "missing", missingColumns: [], home: "/tmp" },
+      }),
+    ).toBe("GATE_FAILED");
+  });
+
+  it("rejects empty wakeOn prefixes the same way as surface", () => {
+    const base = {
+      activeProfile: "quiet",
+      profiles: {
+        quiet: {
+          surface: ["task."],
+          streamPipelineLogs: false,
+          pipelineLogChars: 0,
+          wakeOn: ["captain.escalation"],
+        },
+      },
+      watchPipeline: true,
+      pipelinePollMs: 1000,
+    };
+    expect(observabilityConfigSchema.safeParse(base).success).toBe(true);
+    expect(
+      observabilityConfigSchema.safeParse({
+        ...base,
+        profiles: {
+          quiet: { ...base.profiles.quiet, wakeOn: [""] },
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      observabilityConfigSchema.safeParse({
+        ...base,
+        profiles: {
+          quiet: { ...base.profiles.quiet, surface: [""] },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
   it("resolves activeProfile with quiet fallback", () => {
     const config = {
       activeProfile: "missing",
@@ -79,7 +140,7 @@ describe("PipelineWatcher", () => {
     homes.push(gateHome);
     const db = buildGate(gateHome);
     const logPath = join(gateHome, "logs", "review.log");
-    writeFileSync(logPath, "line-one\n");
+    writeFileSync(logPath, "line-one-preexisting\n");
     const now = Date.now();
     db.prepare(
       `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
@@ -111,6 +172,12 @@ describe("PipelineWatcher", () => {
     expect(watcher.status().transport === "wal-assisted" || watcher.status().transport === "interval-only").toBe(
       true,
     );
+    // First sight seeds offset — preexisting log bytes are not replayed.
+    expect(
+      events
+        .filter((e) => e.type === "pipeline.log_appended")
+        .some((e) => e.type === "pipeline.log_appended" && e.payload.chunk.includes("line-one-preexisting")),
+    ).toBe(false);
 
     events.length = 0;
     appendFileSync(logPath, "pure-append-marker\n");
@@ -119,6 +186,7 @@ describe("PipelineWatcher", () => {
     expect(logs.length).toBe(1);
     if (logs[0]?.type === "pipeline.log_appended") {
       expect(logs[0].payload.chunk).toContain("pure-append-marker");
+      expect(logs[0].payload.chunk).not.toContain("line-one-preexisting");
     }
     // No structured change → no extra run_updated.
     expect(events.filter((e) => e.type === "pipeline.run_updated")).toHaveLength(0);
@@ -267,6 +335,55 @@ describe("PipelineWatcher", () => {
     watcher.applyConfig({ watchPipeline: false, pollMs: 1000 });
     expect(watcher.status().transport).toBe("unavailable");
     expect(events.some((e) => e.type === "pipeline.unavailable")).toBe(true);
+    watcher.stop();
+  });
+
+  it("re-attaches WAL watch on later ticks when the WAL appears after start", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-wal-late-"));
+    homes.push(gateHome);
+    // DELETE journal mode has no -wal file at attach time.
+    mkdirSync(join(gateHome, "logs"), { recursive: true });
+    const db = new Database(join(gateHome, "state.sqlite"));
+    db.pragma("journal_mode = DELETE");
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, repo_id TEXT, branch TEXT NOT NULL, head_sha TEXT NOT NULL,
+        base_sha TEXT, status TEXT NOT NULL DEFAULT 'pending', pr_url TEXT, error TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, intent TEXT
+      );
+      CREATE TABLE step_results (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_name TEXT NOT NULL,
+        step_order INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        exit_code INTEGER, duration_ms INTEGER, log_path TEXT, findings_json TEXT,
+        error TEXT, started_at INTEGER, completed_at INTEGER,
+        last_activity_at INTEGER, last_activity TEXT, agent_pid INTEGER, auto_fix_limit INTEGER
+      );
+    `);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.close();
+
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: () => undefined,
+    });
+    watcher.start();
+    expect(watcher.status().transport).toBe("interval-only");
+
+    // A later write under WAL creates the -wal file the honesty label needs.
+    const writer = new Database(join(gateHome, "state.sqlite"));
+    writer.pragma("journal_mode = WAL");
+    writer
+      .prepare(`UPDATE runs SET updated_at = ? WHERE id = 'run1'`)
+      .run(Date.now());
+    writer.close();
+
+    watcher.tick();
+    expect(watcher.status().transport).toBe("wal-assisted");
     watcher.stop();
   });
 });

@@ -423,9 +423,68 @@ try {
   }
 
   // ── G7 — visibility profiles change BEHAVIOUR, hot-reloaded ───────────
-  // Shape checks alone are false confidence. Under quiet, a pipeline log
-  // append must produce no log frames; under firehose it must.
+  // Shape checks alone are false confidence. Prove all three profile axes
+  // end-to-end: streamPipelineLogs emission, surface filtering on SSE, and
+  // wakeOn delivery into the wake history.
   {
+    const post = async (path, body) =>
+      (
+        await fetch(`${BASE}${path}`, {
+          method: "POST",
+          headers: auth,
+          body: JSON.stringify(body),
+        })
+      ).json();
+    const tool = (name, input) => post("/v1/tools/call", { tool: name, input });
+
+    /** Collect live SSE frames until predicate or timeout (not durable replay). */
+    const readSse = async (until, timeoutMs = 5000) => {
+      const controller = new AbortController();
+      const response = await fetch(`${BASE}/v1/events`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const frames = [];
+      let buffer = "";
+      let pending = null;
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        pending ??= reader.read();
+        const race = await Promise.race([pending, sleep(100).then(() => "timeout")]);
+        if (race === "timeout") {
+          if (until(frames)) break;
+          continue;
+        }
+        pending = null;
+        if (race.done) break;
+        buffer += decoder.decode(race.value, { stream: true });
+        let sep = buffer.indexOf("\n\n");
+        while (sep !== -1) {
+          const block = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+          if (dataLine) {
+            try {
+              frames.push(JSON.parse(dataLine.slice(6)));
+            } catch {
+              // ignore malformed frame
+            }
+          }
+          sep = buffer.indexOf("\n\n");
+        }
+        if (until(frames)) break;
+      }
+      controller.abort();
+      try {
+        reader.cancel();
+      } catch {
+        // ignore
+      }
+      return frames;
+    };
+
     const setActiveProfile = async (name) => {
       const configPath = join(home, "config", "observability.json5");
       const raw = readFileSync(configPath, "utf8");
@@ -463,6 +522,7 @@ try {
 
     await setActiveProfile("quiet");
 
+    // ── axis 1: streamPipelineLogs ─────────────────────────────────────
     const countLogFrames = async () => {
       const replay = await get("/v1/events/replay?types=pipeline.log_appended&limit=10000");
       return (replay.events ?? []).length;
@@ -474,6 +534,59 @@ try {
     const afterQuiet = await countLogFrames();
     const quietBlocks = afterQuiet === beforeQuiet;
 
+    // ── axis 2: surface — SSE under quiet must filter pipeline.* ────────
+    // Quiet surfaces task./captain./brain.down/pipeline.unavailable only.
+    // A live pipeline.run_updated must not reach the Console SSE path; a
+    // captain.escalation must. Collect a fixed window (do not wait for the
+    // blocked type — it must never arrive).
+    const quietEscalationSummary = `G7-quiet-surface-${Date.now()}`;
+    const quietRunId = `01RUNG7QUIET${String(Date.now()).slice(-10)}`;
+    const quietSsePromise = readSse(() => false, 4000);
+    await sleep(300);
+    seedRun(fixtureDb, quietRunId, "phase-x/g7-quiet", [
+      { name: "review", status: "running", lastActivity: "g7 quiet surface" },
+    ]);
+    await tool("escalate_to_captain", {
+      summary: quietEscalationSummary,
+      severity: "warn",
+    });
+    const quietFrames = await quietSsePromise;
+    const quietSurfacesEscalation = quietFrames.some(
+      (f) =>
+        f.event?.type === "captain.escalation" &&
+        f.event?.payload?.summary === quietEscalationSummary,
+    );
+    const quietBlocksPipelineSse = !quietFrames.some(
+      (f) => f.event?.type === "pipeline.run_updated",
+    );
+    // Durable store still has the run update — filtering is live-path only.
+    const durableHasQuietRun = (
+      (await get("/v1/events/replay?types=pipeline.run_updated&limit=200")).events ?? []
+    ).some((e) => e.event?.payload?.runId === quietRunId);
+
+    // ── axis 3: wakeOn under quiet ─────────────────────────────────────
+    // Matching warn escalation wakes; info does not (noise, not a decision);
+    // pipeline.run_updated is not in quiet.wakeOn and must not wake.
+    const wakesAfterQuiet = (await get("/v1/wakes")).wakes ?? [];
+    const quietWarnWoke = wakesAfterQuiet.some(
+      (w) =>
+        w.summary === quietEscalationSummary &&
+        w.class === "NEEDS_INPUT" &&
+        w.absorbed === false,
+    );
+    const infoSummary = `G7-info-no-wake-${Date.now()}`;
+    await tool("notify_captain", { summary: infoSummary, severity: "info" });
+    await sleep(300);
+    const wakesAfterInfo = (await get("/v1/wakes")).wakes ?? [];
+    const infoDidNotWake = !wakesAfterInfo.some((w) => w.summary === infoSummary);
+    const pipelineDidNotWake = !wakesAfterQuiet.some(
+      (w) =>
+        typeof w.detail?.eventType === "string" &&
+        w.detail.eventType === "pipeline.run_updated" &&
+        w.detail.source === "observability.wakeOn",
+    );
+
+    // ── firehose: logs stream + surface admits pipeline.* ──────────────
     await setActiveProfile("firehose");
     const firehoseMarker = `FIREHOSE-LINE-${Date.now()}`;
     appendFileSync(logPath, `${firehoseMarker}\n`);
@@ -488,6 +601,57 @@ try {
       await sleep(100);
     }
 
+    const firehoseRunId = `01RUNG7FIRE${String(Date.now()).slice(-10)}`;
+    const firehoseSsePromise = readSse(
+      (frames) => frames.some((f) => f.event?.type === "pipeline.run_updated"),
+      6000,
+    );
+    await sleep(200);
+    seedRun(fixtureDb, firehoseRunId, "phase-x/g7-firehose", [
+      { name: "review", status: "running", lastActivity: "g7 firehose surface" },
+    ]);
+    const firehoseFrames = await firehoseSsePromise;
+    const firehoseSurfacesPipeline = firehoseFrames.some(
+      (f) =>
+        f.event?.type === "pipeline.run_updated" && f.event?.payload?.runId === firehoseRunId,
+    );
+
+    // firehose wakeOn includes pipeline.unavailable — turning watch off raises it.
+    const wakesBeforeUnavail = ((await get("/v1/wakes")).wakes ?? []).length;
+    const unavailConfigPath = join(home, "config", "observability.json5");
+    const unavailRaw = readFileSync(unavailConfigPath, "utf8");
+    writeFileSync(
+      unavailConfigPath,
+      unavailRaw.replace(/watchPipeline:\s*true/, "watchPipeline: false"),
+    );
+    let firehoseWakeOnUnavailable = false;
+    const unavailDeadline = Date.now() + 10_000;
+    while (Date.now() < unavailDeadline) {
+      const wakes = (await get("/v1/wakes")).wakes ?? [];
+      if (
+        wakes.length > wakesBeforeUnavail &&
+        wakes.some(
+          (w) =>
+            w.class === "GATE_FAILED" &&
+            w.detail?.eventType === "pipeline.unavailable" &&
+            w.detail?.source === "observability.wakeOn",
+        )
+      ) {
+        firehoseWakeOnUnavailable = true;
+        break;
+      }
+      await sleep(200);
+    }
+    // Restore watch so later cleanup is clean.
+    writeFileSync(
+      unavailConfigPath,
+      readFileSync(unavailConfigPath, "utf8").replace(
+        /watchPipeline:\s*false/,
+        "watchPipeline: true",
+      ),
+    );
+    await sleep(500);
+
     const reloaded = (await get("/v1/config/effective")).config?.observability?.activeProfile;
 
     gate(
@@ -499,8 +663,29 @@ try {
         shippedDefaultIsQuiet &&
         quietBlocks &&
         firehoseStreams &&
+        quietSurfacesEscalation &&
+        quietBlocksPipelineSse &&
+        durableHasQuietRun &&
+        firehoseSurfacesPipeline &&
+        quietWarnWoke &&
+        infoDidNotWake &&
+        pipelineDidNotWake &&
+        firehoseWakeOnUnavailable &&
         reloaded === "firehose",
-      `profiles=${profiles.join(",")} quietBlocks=${quietBlocks} firehoseStreams=${firehoseStreams} reloadedTo=${reloaded}`,
+      [
+        `profiles=${profiles.join(",")}`,
+        `quietBlocks=${quietBlocks}`,
+        `firehoseStreams=${firehoseStreams}`,
+        `quietSseEscalation=${quietSurfacesEscalation}`,
+        `quietSseBlocksPipeline=${quietBlocksPipelineSse}`,
+        `durableQuietRun=${durableHasQuietRun}`,
+        `firehoseSsePipeline=${firehoseSurfacesPipeline}`,
+        `quietWarnWoke=${quietWarnWoke}`,
+        `infoDidNotWake=${infoDidNotWake}`,
+        `pipelineDidNotWake=${pipelineDidNotWake}`,
+        `firehoseWakeOnUnavailable=${firehoseWakeOnUnavailable}`,
+        `reloadedTo=${reloaded}`,
+      ].join(" "),
     );
   }
 

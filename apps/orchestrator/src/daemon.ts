@@ -27,8 +27,9 @@ import { PipelineWatcher } from "./pipeline/watcher.js";
 import {
   eventMatchesWakeOn,
   resolveActiveProfile,
+  wakeClassForEvent,
 } from "./observability/profile.js";
-import type { OrchestratorEvent, QuotaSample, WakeClass } from "@agent-os/protocol";
+import type { OrchestratorEvent, QuotaSample } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
 import { PromptService } from "./prompts/service.js";
 import { AnalyticsService } from "./analytics/service.js";
@@ -342,8 +343,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       try {
         const { profile } = resolveActiveProfile(configService.effective().config.observability);
         if (!eventMatchesWakeOn(envelope.event.type, profile.wakeOn)) return;
+        const wakeClass = wakeClassForEvent(envelope.event);
+        // null = profile-matched type that is still not worth a Brain wake
+        // (e.g. captain.escalation with severity "info").
+        if (wakeClass === null) return;
         fleet.watcher.classify({
-          class: wakeClassForEvent(envelope.event),
+          class: wakeClass,
           taskId: taskIdFromEvent(envelope.event),
           summary: wakeSummaryForEvent(envelope.event),
           detail: { eventType: envelope.event.type, source: "observability.wakeOn" },
@@ -522,19 +527,6 @@ function applyPipelineObservability(
     watchPipeline: observability.watchPipeline,
     pollMs: observability.pipelinePollMs,
   });
-}
-
-function wakeClassForEvent(event: OrchestratorEvent): WakeClass {
-  switch (event.type) {
-    case "pipeline.unavailable":
-      return "GATE_FAILED";
-    case "scout.write_violation":
-      return "SECURITY";
-    case "captain.escalation":
-      return event.payload.severity === "critical" ? "BLOCKED" : "NEEDS_INPUT";
-    default:
-      return "STATUS";
-  }
 }
 
 function taskIdFromEvent(event: OrchestratorEvent): string | null {

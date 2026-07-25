@@ -458,6 +458,17 @@ export class PipelineWatcher {
 
       this.structuredReadFailures = 0;
       this.lastPollAt = Date.now();
+      // A gate that was idle at first attach may not have a WAL yet. Re-try
+      // while interval-only so the honesty label can upgrade to wal-assisted
+      // once no-mistakes creates the file.
+      if (!this.walWatchAttached) {
+        this.attachWalWatch();
+        if (this.walWatchAttached) {
+          this.transport = "wal-assisted";
+        } else if (this.transport !== "unavailable") {
+          this.transport = "interval-only";
+        }
+      }
     } catch (error) {
       // A read failure must never take the daemon with it; repeated failures
       // mark compatibility failed so the UI cannot keep showing last-known rows.
@@ -473,22 +484,29 @@ export class PipelineWatcher {
       if (!existsSync(logPath)) return;
       const size = statSync(logPath).size;
       const key = `${runId}:${step}`;
-      const previous = this.logOffsets.get(key) ?? Math.max(0, size - 4096);
-      if (size <= previous) {
-        // Truncation or rotation — resync rather than emitting garbage.
-        if (size < previous) this.logOffsets.set(key, size);
+      const known = this.logOffsets.get(key);
+      // First sight: seed to current size without emitting. Catch-up of prior
+      // bytes belongs in the UI; replaying into the durable event log on every
+      // daemon restart would bloat it monotonically.
+      if (known === undefined) {
+        this.logOffsets.set(key, size);
         return;
       }
-      const toRead = Math.min(LOG_CHUNK_MAX, size - previous);
+      if (size <= known) {
+        // Truncation or rotation — resync rather than emitting garbage.
+        if (size < known) this.logOffsets.set(key, size);
+        return;
+      }
+      const toRead = Math.min(LOG_CHUNK_MAX, size - known);
       const buffer = Buffer.alloc(toRead);
       const fd = openSync(logPath, "r");
       try {
-        readSync(fd, buffer, 0, toRead, previous);
+        readSync(fd, buffer, 0, toRead, known);
       } finally {
         closeSync(fd);
       }
       const chunk = buffer.toString("utf8");
-      this.logOffsets.set(key, previous + toRead);
+      this.logOffsets.set(key, known + toRead);
       if (chunk.trim().length === 0) return;
       this.sink({
         type: "pipeline.log_appended",

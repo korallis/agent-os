@@ -1,4 +1,4 @@
-import type { ObservabilityConfig } from "@agent-os/protocol";
+import type { ObservabilityConfig, OrchestratorEvent, WakeClass } from "@agent-os/protocol";
 
 export type ObservabilityProfile = ObservabilityConfig["profiles"][string];
 
@@ -51,4 +51,23 @@ export function eventMatchesSurface(eventType: string, surface: readonly string[
 /** Same prefix rules as surface — used for wakeOn. */
 export function eventMatchesWakeOn(eventType: string, wakeOn: readonly string[]): boolean {
   return eventMatchesSurface(eventType, wakeOn);
+}
+
+/**
+ * Map a wakeOn-matched event to a wake class, or null when the event must not
+ * wake the Brain. Informational escalations are notices, not decisions —
+ * under the quiet default they must not cost Brain tokens.
+ */
+export function wakeClassForEvent(event: OrchestratorEvent): WakeClass | null {
+  switch (event.type) {
+    case "pipeline.unavailable":
+      return "GATE_FAILED";
+    case "scout.write_violation":
+      return "SECURITY";
+    case "captain.escalation":
+      if (event.payload.severity === "info") return null;
+      return event.payload.severity === "critical" ? "BLOCKED" : "NEEDS_INPUT";
+    default:
+      return "STATUS";
+  }
 }
