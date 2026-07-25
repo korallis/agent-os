@@ -1407,7 +1407,15 @@ export class ToolSurface {
       // Status stays "running" (historical harness contract); the wake is what
       // the Brain sees. Fusion sides finalize via completeFusionSide after the
       // dispatch path registers ownership.
+      // A PROGRESS wake is classified first so the zero-token absorb path is
+      // exercised end-to-end (same class a real extension lifecycle would emit).
       if (fake) {
+        this.deps.watcher.classify({
+          class: "PROGRESS",
+          taskId: task.id,
+          sessionId,
+          summary: `progress on ${task.title}`,
+        });
         this.deps.watcher.classify({
           class: "AGENT_SETTLED",
           taskId: task.id,

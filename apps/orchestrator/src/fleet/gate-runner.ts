@@ -316,7 +316,17 @@ export class GateRunner {
     const gateEnv = buildGateEnv(process.env, input.target);
 
     if (process.env.AGENTOS_FAKE_GATE === "1") {
-      const forced = process.env.AGENTOS_FAKE_GATE_OUTCOME as GateOutcome | undefined;
+      // Outcome resolution order for zero-token fixtures:
+      // 1. AGENTOS_FAKE_GATE_OUTCOME env (process-wide)
+      // 2. $AGENTOS_HOME/fake-gate-outcome file (per-seed, gate scripts write this)
+      // 3. target defaults (baseline → EXPECTED_RED, candidate → PASS)
+      const fileOutcomePath = join(this.home, "fake-gate-outcome");
+      const fileOutcome = existsSync(fileOutcomePath)
+        ? readFileSync(fileOutcomePath, "utf8").trim()
+        : "";
+      const forced =
+        (process.env.AGENTOS_FAKE_GATE_OUTCOME as GateOutcome | undefined) ??
+        (fileOutcome.length > 0 ? (fileOutcome as GateOutcome) : undefined);
       if (forced !== undefined) {
         stdout = forced;
       } else if (input.target === "baseline") {

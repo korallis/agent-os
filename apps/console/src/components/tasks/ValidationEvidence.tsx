@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
-import type { EventEnvelope } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
+import { fetchTaskEvents } from "@/lib/fetchTaskEvents";
 
 /**
  * Auto-validate evidence (master plan §7.2).
@@ -37,6 +37,8 @@ const OUTCOME_MEANING: Record<string, string> = {
   GATE_ERROR: "The gate could not run — infrastructure error, not a verdict, no attempt consumed",
 };
 
+const GATE_TYPES = new Set(["gate.result"]);
+
 export function ValidationEvidence({
   taskId,
   validationAttempt,
@@ -50,17 +52,16 @@ export function ValidationEvidence({
   const refreshKey =
     lastEvent !== null && lastEvent.event.type === "gate.result" ? lastEvent.id : "init";
   const [results, setResults] = useState<GateResult[]>([]);
+  const [truncated, setTruncated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/agentos/events/replay", { cache: "no-store" })
-      .then(async (res) => {
-        if (cancelled || !res.ok) return;
-        const body = (await res.json()) as { events: EventEnvelope[] };
+    fetchTaskEvents(taskId, GATE_TYPES)
+      .then((result) => {
+        if (cancelled) return;
         const mine: GateResult[] = [];
-        for (const envelope of body.events) {
+        for (const envelope of result.events) {
           if (envelope.event.type !== "gate.result") continue;
-          if (envelope.event.payload.taskId !== taskId) continue;
           mine.push({
             target: envelope.event.payload.target,
             outcome: envelope.event.payload.outcome,
@@ -70,6 +71,7 @@ export function ValidationEvidence({
           });
         }
         setResults(mine);
+        setTruncated(result.truncated);
       })
       .catch(() => undefined);
     return () => {
@@ -93,6 +95,7 @@ export function ValidationEvidence({
         >
           attempt {validationAttempt} / {maxValidations}
           {exhausted && " — halted at cap"}
+          {truncated && " · history truncated"}
         </span>
       </div>
       <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">

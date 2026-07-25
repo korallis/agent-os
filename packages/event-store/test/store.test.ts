@@ -122,6 +122,25 @@ describe("EventStore", () => {
     store.close();
   });
 
+  it("supports newest-first reverse scan with truncation", () => {
+    const { store } = EventStore.open(home);
+    const envelopes = Array.from({ length: 10 }, (_, i) => store.append(configChanged(i)));
+    const newest = store.eventsBeforeId(null, 3);
+    expect(newest.events).toHaveLength(3);
+    expect(newest.truncated).toBe(true);
+    expect(newest.events.map((e) => e.seq)).toEqual([10, 9, 8]);
+
+    const page2 = store.eventsBeforeId(newest.events[2]?.id ?? null, 3);
+    expect(page2.events.map((e) => e.seq)).toEqual([7, 6, 5]);
+
+    const since = envelopes[0]?.ts ?? new Date(0).toISOString();
+    const windowed = store.eventsSince(since, 4);
+    expect(windowed.events).toHaveLength(4);
+    expect(windowed.truncated).toBe(true);
+    expect(store.countSince(since)).toBe(10);
+    store.close();
+  });
+
   it("fans out appended events to subscribers", () => {
     const { store } = EventStore.open(home);
     const seen: number[] = [];

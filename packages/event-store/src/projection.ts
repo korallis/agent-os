@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { desc, eq, gt } from "drizzle-orm";
+import { desc, eq, gt, gte, lt } from "drizzle-orm";
 import type { EventEnvelope } from "@agent-os/protocol";
 import { MIGRATIONS, configRevisions, connections, events, quotaSamples } from "./schema.js";
 
@@ -148,6 +148,46 @@ export class SqliteProjection {
       .limit(limit)
       .all();
     return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /**
+   * Newest-first page: events with seq strictly less than `beforeSeq`
+   * (or the newest `limit` events when `beforeSeq` is null).
+   */
+  eventsBeforeSeq(beforeSeq: number | null, limit: number): EventEnvelope[] {
+    const query = this.db.select({ envelope: events.envelope }).from(events);
+    const rows =
+      beforeSeq === null
+        ? query.orderBy(desc(events.seq)).limit(limit).all()
+        : query
+            .where(lt(events.seq, beforeSeq))
+            .orderBy(desc(events.seq))
+            .limit(limit)
+            .all();
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /**
+   * Events at or after an ISO timestamp, oldest-first within the page.
+   * Used by analytics so a day window is not silently the oldest N frames.
+   */
+  eventsSinceTs(sinceTs: string, limit: number): EventEnvelope[] {
+    const rows = this.db
+      .select({ envelope: events.envelope })
+      .from(events)
+      .where(gte(events.ts, sinceTs))
+      .orderBy(events.seq)
+      .limit(limit)
+      .all();
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /** Count of events at or after an ISO timestamp (truncation detection). */
+  countSinceTs(sinceTs: string): number {
+    const row = this.sqlite
+      .prepare("SELECT COUNT(*) AS n FROM events WHERE ts >= ?")
+      .get(sinceTs) as { n: number };
+    return row.n;
   }
 
   seqOfEventId(id: string): number | null {

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type { AnalyticsSnapshot, TaskListItem } from "@agent-os/protocol";
 import { Icon } from "@/components/shell/Icon";
+import { EmptyState } from "@/components/shell/EmptyState";
 import { useEventStream } from "@/lib/useEventStream";
 
 /**
@@ -167,9 +168,11 @@ function TokenConsumptionCard({ analytics }: { analytics: AnalyticsSnapshot | nu
       </div>
       <p className="mt-4 text-4xl font-medium text-fg-1">{compactNumber(tokens)}</p>
       <p className="mt-4 text-[11px] text-fg-3">
-        {cost !== null
-          ? `$${cost.toFixed(2)} reported by providers`
-          : "Cost not reported by any connected provider"}
+        {totals?.costCoverage === "partial"
+          ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost ($${cost?.toFixed(2) ?? "0.00"})`
+          : cost !== null
+            ? `$${cost.toFixed(2)} reported by providers`
+            : "Cost not reported by any connected provider"}
       </p>
       <p className="mt-2 text-xs text-fg-3">
         {totals?.requests ?? 0} requests · in {compactNumber(totals?.inputTokens ?? 0)} / out{" "}
@@ -177,9 +180,12 @@ function TokenConsumptionCard({ analytics }: { analytics: AnalyticsSnapshot | nu
       </p>
       <div className="mt-3 flex-1 rounded-2xl bg-panel-2 p-4 flex flex-col gap-3">
         {topModels.length === 0 ? (
-          <p className="text-[13px] text-fg-3 my-auto">
-            No model usage recorded yet — spawn a crewmate to see consumption here.
-          </p>
+          <EmptyState
+            kind="no-data"
+            title="No model usage yet"
+            body="Spawn a crewmate to see consumption here."
+            className="border-0 bg-transparent my-auto py-6"
+          />
         ) : (
           topModels.map((m) => {
             const total = m.inputTokens + m.outputTokens;
@@ -257,7 +263,12 @@ function TopAgentsCard({ analytics }: { analytics: AnalyticsSnapshot | null }) {
       </div>
       <div className="flex flex-col gap-2 px-4 pb-4">
         {agents.length === 0 && (
-          <p className="text-[13px] text-fg-3 py-6 text-center">No agent telemetry yet.</p>
+          <EmptyState
+            kind="no-data"
+            title="No agent telemetry yet"
+            body="Per-role usage appears as crewmates report tokens."
+            className="border-0 bg-transparent py-6"
+          />
         )}
         {agents.map((agent) => (
           <div
@@ -310,9 +321,12 @@ function RecentTasksTable({ tasks }: { tasks: TaskListItem[] }) {
         </Link>
       </div>
       {recent.length === 0 ? (
-        <p className="px-4 py-10 text-center text-[13px] text-fg-3">
-          No tasks yet. Register a project and dispatch one to see it here.
-        </p>
+        <EmptyState
+          kind="no-data"
+          title="No tasks yet"
+          body="Register a project and dispatch one to see it here."
+          className="border-0 bg-transparent mx-4 my-6"
+        />
       ) : (
         <table className="w-full text-left">
           <thead>

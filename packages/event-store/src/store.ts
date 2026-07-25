@@ -112,8 +112,43 @@ export class EventStore {
     return { events: truncated ? events.slice(0, limit) : events, truncated };
   }
 
+  /**
+   * Newest-first page for evidence surfaces and reverse scans.
+   * `beforeId` is exclusive (events strictly older than that ULID).
+   * Unknown `beforeId` is treated as "from the newest end".
+   */
+  eventsBeforeId(
+    beforeId: string | null,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    let beforeSeq: number | null = null;
+    if (beforeId !== null) {
+      beforeSeq = this.projection.seqOfEventId(beforeId);
+    }
+    const events = this.projection.eventsBeforeSeq(beforeSeq, limit + 1);
+    const truncated = events.length > limit;
+    return { events: truncated ? events.slice(0, limit) : events, truncated };
+  }
+
+  /**
+   * Time-bounded forward scan: events at or after `sinceTs`, oldest-first.
+   * `truncated` is true when more events exist in the window than `limit`.
+   */
+  eventsSince(
+    sinceTs: string,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const events = this.projection.eventsSinceTs(sinceTs, limit + 1);
+    const truncated = events.length > limit;
+    return { events: truncated ? events.slice(0, limit) : events, truncated };
+  }
+
   count(): number {
     return this.projection.count();
+  }
+
+  countSince(sinceTs: string): number {
+    return this.projection.countSinceTs(sinceTs);
   }
 
   lastSeq(): number {

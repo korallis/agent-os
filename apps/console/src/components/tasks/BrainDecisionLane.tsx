@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
-import type { EventEnvelope } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
+import { fetchTaskEvents } from "@/lib/fetchTaskEvents";
 
 /**
  * Brain decision lane (master plan §7.2).
@@ -23,22 +23,23 @@ interface Invocation {
   ts: string;
 }
 
+const TOOL_TYPES = new Set(["tool.invoked"]);
+
 export function BrainDecisionLane({ taskId }: { taskId: string }) {
   const { lastEvent } = useEventStream();
   const refreshKey =
     lastEvent !== null && lastEvent.event.type === "tool.invoked" ? lastEvent.id : "init";
   const [calls, setCalls] = useState<Invocation[]>([]);
+  const [truncated, setTruncated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/agentos/events/replay", { cache: "no-store" })
-      .then(async (res) => {
-        if (cancelled || !res.ok) return;
-        const body = (await res.json()) as { events: EventEnvelope[] };
+    fetchTaskEvents(taskId, TOOL_TYPES)
+      .then((result) => {
+        if (cancelled) return;
         const mine: Invocation[] = [];
-        for (const envelope of body.events) {
+        for (const envelope of result.events) {
           if (envelope.event.type !== "tool.invoked") continue;
-          if (envelope.event.payload.taskId !== taskId) continue;
           mine.push({
             tool: envelope.event.payload.tool,
             ok: envelope.event.payload.ok,
@@ -48,6 +49,7 @@ export function BrainDecisionLane({ taskId }: { taskId: string }) {
           });
         }
         setCalls(mine);
+        setTruncated(result.truncated);
       })
       .catch(() => undefined);
     return () => {
@@ -65,6 +67,7 @@ export function BrainDecisionLane({ taskId }: { taskId: string }) {
         <span className="text-[11px] text-fg-3">
           {calls.length} tool call{calls.length === 1 ? "" : "s"}
           {refused > 0 && ` · ${refused} refused by the substrate`}
+          {truncated && " · history truncated"}
         </span>
       </div>
       <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">

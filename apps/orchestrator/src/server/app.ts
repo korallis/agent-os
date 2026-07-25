@@ -234,6 +234,15 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     return { wakes: deps.fleet.watcher.getHistory(200) };
   });
 
+  // Console + phase-6 gates hit the fleet-prefixed path.
+  app.get("/v1/fleet/wakes", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { wakes: deps.fleet.watcher.getHistory(200) };
+  });
+
   app.get("/v1/projects", async (_request, reply) => {
     if (deps.fleet === undefined) {
       sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
@@ -654,6 +663,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
 
   const replayQuerySchema = z.object({
     after: z.string().optional(),
+    /** Exclusive upper bound for newest-first pages (`order=desc`). */
+    before: z.string().optional(),
+    /**
+     * `asc` — oldest-first after `after` (SSE Last-Event-ID semantics, default).
+     * `desc` — newest-first before `before` (evidence surfaces).
+     */
+    order: z.enum(["asc", "desc"]).default("asc"),
     limit: z.coerce.number().int().min(1).max(10_000).default(1000),
   });
 
@@ -662,6 +678,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     if (!query.success) {
       sendError(reply, 400, "BAD_REQUEST", "invalid replay query");
       return undefined;
+    }
+    if (query.data.order === "desc") {
+      const { events, truncated } = deps.store.eventsBeforeId(
+        query.data.before ?? null,
+        query.data.limit,
+      );
+      return { events, truncated };
     }
     const { events, truncated } = deps.store.eventsAfterId(
       query.data.after ?? null,

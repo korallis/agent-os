@@ -5,6 +5,7 @@ import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type { FleetStateSnapshot, TaskListItem, WakeDigest } from "@agent-os/protocol";
 import { Icon } from "@/components/shell/Icon";
+import { EmptyState } from "@/components/shell/EmptyState";
 import { useEventStream } from "@/lib/useEventStream";
 
 /**
@@ -186,9 +187,21 @@ export function NotificationsView() {
           <span className="text-[11px] text-fg-3">{visible.length} shown</span>
         </div>
         {visible.length === 0 ? (
-          <p className="px-4 py-10 text-center text-[13px] text-fg-3">
-            No wakes recorded yet.
-          </p>
+          wakes.length === 0 ? (
+            <EmptyState
+              kind="no-data"
+              title="No wakes recorded yet"
+              body="The zero-token watcher will list every classified wake here as the fleet runs."
+              className="border-0 bg-transparent m-4"
+            />
+          ) : (
+            <EmptyState
+              kind="no-results"
+              title="No matching wakes"
+              body="No wakes match the current filter. Try All or another chip."
+              className="border-0 bg-transparent m-4"
+            />
+          )
         ) : (
           <ul className="divide-y divide-line-1/60">
             {visible.map((wake) => {

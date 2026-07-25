@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { AnalyticsSnapshot, BudgetsConfig } from "@agent-os/protocol";
 import { Icon } from "@/components/shell/Icon";
+import { EmptyState } from "@/components/shell/EmptyState";
 import { QuotaUsageStrip } from "@/components/analytics/QuotaUsageStrip";
 import { useEventStream } from "@/lib/useEventStream";
 
@@ -14,8 +15,8 @@ import { useEventStream } from "@/lib/useEventStream";
  * Two honesty rules govern this screen:
  *  - a figure that cannot be derived renders as "—" with a stated reason, never
  *    as a plausible number;
- *  - cost is distinguished between "no provider reported it" and "zero", since
- *    subscription-billed connections legitimately report no per-token cost.
+ *  - cost is distinguished between "no provider reported it", "partial coverage",
+ *    and "complete" — subscription legs never silently read as $0.00.
  */
 
 const SERIES_COLORS = ["bg-teal-brand", "bg-electric", "bg-[#a855f7]", "bg-warn", "bg-ok"] as const;
@@ -25,6 +26,20 @@ function compact(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
   return String(value);
+}
+
+function formatRowCost(costUsd: number | null): string {
+  if (costUsd === null) return "—";
+  return `$${costUsd.toFixed(2)}`;
+}
+
+function costNote(totals: AnalyticsSnapshot["totals"] | undefined, windowDays: number): string {
+  if (totals === undefined) return `over ${windowDays}d`;
+  if (totals.costCoverage === "absent") return "not reported by providers";
+  if (totals.costCoverage === "partial") {
+    return `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost`;
+  }
+  return `over ${windowDays}d`;
 }
 
 function Card({ className, children }: { className?: string; children: React.ReactNode }) {
@@ -68,25 +83,30 @@ export function AnalyticsView() {
   const maxDaily = Math.max(...daily.map((d) => d.inputTokens + d.outputTokens), 1);
   const models = snapshot?.models ?? [];
   const agents = snapshot?.agents ?? [];
-  const modelCostTotal = models.reduce((sum, m) => sum + m.costUsd, 0);
+  const modelCostTotal = models.reduce(
+    (sum, m) => sum + (m.costUsd === null ? 0 : m.costUsd),
+    0,
+  );
+  const anyModelCost = models.some((m) => m.costUsd !== null);
+  const windowDays = snapshot?.windowDays ?? 14;
 
   const stats = [
     {
       label: "Total Spend",
       value: cost === null ? "—" : `$${cost.toFixed(2)}`,
-      note: cost === null ? "not reported by providers" : `over ${snapshot?.windowDays ?? 14}d`,
-      noteClass: "text-fg-3",
+      note: costNote(totals, windowDays),
+      noteClass: totals?.costCoverage === "partial" ? "text-warn" : "text-fg-3",
     },
     {
       label: "Tokens Used",
       value: compact(tokensUsed),
-      note: `${totals?.requests ?? 0} requests`,
+      note: `${totals?.requests ?? 0} requests · last ${windowDays}d`,
       noteClass: "text-fg-3",
     },
     {
       label: "Tasks Done",
       value: String(totals?.tasksDone ?? 0),
-      note: `${totals?.tasksTotal ?? 0} total`,
+      note: `${totals?.tasksTotal ?? 0} created · last ${windowDays}d`,
       noteClass: "text-fg-3",
     },
     {
@@ -99,13 +119,10 @@ export function AnalyticsView() {
     },
   ];
 
-  // Budget bar only renders when a budget is actually configured AND cost is
-  // known — a progress bar against an unknown numerator is worse than none.
-  const monthlyBudget = budgets?.perTaskUsd ?? 0;
-  const gatewayBudget = budgets?.gatewayHardUsd ?? 0;
-  const budgetCeiling = gatewayBudget > 0 ? gatewayBudget : monthlyBudget;
+  // Only a genuine fleet-wide ceiling may drive the bar — never per-task.
+  const fleetCeiling = budgets?.gatewayHardUsd ?? 0;
   const budgetPct =
-    cost !== null && budgetCeiling > 0 ? Math.min(100, (cost / budgetCeiling) * 100) : null;
+    cost !== null && fleetCeiling > 0 ? Math.min(100, (cost / fleetCeiling) * 100) : null;
 
   return (
     <main className="flex-1 flex flex-col gap-5 p-8">
@@ -121,9 +138,16 @@ export function AnalyticsView() {
         </div>
         <span className="flex items-center gap-2 h-9 rounded-lg bg-panel border border-line-1 px-3.5 text-[13px] font-medium text-fg-1">
           <Icon src="calendar.svg" className="size-4" />
-          Last {snapshot?.windowDays ?? 14} days
+          Last {windowDays} days
         </span>
       </div>
+
+      {snapshot?.truncated === true && (
+        <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
+          Event history for this window was truncated at the analytics read bound —
+          figures may omit older frames inside the {windowDays}-day range.
+        </div>
+      )}
 
       <QuotaUsageStrip />
 
@@ -146,10 +170,13 @@ export function AnalyticsView() {
               <h3 className="text-[15px] font-semibold text-fg-1">Daily Token Consumption</h3>
               <span className="text-[11px] text-fg-3">input + output</span>
             </div>
-            {daily.length === 0 ? (
-              <p className="py-12 text-center text-[13px] text-fg-3">
-                No usage recorded yet.
-              </p>
+            {daily.every((d) => d.inputTokens + d.outputTokens === 0) ? (
+              <EmptyState
+                kind="no-data"
+                title="No usage recorded yet"
+                body="Token consumption appears here as providers report usage frames."
+                className="border-0 bg-transparent py-10"
+              />
             ) : (
               <div className="flex items-end gap-3 h-[180px]">
                 {daily.map((d) => {
@@ -175,9 +202,12 @@ export function AnalyticsView() {
           <Card className="p-6 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Usage by Agent</h3>
             {agents.length === 0 ? (
-              <p className="py-6 text-center text-[13px] text-fg-3">
-                No agent telemetry yet.
-              </p>
+              <EmptyState
+                kind="no-data"
+                title="No agent telemetry yet"
+                body="Per-role usage appears after crewmates report ext.usage frames."
+                className="border-0 bg-transparent py-6"
+              />
             ) : (
               <>
                 <div className="flex items-center h-8 text-[11px] text-fg-3 border-b border-line-1">
@@ -196,9 +226,7 @@ export function AnalyticsView() {
                     <span className="w-[100px] text-fg-1">
                       {compact(agent.inputTokens + agent.outputTokens)}
                     </span>
-                    <span className="w-[90px] text-fg-1">
-                      {agent.costUsd > 0 ? `$${agent.costUsd.toFixed(2)}` : "—"}
-                    </span>
+                    <span className="w-[90px] text-fg-1">{formatRowCost(agent.costUsd)}</span>
                     <span className="w-[80px] text-fg-2">{agent.sharePct}%</span>
                     <span className="w-[90px] text-fg-2">{agent.requests}</span>
                   </div>
@@ -212,22 +240,29 @@ export function AnalyticsView() {
           <Card className="p-5 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Cost by Model</h3>
             {models.length === 0 ? (
-              <p className="py-6 text-center text-[13px] text-fg-3">No model usage yet.</p>
+              <EmptyState
+                kind="no-data"
+                title="No model usage yet"
+                body="Per-model cost and tokens appear once providers report usage."
+                className="border-0 bg-transparent py-6"
+              />
             ) : (
               <>
                 <div className="flex items-center justify-center py-2">
                   <div
                     className="relative size-[150px] rounded-full"
-                    style={{ background: conicFor(models, modelCostTotal) }}
+                    style={{ background: conicFor(models, anyModelCost ? modelCostTotal : 0) }}
                   >
                     <div className="absolute inset-[18px] rounded-full bg-panel flex flex-col items-center justify-center">
                       <span className="text-lg font-bold text-fg-1">
-                        {modelCostTotal > 0 ? `$${modelCostTotal.toFixed(0)}` : compact(
-                          models.reduce((s, m) => s + m.inputTokens + m.outputTokens, 0),
-                        )}
+                        {anyModelCost
+                          ? `$${modelCostTotal.toFixed(0)}`
+                          : compact(
+                              models.reduce((s, m) => s + m.inputTokens + m.outputTokens, 0),
+                            )}
                       </span>
                       <span className="text-[10px] text-fg-3">
-                        {modelCostTotal > 0 ? "total" : "tokens"}
+                        {anyModelCost ? "reported" : "tokens"}
                       </span>
                     </div>
                   </div>
@@ -241,7 +276,7 @@ export function AnalyticsView() {
                       <span className="font-mono truncate">{model.model}</span>
                     </span>
                     <span className="font-medium text-fg-1 shrink-0 ml-2">
-                      {model.costUsd > 0
+                      {model.costUsd !== null
                         ? `$${model.costUsd.toFixed(2)}`
                         : compact(model.inputTokens + model.outputTokens)}
                     </span>
@@ -255,16 +290,18 @@ export function AnalyticsView() {
             <h3 className="text-[15px] font-semibold text-fg-1">Budget &amp; Limits</h3>
             {budgetPct === null ? (
               <p className="text-[11px] text-fg-3">
-                {budgetCeiling === 0
-                  ? "No spend ceiling configured — set one in Policies ▸ Budgets."
-                  : "Providers have not reported cost, so spend against budget cannot be shown."}
+                {fleetCeiling === 0
+                  ? "No fleet spend ceiling configured — set gatewayHardUsd in Policies ▸ Budgets."
+                  : totals?.costCoverage === "partial"
+                    ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost; spend against budget cannot be shown as complete.`
+                    : "Providers have not reported cost, so spend against budget cannot be shown."}
               </p>
             ) : (
               <div className="flex flex-col gap-2">
                 <div className="flex items-center justify-between text-[11px]">
-                  <span className="text-fg-3">Spend vs ceiling</span>
+                  <span className="text-fg-3">Spend vs fleet ceiling</span>
                   <span className="text-fg-1">
-                    ${(cost ?? 0).toFixed(2)} / ${budgetCeiling.toFixed(2)}
+                    ${(cost ?? 0).toFixed(2)} / ${fleetCeiling.toFixed(2)}
                   </span>
                 </div>
                 <div className="h-1.5 rounded bg-line-2 overflow-hidden">
@@ -280,13 +317,20 @@ export function AnalyticsView() {
                 </div>
                 {budgetPct >= 80 && (
                   <div className="rounded-lg bg-warn/[0.06] border border-warn/20 px-3 py-2 text-[11px] text-warn">
-                    ⚠ {budgetPct.toFixed(1)}% of the configured ceiling used
+                    ⚠ {budgetPct.toFixed(1)}% of the configured fleet ceiling used
                   </div>
+                )}
+                {totals?.costCoverage === "partial" && (
+                  <p className="text-[11px] text-warn">
+                    partial — {totals.costReportedRequests} of {totals.requests} requests reported
+                    cost; the bar only includes reported spend.
+                  </p>
                 )}
               </div>
             )}
             {budgets !== null && (
               <div className="flex flex-col gap-1 text-[11px] text-fg-3">
+                <span>Per-task cap: ${budgets.perTaskUsd.toFixed(2)} (not a fleet ceiling)</span>
                 <span>Brain tokens/day cap: {budgets.brainTokensPerDay.toLocaleString()}</span>
                 <span>Claude extra-usage daily: ${budgets.claudeExtraUsageDailyUsd.toFixed(2)}</span>
               </div>
@@ -311,7 +355,7 @@ function conicFor(
   let cursor = 0;
   const stops: string[] = [];
   models.slice(0, 5).forEach((m, i) => {
-    const value = useCost ? m.costUsd : m.inputTokens + m.outputTokens;
+    const value = useCost ? (m.costUsd ?? 0) : m.inputTokens + m.outputTokens;
     const deg = (value / total) * 360;
     stops.push(`${CONIC_COLORS[i % CONIC_COLORS.length]} ${cursor}deg ${cursor + deg}deg`);
     cursor += deg;

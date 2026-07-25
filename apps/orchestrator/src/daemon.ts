@@ -224,10 +224,24 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     });
 
     // Analytics is a pure reader over durable state — no separate accounting
-    // store to drift out of sync with the event log.
+    // store to drift out of sync with the event log. The reader is time-bounded
+    // to the requested window (newest window, not the oldest N frames) and
+    // surfaces truncation when the bound is hit.
     const analytics = new AnalyticsService(
-      (limit) => eventStore.eventsAfterId(null, limit).events,
-      () => fleet.tools.listTasks(),
+      ({ days, limit }) => {
+        const since = new Date();
+        since.setUTCDate(since.getUTCDate() - (days - 1));
+        since.setUTCHours(0, 0, 0, 0);
+        const sinceTs = since.toISOString();
+        const page = eventStore.eventsSince(sinceTs, limit);
+        // Prefer the projection count when available so we report truncation
+        // even if the page itself filled exactly to the limit boundary.
+        const inWindow = eventStore.countSince(sinceTs);
+        return {
+          events: page.events,
+          truncated: page.truncated || inWindow > limit,
+        };
+      },
       () => [...quotaSamples.values()],
     );
 

@@ -10,14 +10,22 @@ import { quotaSampleSchema } from "./quota.js";
  * value could not be derived — most often because no provider reported cost —
  * and the Console must render that absence honestly rather than substituting a
  * zero or an estimate.
+ *
+ * Cost coverage is explicit: subscription-billed connections (Claude Max, etc.)
+ * contribute null cost and must never be silently counted as $0.00 inside a
+ * total the captain reads as their bill.
  */
+
+export const costCoverageSchema = z.enum(["complete", "partial", "absent"]);
+export type CostCoverage = z.infer<typeof costCoverageSchema>;
 
 export const dailyUsagePointSchema = z.strictObject({
   /** UTC calendar day, YYYY-MM-DD. */
   day: z.string(),
   inputTokens: z.number().int().min(0),
   outputTokens: z.number().int().min(0),
-  costUsd: z.number().min(0),
+  /** Sum of reported costs only; unreported legs contribute nothing (not $0). */
+  costUsd: z.number().min(0).nullable(),
   tasksCreated: z.number().int().min(0),
   tasksCompleted: z.number().int().min(0),
 });
@@ -28,8 +36,13 @@ export const modelUsageSchema = z.strictObject({
   family: modelFamilySchema,
   inputTokens: z.number().int().min(0),
   outputTokens: z.number().int().min(0),
-  costUsd: z.number().min(0),
+  /**
+   * null when no request for this model reported cost; 0 when every reported
+   * cost was zero. Unreported legs never inflate this as free spend.
+   */
+  costUsd: z.number().min(0).nullable(),
   requests: z.number().int().min(0),
+  costReportedRequests: z.number().int().min(0),
 });
 export type ModelUsage = z.infer<typeof modelUsageSchema>;
 
@@ -37,8 +50,13 @@ export const agentUsageSchema = z.strictObject({
   role: z.string(),
   inputTokens: z.number().int().min(0),
   outputTokens: z.number().int().min(0),
-  costUsd: z.number().min(0),
+  /**
+   * null when no request for this role reported cost; 0 when every reported
+   * cost was zero. Unreported legs never inflate this as free spend.
+   */
+  costUsd: z.number().min(0).nullable(),
   requests: z.number().int().min(0),
+  costReportedRequests: z.number().int().min(0),
   sharePct: z.number().min(0).max(100),
 });
 export type AgentUsage = z.infer<typeof agentUsageSchema>;
@@ -46,13 +64,21 @@ export type AgentUsage = z.infer<typeof agentUsageSchema>;
 export const analyticsTotalsSchema = z.strictObject({
   inputTokens: z.number().int().min(0),
   outputTokens: z.number().int().min(0),
-  /** null when no provider reported cost — not the same as zero spend. */
+  /**
+   * Sum of reported costs only. null when coverage is `absent`.
+   * When coverage is `partial`, this is the reported subset — never a bill.
+   */
   costUsd: z.number().min(0).nullable(),
+  costCoverage: costCoverageSchema,
+  /** Requests whose provider returned a non-null costUsd. */
+  costReportedRequests: z.number().int().min(0),
+  /** Requests whose provider returned null costUsd. */
+  costMissingRequests: z.number().int().min(0),
   requests: z.number().int().min(0),
   tasksTotal: z.number().int().min(0),
   tasksDone: z.number().int().min(0),
   tasksFailed: z.number().int().min(0),
-  /** null until at least one task reached a terminal phase. */
+  /** null until at least one task reached a terminal phase in-window. */
   successRatePct: z.number().min(0).max(100).nullable(),
 });
 export type AnalyticsTotals = z.infer<typeof analyticsTotalsSchema>;
@@ -60,6 +86,11 @@ export type AnalyticsTotals = z.infer<typeof analyticsTotalsSchema>;
 export const analyticsSnapshotSchema = z.strictObject({
   generatedAt: isoTimestampSchema,
   windowDays: z.number().int().min(1).max(365),
+  /**
+   * True when the event-store read hit its bound and newer (or older) frames
+   * in the requested window were not scanned. Surfaces partial history honestly.
+   */
+  truncated: z.boolean(),
   totals: analyticsTotalsSchema,
   daily: z.array(dailyUsagePointSchema),
   models: z.array(modelUsageSchema),

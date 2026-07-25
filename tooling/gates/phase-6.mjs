@@ -135,7 +135,11 @@ try {
     })
   ).project.id;
 
-  const seedTask = async (title, roles) => {
+  const setFakeGateOutcome = (outcome) => {
+    writeFileSync(join(home, "fake-gate-outcome"), outcome);
+  };
+
+  const seedTask = async (title, roles, options = {}) => {
     const created = await post("/v1/tasks", {
       spec: {
         shape: "SHIP",
@@ -148,6 +152,26 @@ try {
     });
     const taskId = created.task.id;
     await tool("resolve_cast", { taskId, roles, familyCheckOverride: false });
+
+    // Gate evidence path: author + baseline while still pre-BUILDING, then
+    // spawn the builder (worktree) and run candidate outcomes for FAIL/GATE_ERROR.
+    if (options.withGateEvidence === true) {
+      const validator = roles.find((r) => r.role === "validator") ?? roles[0];
+      const family = String(validator.model).split("/")[0] || "openai";
+      await tool("author_gate", {
+        taskId,
+        validatorCast: {
+          role: validator.role,
+          model: validator.model,
+          thinking: validator.thinking,
+          family,
+          cleanRoom: validator.cleanRoom ?? true,
+        },
+      });
+      setFakeGateOutcome("EXPECTED_RED");
+      await tool("run_gate", { taskId, target: "baseline" });
+    }
+
     const first = roles[0];
     await tool("spawn_crewmate", {
       taskId,
@@ -155,17 +179,39 @@ try {
       model: first.model,
       thinking: first.thinking,
       vars: {},
+      // Override only when we did not establish a real RED proof above.
+      redBaselineOverride: options.withGateEvidence === true ? false : true,
     });
+
+    if (options.withGateEvidence === true) {
+      setFakeGateOutcome("FAIL");
+      await tool("run_gate", { taskId, target: "candidate" });
+      setFakeGateOutcome("GATE_ERROR");
+      await tool("run_gate", { taskId, target: "candidate" });
+      try {
+        rmSync(join(home, "fake-gate-outcome"), { force: true });
+      } catch {
+        // ignore
+      }
+    }
     return taskId;
   };
 
-  const taskA = await seedTask("Console parity task", [
-    { role: "builder", model: "openai/gpt-5.6-sol", thinking: "medium", cleanRoom: true },
-    { role: "validator", model: "anthropic/claude-fable-5", thinking: "high", cleanRoom: true },
-  ]);
+  const taskATitle = "Console parity task";
+  const taskA = await seedTask(
+    taskATitle,
+    [
+      { role: "builder", model: "openai/gpt-5.6-sol", thinking: "medium", cleanRoom: true },
+      { role: "validator", model: "anthropic/claude-fable-5", thinking: "high", cleanRoom: true },
+    ],
+    { withGateEvidence: true },
+  );
   await seedTask("Second console task", [
     { role: "builder", model: "xai/grok-4.5", thinking: "medium", cleanRoom: true },
   ]);
+
+  // Fake-pi spawn classifies a PROGRESS wake absorbed by the zero-token watcher.
+  const absorbedSummary = `progress on ${taskATitle}`;
 
   consoleServer = spawn(
     join(ROOT, "apps", "console", "node_modules", ".bin", "next"),
@@ -254,7 +300,7 @@ try {
     gate(
       "G2",
       "Fleet reflects a new task within 1 s over SSE",
-      reflected && elapsed <= 1500,
+      reflected && elapsed <= 1000,
       `reflected=${reflected} in ${elapsed}ms (before ${String(before ?? "").length} chars)`,
     );
   }
@@ -281,28 +327,40 @@ try {
   // G5 — Notifications shows the real wake queue including absorbed wakes
   {
     const wakes = await (await fetch(`${BASE}/v1/fleet/wakes`, { headers: auth })).json();
-    const absorbed = (wakes.wakes ?? []).filter((w) => w.absorbed).length;
+    const absorbedWakes = (wakes.wakes ?? []).filter((w) => w.absorbed);
+    const seededAbsorbed = absorbedWakes.find((w) => w.summary === absorbedSummary);
     await page.goto(`${CONSOLE}/notifications`, { waitUntil: "networkidle" });
     await sleep(600);
     const text = (await page.textContent("body")) ?? "";
+    // Require the specific absorbed wake's summary AND the "absorbed" marker —
+    // never assert on a bare digit count (matches any "0" on the page).
+    const summaryPresent = text.includes(absorbedSummary);
+    const absorbedMarker = /absorbed/i.test(text);
     gate(
       "G5",
-      "Notifications renders the real wake queue including absorbed wakes",
-      text.includes("Absorbed (zero-token)") && text.includes(String(absorbed)),
-      `absorbedInDaemon=${absorbed}`,
+      "Notifications renders a seeded absorbed wake with its summary and absorbed marker",
+      seededAbsorbed !== undefined && summaryPresent && absorbedMarker && text.includes("Absorbed (zero-token)"),
+      `seeded=${seededAbsorbed !== undefined} summary=${summaryPresent} marker=${absorbedMarker}`,
     );
   }
 
-  // G6 — Task Detail shows Brain decisions + validation evidence
+  // G6 — Task Detail shows Brain decisions + validation evidence (FAIL vs GATE_ERROR)
   {
     await page.goto(`${CONSOLE}/tasks/${taskA}`, { waitUntil: "networkidle" });
     await sleep(800);
     const text = (await page.textContent("body")) ?? "";
+    const brain = text.includes("Brain decisions") && text.includes("resolve_cast");
+    const evidence = text.includes("Validation evidence");
+    const hasFail = text.includes("FAIL");
+    const hasGateError = text.includes("GATE_ERROR");
+    // FAIL and GATE_ERROR must both appear and be distinguishable (different meaning copy).
+    const failMeaning = text.includes("Candidate rejected by the gate");
+    const gateErrorMeaning = text.includes("infrastructure error");
     gate(
       "G6",
-      "Task Detail renders the Brain decision lane with real tool calls",
-      text.includes("Brain decisions") && text.includes("resolve_cast"),
-      `lane=${text.includes("Brain decisions")} toolCall=${text.includes("resolve_cast")}`,
+      "Task Detail renders Brain decisions and validation evidence with FAIL vs GATE_ERROR",
+      brain && evidence && hasFail && hasGateError && failMeaning && gateErrorMeaning,
+      `brain=${brain} evidence=${evidence} FAIL=${hasFail} GATE_ERROR=${hasGateError}`,
     );
   }
 

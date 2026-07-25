@@ -1,42 +1,51 @@
 import type {
   AnalyticsSnapshot,
+  CostCoverage,
   DailyUsagePoint,
   EventEnvelope,
   ModelUsage,
   AgentUsage,
   QuotaSample,
-  TaskSnapshot,
 } from "@agent-os/protocol";
 import { familyFromModel } from "../substrate/family.js";
+
+export type AnalyticsEventPage = {
+  events: EventEnvelope[];
+  truncated: boolean;
+};
 
 /**
  * Usage & cost analytics (master plan §7.6 "Analytics").
  *
- * Every figure is DERIVED from the append-only event log and the live task
- * store — there are no sampled estimates and no placeholder series. When a
- * number cannot be derived it is reported as null and the Console renders the
- * absence, rather than a plausible-looking invention.
+ * Every figure is DERIVED from the append-only event log — there are no sampled
+ * estimates and no placeholder series. When a number cannot be derived it is
+ * reported as null and the Console renders the absence, rather than a
+ * plausible-looking invention.
  *
- * `ext.usage` frames carry per-request tokens and (where the provider reports
- * it) cost, keyed by session; `session.spawned` maps a session to its role,
- * model and task. Joining the two gives per-model and per-agent attribution
- * without asking any model to self-report.
+ * All aggregates (totals, models, agents, daily) share the same day window.
+ * Cost is tracked as reported-vs-missing per bucket so a Claude Max
+ * subscription that contributes null cost never silently reads as $0.00.
  */
 export class AnalyticsService {
   /**
-   * @param readEvents pulls the durable log (bounded); the daemon passes a
-   * reader over the event store so this module stays I/O-free and testable.
+   * @param readEvents pulls a time-bounded page of the durable log; the daemon
+   *   passes a reader that scans from the window start and surfaces truncation.
+   * @param readQuota live quota samples (not windowed — current fleet state).
    */
   constructor(
-    private readonly readEvents: (limit: number) => EventEnvelope[],
-    private readonly readTasks: () => TaskSnapshot[],
+    private readonly readEvents: (options: {
+      days: number;
+      limit: number;
+    }) => AnalyticsEventPage,
     private readonly readQuota: () => QuotaSample[],
   ) {}
 
   snapshot(options: { days?: number; limit?: number } = {}): AnalyticsSnapshot {
     const days = options.days ?? 14;
-    const events = this.readEvents(options.limit ?? 100_000);
-    const tasks = this.readTasks();
+    const limit = options.limit ?? 100_000;
+    const { events, truncated } = this.readEvents({ days, limit });
+    const windowDays = lastNDays(days);
+    const windowSet = new Set(windowDays);
 
     /** sessionId → its spawn facts, so usage frames can be attributed. */
     const sessions = new Map<
@@ -53,86 +62,102 @@ export class AnalyticsService {
       }
     }
 
-    const byDay = new Map<string, { inputTokens: number; outputTokens: number; costUsd: number }>();
-    const byModel = new Map<string, { inputTokens: number; outputTokens: number; costUsd: number; requests: number }>();
-    const byAgent = new Map<string, { inputTokens: number; outputTokens: number; costUsd: number; requests: number }>();
+    type CostBucket = {
+      inputTokens: number;
+      outputTokens: number;
+      costUsd: number;
+      costReportedRequests: number;
+      requests: number;
+    };
+
+    const byDay = new Map<string, CostBucket>();
+    const byModel = new Map<string, CostBucket>();
+    const byAgent = new Map<string, CostBucket>();
 
     let totalInput = 0;
     let totalOutput = 0;
     let totalCost = 0;
-    let costReported = false;
+    let costReportedRequests = 0;
+    let costMissingRequests = 0;
 
     for (const envelope of events) {
       if (envelope.event.type !== "ext.usage") continue;
-      const usage = envelope.event.payload;
       const day = envelope.ts.slice(0, 10);
+      if (!windowSet.has(day)) continue;
+
+      const usage = envelope.event.payload;
       const input = usage.inputTokens ?? 0;
       const output = usage.outputTokens ?? 0;
-      // Providers differ on whether they report cost; track whether ANY did so
-      // the Console can distinguish "zero spend" from "cost not reported".
-      const cost = usage.costUsd ?? 0;
-      if (usage.costUsd !== null) costReported = true;
+      const reported = usage.costUsd !== null && usage.costUsd !== undefined;
+      const cost = reported ? (usage.costUsd as number) : 0;
 
       totalInput += input;
       totalOutput += output;
-      totalCost += cost;
+      if (reported) {
+        totalCost += cost;
+        costReportedRequests += 1;
+      } else {
+        costMissingRequests += 1;
+      }
 
-      const dayBucket = byDay.get(day) ?? { inputTokens: 0, outputTokens: 0, costUsd: 0 };
-      dayBucket.inputTokens += input;
-      dayBucket.outputTokens += output;
-      dayBucket.costUsd += cost;
-      byDay.set(day, dayBucket);
+      const touch = (bucket: CostBucket): CostBucket => {
+        bucket.inputTokens += input;
+        bucket.outputTokens += output;
+        bucket.requests += 1;
+        if (reported) {
+          bucket.costUsd += cost;
+          bucket.costReportedRequests += 1;
+        }
+        return bucket;
+      };
+
+      const empty = (): CostBucket => ({
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        costReportedRequests: 0,
+        requests: 0,
+      });
+
+      byDay.set(day, touch(byDay.get(day) ?? empty()));
 
       const modelKey = `${usage.provider}/${usage.model}`;
-      const modelBucket = byModel.get(modelKey) ?? {
-        inputTokens: 0,
-        outputTokens: 0,
-        costUsd: 0,
-        requests: 0,
-      };
-      modelBucket.inputTokens += input;
-      modelBucket.outputTokens += output;
-      modelBucket.costUsd += cost;
-      modelBucket.requests += 1;
-      byModel.set(modelKey, modelBucket);
+      byModel.set(modelKey, touch(byModel.get(modelKey) ?? empty()));
 
       const role = sessions.get(usage.sessionId)?.role ?? "unattributed";
-      const agentBucket = byAgent.get(role) ?? {
-        inputTokens: 0,
-        outputTokens: 0,
-        costUsd: 0,
-        requests: 0,
-      };
-      agentBucket.inputTokens += input;
-      agentBucket.outputTokens += output;
-      agentBucket.costUsd += cost;
-      agentBucket.requests += 1;
-      byAgent.set(role, agentBucket);
+      byAgent.set(role, touch(byAgent.get(role) ?? empty()));
     }
 
-    // Task throughput per day, from real phase transitions.
+    // Task throughput per day, from real phase transitions inside the window.
     const createdByDay = new Map<string, number>();
     const completedByDay = new Map<string, number>();
+    const failedByDay = new Map<string, number>();
     for (const envelope of events) {
+      const day = envelope.ts.slice(0, 10);
+      if (!windowSet.has(day)) continue;
       if (envelope.event.type === "task.created") {
-        const day = envelope.ts.slice(0, 10);
         createdByDay.set(day, (createdByDay.get(day) ?? 0) + 1);
-      } else if (
-        envelope.event.type === "task.phase_changed" &&
-        envelope.event.payload.to === "DONE"
-      ) {
-        const day = envelope.ts.slice(0, 10);
-        completedByDay.set(day, (completedByDay.get(day) ?? 0) + 1);
+      } else if (envelope.event.type === "task.phase_changed") {
+        if (envelope.event.payload.to === "DONE") {
+          completedByDay.set(day, (completedByDay.get(day) ?? 0) + 1);
+        } else if (
+          envelope.event.payload.to === "FAILED" ||
+          envelope.event.payload.to === "VALIDATION_EXHAUSTED" ||
+          envelope.event.payload.to === "CANCELLED"
+        ) {
+          failedByDay.set(day, (failedByDay.get(day) ?? 0) + 1);
+        }
       }
     }
 
-    const daily: DailyUsagePoint[] = lastNDays(days).map((day) => {
+    const daily: DailyUsagePoint[] = windowDays.map((day) => {
       const usage = byDay.get(day);
       return {
         day,
         inputTokens: usage?.inputTokens ?? 0,
         outputTokens: usage?.outputTokens ?? 0,
-        costUsd: usage?.costUsd ?? 0,
+        costUsd:
+          usage === undefined || usage.costReportedRequests === 0 ? null : usage.costUsd,
         tasksCreated: createdByDay.get(day) ?? 0,
         tasksCompleted: completedByDay.get(day) ?? 0,
       };
@@ -144,8 +169,9 @@ export class AnalyticsService {
         family: familyFromModel(model),
         inputTokens: v.inputTokens,
         outputTokens: v.outputTokens,
-        costUsd: v.costUsd,
+        costUsd: v.costReportedRequests === 0 ? null : v.costUsd,
         requests: v.requests,
+        costReportedRequests: v.costReportedRequests,
       }))
       .sort((a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens));
 
@@ -157,30 +183,42 @@ export class AnalyticsService {
           role,
           inputTokens: v.inputTokens,
           outputTokens: v.outputTokens,
-          costUsd: v.costUsd,
+          costUsd: v.costReportedRequests === 0 ? null : v.costUsd,
           requests: v.requests,
+          costReportedRequests: v.costReportedRequests,
           sharePct: totalTokens === 0 ? 0 : Number(((tokens / totalTokens) * 100).toFixed(1)),
         };
       })
       .sort((a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens));
 
-    const done = tasks.filter((t) => t.phase === "DONE").length;
-    const failed = tasks.filter((t) => t.phase === "FAILED").length;
-    const terminal = done + failed;
+    const tasksDone = [...completedByDay.values()].reduce((a, b) => a + b, 0);
+    const tasksFailed = [...failedByDay.values()].reduce((a, b) => a + b, 0);
+    const tasksTotal = [...createdByDay.values()].reduce((a, b) => a + b, 0);
+    const terminal = tasksDone + tasksFailed;
+    const totalRequests = costReportedRequests + costMissingRequests;
+    const costCoverage: CostCoverage =
+      totalRequests === 0 || costReportedRequests === 0
+        ? "absent"
+        : costMissingRequests === 0
+          ? "complete"
+          : "partial";
 
     return {
       generatedAt: new Date().toISOString(),
       windowDays: days,
+      truncated,
       totals: {
         inputTokens: totalInput,
         outputTokens: totalOutput,
-        // Distinguish "no provider reported cost" from "spend was zero".
-        costUsd: costReported ? totalCost : null,
-        requests: models.reduce((sum, m) => sum + m.requests, 0),
-        tasksTotal: tasks.length,
-        tasksDone: done,
-        tasksFailed: failed,
-        successRatePct: terminal === 0 ? null : Number(((done / terminal) * 100).toFixed(1)),
+        costUsd: costReportedRequests === 0 ? null : totalCost,
+        costCoverage,
+        costReportedRequests,
+        costMissingRequests,
+        requests: totalRequests,
+        tasksTotal,
+        tasksDone,
+        tasksFailed,
+        successRatePct: terminal === 0 ? null : Number(((tasksDone / terminal) * 100).toFixed(1)),
       },
       daily,
       models,

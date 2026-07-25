@@ -42,15 +42,16 @@ export function FusionColumns({ taskId }: { taskId: string }) {
         if (cancelled || !res.ok) return;
         const body = (await res.json()) as { runs: FusionRun[] };
         setRuns(body.runs);
-        if (body.runs.length > 0 && selected === null) {
-          setSelected(body.runs[0]?.runId ?? null);
-        }
+        setSelected((prev) => {
+          if (prev !== null && body.runs.some((r) => r.runId === prev)) return prev;
+          return body.runs[0]?.runId ?? null;
+        });
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [taskId, refreshKey, selected]);
+  }, [taskId, refreshKey]);
 
   useEffect(() => {
     if (selected === null) return;
