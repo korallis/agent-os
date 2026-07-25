@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -398,6 +398,95 @@ describe("worktree lease reclaim on stop/respawn", () => {
       expect(leased.length).toBeLessThanOrEqual(poolSize);
       expect(leased.length).toBe(1);
     }
+  });
+
+  it("respawns after dirty stop that quarantined the task branch", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "dirty-respawn",
+      shape: "SHIP",
+      role: "builder",
+    });
+
+    const first = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(first.ok).toBe(true);
+    const session = (
+      first.data as { session: { sessionId: string; worktreePath: string } }
+    ).session;
+
+    // Dirty the tree so stop → release quarantines while still holding the task branch.
+    writeFileSync(join(session.worktreePath, "wip.txt"), "uncommitted builder work\n");
+    const stopped = service.tools.invoke("stop_crewmate", {
+      sessionId: session.sessionId,
+      reason: "session lost dirty",
+    });
+    expect(stopped.ok).toBe(true);
+    const quarantined = service.worktrees
+      .list()
+      .filter((l) => l.state === "quarantined" && l.path === session.worktreePath);
+    expect(quarantined).toHaveLength(1);
+
+    const respawn = service.tools.invoke("respawn_crewmate", {
+      sessionId: session.sessionId,
+      reason: "recover after quarantine",
+    });
+    expect(respawn.ok).toBe(true);
+    const next = (
+      respawn.data as { session: { worktreePath: string; sessionId: string } }
+    ).session;
+    expect(next.worktreePath).not.toBe(session.worktreePath);
+    expect(
+      execFileSync("git", ["-C", next.worktreePath, "rev-parse", "--is-inside-work-tree"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("true");
+    // Prior uncommitted work must still be intact under quarantine.
+    expect(readFileSync(join(session.worktreePath, "wip.txt"), "utf8")).toContain(
+      "uncommitted builder work",
+    );
+  });
+});
+
+describe("deliver_task dirty worktree fail-closed", () => {
+  it("quarantines and preserves uncommitted files instead of resetting", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "dirty-deliver",
+      shape: "SHIP",
+      role: "builder",
+    });
+
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const path = (spawned.data as { session: { worktreePath: string } }).session.worktreePath;
+
+    writeFileSync(join(path, "builder-wip.txt"), "must not be discarded\n");
+
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(deliver.error?.code).toBe("CONFLICT");
+
+    const lease = service.worktrees.list().find((l) => l.path === path);
+    expect(lease?.state).toBe("quarantined");
+    expect(readFileSync(join(path, "builder-wip.txt"), "utf8")).toContain(
+      "must not be discarded",
+    );
+
+    const task = service.tools.invoke("read_task", { taskId });
+    expect(task.ok).toBe(true);
+    expect((task.data as { phase: string }).phase).not.toBe("DONE");
   });
 });
 

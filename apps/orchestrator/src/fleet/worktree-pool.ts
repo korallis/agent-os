@@ -6,7 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { monotonicFactory } from "ulid";
 import type { OrchestratorEvent, WorktreeLease, WorktreesConfig } from "@agent-os/protocol";
@@ -91,19 +91,25 @@ export class WorktreePool {
     sessionId?: string;
     branch?: string;
   }): WorktreeLease {
-    const branch = input.branch ?? `ao/${input.taskId.slice(0, 10).toLowerCase()}`;
+    const preferredBranch = input.branch ?? `ao/${input.taskId.slice(0, 10).toLowerCase()}`;
     // Prefer idle reuse, but never re-issue a missing/broken tree — drop and allocate fresh.
     for (;;) {
       const idle = this.listForProject(input.projectId).find((l) => l.state === "idle");
       if (idle === undefined) break;
       if (!this.isUsableWorktreePath(idle.path)) {
-        this.dropIdleLease(idle, "idle worktree path missing or not a usable git worktree");
+        this.dropIdleLease(idle, "idle worktree path missing or not a usable git worktree", input.repoPath);
         continue;
       }
+      let branch = preferredBranch;
       try {
-        this.checkoutBranchForReuse(idle.path, input.repoPath, branch);
+        branch = this.checkoutBranchForReuse(
+          idle.path,
+          input.repoPath,
+          preferredBranch,
+          input.sessionId,
+        );
       } catch {
-        this.dropIdleLease(idle, "idle worktree checkout failed");
+        this.dropIdleLease(idle, "idle worktree checkout failed", input.repoPath);
         continue;
       }
       const leased: WorktreeLease = {
@@ -142,16 +148,19 @@ export class WorktreePool {
     const path = join(this.poolRoot, input.projectId, id);
     mkdirSync(join(this.poolRoot, input.projectId), { recursive: true, mode: 0o700 });
 
+    let branch = preferredBranch;
     if (process.env.AGENTOS_FAKE_GIT === "1" || !existsSync(join(input.repoPath, ".git"))) {
       // Explicit test seam / non-git fixture path: marker directory only.
       mkdirSync(path, { recursive: true, mode: 0o700 });
       writeFileSync(join(path, ".agentos-worktree"), `${input.taskId}\n`, { mode: 0o600 });
     } else {
-      const add = spawnSync(
-        "git",
-        ["-C", input.repoPath, "worktree", "add", "-b", branch, path, "HEAD"],
-        { encoding: "utf8", timeout: 60_000 },
-      );
+      const resolved = this.resolveBranchForAdd(input.repoPath, preferredBranch, input.sessionId);
+      branch = resolved.branch;
+      const addArgs =
+        resolved.mode === "create"
+          ? ["-C", input.repoPath, "worktree", "add", "-b", branch, path, "HEAD"]
+          : ["-C", input.repoPath, "worktree", "add", path, branch];
+      const add = spawnSync("git", addArgs, { encoding: "utf8", timeout: 60_000 });
       if (add.status !== 0) {
         const detail = (add.stderr || add.stdout || "worktree add failed").trim();
         throw new Error(`git worktree add failed: ${detail}`);
@@ -199,12 +208,95 @@ export class WorktreePool {
     return probe.status === 0 && probe.stdout.trim() === "true";
   }
 
+  /**
+   * Branches currently checked out by any worktree of this repo (including main).
+   * `excludePath` skips the worktree being reused so its own branch is not treated as held.
+   */
+  private branchesCheckedOutInWorktrees(repoPath: string, excludePath?: string): Set<string> {
+    const listed = spawnSync("git", ["-C", repoPath, "worktree", "list", "--porcelain"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    const checkedOut = new Set<string>();
+    if (listed.status !== 0) return checkedOut;
+    const exclude = excludePath !== undefined ? resolve(excludePath) : undefined;
+    let currentPath: string | null = null;
+    for (const line of listed.stdout.split("\n")) {
+      if (line.startsWith("worktree ")) {
+        currentPath = resolve(line.slice("worktree ".length).trim());
+        continue;
+      }
+      if (line.startsWith("branch refs/heads/")) {
+        if (exclude !== undefined && currentPath === exclude) continue;
+        checkedOut.add(line.slice("branch refs/heads/".length).trim());
+      }
+    }
+    return checkedOut;
+  }
+
+  private branchExistsLocally(repoPath: string, branch: string): boolean {
+    const exists = spawnSync(
+      "git",
+      ["-C", repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    return exists.status === 0;
+  }
+
+  /**
+   * Pick a branch for worktree add/reuse:
+   * - free existing branch → checkout without -b / switch
+   * - missing branch → create with -b / switch -c
+   * - held by another worktree (including quarantine) → distinct branch
+   */
+  private resolveBranchForAdd(
+    repoPath: string,
+    preferred: string,
+    sessionId?: string,
+    excludePath?: string,
+  ): { branch: string; mode: "create" | "checkout" } {
+    const checkedOut = this.branchesCheckedOutInWorktrees(repoPath, excludePath);
+    const candidates = [
+      preferred,
+      sessionId !== undefined ? `${preferred}-${sessionId.slice(0, 10).toLowerCase()}` : undefined,
+      `${preferred}-${nextUlid().slice(0, 10).toLowerCase()}`,
+    ].filter((b): b is string => b !== undefined);
+
+    for (const branch of candidates) {
+      if (checkedOut.has(branch)) continue;
+      if (this.branchExistsLocally(repoPath, branch)) {
+        return { branch, mode: "checkout" };
+      }
+      return { branch, mode: "create" };
+    }
+
+    throw new Error(
+      `git worktree add failed: no free branch for ${preferred} (all candidates checked out)`,
+    );
+  }
+
   /** Drop a broken idle lease so the pool can allocate a replacement. */
-  private dropIdleLease(lease: WorktreeLease, reason: string): void {
-    try {
-      rmSync(lease.path, { recursive: true, force: true });
-    } catch {
-      // best-effort
+  private dropIdleLease(lease: WorktreeLease, reason: string, repoPath?: string): void {
+    if (
+      process.env.AGENTOS_FAKE_GIT !== "1" &&
+      repoPath !== undefined &&
+      existsSync(join(repoPath, ".git"))
+    ) {
+      spawnSync("git", ["-C", repoPath, "worktree", "remove", "--force", lease.path], {
+        encoding: "utf8",
+        timeout: 60_000,
+      });
+      spawnSync("git", ["-C", repoPath, "worktree", "prune"], {
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+    }
+    if (existsSync(lease.path)) {
+      try {
+        rmSync(lease.path, { recursive: true, force: true });
+      } catch {
+        // best-effort leftover cleanup
+      }
     }
     this.leases.delete(lease.id);
     this.persistProject(lease.projectId);
@@ -223,25 +315,35 @@ export class WorktreePool {
   /**
    * On idle reuse of a real git worktree, move HEAD to the requested branch so
    * lease.branch matches the tree. Non-git / AGENTOS_FAKE_GIT paths are metadata-only.
+   * Returns the branch actually checked out (may be a session-suffixed alternate
+   * when the preferred task branch is held elsewhere).
    */
-  private checkoutBranchForReuse(worktreePath: string, repoPath: string, branch: string): void {
-    if (process.env.AGENTOS_FAKE_GIT === "1") return;
-    if (!existsSync(join(worktreePath, ".git"))) return;
+  private checkoutBranchForReuse(
+    worktreePath: string,
+    repoPath: string,
+    preferredBranch: string,
+    sessionId?: string,
+  ): string {
+    if (process.env.AGENTOS_FAKE_GIT === "1") return preferredBranch;
+    if (!existsSync(join(worktreePath, ".git"))) return preferredBranch;
+
+    const resolved = this.resolveBranchForAdd(
+      repoPath,
+      preferredBranch,
+      sessionId,
+      worktreePath,
+    );
+    const branch = resolved.branch;
 
     const current = spawnSync("git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
       encoding: "utf8",
       timeout: 15_000,
     });
     if (current.status === 0 && current.stdout.trim() === branch) {
-      return;
+      return branch;
     }
 
-    const exists = spawnSync(
-      "git",
-      ["-C", worktreePath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-      { encoding: "utf8", timeout: 15_000 },
-    );
-    if (exists.status === 0) {
+    if (resolved.mode === "checkout") {
       const sw = spawnSync("git", ["-C", worktreePath, "switch", branch], {
         encoding: "utf8",
         timeout: 30_000,
@@ -250,7 +352,7 @@ export class WorktreePool {
         const detail = (sw.stderr || sw.stdout || "git switch failed").trim();
         throw new Error(`git worktree branch switch failed: ${detail}`);
       }
-      return;
+      return branch;
     }
 
     const base = spawnSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
@@ -271,6 +373,7 @@ export class WorktreePool {
       const detail = (create.stderr || create.stdout || "git switch -c failed").trim();
       throw new Error(`git worktree branch create failed: ${detail}`);
     }
+    return branch;
   }
 
   /**

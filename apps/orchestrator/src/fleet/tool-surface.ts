@@ -1376,18 +1376,49 @@ export class ToolSurface {
       { mode: 0o600 },
     );
 
-    // Release worktrees with durable HEAD so the pool verified-resets instead of quarantining.
+    // Only verified-reset when porcelain is clean. Dirty trees quarantine and
+    // surface CONFLICT so uncommitted builder work is never discarded on DONE.
     for (const lease of this.deps.worktrees.list().filter((l) => l.taskId === task.id)) {
+      if (process.env.AGENTOS_FAKE_GIT === "1") {
+        this.deps.worktrees.release(lease.id, {});
+        continue;
+      }
+
+      const dirty = spawnSync("git", ["-C", lease.path, "status", "--porcelain"], {
+        encoding: "utf8",
+        timeout: 15_000,
+      });
+      if (dirty.error !== undefined || dirty.status !== 0) {
+        this.deps.worktrees.release(lease.id, { forceQuarantine: true });
+        const detail = (
+          dirty.error?.message ||
+          dirty.stderr ||
+          dirty.stdout ||
+          `git status exit ${String(dirty.status)}`
+        )
+          .toString()
+          .trim();
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot deliver task ${task.id}: worktree status failed (${detail}); quarantined`,
+        );
+      }
+      if (dirty.stdout.trim().length > 0) {
+        this.deps.worktrees.release(lease.id, { forceQuarantine: true });
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot deliver task ${task.id}: worktree has uncommitted changes; quarantined for Captain inspection`,
+        );
+      }
+
       let finalSha: string | undefined;
-      if (process.env.AGENTOS_FAKE_GIT !== "1") {
-        const rev = spawnSync("git", ["-C", lease.path, "rev-parse", "HEAD"], {
-          encoding: "utf8",
-          timeout: 15_000,
-        });
-        if (rev.status === 0) {
-          const sha = rev.stdout.trim();
-          if (sha.length > 0) finalSha = sha;
-        }
+      const rev = spawnSync("git", ["-C", lease.path, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+        timeout: 15_000,
+      });
+      if (rev.status === 0) {
+        const sha = rev.stdout.trim();
+        if (sha.length > 0) finalSha = sha;
       }
       this.deps.worktrees.release(
         lease.id,
