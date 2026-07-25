@@ -435,7 +435,7 @@ agent-os/
 ├── tsconfig.base.json                # strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes
 ├── eslint.config.mjs                 # @typescript-eslint/no-explicit-any: error
 ├── .github/workflows/
-│   ├── ci.yml                        # typecheck/lint/build/test + phase-1…6 gates
+│   ├── ci.yml                        # typecheck/lint/build/test + phase-1…6,8 gates
 │   └── pi-canary.yml                 # weekly: harness contract suite vs latest Pi [R2]
 ├── docs/{plans,qa,screenshots}/
 ├── apps/
