@@ -95,6 +95,8 @@ export interface PipelineCompatibility {
 
 const MAX_STRUCTURED_READ_FAILURES = 3;
 const LOG_CHUNK_MAX = 16_384;
+/** Floor between WAL-driven ticks so dense notifications cannot storm the loop. */
+const WAL_TICK_COALESCE_MS = 75;
 
 export class PipelineWatcher {
   private readonly home: string;
@@ -103,6 +105,8 @@ export class PipelineWatcher {
   private readonly profile: () => { streamPipelineLogs: boolean };
   private timer: ReturnType<typeof setInterval> | null = null;
   private walWatcher: FSWatcher | null = null;
+  /** At most one WAL-scheduled tick is outstanding at a time. */
+  private pendingWalTick: ReturnType<typeof setTimeout> | null = null;
   private transport: PipelineTransport = "unavailable";
   private walWatchAttached = false;
   private compatibility: PipelineCompatibility = {
@@ -279,6 +283,7 @@ export class PipelineWatcher {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.clearPendingWalTick();
     if (this.walWatcher !== null) {
       this.walWatcher.close();
       this.walWatcher = null;
@@ -296,6 +301,27 @@ export class PipelineWatcher {
     this.timer.unref?.();
   }
 
+  private clearPendingWalTick(): void {
+    if (this.pendingWalTick !== null) {
+      clearTimeout(this.pendingWalTick);
+      this.pendingWalTick = null;
+    }
+  }
+
+  /**
+   * Coalesce dense WAL notifications to at most one pending structured read.
+   * The interval remains the miss floor; this only limits how often fs.watch
+   * can force a full open+SELECT cycle under active gate work.
+   */
+  private scheduleWalTick(): void {
+    if (this.pendingWalTick !== null) return;
+    this.pendingWalTick = setTimeout(() => {
+      this.pendingWalTick = null;
+      this.tick();
+    }, WAL_TICK_COALESCE_MS);
+    this.pendingWalTick.unref?.();
+  }
+
   private attachWalWatch(): void {
     if (this.walWatcher !== null) {
       this.walWatcher.close();
@@ -305,7 +331,7 @@ export class PipelineWatcher {
     const wal = `${this.dbPath()}-wal`;
     if (!existsSync(wal)) return;
     try {
-      this.walWatcher = watch(wal, () => this.tick());
+      this.walWatcher = watch(wal, () => this.scheduleWalTick());
       this.walWatchAttached = true;
     } catch {
       // fs.watch is best-effort on some platforms; the interval still covers us.

@@ -95,10 +95,15 @@ function transportDescription(status: PipelineStatus | null): string {
   }
 }
 
+/** Consecutive BFF/daemon blips before the whole page is treated as dead. */
+const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+
 export function PipelineView() {
   const [status, setStatus] = useState<PipelineStatus | null>(null);
   const [runs, setRuns] = useState<PipelineRunSnapshot[] | null>(null);
   const [failed, setFailed] = useState(false);
+  /** Transient refresh failure with last-known data still shown (not schema drift). */
+  const [stale, setStale] = useState(false);
   const [logs, setLogs] = useState<Record<string, string>>({});
   const [logTruncated, setLogTruncated] = useState<Record<string, boolean>>({});
   const [pollTick, setPollTick] = useState(0);
@@ -108,6 +113,9 @@ export function PipelineView() {
   /** Mirror of `logs` for append-only updates without reading stale state. */
   const logsRef = useRef<Record<string, string>>({});
   const logTruncatedRef = useRef<Record<string, boolean>>({});
+  const consecutivePollFailures = useRef(0);
+  /** Whether we have ever painted a successful pipeline status response. */
+  const hasLastKnown = useRef(false);
 
   const logChars = status?.profile?.pipelineLogChars ?? 20_000;
 
@@ -144,8 +152,13 @@ export function PipelineView() {
           unavailable?: boolean;
         };
         if (cancelled) return;
+        consecutivePollFailures.current = 0;
+        hasLastKnown.current = true;
+        setStale(false);
+        setFailed(false);
         setStatus(statusBody.pipeline);
         // Never paint prior snapshots when the gate is not currently readable.
+        // This is schema/transport unreadable — not a transient fetch blip.
         const unreadable =
           statusBody.pipeline.compatibility.ok === false ||
           statusBody.pipeline.transport === "unavailable" ||
@@ -155,9 +168,18 @@ export function PipelineView() {
         } else {
           setRuns(runsBody.runs);
         }
-        setFailed(false);
       } catch {
-        if (!cancelled) setFailed(true);
+        if (cancelled) return;
+        consecutivePollFailures.current += 1;
+        // Keep last-known rows across brief BFF/daemon blips. Only blank the
+        // page after consecutive failures; without last-known data, stay on
+        // the loading path until the threshold is hit.
+        if (consecutivePollFailures.current >= MAX_CONSECUTIVE_POLL_FAILURES) {
+          setFailed(true);
+          setStale(false);
+        } else if (hasLastKnown.current) {
+          setStale(true);
+        }
       }
     })();
     return () => {
@@ -239,6 +261,7 @@ export function PipelineView() {
   const transportDown = status !== null && status.transport === "unavailable";
   // Suppress the run list whenever the view is not readable — a banner that
   // says nothing below is current must not sit above last-known rows.
+  // Transient poll failures (stale) deliberately keep last-known rows.
   const visibleRuns = incompatible || transportDown ? [] : (runs ?? []);
 
   return (
@@ -256,6 +279,18 @@ export function PipelineView() {
         <span className="text-[12px] text-fg-2">{transportDescription(status)}</span>
         <span className="ml-auto text-[11px] text-fg-3">read-only · never drives the pipeline</span>
       </div>
+
+      {stale && !incompatible && (
+        // Distinct from schema-unreadable: data was trustworthy a moment ago;
+        // we simply could not refresh. Last-known rows stay visible.
+        <div className="rounded-[10px] border border-electric/40 bg-electric/[0.06] px-4 py-3">
+          <p className="text-[13px] font-semibold text-electric">Refresh delayed — showing last-known</p>
+          <p className="mt-1 text-[12px] text-fg-2">
+            The pipeline API could not be reached on the last poll. Rows below are
+            the last successful read, not confirmed current.
+          </p>
+        </div>
+      )}
 
       {incompatible && (
         // Degrade visibly. Rendering stale rows as current would be worse than
