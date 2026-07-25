@@ -244,40 +244,63 @@ describe("structural WEDGED ladder", () => {
     expect(acted[0]?.action).toBe("respawned");
   });
 
-  it("keeps the ladder per task+role, not global", () => {
+  it("keeps the ladder per task+role on the same task", () => {
     const { service } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
-    const builder = seedBuilder(service, { role: "builder", model: "openai/gpt-4.1" });
-    const validator = seedBuilder(service, {
+    // Same task, two roles — ledger keys are taskId:role, not a global counter.
+    const { taskId, sessionId: builderSessionId } = seedBuilder(service, {
+      role: "builder",
+      model: "openai/gpt-4.1",
+    });
+    const cast = service.tools.invoke("resolve_cast", {
+      taskId,
+      roles: [
+        { role: "validator", model: "anthropic/claude-sonnet-4-5", thinking: "low", cleanRoom: true },
+      ],
+      familyCheckOverride: false,
+    });
+    expect(cast.ok).toBe(true);
+    const validatorSpawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
       role: "validator",
       model: "anthropic/claude-sonnet-4-5",
+      thinking: "low",
+      vars: {},
+      redBaselineOverride: true,
     });
+    expect(validatorSpawned.ok).toBe(true);
+    const validatorSessionId = (
+      validatorSpawned.data as { session: { sessionId: string } }
+    ).session.sessionId;
 
-    backdateSession(service, builder.sessionId, {
+    backdateSession(service, builderSessionId, {
       idleMinutes: 60,
       lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
     expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("respawned");
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.builder).toBe(1);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.validator ?? 0).toBe(0);
+    expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+
+    // Validator still has its own free respawn while the task is BUILDING.
+    backdateSession(service, validatorSessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("respawned");
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.builder).toBe(1);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.validator).toBe(1);
 
     const builderLive = service.tools
       .listSessions()
-      .find(
-        (s) =>
-          s.taskId === builder.taskId && s.role === "builder" && s.status === "running",
-      );
+      .find((s) => s.taskId === taskId && s.role === "builder" && s.status === "running");
     expect(builderLive).toBeDefined();
     backdateSession(service, builderLive!.sessionId, {
       idleMinutes: 60,
       lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
-    backdateSession(service, validator.sessionId, {
-      idleMinutes: 60,
-      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
-    });
-
-    const acted = service.tools.reconcileWedgedSessions(Date.now());
-    const bySession = new Map(acted.map((a) => [a.sessionId, a.action]));
-    expect(bySession.get(builderLive!.sessionId)).toBe("escalated");
-    expect(bySession.get(validator.sessionId)).toBe("respawned");
+    expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("escalated");
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.builder).toBe(1);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.validator).toBe(1);
   });
 
   it("honours a respawn cap of zero by escalating immediately", () => {
@@ -397,14 +420,14 @@ describe("structural WEDGED ladder", () => {
     expect(events.some((e) => e.type === "task.phase_changed")).toBe(false);
   });
 
-  it("keeps the ledger spent when stop ran but spawn failed, without re-wedging the stopped seat", () => {
+  it("preflights known-illegal respawns: escalate without stop or spend", () => {
     const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
       lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
-    // Force spawn to refuse after stop: builders cannot start in VALIDATING.
+    // Builders cannot legally spawn in VALIDATING — do not stop to find that out.
     const task = service.tools.getTask(taskId)!;
     service.tools.hydrateTask({
       ...task,
@@ -414,6 +437,100 @@ describe("structural WEDGED ladder", () => {
     events.length = 0;
     const acted = service.tools.reconcileWedgedSessions(Date.now());
     expect(acted[0]?.action).toBe("escalated");
+    const session = service.tools.listSessions().find((s) => s.sessionId === sessionId);
+    expect(session?.status).toBe("wedged");
+    expect(service.tmux.hasWindow(session!.tmuxWindow)).toBe(true);
+    const durable = service.tools.getTask(taskId)!;
+    const durableRow = durable.sessions.find((s) => s.sessionId === sessionId);
+    expect(durableRow?.status).toBe("wedged");
+    expect(durable.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    const wedged = events.find((e) => e.type === "session.wedged");
+    expect(wedged?.type).toBe("session.wedged");
+    if (wedged?.type === "session.wedged") {
+      expect(wedged.payload.action).toBe("escalated");
+      expect(wedged.payload.respawnsUsed).toBe(0);
+    }
+    expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
+  });
+
+  it("does not stop a first-wedge seat when the task is already NEEDS_CAPTAIN", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId: builderSessionId } = seedBuilder(service, {
+      role: "builder",
+      model: "openai/gpt-4.1",
+    });
+    const cast = service.tools.invoke("resolve_cast", {
+      taskId,
+      roles: [
+        { role: "validator", model: "anthropic/claude-sonnet-4-5", thinking: "low", cleanRoom: true },
+      ],
+      familyCheckOverride: false,
+    });
+    expect(cast.ok).toBe(true);
+    const validatorSpawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "validator",
+      model: "anthropic/claude-sonnet-4-5",
+      thinking: "low",
+      vars: {},
+      redBaselineOverride: true,
+    });
+    expect(validatorSpawned.ok).toBe(true);
+    const validatorSessionId = (
+      validatorSpawned.data as { session: { sessionId: string } }
+    ).session.sessionId;
+
+    // Cap-zero escalate on the builder so the task is already NEEDS_CAPTAIN
+    // while the validator still has a free respawn budget.
+    const task = service.tools.getTask(taskId)!;
+    service.tools.hydrateTask({
+      ...task,
+      phase: "NEEDS_CAPTAIN",
+      needsCaptainSummary: "prior seat escalated",
+      updatedAt: new Date().toISOString(),
+    });
+    backdateSession(service, validatorSessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    // Builder is not idle-wedged this tick — only the validator is.
+    void builderSessionId;
+    events.length = 0;
+    const acted = service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted).toHaveLength(1);
+    expect(acted[0]?.sessionId).toBe(validatorSessionId);
+    expect(acted[0]?.action).toBe("escalated");
+    const validator = service.tools.listSessions().find((s) => s.sessionId === validatorSessionId);
+    expect(validator?.status).toBe("wedged");
+    expect(service.tmux.hasWindow(validator!.tmuxWindow)).toBe(true);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.validator ?? 0).toBe(0);
+    expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
+    const wedged = events.find((e) => e.type === "session.wedged");
+    if (wedged?.type === "session.wedged") {
+      expect(wedged.payload.action).toBe("escalated");
+      expect(wedged.payload.respawnsUsed).toBe(0);
+    }
+  });
+
+  it("keeps the ledger spent when stop ran but spawn failed, without re-wedging the stopped seat", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    // Phase still allows builder spawn; force the post-stop spawn half to fail.
+    const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+    service.tmux.newWindow = () => {
+      throw new Error("simulated spawn refusal after stop");
+    };
+    events.length = 0;
+    try {
+      const acted = service.tools.reconcileWedgedSessions(Date.now());
+      expect(acted[0]?.action).toBe("escalated");
+    } finally {
+      service.tmux.newWindow = originalNewWindow;
+    }
     const session = service.tools.listSessions().find((s) => s.sessionId === sessionId);
     expect(session?.status).toBe("stopped");
     const durable = service.tools.getTask(taskId)!;

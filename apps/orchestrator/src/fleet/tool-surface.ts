@@ -632,6 +632,19 @@ export class ToolSurface {
    * task+role (bounded by supervision.respawnPerStage), then escalate. A
    * substrate that respawns forever converts a wedged model into an infinite
    * spend, and the second wedge is far more likely to be the task than the seat.
+   *
+   * Respawn ledger + preflight (one policy):
+   * - The ledger counts attempts that cost the fleet a seat. It is spent
+   *   before the attempt so a crash cannot lose the spend, and rolled back
+   *   only when the attempt demonstrably did not reach the stop (once stop
+   *   has happened the spend stands even if the subsequent spawn fails).
+   * - If the task is already NEEDS_CAPTAIN, or the role cannot legally spawn
+   *   in the current phase, do not stop the seat at all: escalate directly,
+   *   spend nothing, and leave the live seat for the Captain to inspect.
+   *   Destroying a seat to attempt a spawn the substrate will refuse both
+   *   burns the role's only respawn and removes the evidence the Captain
+   *   would have wanted to look at — so we never reach stop on a known-
+   *   illegal spawn, and nothing is spent.
    */
   reconcileWedgedSessions(now = Date.now()): Array<{ sessionId: string; action: string }> {
     // Coalesce hot activity stamps before idle checks so the durable clock
@@ -665,6 +678,10 @@ export class ToolSurface {
 
       const used = this.getWedgeRespawns(session.taskId, session.role);
       const canRespawn = used < respawnCap;
+      const task =
+        session.taskId !== null ? (this.tasks.get(session.taskId) ?? null) : null;
+      const spawnLegal =
+        task !== null && this.canLegallySpawnForWedgeRespawn(task, session.role);
 
       // In-memory only until the outcome is known — durable wedged before
       // respawn/escalate strands the seat if we crash mid-ladder (rehydrate
@@ -673,11 +690,8 @@ export class ToolSurface {
 
       let action: "respawned" | "escalated";
       let escalateSummary: string | null = null;
-      if (canRespawn) {
+      if (canRespawn && spawnLegal) {
         try {
-          // Ledger invariant: counts attempts that cost the fleet a seat. Spent
-          // before the attempt so a crash cannot lose the spend; rolled back
-          // only when the attempt demonstrably did not reach the stop.
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
           this.respawnCrewmate({
             sessionId: session.sessionId,
@@ -697,6 +711,16 @@ export class ToolSurface {
             this.persistSessionWedged(current);
           }
         }
+      } else if (canRespawn && !spawnLegal) {
+        // Known-illegal spawn: never stop. Escalate with the seat still live.
+        action = "escalated";
+        const phase = task?.phase ?? "unknown";
+        escalateSummary =
+          task?.phase === "NEEDS_CAPTAIN"
+            ? `Seat ${session.role} wedged while task is already NEEDS_CAPTAIN — leaving the seat live for the Captain (no activity for ${Math.round(idleMinutes)}m)`
+            : `Seat ${session.role} wedged but cannot legally respawn in phase ${phase} — leaving the seat live for the Captain (no activity for ${Math.round(idleMinutes)}m)`;
+        const current = this.sessions.get(session.sessionId) ?? session;
+        this.persistSessionWedged(current);
       } else {
         // Cap consumed: the Captain decides, because a second wedge on the same
         // role is far more likely to be the task than the seat.
@@ -716,7 +740,6 @@ export class ToolSurface {
         respawnCap,
         action,
       });
-      this.wedgeLadderCompleted.add(session.sessionId);
       if (escalateSummary !== null) {
         this.escalate({
           taskId: session.taskId ?? undefined,
@@ -724,9 +747,33 @@ export class ToolSurface {
           severity: "critical",
         });
       }
+      // Only after a successful escalate (or a finished no-escalate respawn).
+      // The reconcile tick swallows errors — marking complete first would leave
+      // a durable-wedged seat that never re-attempts captain.escalation.
+      this.wedgeLadderCompleted.add(session.sessionId);
       acted.push({ sessionId: session.sessionId, action });
     }
     return acted;
+  }
+
+  /**
+   * Whether a wedge respawn would clear the phase/role gates that spawnCrewmate
+   * enforces. Used to preflight so we never stop a seat for a spawn we already
+   * know the substrate will refuse.
+   */
+  private canLegallySpawnForWedgeRespawn(task: TaskSnapshot, role: string): boolean {
+    if (isTerminalPhase(task.phase) || task.phase === "NEEDS_CAPTAIN") {
+      return false;
+    }
+    if (role === "scout") {
+      return canSpawnScout(task.phase);
+    }
+    if (role === "builder") {
+      const enforceRedBaseline =
+        this.cfg().policies.redBaselineGateRequired && !this.hasRedBaselineOverride(task);
+      return canSpawnBuilder(task.phase, { redBaselineRequired: enforceRedBaseline });
+    }
+    return true;
   }
 
   private getWedgeRespawns(taskId: string | null, role: string): number {
