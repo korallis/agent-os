@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { isoTimestampSchema } from "./ids.js";
-import { modelFamilySchema } from "./providers.js";
+import { billingSurfaceSchema, modelFamilySchema } from "./providers.js";
 import { quotaSampleSchema } from "./quota.js";
 
 /**
@@ -83,6 +83,58 @@ export const analyticsTotalsSchema = z.strictObject({
 });
 export type AnalyticsTotals = z.infer<typeof analyticsTotalsSchema>;
 
+/**
+ * Spend broken out by how the provider actually bills it (§11 Phase 8).
+ * `unattributed` is a real bucket, not a rounding hole: usage whose connection
+ * could not be identified must be visible, not folded into a surface it may
+ * not belong to.
+ */
+export const billingSurfaceUsageSchema = z.strictObject({
+  surface: z.union([billingSurfaceSchema, z.literal("unattributed")]),
+  inputTokens: z.number().int().min(0),
+  outputTokens: z.number().int().min(0),
+  costUsd: z.number().min(0).nullable(),
+  requests: z.number().int().min(0),
+  costReportedRequests: z.number().int().min(0),
+});
+export type BillingSurfaceUsage = z.infer<typeof billingSurfaceUsageSchema>;
+
+/**
+ * Brain overhead vs crew work (§11 Phase 8). The Brain never edits code, so its
+ * tokens are pure orchestration cost — the Captain needs to see that separately
+ * from the tokens that actually built something.
+ */
+export const brainUsageSchema = z.strictObject({
+  brainInputTokens: z.number().int().min(0),
+  brainOutputTokens: z.number().int().min(0),
+  brainCostUsd: z.number().min(0).nullable(),
+  brainRequests: z.number().int().min(0),
+  crewInputTokens: z.number().int().min(0),
+  crewOutputTokens: z.number().int().min(0),
+  crewCostUsd: z.number().min(0).nullable(),
+  crewRequests: z.number().int().min(0),
+  /** Share of all in-window tokens spent orchestrating rather than building. */
+  brainSharePct: z.number().min(0).max(100),
+});
+export type BrainUsage = z.infer<typeof brainUsageSchema>;
+
+/**
+ * Reconciliation (§11 Phase 8 "analytics reconcile ±0"). Every breakdown is
+ * derived from the same event pass as the totals, so each must sum back to them
+ * exactly. Computed daemon-side and asserted by the Phase 8 gate: a false here
+ * is a defect in the derivation, not a rounding artifact.
+ */
+export const analyticsReconcileSchema = z.strictObject({
+  modelsMatchTotals: z.boolean(),
+  agentsMatchTotals: z.boolean(),
+  dailyMatchTotals: z.boolean(),
+  billingSurfacesMatchTotals: z.boolean(),
+  brainPlusCrewMatchTotals: z.boolean(),
+  /** True only when every breakdown above reconciles exactly. */
+  exact: z.boolean(),
+});
+export type AnalyticsReconcile = z.infer<typeof analyticsReconcileSchema>;
+
 export const analyticsSnapshotSchema = z.strictObject({
   generatedAt: isoTimestampSchema,
   windowDays: z.number().int().min(1).max(365),
@@ -97,6 +149,9 @@ export const analyticsSnapshotSchema = z.strictObject({
   daily: z.array(dailyUsagePointSchema),
   models: z.array(modelUsageSchema),
   agents: z.array(agentUsageSchema),
+  billingSurfaces: z.array(billingSurfaceUsageSchema),
+  brain: brainUsageSchema,
+  reconcile: analyticsReconcileSchema,
   quota: z.array(quotaSampleSchema),
 });
 export type AnalyticsSnapshot = z.infer<typeof analyticsSnapshotSchema>;

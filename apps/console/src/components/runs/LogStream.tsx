@@ -58,6 +58,10 @@ function levelOf(envelope: EventEnvelope): Level {
     case "prompt.installed":
     case "crew.answered":
     case "bridge.tool_call":
+    case "afk.changed":
+    case "afk.auto_answered":
+    case "brain.handoff_triggered":
+    case "brain.handoff_completed":
       return "INFO";
     case "fusion.completed":
       return envelope.event.payload.error != null && envelope.event.payload.error.length > 0
@@ -116,6 +120,12 @@ function sourceOf(envelope: EventEnvelope): string {
       return "scout";
     case "bridge.tool_call":
       return "bridge";
+    case "afk.changed":
+    case "afk.auto_answered":
+      return "afk";
+    case "brain.handoff_triggered":
+    case "brain.handoff_completed":
+      return "brain";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -243,6 +253,16 @@ function messageOf(envelope: EventEnvelope): string {
       return event.payload.accepted
         ? `Bridge ${event.payload.tool} accepted from ${event.payload.sessionId.slice(0, 8)}`
         : `Bridge ${event.payload.tool} refused — ${event.payload.reason ?? "unknown"}`;
+    case "afk.changed":
+      return event.payload.armed
+        ? `AFK armed — ${event.payload.faqEntries} FAQ entr${event.payload.faqEntries === 1 ? "y" : "ies"}${event.payload.until !== null ? ` until ${event.payload.until}` : ""}`
+        : "AFK disarmed";
+    case "afk.auto_answered":
+      return `AFK answered from FAQ — ${event.payload.rationale}`;
+    case "brain.handoff_triggered":
+      return `Brain handoff ${event.payload.fromModel} → ${event.payload.toModel} (${event.payload.metric} ${event.payload.observedPct}% ≥ ${event.payload.thresholdPct}%)`;
+    case "brain.handoff_completed":
+      return `Brain handoff complete — ${event.payload.toModel} in new session ${event.payload.toSessionId ?? "(none)"} (${event.payload.reason})`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {

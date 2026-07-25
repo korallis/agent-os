@@ -63,6 +63,8 @@ export class BrainManager {
   private sink: BrainEventSink = () => undefined;
   private config: BrainConfig;
   private readonly fake: boolean;
+  /** Set by handoff(); overrides cast resolution until the Captain changes it. */
+  private handoffModel: string | null = null;
 
   constructor(private readonly deps: BrainManagerDeps) {
     this.config = deps.config;
@@ -227,6 +229,53 @@ export class BrainManager {
     return this.getSnapshot();
   }
 
+  /**
+   * Budget handoff (master plan §11 Phase 8, [R4]).
+   *
+   * Moves the Brain to another model when its own connection has spent past the
+   * configured share of its window. The replacement runs in a NEW Pi session
+   * with its own per-model session dir: a Claude transcript is not valid input
+   * to GPT, so nothing is replayed across the boundary. The new Brain rebuilds
+   * its picture the same way a cold start does — read_fleet_state first.
+   *
+   * In-flight tasks are untouched: crewmate panes, leases, and task phases live
+   * in the substrate, not in the Brain's context.
+   */
+  handoff(toModel: string, reason: string): BrainSnapshot {
+    const fromModel = this.snapshot.model;
+    const fromSessionId = this.snapshot.sessionId;
+    if (toModel === fromModel) {
+      return this.getSnapshot();
+    }
+    this.handoffModel = toModel;
+    // start() tears down the prior pane, mints a fresh session id, and resolves
+    // a session dir keyed to the new model — the no-replay guarantee is
+    // structural rather than a rule the caller has to remember.
+    const next = this.start(`brain handoff: ${reason}`);
+    this.snapshot = {
+      ...this.snapshot,
+      handoffFrom: fromModel,
+      handoffReason: reason,
+    };
+    this.deps.tools.setBrainSnapshot(this.snapshot);
+    this.sink({
+      type: "brain.handoff_completed",
+      payload: {
+        fromModel,
+        toModel,
+        fromSessionId,
+        toSessionId: this.snapshot.sessionId,
+        reason,
+      },
+    });
+    return { ...next, handoffFrom: fromModel, handoffReason: reason };
+  }
+
+  /** The model a handoff moved the Brain to, or null when none has happened. */
+  handoffTarget(): string | null {
+    return this.handoffModel;
+  }
+
   /** Enter BRAIN_DOWN — sessions stay alive; wakes queue; no orchestration. */
   enterDown(reason: string): void {
     this.snapshot = {
@@ -339,6 +388,9 @@ export class BrainManager {
   }
 
   private resolveModel(): string {
+    // A budget handoff wins over configured cast until reset — the whole point
+    // of the handoff is that the configured model can no longer be spent.
+    if (this.handoffModel !== null) return this.handoffModel;
     if (this.config.cast !== "auto") {
       return this.config.cast;
     }

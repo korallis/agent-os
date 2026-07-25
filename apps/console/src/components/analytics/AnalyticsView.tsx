@@ -24,6 +24,15 @@ import {
  *    and "complete" — subscription legs never silently read as $0.00.
  */
 
+/** Figma-side wording for the billing surfaces the daemon reports. */
+const SURFACE_LABELS: Readonly<Record<string, string>> = {
+  "plan-quota": "Plan quota",
+  "extra-usage-per-token": "Extra usage (per token)",
+  "api-metered": "API metered",
+  "sdk-credit-pool": "SDK credit pool",
+  unattributed: "Unattributed",
+};
+
 const SERIES_COLORS = ["bg-teal-brand", "bg-electric", "bg-[#a855f7]", "bg-warn", "bg-ok"] as const;
 const CONIC_COLORS = ["#2dd4bf", "#3b82f6", "#a855f7", "#fbbf24", "#4ade80"] as const;
 
@@ -121,6 +130,9 @@ export function AnalyticsView() {
   const maxDaily = Math.max(...daily.map((d) => d.inputTokens + d.outputTokens), 1);
   const models = snapshot?.models ?? [];
   const agents = snapshot?.agents ?? [];
+  const billingSurfaces = snapshot?.billingSurfaces ?? [];
+  const brainUsage = snapshot?.brain;
+  const reconcile = snapshot?.reconcile;
   const modelCostTotal = models.reduce(
     (sum, m) => sum + (m.costUsd === null ? 0 : m.costUsd),
     0,
@@ -337,6 +349,83 @@ export function AnalyticsView() {
                     <span className="w-[90px] text-fg-2">{agent.requests}</span>
                   </div>
                 ))}
+              </>
+            )}
+          </Card>
+
+          <Card className="p-5 flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[15px] font-semibold text-fg-1">Billing Surface &amp; Brain Overhead</h3>
+              {reconcile !== undefined ? (
+                <span
+                  className={cn(
+                    "text-[11px] px-2 py-0.5 rounded",
+                    reconcile.exact ? "text-ok bg-ok/10" : "text-warn bg-warn/10",
+                  )}
+                >
+                  {reconcile.exact ? "reconciles ±0" : "breakdown mismatch"}
+                </span>
+              ) : null}
+            </div>
+            {snapshotStatus === "loading" ? (
+              <p className="py-6 text-center text-[13px] text-fg-3">Loading usage…</p>
+            ) : snapshotStatus === "unavailable" ? (
+              <EmptyState
+                kind="server-error"
+                title="Usage unavailable"
+                body="Billing-surface and Brain breakdowns could not be loaded from the daemon."
+                className="border-0 bg-transparent py-6"
+              />
+            ) : billingSurfaces.length === 0 ? (
+              <EmptyState
+                kind="no-data"
+                title="No billed usage yet"
+                body="Spend splits by billing surface once providers report usage frames."
+                className="border-0 bg-transparent py-6"
+              />
+            ) : (
+              <>
+                <div className="flex items-center h-8 text-[11px] text-fg-3 border-b border-line-1">
+                  <span className="flex-1">Billing surface</span>
+                  <span className="w-[100px]">Tokens</span>
+                  <span className="w-[90px]">Cost</span>
+                  <span className="w-[90px]">Requests</span>
+                </div>
+                {billingSurfaces.map((surface) => (
+                  <div key={surface.surface} className="flex items-center text-xs">
+                    <span className="flex-1 text-fg-1">
+                      {SURFACE_LABELS[surface.surface] ?? surface.surface}
+                    </span>
+                    <span className="w-[100px] text-fg-1">
+                      {compact(surface.inputTokens + surface.outputTokens)}
+                    </span>
+                    <span className="w-[90px] text-fg-1">
+                      {formatRowCost(
+                        surface.costUsd,
+                        surface.costReportedRequests,
+                        surface.requests,
+                      )}
+                    </span>
+                    <span className="w-[90px] text-fg-2">{surface.requests}</span>
+                  </div>
+                ))}
+                {brainUsage !== undefined ? (
+                  <div className="flex flex-col gap-2 pt-3 border-t border-line-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-fg-2">Brain tokens (orchestration)</span>
+                      <span className="text-fg-1">
+                        {compact(brainUsage.brainInputTokens + brainUsage.brainOutputTokens)} ·{" "}
+                        {brainUsage.brainSharePct}% of window
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-fg-2">Crew tokens (work)</span>
+                      <span className="text-fg-1">
+                        {compact(brainUsage.crewInputTokens + brainUsage.crewOutputTokens)}
+                      </span>
+                    </div>
+                  </div>
+                ) : null}
               </>
             )}
           </Card>

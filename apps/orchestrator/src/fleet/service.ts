@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
   DaemonControlFrame,
+  QuotaSample,
   ExtensionToDaemonFrame,
   FleetSummary,
   OrchestratorEvent,
@@ -22,6 +23,8 @@ import { BrainManager } from "./brain.js";
 import { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
+import { AfkService } from "./afk.js";
+import { decideHandoff } from "./brain-handoff.js";
 
 export type FleetEventSink = (event: OrchestratorEvent) => void;
 
@@ -36,7 +39,23 @@ export interface FleetServiceOptions {
   fakeTmux?: boolean;
   fakePi?: boolean;
   fakeBrain?: boolean;
+  /** Latest quota samples, read live so handoff decisions use current numbers. */
+  quotaSamples?: () => QuotaSample[];
 }
+
+/**
+ * Brain-capable default model per provider. Deliberately conservative: a
+ * handoff target must be a model we already spawn Brains on, not whatever the
+ * provider happens to offer.
+ */
+const DEFAULT_BRAIN_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = {
+  anthropic: "anthropic/claude-sonnet-4-5",
+  "claude-agent-sdk": "claude-agent-sdk/claude-sonnet-4-5",
+  openai: "openai/gpt-4.1",
+  xai: "xai/grok-3",
+  openrouter: "anthropic/claude-sonnet-4-5",
+  "vercel-ai-gateway": "anthropic/claude-sonnet-4-5",
+};
 
 type PendingToolResult = {
   frame: Extract<DaemonControlFrame, { type: "ctl.tool_result" }>;
@@ -58,6 +77,7 @@ export class FleetService {
   readonly sessionKeys: SessionKeyStore;
   readonly tools: ToolSurface;
   readonly brain: BrainManager;
+  readonly afk: AfkService;
   private sink: FleetEventSink = () => undefined;
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   /** ctl.tool_result frames that failed sendControl; retried on session re-hello. */
@@ -74,6 +94,7 @@ export class FleetService {
     this.gates = new GateRunner(options.home, cfg.validation);
     this.fusionRuns = new FusionRunStore(options.home);
     this.sessionKeys = new SessionKeyStore(options.home);
+    this.afk = new AfkService(join(options.home, "afk"));
     this.tools = new ToolSurface({
       home: options.home,
       config: options.config,
@@ -90,6 +111,7 @@ export class FleetService {
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
       ...(options.fakePi !== undefined ? { fakePi: options.fakePi } : {}),
+      afk: this.afk,
     });
     this.brain = new BrainManager({
       home: options.home,
@@ -120,6 +142,7 @@ export class FleetService {
     this.watcher.onEvent(fanout);
     this.tools.onEvent(fanout);
     this.brain.onEvent(fanout);
+    this.afk.onEvent(fanout);
   }
 
   /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */
@@ -452,6 +475,72 @@ export class FleetService {
     this.tools.reconcileMissingCastRoles();
   }
 
+  /**
+   * Brain budget handoff (master plan §11 Phase 8, [R4]).
+   *
+   * Run on every reconcile tick and callable directly by gates/fixtures. The
+   * decision is made in `decideHandoff`, which is pure; this method only maps
+   * the fleet's live state into it and carries out what it decided.
+   *
+   * The below-threshold case is deliberately silent: emitting an event every
+   * tick for "nothing happened" would bury the one that matters.
+   */
+  evaluateBrainHandoff(): ReturnType<typeof decideHandoff> | null {
+    const brainSnapshot = this.brain.getSnapshot();
+    if (brainSnapshot.model === null) return null;
+    const cfg = this.options.config.effective().config;
+    const samples = this.options.quotaSamples?.() ?? [];
+    const connections = this.options.connections?.list() ?? [];
+
+    // The Brain's connection is the one whose provider serves its model ref.
+    const brainProvider = brainSnapshot.model.split("/")[0] ?? "";
+    const brainConnection =
+      connections.find((c) => c.provider === brainProvider) ?? null;
+
+    const decision = decideHandoff({
+      brainModel: brainSnapshot.model,
+      brainConnectionId: brainConnection?.id ?? null,
+      config: cfg.brain,
+      budgets: cfg.budgets,
+      samples,
+      candidates: this.handoffCandidates(brainSnapshot.model),
+    });
+    if (!decision.shouldHandoff || decision.toModel === null) return decision;
+
+    this.sink({
+      type: "brain.handoff_triggered",
+      payload: {
+        fromModel: decision.fromModel,
+        toModel: decision.toModel,
+        metric: decision.metric,
+        observedPct: decision.observedPct,
+        thresholdPct: decision.thresholdPct,
+      },
+    });
+    this.brain.handoff(decision.toModel, decision.reason);
+    return decision;
+  }
+
+  /**
+   * Models the Brain could be moved to: one per healthy, not-limit-reached
+   * connection other than the one it is spending down. A connection at its own
+   * limit is not a refuge.
+   */
+  private handoffCandidates(currentModel: string): string[] {
+    const connections = this.options.connections?.list() ?? [];
+    const currentProvider = currentModel.split("/")[0] ?? "";
+    const candidates: string[] = [];
+    for (const connection of connections) {
+      if (connection.limitReached) continue;
+      if (connection.health === "unhealthy") continue;
+      if (connection.provider === currentProvider) continue;
+      const model = DEFAULT_BRAIN_MODEL_BY_PROVIDER[connection.provider];
+      if (model === undefined) continue;
+      candidates.push(model);
+    }
+    return candidates;
+  }
+
   private startReconcileTick(): void {
     this.stopReconcileTick();
     const seconds = this.options.config.effective().config.supervision.heartbeatSeconds;
@@ -459,6 +548,7 @@ export class FleetService {
     this.reconcileTimer = setInterval(() => {
       try {
         this.reconcile();
+        this.evaluateBrainHandoff();
       } catch {
         // never let the tick crash the daemon
       }

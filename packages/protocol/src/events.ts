@@ -483,6 +483,54 @@ export const bridgeToolCallEventSchema = z.strictObject({
   }),
 });
 
+/** AFK posture armed or disarmed. */
+export const afkChangedEventSchema = z.strictObject({
+  type: z.literal("afk.changed"),
+  payload: z.strictObject({
+    armed: z.boolean(),
+    until: isoTimestampSchema.nullable(),
+    faqEntries: z.number().int().min(0),
+  }),
+});
+
+/** A crew question answered from the Captain's recorded FAQ while AFK. */
+export const afkAutoAnsweredEventSchema = z.strictObject({
+  type: z.literal("afk.auto_answered"),
+  payload: z.strictObject({
+    question: z.string(),
+    rationale: z.string(),
+    matched: z.array(z.string()),
+  }),
+});
+
+/** Brain crossed its budget window and was handed to another model. */
+export const brainHandoffTriggeredEventSchema = z.strictObject({
+  type: z.literal("brain.handoff_triggered"),
+  payload: z.strictObject({
+    fromModel: z.string(),
+    toModel: z.string(),
+    metric: z.string(),
+    observedPct: z.number().min(0),
+    thresholdPct: z.number().min(0),
+  }),
+});
+
+/**
+ * The handoff actually happened: the new Brain seat is live in a NEW session.
+ * Recording both session ids is what makes "no cross-model transcript replay"
+ * checkable after the fact rather than a claim in a comment.
+ */
+export const brainHandoffCompletedEventSchema = z.strictObject({
+  type: z.literal("brain.handoff_completed"),
+  payload: z.strictObject({
+    fromModel: z.string().nullable(),
+    toModel: z.string(),
+    fromSessionId: ulidSchema.nullable(),
+    toSessionId: ulidSchema.nullable(),
+    reason: z.string(),
+  }),
+});
+
 export const captainEscalationEventSchema = z.strictObject({
   type: z.literal("captain.escalation"),
   payload: z.strictObject({
@@ -546,6 +594,10 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   crewAnsweredEventSchema,
   scoutWriteViolationEventSchema,
   bridgeToolCallEventSchema,
+  afkChangedEventSchema,
+  afkAutoAnsweredEventSchema,
+  brainHandoffTriggeredEventSchema,
+  brainHandoffCompletedEventSchema,
   captainEscalationEventSchema,
   taskDeliveryBlockResolvedEventSchema,
 ]);

@@ -212,6 +212,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       fakeTmux: process.env.AGENTOS_FAKE_TMUX === "1",
       fakePi: process.env.AGENTOS_FAKE_PI === "1",
       fakeBrain: process.env.AGENTOS_FAKE_BRAIN === "1",
+      // Read live rather than snapshotting: a handoff decision made from a
+      // stale sample is a decision about a window that already moved.
+      quotaSamples: () => [...quotaSamples.values()],
     });
     fleet.onEvent((event) => {
       eventStore.append(event);
@@ -268,6 +271,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         }
         return { facts, truncated: spawnTruncated };
       },
+      () =>
+        connections
+          .list()
+          .map((c) => ({ provider: c.provider, billingSurface: c.billingSurface })),
     );
 
     // Read-only terminal attach: single-use tickets minted over authenticated
