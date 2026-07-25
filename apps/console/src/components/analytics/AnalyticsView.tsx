@@ -5,6 +5,7 @@ import { cn } from "@agent-os/ui";
 import type { AnalyticsSnapshot, BudgetsConfig } from "@agent-os/protocol";
 import { Icon } from "@/components/shell/Icon";
 import { EmptyState } from "@/components/shell/EmptyState";
+import { AnalyticsSubnav } from "@/components/analytics/AnalyticsSubnav";
 import { QuotaUsageStrip } from "@/components/analytics/QuotaUsageStrip";
 import { useEventStream } from "@/lib/useEventStream";
 import {
@@ -168,7 +169,7 @@ export function AnalyticsView() {
 
   return (
     <main className="flex-1 flex flex-col gap-5 p-8">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2.5">
             <Icon src="trend-up.svg" className="size-5" />
@@ -178,10 +179,13 @@ export function AnalyticsView() {
             Derived from the daemon event log — no sampled estimates
           </p>
         </div>
-        <span className="flex items-center gap-2 h-9 rounded-lg bg-panel border border-line-1 px-3.5 text-[13px] font-medium text-fg-1">
-          <Icon src="calendar.svg" className="size-4" />
-          Last {windowDays} days
-        </span>
+        <div className="flex items-center gap-3">
+          <AnalyticsSubnav />
+          <span className="flex items-center gap-2 h-9 rounded-lg bg-panel border border-line-1 px-3.5 text-[13px] font-medium text-fg-1">
+            <Icon src="calendar.svg" className="size-4" />
+            Last {windowDays} days
+          </span>
+        </div>
       </div>
 
       {snapshot?.truncated === true && (

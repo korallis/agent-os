@@ -44,6 +44,29 @@ const BILLING_LABEL: Record<string, { label: string; tone: string; note: string 
   },
 };
 
+function spendNote(
+  analyticsStatus: LoadState,
+  coverage: AnalyticsSnapshot["totals"]["costCoverage"] | undefined,
+  totals: AnalyticsSnapshot["totals"] | undefined,
+): { text: string; tone: string } {
+  if (analyticsStatus === "loading") {
+    return { text: "loading analytics…", tone: "text-fg-3" };
+  }
+  if (analyticsStatus === "unavailable" || totals === undefined) {
+    return { text: "analytics unavailable", tone: "text-warn" };
+  }
+  if (coverage === "complete") {
+    return { text: "all requests reported cost", tone: "text-fg-3" };
+  }
+  if (coverage === "partial") {
+    return {
+      text: `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost`,
+      tone: "text-warn",
+    };
+  }
+  return { text: "no provider reported cost", tone: "text-fg-3" };
+}
+
 export function BillingView() {
   const { events } = useEventStream();
   const refreshKey = useStickyRefreshKey(
@@ -58,6 +81,7 @@ export function BillingView() {
   const [samples, setSamples] = useState<QuotaSample[]>([]);
   const [budgets, setBudgets] = useState<BudgetsConfig | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsSnapshot | null>(null);
+  const [analyticsStatus, setAnalyticsStatus] = useState<LoadState>("loading");
   const [state, setState] = useState<LoadState>("loading");
 
   useEffect(() => {
@@ -90,6 +114,9 @@ export function BillingView() {
       if (analyticsRes.status === "fulfilled" && analyticsRes.value.ok) {
         anyOk = true;
         setAnalytics((await analyticsRes.value.json()) as AnalyticsSnapshot);
+        setAnalyticsStatus("ready");
+      } else {
+        setAnalyticsStatus((prev) => (prev === "ready" ? "ready" : "unavailable"));
       }
       setState((prev) => (anyOk ? "ready" : prev === "ready" ? "ready" : "unavailable"));
     };
@@ -106,31 +133,31 @@ export function BillingView() {
     return <p className="py-10 text-center text-[13px] text-fg-3">Loading…</p>;
   }
 
-  const totals = analytics?.totals;
-  const coverage = totals?.costCoverage ?? "absent";
+  const analyticsReady = analyticsStatus === "ready" && analytics !== null;
+  const totals = analyticsReady ? analytics.totals : undefined;
+  const coverage = totals?.costCoverage;
+  const spend = spendNote(analyticsStatus, coverage, totals);
+  const windowDays = analytics?.windowDays ?? 14;
 
   return (
     <div className="flex flex-col gap-5">
+      {analyticsReady && analytics.truncated === true && (
+        <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
+          Analytics history was truncated at a read bound — reported spend keeps the
+          newest frames and may omit older in-window usage inside the {windowDays}-day
+          range.
+        </div>
+      )}
+
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1">
           <span className="text-[11px] uppercase tracking-wide text-fg-3">
-            Reported spend ({analytics?.windowDays ?? 14}d)
+            Reported spend ({windowDays}d)
           </span>
           <span className="text-2xl font-semibold text-fg-1">
-            {totals?.costUsd == null ? "—" : `$${totals.costUsd.toFixed(2)}`}
+            {!analyticsReady || totals?.costUsd == null ? "—" : `$${totals.costUsd.toFixed(2)}`}
           </span>
-          <span
-            className={cn(
-              "text-[11px]",
-              coverage === "partial" ? "text-warn" : "text-fg-3",
-            )}
-          >
-            {coverage === "complete"
-              ? "all requests reported cost"
-              : coverage === "partial"
-                ? `partial — ${totals?.costReportedRequests ?? 0} of ${totals?.requests ?? 0} requests reported cost`
-                : "no provider reported cost"}
-          </span>
+          <span className={cn("text-[11px]", spend.tone)}>{spend.text}</span>
         </div>
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1">
           <span className="text-[11px] uppercase tracking-wide text-fg-3">Fleet ceiling</span>

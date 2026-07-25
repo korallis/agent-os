@@ -5,6 +5,7 @@ import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type { EventEnvelope } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
+import { fetchEventsReplay } from "@/lib/fetchEventsReplay";
 import { useEventStream } from "@/lib/useEventStream";
 import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
 
@@ -39,6 +40,11 @@ interface Alert {
   taskId: string | null;
 }
 
+function quotaSeverity(level: "warn" | "critical" | "limit-reached"): Alert["severity"] {
+  if (level === "limit-reached" || level === "critical") return "critical";
+  return "warn";
+}
+
 function toAlert(envelope: EventEnvelope): Alert | null {
   const { event } = envelope;
   const base = { id: envelope.id, ts: envelope.ts, type: event.type, taskId: null as string | null };
@@ -46,25 +52,29 @@ function toAlert(envelope: EventEnvelope): Alert | null {
     case "quota.threshold":
       return {
         ...base,
-        severity: event.payload.level === "limit-reached" ? "critical" : "warn",
+        severity: quotaSeverity(event.payload.level),
         title: `Quota ${event.payload.level} — ${event.payload.provider}`,
         detail: event.payload.reason,
       };
     case "captain.escalation":
       return {
         ...base,
-        severity: event.payload.severity === "critical" ? "critical" : "warn",
+        severity: event.payload.severity,
         title: "Escalated to Captain",
         detail: event.payload.summary,
         taskId: event.payload.taskId,
       };
-    case "provider.billing_mismatch":
+    case "provider.billing_mismatch": {
+      const paths = `expected ${event.payload.expectedPath}, observed ${event.payload.observedPath}`;
+      const detail =
+        event.payload.detail.length > 0 ? `${event.payload.detail} (${paths})` : paths;
       return {
         ...base,
         severity: "critical",
         title: "Billing mismatch",
-        detail: `expected ${event.payload.expectedPath}, observed ${event.payload.observedPath}`,
+        detail,
       };
+    }
     case "scout.write_violation":
       return {
         ...base,
@@ -114,28 +124,24 @@ export function AlertsView() {
     "alerts",
   );
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [truncated, setTruncated] = useState(false);
   const [state, setState] = useState<LoadState>("loading");
 
   useEffect(() => {
     let cancelled = false;
     const load = async (): Promise<void> => {
-      try {
-        const res = await fetch("/api/agentos/events/replay?limit=5000", { cache: "no-store" });
-        if (cancelled) return;
-        if (!res.ok) {
-          setState((prev) => (prev === "ready" ? "ready" : "unavailable"));
-          return;
-        }
-        const body = (await res.json()) as { events: EventEnvelope[] };
-        const mapped = body.events
-          .map(toAlert)
-          .filter((a): a is Alert => a !== null)
-          .reverse();
-        setAlerts(mapped);
-        setState("ready");
-      } catch {
-        if (!cancelled) setState((prev) => (prev === "ready" ? "ready" : "unavailable"));
+      const result = await fetchEventsReplay({ limit: 5000 });
+      if (cancelled) return;
+      if (result.unavailable) {
+        setState((prev) => (prev === "ready" ? "ready" : "unavailable"));
+        return;
       }
+      const mapped = result.events
+        .map(toAlert)
+        .filter((a): a is Alert => a !== null);
+      setAlerts(mapped);
+      setTruncated(result.truncated);
+      setState("ready");
     };
     void load();
     return () => {
@@ -163,6 +169,12 @@ export function AlertsView() {
 
   return (
     <div className="flex flex-col gap-4">
+      {truncated && (
+        <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
+          Alert history was truncated at a read bound — only the newest matching
+          frames are shown; older alerts may be omitted.
+        </div>
+      )}
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
         {[
           { label: "Critical", value: critical, danger: critical > 0 },

@@ -265,9 +265,12 @@ function QuickActionsCard({ needsCaptain }: { needsCaptain: number }) {
     { href: "/tasks", label: "Tasks board", hint: "Dispatch and track work" },
     { href: "/projects", label: "Projects", hint: "Register a repository" },
     { href: "/providers", label: "Providers & quota", hint: "Connections and limits" },
+    { href: "/notifications", label: "Notifications", hint: "Wake queue and needs-you" },
+    { href: "/alerts", label: "Recent alerts", hint: "Quota, escalations, violations" },
     { href: "/runs", label: "Live log stream", hint: "Everything the fleet emits" },
     { href: "/runs/history", label: "Run history", hint: "Gate and fusion journeys" },
     { href: "/policies", label: "Policies", hint: "Layered config and safety" },
+    { href: "/onboarding", label: "Setup wizard", hint: "Guided first-run and re-setup" },
   ];
   return (
     <Card className="p-5 flex flex-col gap-4">

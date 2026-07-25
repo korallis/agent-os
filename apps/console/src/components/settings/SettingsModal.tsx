@@ -160,5 +160,5 @@ export const SETTINGS_TABS: SettingsTab[] = [
   { label: "Workspace", icon: "st-workspace.svg", href: "/settings" },
   { label: "API Providers", icon: "st-plug.svg", href: "/providers" },
   { label: "Team Members", icon: "st-team.svg" },
-  { label: "Billing", icon: "st-billing.svg" },
+  { label: "Billing", icon: "st-billing.svg", href: "/settings/billing" },
 ];
