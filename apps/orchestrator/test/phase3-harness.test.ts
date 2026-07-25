@@ -356,9 +356,10 @@ describe("spawn env delivery", () => {
           socketPath: join(home, `${seat.role}.sock`),
           extensionPath: join(home, "ext.js"),
           grantProviderKey: null,
-          gateWorkspace: seat.gateWorkspace,
-          seatWorkspace: seat.seatWorkspace,
-          sessionDir: seat.sessionDir,
+          // exactOptionalPropertyTypes: omit optional keys rather than pass undefined
+          ...(seat.gateWorkspace !== undefined ? { gateWorkspace: seat.gateWorkspace } : {}),
+          ...(seat.seatWorkspace !== undefined ? { seatWorkspace: seat.seatWorkspace } : {}),
+          ...(seat.sessionDir !== undefined ? { sessionDir: seat.sessionDir } : {}),
         });
         const joined = Object.values(spec.env).join("\0");
         expect(joined).not.toContain(sentinel);
