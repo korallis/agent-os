@@ -211,7 +211,7 @@ describe("session keys (G6)", () => {
     expect(missing).toEqual([{ role: "planner", model: "openai/gpt-5.6-sol" }]);
   });
 
-  it("wires session dirs into live spawns and hands AGENTOS_SESSION_DIR to Pi", () => {
+  it("wires session dirs into live spawns and hands native Pi session isolation", () => {
     const { service } = fleet();
     const { taskId, projectId } = seedShipTask(service);
 
@@ -261,7 +261,9 @@ describe("session keys (G6)", () => {
     expect(existsSync(join(dirA, "session.json"))).toBe(true);
     expect(existsSync(join(dirB, "session.json"))).toBe(true);
 
-    // buildPiSpawnSpec carries AGENTOS_SESSION_DIR through the scrubbed env.
+    // buildPiSpawnSpec must point Pi's own session store at the per-model dir
+    // (--session-dir + PI_CODING_AGENT_SESSION_DIR), not only AGENTOS_SESSION_DIR
+    // (extension output capture).
     const detection: PiDetection = {
       binary: "/usr/bin/true",
       version: "0.0.0-test",
@@ -271,20 +273,47 @@ describe("session keys (G6)", () => {
       configDirEnv: "PI_CONFIG_DIR",
       isolationMode: "managed",
     };
-    const spec = buildPiSpawnSpec({
-      agentosHome: temp("agentos-p4-spec-home-"),
+    const specA = buildPiSpawnSpec({
+      agentosHome: temp("agentos-p4-spec-home-a-"),
       detection,
-      args: ["-p", "hi", "--model", "openai/gpt-4.1"],
-      cwd: temp("agentos-p4-spec-cwd-"),
+      args: ["-p", "hi", "--model", "anthropic/claude-fable-5"],
+      cwd: temp("agentos-p4-spec-cwd-a-"),
       sessionId: "01JSESSION000000000000000A",
       role: "planner",
-      socketPath: "/tmp/agentos-test.sock",
-      extensionPath: join(temp("agentos-p4-ext-"), "ext.js"),
+      socketPath: "/tmp/agentos-test-a.sock",
+      extensionPath: join(temp("agentos-p4-ext-a-"), "ext.js"),
+      sessionDir: dirA,
+      cleanRoom: true,
+    });
+    const specB = buildPiSpawnSpec({
+      agentosHome: temp("agentos-p4-spec-home-b-"),
+      detection,
+      args: ["-p", "hi", "--model", "openai/gpt-4.1"],
+      cwd: temp("agentos-p4-spec-cwd-b-"),
+      sessionId: "01JSESSION000000000000000B",
+      role: "planner",
+      socketPath: "/tmp/agentos-test-b.sock",
+      extensionPath: join(temp("agentos-p4-ext-b-"), "ext.js"),
       sessionDir: dirB,
       cleanRoom: true,
     });
-    expect(spec.env.AGENTOS_SESSION_DIR).toBe(dirB);
-    expect(spec.envKeys).toContain("AGENTOS_SESSION_DIR");
+    expect(specA.args).toContain("--session-dir");
+    expect(specA.args[specA.args.indexOf("--session-dir") + 1]).toBe(dirA);
+    expect(specA.env.PI_CODING_AGENT_SESSION_DIR).toBe(dirA);
+    expect(specA.env.AGENTOS_SESSION_DIR).toBe(dirA);
+    expect(specA.envKeys).toContain("PI_CODING_AGENT_SESSION_DIR");
+    expect(specA.envKeys).toContain("AGENTOS_SESSION_DIR");
+    expect(specB.args).toContain("--session-dir");
+    expect(specB.args[specB.args.indexOf("--session-dir") + 1]).toBe(dirB);
+    expect(specB.env.PI_CODING_AGENT_SESSION_DIR).toBe(dirB);
+    expect(specB.env.AGENTOS_SESSION_DIR).toBe(dirB);
+    // Two models ⇒ two distinct Pi session directories on the spawn argv/env.
+    expect(specA.args[specA.args.indexOf("--session-dir") + 1]).not.toBe(
+      specB.args[specB.args.indexOf("--session-dir") + 1],
+    );
+    expect(specA.env.PI_CODING_AGENT_SESSION_DIR).not.toBe(
+      specB.env.PI_CODING_AGENT_SESSION_DIR,
+    );
 
     // Wipe exactly the openai session dir; anthropic survives.
     rmSync(dirB, { recursive: true, force: true });
@@ -1023,6 +1052,11 @@ describe("/opinion live path", () => {
     const types = events.map((e) => e.type);
     expect(types.filter((t) => t === "fusion.side_completed")).toHaveLength(2);
     expect(types).toContain("fusion.completed");
+    const completed = events.find((e) => e.type === "fusion.completed");
+    expect(completed?.type).toBe("fusion.completed");
+    if (completed?.type === "fusion.completed") {
+      expect(completed.payload.error).toBe("captain cancelled mid-opinion");
+    }
 
     const run = service.fusionRuns.get(taskId, runId);
     expect(run).not.toBeNull();

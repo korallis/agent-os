@@ -1082,7 +1082,8 @@ export class ToolSurface {
     }
 
     // Per-model session key: a model change yields a new directory so transcripts
-    // never cross families. Handed to Pi as AGENTOS_SESSION_DIR.
+    // never cross families. buildPiSpawnSpec hands it to Pi via --session-dir +
+    // PI_CODING_AGENT_SESSION_DIR; AGENTOS_SESSION_DIR is extension output only.
     const sessionDir = this.deps.sessionKeys.ensure({
       projectId: task.projectId,
       role: input.role,
@@ -1637,7 +1638,7 @@ export class ToolSurface {
    * does not hold a pool slot. fusionBySessionId stays until the run
    * completes so late usage frames after agent_settled still attribute.
    */
-  private completeFusionSide(sessionId: string): void {
+  private completeFusionSide(sessionId: string, error?: string | null): void {
     const ref = this.fusionBySessionId.get(sessionId);
     if (ref === undefined) return;
 
@@ -1654,7 +1655,7 @@ export class ToolSurface {
     }
     if (side.settledAt != null || side.artifactPath !== null) {
       // Already recorded (e.g. double settle from agent_settled + session_end).
-      this.tryCompleteFusionRun(ref.taskId, ref.runId);
+      this.tryCompleteFusionRun(ref.taskId, ref.runId, error);
       this.releaseSettledFusionCrewmate(sessionId);
       return;
     }
@@ -1697,7 +1698,7 @@ export class ToolSurface {
       },
     });
 
-    this.tryCompleteFusionRun(ref.taskId, ref.runId);
+    this.tryCompleteFusionRun(ref.taskId, ref.runId, error);
     this.releaseSettledFusionCrewmate(sessionId);
   }
 
@@ -1774,7 +1775,11 @@ export class ToolSurface {
     }
   }
 
-  private tryCompleteFusionRun(taskId: string, runId: string): void {
+  private tryCompleteFusionRun(
+    taskId: string,
+    runId: string,
+    error?: string | null,
+  ): void {
     const run = this.deps.fusionRuns.get(taskId, runId);
     if (run === null) return;
     // A side is done when it has settled (possibly without an artifact) or,
@@ -1790,9 +1795,12 @@ export class ToolSurface {
       run.sides.map((s) => s.sessionId),
     );
 
-    this.emitFusionCompleted(run);
+    this.emitFusionCompleted(run, error);
 
-    if (run.kind === "plan-fusion") {
+    if (
+      run.kind === "plan-fusion" &&
+      (error == null || error.length === 0)
+    ) {
       const task = this.tasks.get(taskId);
       if (task !== undefined && task.phase === "PLANNING") {
         this.transition(task, "PLAN_FUSED", "plan-fusion complete");
@@ -2265,7 +2273,8 @@ export class ToolSurface {
   private haltAndReleaseTask(taskId: string, reason: string): void {
     // Same completeFusionSide path as stop_crewmate / markSessionLost so
     // cancel_task / FAILED / DONE cannot strand runs on fusion.dispatched.
-    this.finalizeFusionSidesForTask(taskId);
+    // Pass reason so fusion.completed.error distinguishes abort from success.
+    this.finalizeFusionSidesForTask(taskId, reason);
     this.haltTaskSessions(taskId, reason);
     this.releaseWorktreeLeases({ taskId });
   }
@@ -2273,9 +2282,13 @@ export class ToolSurface {
   /**
    * Settle every in-flight fusion side for a task via the shared
    * completeFusionSide helper (artifact capture, side_completed, and
-   * fusion.completed when the last side settles).
+   * fusion.completed when the last side settles). When `error` is set
+   * (cancel / FAILED / DONE abort), it is attached to fusion.completed.
    */
-  private finalizeFusionSidesForTask(taskId: string): void {
+  private finalizeFusionSidesForTask(
+    taskId: string,
+    error?: string | null,
+  ): void {
     const ownedSessionIds = [
       ...new Set(
         [...this.fusionBySessionId.entries()]
@@ -2284,7 +2297,7 @@ export class ToolSurface {
       ),
     ];
     for (const sessionId of ownedSessionIds) {
-      this.completeFusionSide(sessionId);
+      this.completeFusionSide(sessionId, error);
     }
 
     // Durable runs may still have unsettled sides that lost map ownership
@@ -2316,7 +2329,7 @@ export class ToolSurface {
               artifactPath: null,
             },
           });
-          this.tryCompleteFusionRun(taskId, latest.runId);
+          this.tryCompleteFusionRun(taskId, latest.runId, error);
           continue;
         }
         this.fusionBySessionId.set(side.sessionId, {
@@ -2324,7 +2337,7 @@ export class ToolSurface {
           runId: latest.runId,
           sideIndex,
         });
-        this.completeFusionSide(side.sessionId);
+        this.completeFusionSide(side.sessionId, error);
       }
     }
   }

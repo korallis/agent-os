@@ -109,8 +109,10 @@ export interface BuildSpawnOptions {
   /** Extension path (agent-os) always passed with -e. */
   extensionPath: string;
   /**
-   * Per-model session directory from SessionKeyStore. Handed to Pi as
-   * AGENTOS_SESSION_DIR so transcripts never cross model families.
+   * Per-model session directory from SessionKeyStore.
+   * - `--session-dir` + `PI_CODING_AGENT_SESSION_DIR`: Pi's native transcript store
+   *   (precedence: flag, then env, then settings.json) so models never share one.
+   * - `AGENTOS_SESSION_DIR`: extension-only output capture path for fusion artifacts.
    */
   sessionDir?: string;
   /** Optional single API key grant. */
@@ -136,7 +138,10 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
     AGENTOS_ROLE: options.role,
   };
   if (options.sessionDir !== undefined) {
+    // Extension captures side output under AGENTOS_SESSION_DIR/outputs/.
     extraAllow.AGENTOS_SESSION_DIR = options.sessionDir;
+    // Pi's native session store (docs/environment-variables.md); pairs with --session-dir.
+    extraAllow.PI_CODING_AGENT_SESSION_DIR = options.sessionDir;
   }
   if (options.detection.configDirEnv !== null) {
     extraAllow[options.detection.configDirEnv] = options.detection.managedHome;
@@ -149,6 +154,10 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
   });
 
   const args: string[] = [];
+  if (options.sessionDir !== undefined) {
+    // Pi session storage precedence: --session-dir, then PI_CODING_AGENT_SESSION_DIR.
+    args.push("--session-dir", options.sessionDir);
+  }
   if (options.cleanRoom === true) {
     // R2-Q2: --no-extensions scoping — still pass our telemetry-only -e after.
     args.push("--no-skills", "--no-extensions", "--no-context-files");
