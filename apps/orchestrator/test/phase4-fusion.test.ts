@@ -798,6 +798,19 @@ describe("/opinion live path", () => {
     });
     expect(service.fusionRuns.get(taskId, runId)?.sides[0]?.inputTokens).toBe(7);
 
+    // Real Pi order: agent_settled then session_end while sibling still in flight.
+    // Ownership must survive session_end so a late usage frame still attributes.
+    service.tools.releaseSessionOnEnd(sessionA);
+    service.tools.attributeFusionUsage(sessionA, {
+      inputTokens: 11,
+      outputTokens: 5,
+      costUsd: 0.02,
+    });
+    // recordSideUsage sums frames; 7+11 / 3+5 must still land on side A.
+    expect(service.fusionRuns.get(taskId, runId)?.sides[0]?.inputTokens).toBe(18);
+    expect(service.fusionRuns.get(taskId, runId)?.sides[0]?.outputTokens).toBe(8);
+    expect(service.fusionRuns.get(taskId, runId)?.completedAt == null).toBe(true);
+
     // No real model output for side B — remove the per-session capture so stop
     // finalizes with artifactPath null rather than a placeholder.
     const dirB = service.sessionKeys.ensure({

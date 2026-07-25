@@ -170,8 +170,9 @@ export class ToolSurface {
   private brainSessionId: string | null = null;
   /**
    * sessionId → fusion side ownership for O(1) usage attribution and settle
-   * completion. Entries stay until the run completes or the session stops so
-   * late ext.usage frames after agent_settled are still attributed.
+   * completion. Lifetime is owned by clearFusionRunSessionState only: entries
+   * stay until the whole run completes so late ext.usage after agent_settled
+   * or session_end still attributes while siblings are in flight.
    */
   private readonly fusionBySessionId = new Map<
     string,
@@ -1310,11 +1311,12 @@ export class ToolSurface {
     if (session.role === "scout") {
       this.auditScoutSession(input.sessionId);
     }
-    // Finalize any in-flight fusion side before dropping ownership so a stop
-    // cannot leave the run stranded on fusion.dispatched. Pass reason so the
-    // last side's stop is not reported as a clean fusion.completed success.
-    // Suppress releaseSettled's session.stopped — this method owns the single
-    // terminal lifecycle event with the caller reason.
+    // Finalize any in-flight fusion side so a stop cannot leave the run
+    // stranded on fusion.dispatched. Pass reason so the last side's stop is
+    // not reported as a clean fusion.completed success. Ownership stays until
+    // the whole run completes (clearFusionRunSessionState). Suppress
+    // releaseSettled's session.stopped — this method owns the single terminal
+    // lifecycle event with the caller reason.
     this.completeFusionSide(input.sessionId, input.reason, {
       suppressStopEvent: true,
     });
@@ -1886,8 +1888,7 @@ export class ToolSurface {
       return;
     }
 
-    // Drop ownership + session-dir maps for this run once every side is done
-    // (fake-Pi never emits session_end, so clearFusionSession alone is not enough).
+    // Sole owner of fusionBySessionId lifetime: drop only when every side is done.
     this.clearFusionRunSessionState(
       runId,
       run.sides.map((s) => s.sessionId),
@@ -1935,7 +1936,11 @@ export class ToolSurface {
     });
   }
 
-  /** Drop fusion ownership and session-dir entries for a finished/failed run. */
+  /**
+   * Drop fusion ownership and session-dir entries for a finished/failed run.
+   * This is the only path that clears fusionBySessionId for a live run —
+   * stop/lost/session_end must not drop ownership while siblings are in flight.
+   */
   private clearFusionRunSessionState(
     runId: string,
     sessionIds: Array<string | null | undefined>,
@@ -1953,8 +1958,11 @@ export class ToolSurface {
     }
   }
 
+  /**
+   * Drop the session-dir mapping only. Fusion ownership is intentionally not
+   * cleared here — that is clearFusionRunSessionState's job at run completion.
+   */
   private clearFusionSession(sessionId: string): void {
-    this.fusionBySessionId.delete(sessionId);
     this.sessionDirs.delete(sessionId);
   }
 
@@ -2978,11 +2986,11 @@ export class ToolSurface {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
     if (session.status === "lost" || session.status === "stopped") return;
-    // Finalize any in-flight fusion side before dropping ownership so a
-    // pane-lost side cannot leave the run stranded on fusion.dispatched.
-    // Pass reason so a lost last side is not reported as a clean success.
-    // Suppress releaseSettled's session.stopped — session.lost is the single
-    // terminal lifecycle event for this path.
+    // Finalize any in-flight fusion side so a pane-lost side cannot leave the
+    // run stranded on fusion.dispatched. Pass reason so a lost last side is
+    // not reported as a clean success. Ownership stays until the whole run
+    // completes. Suppress releaseSettled's session.stopped — session.lost is
+    // the single terminal lifecycle event for this path.
     this.completeFusionSide(sessionId, reason, { suppressStopEvent: true });
     // Kill a still-live pane so reconcile/respawn cannot share
     // AGENTOS_SESSION_DIR/outputs with an orphan process.
@@ -3041,7 +3049,8 @@ export class ToolSurface {
    * Clean Pi exit (ext.lifecycle session_end): release the worktree lease so
    * settle-and-exit does not exhaust the pool. Reuses the shared release helper
    * (verified-reset when clean, quarantine + deliveryBlocked when dirty).
-   * Also settles any fusion side still waiting on this session.
+   * Also settles any fusion side still waiting on this session. Ownership stays
+   * until the whole fusion run completes so late ext.usage still attributes.
    */
   releaseSessionOnEnd(sessionId: string): void {
     // session_end without a prior agent_settled still finalizes fusion sides.
