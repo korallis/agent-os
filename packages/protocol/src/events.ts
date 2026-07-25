@@ -434,6 +434,18 @@ export const captainEscalationEventSchema = z.strictObject({
   }),
 });
 
+/** Captain cleared a sticky deliveryBlocked stamp after inspecting the tree. */
+export const taskDeliveryBlockResolvedEventSchema = z.strictObject({
+  type: z.literal("task.delivery_block_resolved"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    reason: z.string(),
+    previousLeaseId: z.string().nullable(),
+    previousReason: z.string().nullable(),
+    clearedBy: z.literal("captain"),
+  }),
+});
+
 export const orchestratorEventSchema = z.discriminatedUnion("type", [
   daemonStartedEventSchema,
   daemonStoppingEventSchema,
@@ -473,6 +485,7 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   scoutWriteViolationEventSchema,
   bridgeToolCallEventSchema,
   captainEscalationEventSchema,
+  taskDeliveryBlockResolvedEventSchema,
 ]);
 export type OrchestratorEvent = z.infer<typeof orchestratorEventSchema>;
 

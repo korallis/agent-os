@@ -770,6 +770,182 @@ describe("delivery invariant choke points", () => {
     expect(cancelled.error?.code).toBe("ILLEGAL_TRANSITION");
     expect(cancelled.error?.message).toContain("cancel_task");
   });
+
+  it("keeps deliveryBlocked sticky across BUILDING→VALIDATING after dirty stop", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "sticky-block-advance",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const session = (spawned.data as { session: { sessionId: string; worktreePath: string } })
+      .session;
+    writeFileSync(join(session.worktreePath, "wip.txt"), "must stay blocked\n");
+
+    const stopped = service.tools.invoke("stop_crewmate", {
+      sessionId: session.sessionId,
+      reason: "dirty stop",
+    });
+    expect(stopped.ok).toBe(true);
+
+    const afterStop = service.tools.invoke("read_task", { taskId });
+    expect(afterStop.ok).toBe(true);
+    const blocked = afterStop.data as {
+      phase: string;
+      deliveryBlocked: { reason: string } | null;
+    };
+    expect(blocked.deliveryBlocked).not.toBeNull();
+
+    // Ordinary substrate move must not wipe the stamp (Round 9 bypass).
+    const advanced = service.tools.invoke("advance_phase", {
+      taskId,
+      to: "VALIDATING",
+      reason: "brain advance after stop",
+    });
+    // BUILDING→VALIDATING is legal; if phase moved earlier, try from current.
+    if (!advanced.ok) {
+      // SESSION_LOST etc. — still assert deliver refuses.
+    } else {
+      const mid = service.tools.invoke("read_task", { taskId });
+      expect(mid.ok).toBe(true);
+      expect(
+        (mid.data as { deliveryBlocked: unknown }).deliveryBlocked,
+      ).not.toBeNull();
+    }
+
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(deliver.error?.code).toMatch(/CONFLICT|ILLEGAL_TRANSITION/);
+    const final = service.tools.invoke("read_task", { taskId });
+    expect(final.ok).toBe(true);
+    const snap = final.data as {
+      phase: string;
+      deliveryBlocked: { reason: string } | null;
+    };
+    expect(snap.phase).not.toBe("DONE");
+    expect(snap.deliveryBlocked).not.toBeNull();
+  });
+
+  it("stamps deliveryBlocked on SCOUT force-quarantine write violation", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId } = seedTask(service, {
+      name: "scout-block-stamp",
+      shape: "SCOUT",
+      role: "scout",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "scout",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const session = (spawned.data as { session: { sessionId: string; worktreePath: string } })
+      .session;
+    writeFileSync(join(session.worktreePath, "sneaky.txt"), "scout wrote\n");
+    const violation = service.tools.auditScoutSession(session.sessionId);
+    expect(violation.clean).toBe(false);
+
+    const task = service.tools.invoke("read_task", { taskId });
+    expect(task.ok).toBe(true);
+    const snap = task.data as {
+      phase: string;
+      deliveryBlocked: { leaseId: string; reason: string } | null;
+    };
+    expect(snap.deliveryBlocked).not.toBeNull();
+
+    // After escalate → NEEDS_CAPTAIN, phase moves must not enable DONE.
+    if (snap.phase === "NEEDS_CAPTAIN") {
+      const rework = service.tools.invoke("advance_phase", {
+        taskId,
+        to: "BUILDING",
+        reason: "try rework",
+      });
+      if (rework.ok) {
+        expect(
+          (service.tools.invoke("read_task", { taskId }).data as {
+            deliveryBlocked: unknown;
+          }).deliveryBlocked,
+        ).not.toBeNull();
+      }
+    }
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(
+      (service.tools.invoke("read_task", { taskId }).data as { phase: string }).phase,
+    ).not.toBe("DONE");
+  });
+
+  it("resolve_delivery_block is Captain-only and keeps dirty tree from DONE", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "captain-resolve-block",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const session = (spawned.data as { session: { sessionId: string; worktreePath: string } })
+      .session;
+    writeFileSync(join(session.worktreePath, "wip.txt"), "still dirty\n");
+    expect(
+      service.tools.invoke("stop_crewmate", {
+        sessionId: session.sessionId,
+        reason: "stop",
+      }).ok,
+    ).toBe(true);
+
+    // Crew / session path cannot clear the block.
+    service.tools.setBrainSessionId("01JBR4N0000000000000000000");
+    const fromSession = service.tools.invokeFromSession(
+      "01JCREW0000000000000000000",
+      "resolve_delivery_block",
+      { taskId, reason: "crew attempt" },
+    );
+    expect(fromSession.ok).toBe(false);
+    expect(fromSession.error?.code).toBe("UNAUTHORIZED_TOOL");
+
+    const fromBrain = service.tools.invokeFromSession(
+      "01JBR4N0000000000000000000",
+      "resolve_delivery_block",
+      { taskId, reason: "brain attempt" },
+    );
+    expect(fromBrain.ok).toBe(false);
+    expect(fromBrain.error?.code).toBe("UNAUTHORIZED_TOOL");
+
+    // Captain REST path can clear the stamp.
+    const resolved = service.tools.invoke("resolve_delivery_block", {
+      taskId,
+      reason: "inspected; captain accepts rework",
+    });
+    expect(resolved.ok).toBe(true);
+    expect(
+      (resolved.data as { deliveryBlocked: unknown }).deliveryBlocked,
+    ).toBeNull();
+
+    // Tree still dirty via session association — deliver must still refuse.
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(deliver.error?.code).toBe("CONFLICT");
+    expect(
+      (service.tools.invoke("read_task", { taskId }).data as { phase: string }).phase,
+    ).not.toBe("DONE");
+  });
 });
 
 describe("resolveExtensionPath fail-closed", () => {

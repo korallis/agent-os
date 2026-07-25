@@ -18,6 +18,7 @@ import {
   readPolicyInputSchema,
   readTaskInputSchema,
   resolveCastInputSchema,
+  resolveDeliveryBlockInputSchema,
   respawnCrewmateInputSchema,
   runGateInputSchema,
   sendToCrewInputSchema,
@@ -88,6 +89,12 @@ const CREW_ALLOWED_TOOLS = new Set<BrainToolName>([
   "read_run_artifacts",
   "notify_captain",
 ]);
+
+/**
+ * Captain REST only — never available on a session socket (Brain or crew).
+ * Clears sticky deliveryBlocked after human inspection.
+ */
+const CAPTAIN_ONLY_TOOLS = new Set<BrainToolName>(["resolve_delivery_block"]);
 
 /** A crewmate question awaiting an answer from the Brain or Captain. */
 export interface PendingQuestion {
@@ -198,6 +205,17 @@ export class ToolSurface {
       };
     }
     const name = parsed.data;
+    if (CAPTAIN_ONLY_TOOLS.has(name)) {
+      return {
+        invocationId: nextUlid(),
+        ok: false,
+        error: err(
+          "UNAUTHORIZED_TOOL",
+          `${name} is Captain-only — not available over a session socket`,
+        ),
+        durationMs: 0,
+      };
+    }
     const isBrain = this.brainSessionId !== null && sessionId === this.brainSessionId;
     if (!isBrain && !CREW_ALLOWED_TOOLS.has(name)) {
       return {
@@ -319,7 +337,7 @@ export class ToolSurface {
       if (cached !== undefined) return cached;
     }
 
-    // Orchestration tools blocked in BRAIN_DOWN except read_* and create via REST captain.
+    // Orchestration tools blocked in BRAIN_DOWN except read_* and Captain REST.
     if (
       this.brainDown &&
       tool !== "read_fleet_state" &&
@@ -328,8 +346,8 @@ export class ToolSurface {
       tool !== "read_run_artifacts" &&
       tool !== "notify_captain"
     ) {
-      // Captain REST may still create_task; Brain cannot orchestrate.
-      if (tool !== "create_task") {
+      // Captain REST may still create_task / resolve_delivery_block.
+      if (tool !== "create_task" && tool !== "resolve_delivery_block") {
         return this.finish(invocationId, tool, null, started, {
           ok: false,
           error: err("BRAIN_DOWN", "brain is down — orchestration tools are blocked"),
@@ -443,6 +461,8 @@ export class ToolSurface {
         return this.answerCrewmate(raw);
       case "deliver_task":
         return this.deliverTask(raw);
+      case "resolve_delivery_block":
+        return this.resolveDeliveryBlock(raw);
       case "escalate_to_captain":
         return this.escalate(raw);
       case "notify_captain":
@@ -555,7 +575,7 @@ export class ToolSurface {
     const input = cancelTaskInputSchema.parse(raw);
     this.requireTask(input.taskId);
     this.releaseWorktreeLeases({ taskId: input.taskId });
-    // Re-read after release so a quarantine stamp is visible, then clear on CANCELLED.
+    // Re-read after release so a quarantine stamp is visible on the terminal task.
     return this.transition(this.requireTask(input.taskId), "CANCELLED", input.reason);
   }
 
@@ -599,15 +619,22 @@ export class ToolSurface {
   /**
    * Release a single lease. When the tree quarantines and was task-linked,
    * stamp deliveryBlocked on the owning task so deliver_task cannot mark DONE
-   * after the lease association is cleared.
+   * after the lease association is cleared. Sole choke point for task-linked
+   * quarantine stamps (stop, lost, reclaim, SCOUT audit, deliver dirty path).
    */
-  private releaseOneWorktreeLease(leaseId: string): void {
+  private releaseOneWorktreeLease(
+    leaseId: string,
+    options: { forceQuarantine?: boolean } = {},
+  ): void {
     const lease = this.deps.worktrees.list().find((l) => l.id === leaseId);
     if (lease === undefined) return;
     const owningTaskId = lease.taskId;
     let result;
     try {
-      result = this.deps.worktrees.release(leaseId);
+      result = this.deps.worktrees.release(
+        leaseId,
+        options.forceQuarantine === true ? { forceQuarantine: true } : {},
+      );
     } catch {
       // best-effort — do not block stop/lost/cancel on a reclaim race
       return;
@@ -1380,7 +1407,7 @@ export class ToolSurface {
   ): { clean: boolean; changedPaths: string[] } {
     let quarantined = false;
     for (const lease of this.deps.worktrees.list().filter((l) => l.sessionId === sessionId)) {
-      this.deps.worktrees.release(lease.id, { forceQuarantine: true });
+      this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
       quarantined = true;
     }
     this.sink({
@@ -1453,7 +1480,7 @@ export class ToolSurface {
           .trim();
         const reason = `worktree status failed (${detail}); quarantined`;
         this.blockDelivery(task, lease.id, reason, []);
-        this.deps.worktrees.release(lease.id, { forceQuarantine: true });
+        this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
         throw new ToolSurfaceError(
           "CONFLICT",
           `cannot deliver task ${task.id}: ${reason}`,
@@ -1468,7 +1495,7 @@ export class ToolSurface {
         const reason =
           "worktree has uncommitted changes; quarantined for Captain inspection";
         this.blockDelivery(task, lease.id, reason, dirtyPaths);
-        this.deps.worktrees.release(lease.id, { forceQuarantine: true });
+        this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
         throw new ToolSurfaceError(
           "CONFLICT",
           `cannot deliver task ${task.id}: ${reason}`,
@@ -1511,6 +1538,7 @@ export class ToolSurface {
       { mode: 0o600 },
     );
 
+    // DONE is only written here; clear the stamp only after the invariant holds.
     task = {
       ...this.transition(task, "DONE", "delivered", { allowDone: true }),
       branch,
@@ -1518,6 +1546,39 @@ export class ToolSurface {
     };
     this.saveTask(task);
     return task;
+  }
+
+  /**
+   * Captain-only (REST invoke): clear a sticky deliveryBlocked stamp. Never
+   * runs as a side effect of phase moves. Emits an audit event with the reason.
+   */
+  private resolveDeliveryBlock(raw: Record<string, unknown>): TaskSnapshot {
+    const input = resolveDeliveryBlockInputSchema.parse(raw);
+    const task = this.requireTask(input.taskId);
+    if (task.deliveryBlocked === null) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `task ${task.id} has no delivery block to resolve`,
+      );
+    }
+    const previous = task.deliveryBlocked;
+    const updated: TaskSnapshot = {
+      ...task,
+      deliveryBlocked: null,
+      updatedAt: new Date().toISOString(),
+    };
+    this.saveTask(updated);
+    this.sink({
+      type: "task.delivery_block_resolved",
+      payload: {
+        taskId: task.id,
+        reason: input.reason,
+        previousLeaseId: previous.leaseId,
+        previousReason: previous.reason,
+        clearedBy: "captain",
+      },
+    });
+    return updated;
   }
 
   /** Persist a sticky delivery refusal on the task (survives lease quarantine). */
@@ -1553,8 +1614,10 @@ export class ToolSurface {
 
   /**
    * Delivery invariant (single choke point): a task may only reach DONE via
-   * deliver_task, with a clean tree, no outstanding deliveryBlocked stamp, and
-   * its leases released.
+   * deliver_task. Preconditions are re-derived from durable state at call time:
+   * no unresolved deliveryBlocked, all leases released, and clean porcelain on
+   * every worktree ever associated with the task. If cleanliness cannot be
+   * proven, refuse.
    */
   private assertDoneInvariant(task: TaskSnapshot): void {
     this.assertNotDeliveryBlocked(task);
@@ -1570,6 +1633,71 @@ export class ToolSurface {
         "CONFLICT",
         `cannot mark task ${task.id} DONE: ${String(outstanding.length)} worktree lease(s) still held`,
       );
+    }
+    this.assertAssociatedWorktreesClean(task);
+  }
+
+  /**
+   * Paths of worktrees ever associated with this task, from durable task state
+   * and the lease pool (including quarantined leases whose taskId was cleared).
+   */
+  private associatedWorktreePaths(task: TaskSnapshot): string[] {
+    const paths = new Set<string>();
+    if (task.worktreePath !== null) paths.add(task.worktreePath);
+    for (const s of task.sessions) {
+      if (s.worktreePath !== null) paths.add(s.worktreePath);
+    }
+    for (const lease of this.deps.worktrees.list()) {
+      if (lease.taskId === task.id) paths.add(lease.path);
+    }
+    if (task.deliveryBlocked !== null) {
+      const blocked = this.deps.worktrees
+        .list()
+        .find((l) => l.id === task.deliveryBlocked!.leaseId);
+      if (blocked !== undefined) paths.add(blocked.path);
+    }
+    return [...paths];
+  }
+
+  private assertAssociatedWorktreesClean(task: TaskSnapshot): void {
+    if (process.env.AGENTOS_FAKE_GIT === "1") return;
+    for (const path of this.associatedWorktreePaths(task)) {
+      if (!existsSync(path)) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot mark task ${task.id} DONE: associated worktree missing (${path}); cleanliness cannot be proven`,
+        );
+      }
+      if (!existsSync(join(path, ".git"))) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot mark task ${task.id} DONE: associated worktree is not a git repo (${path})`,
+        );
+      }
+      const dirty = spawnSync("git", ["-C", path, "status", "--porcelain"], {
+        encoding: "utf8",
+        timeout: 15_000,
+      });
+      if (dirty.error !== undefined || dirty.status !== 0) {
+        const detail = (
+          dirty.error?.message ||
+          dirty.stderr ||
+          dirty.stdout ||
+          `git status exit ${String(dirty.status)}`
+        )
+          .toString()
+          .trim();
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot mark task ${task.id} DONE: cannot prove worktree clean (${path}): ${detail}`,
+        );
+      }
+      if (dirty.stdout.trim().length > 0) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot mark task ${task.id} DONE: associated worktree has uncommitted changes (${path})`,
+        );
+      }
     }
   }
 
@@ -1678,27 +1806,17 @@ export class ToolSurface {
     }
     assertTransition(task.id, from, to);
     // Prefer the store copy so a release that stamped deliveryBlocked is not
-    // overwritten by a stale caller snapshot.
+    // overwritten by a stale caller snapshot. deliveryBlocked is NEVER cleared
+    // by a phase transition — only resolve_delivery_block (Captain) or a
+    // successful deliver_task after assertDoneInvariant may clear it.
     const stored = this.tasks.get(task.id);
     const stickyBlock = stored?.deliveryBlocked ?? task.deliveryBlocked;
-    // Captain rework / terminate clears a sticky dirty-delivery refuse. Staying
-    // in DELIVERING (or NEEDS_CAPTAIN alone) does not — deliver_task keeps refusing.
-    const clearDeliveryBlock =
-      to === "CANCELLED" ||
-      to === "FAILED" ||
-      to === "BUILDING" ||
-      to === "QUEUED" ||
-      to === "DISPATCH_RESOLVED" ||
-      to === "PLANNING" ||
-      to === "GATE_AUTHORING" ||
-      to === "VALIDATING" ||
-      to === "WAITING_WORKTREE";
     const updated: TaskSnapshot = {
       ...task,
       phase: to,
       failureCause: to === "FAILED" ? (task.failureCause ?? "UNKNOWN") : task.failureCause,
       needsCaptainSummary: to === "NEEDS_CAPTAIN" ? (reason ?? task.needsCaptainSummary) : task.needsCaptainSummary,
-      deliveryBlocked: clearDeliveryBlock ? null : stickyBlock,
+      deliveryBlocked: stickyBlock,
       updatedAt: new Date().toISOString(),
     };
     this.saveTask(updated);

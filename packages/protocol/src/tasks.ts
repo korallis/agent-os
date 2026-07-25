@@ -112,7 +112,8 @@ export type TaskSession = z.infer<typeof taskSessionSchema>;
 /**
  * Durable refuse of deliver_task after a dirty/status-failed worktree. Survives
  * quarantine clearing the lease↔task association so a retry cannot mark DONE.
- * Cleared only when the Captain reworks or terminates the task (not on retry).
+ * Cleared only by the Captain tool `resolve_delivery_block` — never as a side
+ * effect of a phase transition.
  */
 export const deliveryBlockedSchema = z.strictObject({
   leaseId: z.string().min(1),
@@ -139,7 +140,7 @@ export const taskSnapshotSchema = z.strictObject({
   branch: z.string().nullable(),
   worktreePath: z.string().nullable(),
   needsCaptainSummary: z.string().nullable(),
-  /** Set when deliver_task refuses a dirty/un-auditable tree; sticky until rework/cancel. */
+  /** Set when a task-linked worktree quarantines dirty; sticky until Captain resolves. */
   deliveryBlocked: deliveryBlockedSchema.nullable(),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,

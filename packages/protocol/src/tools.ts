@@ -166,6 +166,16 @@ export const deliverTaskInputSchema = z.strictObject({
 });
 export type DeliverTaskInput = z.infer<typeof deliverTaskInputSchema>;
 
+/**
+ * Captain-only: clear a sticky deliveryBlocked stamp after inspection.
+ * Never available to crew (or Brain) sessions — only REST / Captain invoke.
+ */
+export const resolveDeliveryBlockInputSchema = z.strictObject({
+  taskId: ulidSchema,
+  reason: z.string().min(1).max(2000),
+});
+export type ResolveDeliveryBlockInput = z.infer<typeof resolveDeliveryBlockInputSchema>;
+
 export const escalateToCaptainInputSchema = z.strictObject({
   taskId: ulidSchema.optional(),
   summary: z.string().min(1).max(5000),
@@ -250,6 +260,7 @@ export const brainToolNameSchema = z.enum([
   "send_to_crew",
   "answer_crewmate",
   "deliver_task",
+  "resolve_delivery_block",
   "escalate_to_captain",
   "notify_captain",
   "route_to_secondmate",
