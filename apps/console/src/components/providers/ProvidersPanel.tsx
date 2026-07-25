@@ -322,9 +322,19 @@ export function ProvidersPanel() {
                   </span>
                 </div>
                 {c.limitReached && (
-                  <span className="mb-2 inline-flex rounded-[20px] bg-danger/15 px-2 py-0.5 text-[11px] font-semibold text-danger">
-                    LIMIT REACHED
-                  </span>
+                  /* The pill alone says "you cannot use this" without saying
+                     why. The reason is the actionable half — a Captain seeing
+                     LIMIT REACHED needs to know which window ran out and when
+                     it resets, not just that the connection is excluded. */
+                  <div className="mb-2 flex flex-col gap-1">
+                    <span className="inline-flex w-fit rounded-[20px] bg-danger/15 px-2 py-0.5 text-[11px] font-semibold text-danger">
+                      LIMIT REACHED
+                    </span>
+                    <p className="text-[11px] text-danger/80">
+                      Excluded from casts —{" "}
+                      {c.limitReachedReason ?? "reason not reported by the provider"}
+                    </p>
+                  </div>
                 )}
                 {c.billingSurface === "extra-usage-per-token" && (
                   <p className="mb-2 text-[11px] font-medium text-warn">

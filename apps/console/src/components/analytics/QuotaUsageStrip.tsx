@@ -3,16 +3,28 @@
 import { useEffect, useState } from "react";
 import type { QuotaSample } from "@agent-os/protocol";
 import { selectPrimaryQuotaMetric } from "@/lib/selectPrimaryQuotaMetric";
+import { useEventStream } from "@/lib/useEventStream";
 
 /**
  * Live quota strip for Token Usage (§7.3).
  *
  * Loading, unavailable, and genuinely empty are distinct — a failed probe
  * fetch must not read as "connect providers".
+ *
+ * Refreshes on `quota.updated` over SSE, not just on the 30 s poll: a Captain
+ * who just hit refresh on a provider card should see the strip agree with it
+ * immediately, and a half-minute of disagreement between two live surfaces
+ * reads as one of them being wrong.
  */
 export function QuotaUsageStrip() {
   const [samples, setSamples] = useState<QuotaSample[]>([]);
   const [status, setStatus] = useState<"loading" | "ready" | "unavailable">("loading");
+  const { events } = useEventStream();
+  // Latest quota frame id — changes whenever the daemon reports new numbers.
+  // useEventStream PREPENDS, so the newest frame is at index 0. Reading the
+  // tail would pin this to the oldest buffered frame and never re-fire.
+  const quotaCursor =
+    events.find((envelope) => envelope.event.type === "quota.updated")?.id ?? "none";
 
   useEffect(() => {
     let cancelled = false;
@@ -37,12 +49,13 @@ export function QuotaUsageStrip() {
       }
     };
     void load();
+    // The poll stays as a safety net for a dropped stream; SSE is the fast path.
     const id = setInterval(() => void load(), 30_000);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [quotaCursor]);
 
   if (status === "loading" && samples.length === 0) {
     return (
