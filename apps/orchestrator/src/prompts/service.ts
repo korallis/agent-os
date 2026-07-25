@@ -142,8 +142,9 @@ export class PromptService {
   }
 
   /**
-   * Three-way diff data for an upgrade: the shipped bytes this template was
-   * installed from, the shipped bytes now, and the Captain's current copy.
+   * Three-way diff data for an upgrade: `shippedAtInstall` is the hash of the
+   * shipped bytes this copy was installed from (original text is not retained),
+   * plus full text for shipped-now and the Captain's current copy.
    */
   threeWayDiff(ref: string): {
     ref: string;

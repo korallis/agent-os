@@ -415,7 +415,7 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 
 **Configurable ≠ unenforced (the critical nuance):** whatever is configured is enforced **mechanically by the substrate** — the Brain cannot bypass configured policy, silently or otherwise; only the Captain can change policy (Console auth or config file on disk, which only the OS user can write). Any run executed under a weakened safety policy carries `policyOverrides[]` in `summary.json` (what, when, by which config layer) and the Console badges it. **Config-locked justification:** loopback-only and secret redaction protect the *machine and credentials themselves*, not workflow preferences — a workflow knob misconfigured wastes tokens; these two misconfigured expose the host. They are defensible as non-configurable and remain so in v1.
 
-**Prompt-template upgrade story** (risk R19): every shipped template carries a version header; user-customized templates are detected by hash; on upgrade, the daemon never overwrites customizations — it installs the new default alongside, shows a three-way diff in the Policies page (shipped-old / shipped-new / yours), and the Captain merges or keeps. `agentos config doctor` lists drifted templates.
+**Prompt-template upgrade story** (risk R19): every shipped template carries a version header; user-customized templates are detected by hash; on upgrade, the daemon never overwrites customizations — it installs the new default alongside and serves three-way diff data via `GET /v1/prompts/diff` (`shippedAtInstall` = hash of the bytes the copy was installed from — original text is not retained; `shippedNow` / `yours` = full text). The Policies page renders that data (Phase 6 UI); the Captain merges or keeps. `agentos config doctor` lists drifted templates.
 
 ---
 
@@ -423,7 +423,7 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 
 pnpm workspaces + Turborepo (§2.1). Marketing lives at `apps/marketing` (verbatim migration from the former root `src/`); shared design-system primitives live in `packages/ui`. [A]
 
-**Phase 3 as-built** (fleet substrate, Brain tool surface, real Pi harness path, live tasks/projects boards) is the current tree; later-phase modules below remain planned. Authoritative route inventory: §7. Executable gates: `tooling/gates/phase-{1,2,3}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
+**Phase 4 as-built** (fleet substrate, Brain tool surface, `/opinion`·`/fusion`·plan-fusion primitives, layered prompt packs, real Pi harness path, live tasks/projects boards) is the current tree; later-phase modules below remain planned. Authoritative route inventory: §7. Executable gates: `tooling/gates/phase-{1,2,3,4}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
 
 ```
 agent-os/
@@ -433,7 +433,7 @@ agent-os/
 ├── tsconfig.base.json                # strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes
 ├── eslint.config.mjs                 # @typescript-eslint/no-explicit-any: error
 ├── .github/workflows/
-│   ├── ci.yml                        # typecheck/lint/build/test + phase-1/2/3 gates
+│   ├── ci.yml                        # typecheck/lint/build/test + phase-1/2/3/4 gates
 │   └── pi-canary.yml                 # weekly: harness contract suite vs latest Pi [R2]
 ├── docs/{plans,qa,screenshots}/
 ├── apps/
@@ -445,12 +445,12 @@ agent-os/
 │   │       │   ├── layout.tsx
 │   │       │   ├── page.tsx                    # redirect → /fleet [B]
 │   │       │   ├── fleet/page.tsx              # Home Dashboard (summary live; chart/table fixtures → Phase 6)
-│   │       │   ├── runs/page.tsx               # Live Log Stream (SSE)
+│   │       │   ├── runs/page.tsx               # Live Log Stream (SSE; fusion.* + prompt.installed)
 │   │       │   ├── policies/page.tsx           # effective config + source-layer chips
 │   │       │   ├── settings/page.tsx
 │   │       │   ├── providers/page.tsx
 │   │       │   ├── tasks/page.tsx              # Inference Jobs board (`/v1/tasks` + SSE)
-│   │       │   ├── tasks/[id]/page.tsx         # task detail (cast/session columns; fusion columns Phases 4–5)
+│   │       │   ├── tasks/[id]/page.tsx         # task detail (cast/session columns; fusion columns → Phase 6)
 │   │       │   ├── projects/page.tsx           # project registry (`/v1/projects`)
 │   │       │   ├── analytics/page.tsx          # Token Usage (placeholder → Phase 6/8)
 │   │       │   ├── onboarding/page.tsx
@@ -465,30 +465,31 @@ agent-os/
 │           ├── bin/{agentos,agentosd}.ts
 │           ├── cli.ts · doctor.ts · daemon.ts · home.ts · version.ts
 │           ├── config/               # resolver + service (layered Policy Packs)
-│           ├── server/               # fastify: health, config, events SSE, fleet/tasks/projects/tools
+│           ├── prompts/              # layered prompt packs + three-way diff data [Phase 4]
+│           ├── server/               # fastify: health, config, events SSE, fleet/tasks/projects/tools/fusion/prompts
 │           ├── substrate/            # task-machine.ts, family.ts
-│           ├── fleet/                # service, brain, tool-surface, worktree-pool, tmux,
-│           │                         # watcher, gate-runner, projects, secondmates
+│           ├── fleet/                # service, brain, tool-surface, fusion-runs, sessions,
+│           │                         # worktree-pool, tmux, watcher, gate-runner, projects, secondmates
 │           ├── pi/                   # manager, auth-broker, connections, socket-hub
 │           ├── onboarding/           # wizard state
 │           ├── quota-probes/         # [R5] allowlist + adapters + scheduler
 │           └── security/             # env-scrub, auth-store, secret-canary, …
 ├── packages/
-│   ├── protocol/                     # zod: REST, SSE, config, tools, fleet, tasks, sockets
+│   ├── protocol/                     # zod: REST, SSE, config, tools, fleet, tasks, sockets, prompts
 │   ├── event-store/                  # NDJSON writer + rebuildable SQLite projection [B]
 │   ├── ui/                           # dual-source [R6.3]: promoted marketing components
 │   │                                 #   (SiteHeader, GlassCard, MagneticButton, …) + Figma
 │   │                                 #   product tokens in theme.css — Figma wins on product
-│   ├── pi-extension/                 # telemetry + control + Brain tool bridge over Unix sockets [R2]+[R3]
+│   ├── pi-extension/                 # telemetry + control + Brain tool bridge; clean-room crew surface [R2]+[R3]+[Phase 4]
 │   ├── pi-ext-claude-agent-sdk/      # [R6.1] vendored claude-agent-sdk-pi fork
 │   └── fusion-core/                  # pure fusion contract/templates/attribution (no I/O) [B]
 ├── scripts/verify-no-deprecated.mjs
 └── tooling/
-    ├── gates/phase-{1,2,3}.mjs       # executable phase gates
+    ├── gates/phase-{1,2,3,4}.mjs     # executable phase gates
     └── screenshots/capture-console.mjs  # Playwright PR evidence (pnpm screenshots)
 ```
 
-**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); fusion *executors* for opinion/plan-fusion/auto-validate remain Phase 4–5 — Phase 3 ships `fusion-core` pure logic + `fleet/gate-runner.ts`.
+**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); Phase 4 ships `dispatch_fusion` executors for opinion / fusion / plan-fusion plus `fleet/fusion-runs.ts`, `fleet/sessions.ts`, and `prompts/service.ts` — `/auto-validate` remains Phase 5; Console fusion side-by-side columns remain Phase 6.
 ---
 
 ## 4. Provider Connection Subsystem
@@ -809,7 +810,7 @@ The Rev-2 `FusionProfile` type is unchanged, but profiles are now **files** (`~/
 
 ### 6.7 Run artifacts
 
-Unchanged from Rev 2 (directory, write-once phases, SHA-256, redaction), with `summary.json` gaining **[R3]**: `policyOverrides[]` (each: policy id, configured value, layer, stamped-at) and `configSnapshot` (hash of the effective config the run executed under — full resolved config archived in the run dir for reproducibility).
+Unchanged from Rev 2 in discipline (write-once phases, SHA-256, redaction), with `summary.json` gaining **[R3]**: `policyOverrides[]` (each: policy id, configured value, layer, stamped-at) and `configSnapshot` (hash of the effective config the run executed under — full resolved config archived in the run dir for reproducibility). **[Phase 4]** fusion runs live at `runs/<taskId>/fusion/<runId>/` (`run.json`, `instruction.md`, `side-*`, optional `fused.md`) — see §9.
 
 ---
 
@@ -828,7 +829,7 @@ Unchanged from Rev 2 (directory, write-once phases, SHA-256, redaction), with `s
 | Landing Page · "Orchestrate AI Agents At Scale" | `8:11470` | `apps/marketing` home | Phase 0 (visual refresh at Captain's option) |
 | Dashboard · Home Dashboard | `10:11978` | `/fleet` | **Phase 3 partial live** (fleet summary chips + brain status); Swarm Activity / Token Consumption / Top Agents / Recent Tasks remain Figma fixtures → Phase 6 |
 | Dashboard · All Agents | `17:4` | `/tasks` (board) | **Phase 3 live** (`/v1/tasks` + SSE) |
-| Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | **Phase 3 live** foundation → fusion columns Phases 4–5 |
+| Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | **Phase 3 live** foundation; daemon fusion artifacts Phase 4 → Console fusion columns Phase 6 |
 | Dashboard · Swarm Activity | `37:2871` | `/fleet` activity + `/runs` overview | pixel Phase 1; **live data Phase 6** |
 | Dashboard · Notifications | `17:940` | `/notifications` (wake queue / needs-you) | Phase 3 (route deferred; needs-you chip on `/fleet`) |
 | Dashboard · Token Usage | `37:2265` | `/analytics` | UI Phase 1 placeholder → probes Phase 2 → full Phase 6/8 |
@@ -836,7 +837,7 @@ Unchanged from Rev 2 (directory, write-once phases, SHA-256, redaction), with `s
 | Dashboard · User Profile | `37:1553` | `/settings` (profile section) | Phase 6 |
 | Agent Detail · Agent Detail / Agent Logs / Create New Agent / Edit Agent | `41:2` / `41:456` / `41:1226` / `41:1605` | crewmate/session detail · terminal log view · new-task dispatch · task/config edit | Phase 3 foundation on `/tasks/[id]`; full agent chrome Phase 6 |
 | Inference Jobs · Inference Jobs | `41:2412` | `/tasks` | **Phase 3 live** |
-| Inference Jobs · Pipeline Runs | `41:5136` | `/runs` history / fusion runs | Phases 4–5 |
+| Inference Jobs · Pipeline Runs | `41:5136` | `/runs` history / fusion runs | daemon fusion REST Phase 4; Console history UI Phase 6 |
 | Inference Jobs · Live Log Stream | `41:3973` | `/runs` | **Phase 1 live** (daemon SSE; filters/pause/search/detail) |
 | Inference Jobs · Model Performance | `41:4355` | `/analytics` (per-model) | Phase 8 |
 | Inference Jobs · Recent Alerts | `41:5674` | wake queue / `quota.threshold` surfaces | Phase 3–6 |
@@ -851,7 +852,7 @@ Unchanged from Rev 2 (directory, write-once phases, SHA-256, redaction), with `s
 | Other · Delete Agent / KB Upload / Test Agent modals | `41:1519` / `41:3790` / `41:6787` | modals on their owning screens | with owners |
 | **SKIPPED (R6.3-Q1 — Captain: "skip"):** Login (Sign In/Up/Forgot, `37:3447/37:3607/37:3689`); Pricing & Upgrade/Checkout/Payment Success (`37:3849/37:4074/37:4230`); Settings · Team Members (`37:4297/41:6442`); Knowledge Base (`41:2767/41:3226/41:3505`) — **not implemented**; only frames mapping to the local single-user product are built. Retained here as future/marketing candidates | | not built | — |
 
-**Future-phase screens [R6.3]:** frames whose data arrives later are implemented **pixel-faithful with placeholder data at UI-build time** and wired live in their phase — never left as empty panes. As of Phase 3: `/tasks` and `/projects` are live; `/fleet` still carries chart/table fixtures pending Phase 6.
+**Future-phase screens [R6.3]:** frames whose data arrives later are implemented **pixel-faithful with placeholder data at UI-build time** and wired live in their phase — never left as empty panes. As of Phase 4: `/tasks` and `/projects` are live; daemon fusion REST/SSE is gated; Task Detail fusion columns, Fleet chart/table fixtures, and Policies three-way-diff UI remain Phase 6.
 
 Carried forward unchanged: nav destinations (now the Figma icon rail + top bar); ⌘K **Brain chat** drawer [R3]; one SSE stream; on-demand ticketed terminal; red for security/auth/hard failures incl. the `LIMIT REACHED` pill [R5]; unknown quota renders `?`; extension-fed live columns [R2]; safety-override amber badge [R3]; per-metric honesty tier + source + synced-at [R5].
 
@@ -1038,14 +1039,16 @@ Rev-2 table retained; [R3] additions:
 | *(all Rev-2 routes retained: status, providers + login/logout flows + probe, projects, tasks + actions + artifacts, runs, fusion, dispatch-profiles, fleet state, secondmates, analytics, sessions ticket, events SSE, terminal WS)* | | | |
 | GET | `/v1/config/effective?project=&task=` | → resolved config + per-key source layer | **[R3]** powers the Policies chain view |
 | GET/PUT | `/v1/config/:layer/:domain` | JSON5 body → validated write | **[R3]** layer ∈ {global, project, task}; typed path-precise validation errors; safety-policy writes require Captain confirmation and emit `policy.changed` |
-| GET | `/v1/config/prompts` · GET/PUT `/v1/config/prompts/*` | template list / content | **[R3]** hash + version headers; three-way diff data |
+| GET | `/v1/prompts` | → `{ templates: PromptTemplateInfo[] }` | **[Phase 4]** layered pack list (ref, layer, contentHash, customized, upstreamChanged) |
+| GET | `/v1/prompts/diff?ref=` | → three-way diff data | **[Phase 4]** `shippedAtInstall` is the install-time **hash** (text not retained); `shippedNow` / `yours` are full text |
+| GET | `/v1/tasks/:id/fusion` · GET `/v1/tasks/:id/fusion/:runId` | → run list / detail (sides, artifacts, spans, `promptsIdentical`, `aggregatorFamily`) | **[Phase 4]** durable fusion run records under `runs/<taskId>/fusion/` |
 | POST | `/v1/config/project-trust` | `{ projectId, ackHash }` | **[R3]** acknowledges `.agentos/` overrides |
 | GET | `/v1/brain/status` · POST `/v1/brain/restart` | Brain process health / respawn | **[R3]** |
 | GET/POST | `/v1/brain/history` · `/v1/brain/message` | Brain chat (streamed) | renamed from `liaison` [R3] |
 | GET | `/v1/connections/:id/quota` | → latest `QuotaMetric[]` (tier/source/syncedAt per metric) | **[R5]** |
 | POST | `/v1/connections/:id/quota/refresh` | on-demand probe → fresh metrics | **[R5]** courtesy-limited (min interval) |
 
-New SSE members **[R3]**: `policy.changed { domain, layer, safetyOverride: boolean }`, `brain.decision { taskId?, tool, rationale }`, `brain.status { state: "running" | "down" | "restarting", queuedWakes: number }`; **[R4]**: `brain.handoff { fromCast, toCast, trigger: "budget-80pct" | "window-80pct" | "manual" | "revert", metric: string }`; **[R5]**: `quota.updated { connectionId, metrics: QuotaMetric[] }` and `quota.threshold { connectionId, metric, level: "80pct" | "95pct" | "limit-reached" | "low-balance" | "reset-imminent" }` — added to the Rev-2 `OrchestratorEvent` union (which is otherwise retained: `task.state`, `agent.delta/tool/settled/context`, `run.gate`, `provider.*`, `fleet.*`, `fusion.artifact`, `needs.captain`).
+New SSE members **[R3]**: `policy.changed { domain, layer, safetyOverride: boolean }`, `brain.decision { taskId?, tool, rationale }`, `brain.status { state: "running" | "down" | "restarting", queuedWakes: number }`; **[R4]**: `brain.handoff { fromCast, toCast, trigger: "budget-80pct" | "window-80pct" | "manual" | "revert", metric: string }`; **[R5]**: `quota.updated { connectionId, metrics: QuotaMetric[] }` and `quota.threshold { connectionId, metric, level: "80pct" | "95pct" | "limit-reached" | "low-balance" | "reset-imminent" }`; **[Phase 4]**: `prompt.installed { refs }`, `fusion.side_completed { taskId, runId, role, model, family, promptHash, artifactPath }`, `fusion.completed { taskId, runId, kind, promptsIdentical, aggregatorFamily, contractOk, error? }` — added to the Rev-2 `OrchestratorEvent` union (which is otherwise retained: `task.state`, `agent.delta/tool/settled/context`, `run.gate`, `provider.*`, `fleet.*`, `fusion.dispatched`, `needs.captain`).
 
 ### 8.3 Daemon ⇄ extension socket protocol
 
@@ -1078,6 +1081,7 @@ Guard policies still load from disk at extension init, not from the socket — a
 │   ├── policies.json5                   # safety toggles (default ON)
 │   ├── fusion/profiles/*.json5
 │   ├── prompts/                         # editable template pack ({{VAR}}, version headers)
+│   │   ├── .installed.json              # ref → shippedHash at install (three-way diff base) [Phase 4]
 │   │   ├── brain/system.md
 │   │   ├── roles/{planner,builder,validator,fusion,scout}.md
 │   │   ├── fusion/{opinion,fusion,plan-instruction,gate-brief,triage-brief}.md
@@ -1095,8 +1099,8 @@ Guard policies still load from disk at extension init, not from the socket — a
 ├── worktrees/<slug>/pool-{1..N}/
 ├── tasks/<taskId>/{task.json, events.ndjson, terminal.log, report.md}
 │                                        # task.json now embeds per-task config overrides [R3]
-├── runs/<runId>/                        # §6.7 + config-snapshot.json5 [R3]
-├── sessions/<projectId>/<role>-<provider>-<model>/     # incl. brain sessions [R2]
+├── runs/<taskId>/fusion/<runId>/        # [Phase 4] run.json · instruction.md · side-* · fused.md
+├── sessions/<key>/                      # [Phase 4] sha256(project|role|model)[:32]; session.json
 └── secondmates/<name>/{config/, state.sqlite3, events.ndjson, session.lock, projects/}
 
 <repo>/.agentos/                         # [R3] PROJECT layer (trust-gated, hash-acknowledged)
@@ -1202,13 +1206,13 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] Reclaim: stop/respawn/reconcile reclaim leases; dirty SCOUT tree quarantines (G9, harness). Full 20-cycle soak matrix remains Phase 8.
 - [x] **Absorb-rule path [R3]:** supervision `absorb[]` drives watcher classification (vitest); config hot-reload feeds supervision into the fleet service. Dedicated absorb-class add/remove gate still thin — soak in Phase 8.
 
-**Phase 4 — Fusion primitives (2 wk)** — unchanged from Rev 2 plus template gates [R3]:
-- [ ] `/opinion` artifacts + per-side telemetry; live side-by-side. **[CONSENSUS]**
-- [ ] Clean-room: byte-identical prompts; no cross-reads; extension injects nothing model-visible (transcript audit). [B]+[R2]
-- [ ] `/fusion` contract enforcement (`FUSION_CONTRACT`). [A]+[B]
-- [ ] Session-key gate: key change → new session dir; restart resumes only the missing role. **[CONSENSUS]**
-- [ ] Aggregator family retention. [B]
-- [ ] **Template gates [R3]:** editing `prompts/fusion/fusion.md` (global) changes the next run's rendered instruction (hash-verified); a project prompt override wins over global; `{{VAR}}` interpolation rejects undefined variables with a typed error; customized-template detection + three-way diff data served.
+**Phase 4 — Fusion primitives (2 wk)** — daemon + gates shipped (`tooling/gates/phase-4.mjs` G1–G11; vitest `phase4-fusion.test.ts`). Console fusion side-by-side columns and Policies three-way-diff UI remain Phase 6 (deliberately deferred).
+- [x] `/opinion` artifacts + per-side telemetry (`promptsIdentical` + per-side `promptHash` on the durable run record); REST detail + SSE for live consumers. Console side-by-side columns → Phase 6. **[CONSENSUS]**
+- [x] Clean-room: byte-identical prompts (render-once); no model-visible tools on crew; no cross-reads (`read_run_artifacts` → `UNAUTHORIZED_TOOL`); extension injects nothing model-visible (G2, G11). [B]+[R2]
+- [x] `/fusion` contract enforcement (`FUSION_CONTRACT` via `@agent-os/fusion-core`; G4). [A]+[B]
+- [x] Session-key gate: key change → new session dir; restart resumes only the missing role (G6). **[CONSENSUS]**
+- [x] Aggregator family retention: fusion agent runs on the architect side's family (first planner in the cast); recorded on the run record (G5). [B]
+- [x] **Template gates [R3]:** editing `prompts/fusion/fusion.md` (global) changes the next run's rendered instruction (hash-verified, G7); a project prompt override wins over global (G9); `{{VAR}}` interpolation rejects undefined variables with a typed error (G8); customized-template detection + three-way diff data served (`shippedAtInstall` hash — install text not retained; G10).
 
 **Phase 5 — Cross-family auto-validation (3 wk)** — unchanged from Rev 2:
 - [ ] `GATE_ERROR` ≠ RED; named `EXPECTED_RED` before builder starts. [B]
