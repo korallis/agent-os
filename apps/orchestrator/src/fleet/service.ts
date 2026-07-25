@@ -328,11 +328,28 @@ export class FleetService {
    * Fallback liveness sweep (master plan: pane-scraping demotes to fallback).
    * Public so gates/tests can force one reconcile cycle without waiting.
    * Covers both crewmate sessions and the Brain (which is not a FleetSession).
+   * Also reclaims worktree leases whose sessions are all terminal (stopped/lost
+   * / missing pane) so a missed release path cannot exhaust the pool until reboot.
    */
   reconcile(): string[] {
     const lost = this.tools.reconcileDeadPanes();
     this.reconcileBrainPane();
+    this.reclaimOrphanedWorktreeLeases();
     return lost;
+  }
+
+  /**
+   * A lease is live only while its session is still starting/running and the
+   * tmux pane exists. stopped/lost/missing sessions free the slot.
+   */
+  private reclaimOrphanedWorktreeLeases(): number {
+    return this.tools.reclaimOrphanedLeases((sessionId) => {
+      if (sessionId === null) return false;
+      const session = this.tools.listSessions().find((s) => s.sessionId === sessionId);
+      if (session === undefined) return false;
+      if (session.status === "lost" || session.status === "stopped") return false;
+      return this.tmux.hasWindow(session.tmuxWindow);
+    });
   }
 
   /**
@@ -371,13 +388,7 @@ export class FleetService {
     this.tools.rebindSessionListeners();
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
-    this.tools.reclaimOrphanedLeases((sessionId) => {
-      if (sessionId === null) return false;
-      const session = this.tools.listSessions().find((s) => s.sessionId === sessionId);
-      if (session === undefined) return false;
-      if (session.status === "lost" || session.status === "stopped") return false;
-      return this.tmux.hasWindow(session.tmuxWindow);
-    });
+    this.reclaimOrphanedWorktreeLeases();
   }
 
   private startReconcileTick(): void {

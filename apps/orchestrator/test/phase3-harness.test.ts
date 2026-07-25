@@ -1466,6 +1466,134 @@ describe("crewmate cwd isolation", () => {
   });
 });
 
+describe("terminal task lifecycle choke points", () => {
+  it("cancel_task halts live sessions before releasing worktree leases", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "cancel-halt",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "running",
+    );
+    expect(service.worktrees.list().some((l) => l.taskId === taskId && l.state === "leased")).toBe(
+      true,
+    );
+
+    const cancelled = service.tools.invoke("cancel_task", {
+      taskId,
+      reason: "captain cancelled",
+    });
+    expect(cancelled.ok).toBe(true);
+    expect((cancelled.data as { phase: string }).phase).toBe("CANCELLED");
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "stopped",
+    );
+    expect(service.worktrees.list().some((l) => l.taskId === taskId && l.state === "leased")).toBe(
+      false,
+    );
+  });
+
+  it("refuses spawn_crewmate on terminal tasks for every role", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "spawn-terminal",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const cancelled = service.tools.invoke("cancel_task", {
+      taskId,
+      reason: "before spawn",
+    });
+    expect(cancelled.ok).toBe(true);
+
+    for (const role of ["builder", "planner", "fusion", "healthcheck", "validator"] as const) {
+      const spawned = service.tools.invoke("spawn_crewmate", {
+        taskId,
+        role,
+        model,
+        thinking: "low",
+        vars: {},
+      });
+      expect(spawned.ok).toBe(false);
+      expect(spawned.error?.code).toBe("CONFLICT");
+      expect(spawned.error?.message).toMatch(/terminal/i);
+    }
+  });
+
+  it("deliver abort after halt releases remaining task leases", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "deliver-abort-release",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+    const worktreePath = service.tools.listSessions().find((s) => s.sessionId === sessionId)
+      ?.worktreePath;
+    expect(worktreePath).toBeTruthy();
+
+    // Dirty the builder tree so deliver halts the session then aborts on clean gate.
+    writeFileSync(join(worktreePath!, "uncommitted.txt"), "dirty deliver abort\n");
+
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(deliver.error?.code).toBe("CONFLICT");
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "stopped",
+    );
+    expect(service.worktrees.list().some((l) => l.taskId === taskId && l.state === "leased")).toBe(
+      false,
+    );
+  });
+
+  it("periodic reconcile reclaims leases under stopped sessions", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "reconcile-orphan-lease",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+    const lease = service.worktrees.list().find((l) => l.sessionId === sessionId);
+    expect(lease?.state).toBe("leased");
+
+    // Simulate a missed release path: session stopped, lease still leased.
+    service.tools.markSessionStatus(sessionId, "stopped");
+    expect(service.worktrees.list().find((l) => l.id === lease!.id)?.state).toBe("leased");
+
+    service.reconcile();
+    const after = service.worktrees.list().find((l) => l.id === lease!.id);
+    expect(after?.state === "idle" || after?.state === "quarantined").toBe(true);
+  });
+});
+
 describe("gate env hygiene", () => {
   it("buildGateEnv strips provider keys and keeps only the allowlist", async () => {
     const { buildGateEnv } = await import("../src/fleet/gate-runner.js");

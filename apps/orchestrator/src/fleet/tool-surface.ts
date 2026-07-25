@@ -574,8 +574,7 @@ export class ToolSurface {
   private cancelTask(raw: Record<string, unknown>): TaskSnapshot {
     const input = cancelTaskInputSchema.parse(raw);
     this.requireTask(input.taskId);
-    this.releaseWorktreeLeases({ taskId: input.taskId });
-    // Re-read after release so a quarantine stamp is visible on the terminal task.
+    // Halt → release → stamp happens inside transition for terminal phases.
     return this.transition(this.requireTask(input.taskId), "CANCELLED", input.reason);
   }
 
@@ -833,6 +832,12 @@ export class ToolSurface {
   } {
     const input = spawnCrewmateInputSchema.parse(raw);
     let task = this.requireTask(input.taskId);
+    if (isTerminalPhase(task.phase)) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `task ${task.id} is terminal (${task.phase}); cannot spawn`,
+      );
+    }
     const project = this.deps.projects.get(task.projectId);
     if (project === null) {
       throw new ToolSurfaceError("NOT_FOUND", `project not found: ${task.projectId}`);
@@ -1536,7 +1541,13 @@ export class ToolSurface {
     return { clean: false, changedPaths };
   }
 
-  private haltSessionsForDelivery(taskId: string): void {
+  /**
+   * Halt every live session for a task: scout audit, kill tmux window, close
+   * session socket, persist status stopped. Does not release worktree leases —
+   * callers release next (with finalSha on successful deliver, or plain release
+   * on cancel / abort).
+   */
+  private haltTaskSessions(taskId: string, reason: string): void {
     const live = [...this.sessions.values()].filter(
       (s) =>
         s.taskId === taskId && s.status !== "stopped" && s.status !== "lost",
@@ -1552,13 +1563,13 @@ export class ToolSurface {
         const message = error instanceof Error ? error.message : String(error);
         throw new ToolSurfaceError(
           "CONFLICT",
-          `cannot deliver task ${taskId}: session ${session.sessionId} is still live and could not be stopped (${message})`,
+          `cannot halt task ${taskId}: session ${session.sessionId} is still live and could not be stopped (${message})`,
         );
       }
       if (this.deps.tmux.hasWindow(session.tmuxWindow)) {
         throw new ToolSurfaceError(
           "CONFLICT",
-          `cannot deliver task ${taskId}: session ${session.sessionId} is still live (tmux window ${session.tmuxWindow} remains)`,
+          `cannot halt task ${taskId}: session ${session.sessionId} is still live (tmux window ${session.tmuxWindow} remains)`,
         );
       }
       const now = new Date().toISOString();
@@ -1581,10 +1592,21 @@ export class ToolSurface {
         payload: {
           sessionId: session.sessionId,
           taskId,
-          reason: "deliver_task halt",
+          reason,
         },
       });
     }
+  }
+
+  /**
+   * Single choke point when a task leaves the live set: halt every session,
+   * then release every task-linked lease (clean → verified-reset, dirty →
+   * quarantine + deliveryBlocked stamp). Used by cancel/FAILED terminal paths
+   * and as the deliver abort reclaim.
+   */
+  private haltAndReleaseTask(taskId: string, reason: string): void {
+    this.haltTaskSessions(taskId, reason);
+    this.releaseWorktreeLeases({ taskId });
   }
 
   private deliverTask(raw: Record<string, unknown>): TaskSnapshot {
@@ -1611,102 +1633,113 @@ export class ToolSurface {
       task = this.transition(task, "DELIVERING", "deliver_task");
     }
 
-    this.haltSessionsForDelivery(task.id);
-    task = this.requireTask(task.id);
-    this.assertNotDeliveryBlocked(task);
+    // After halt begins, any abort must still release remaining leases so the
+    // pool cannot strand under stopped sessions (scout violation, dirty tree, etc.).
+    let deliveryComplete = false;
+    try {
+      this.haltTaskSessions(task.id, "deliver_task halt");
+      task = this.requireTask(task.id);
+      this.assertNotDeliveryBlocked(task);
 
-    const branch = task.branch ?? `ao/${task.id.slice(0, 10).toLowerCase()}`;
+      const branch = task.branch ?? `ao/${task.id.slice(0, 10).toLowerCase()}`;
 
-    // Only verified-reset when porcelain is clean. Dirty trees quarantine and
-    // surface CONFLICT so uncommitted builder work is never discarded on DONE.
-    // delivery.json is written only after every lease clears the clean gate.
-    for (const lease of this.deps.worktrees.list().filter((l) => l.taskId === task.id)) {
-      if (process.env.AGENTOS_FAKE_GIT === "1") {
-        this.releaseOneWorktreeLease(lease.id);
-        continue;
-      }
+      // Only verified-reset when porcelain is clean. Dirty trees quarantine and
+      // surface CONFLICT so uncommitted builder work is never discarded on DONE.
+      // delivery.json is written only after every lease clears the clean gate.
+      for (const lease of this.deps.worktrees.list().filter((l) => l.taskId === task.id)) {
+        if (process.env.AGENTOS_FAKE_GIT === "1") {
+          this.releaseOneWorktreeLease(lease.id);
+          continue;
+        }
 
-      const dirty = spawnSync("git", ["-C", lease.path, "status", "--porcelain"], {
-        encoding: "utf8",
-        timeout: 15_000,
-      });
-      if (dirty.error !== undefined || dirty.status !== 0) {
-        const detail = (
-          dirty.error?.message ||
-          dirty.stderr ||
-          dirty.stdout ||
-          `git status exit ${String(dirty.status)}`
-        )
-          .toString()
-          .trim();
-        const reason = `worktree status failed (${detail}); quarantined`;
-        this.blockDelivery(task, lease.id, reason, []);
-        this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
-        throw new ToolSurfaceError(
-          "CONFLICT",
-          `cannot deliver task ${task.id}: ${reason}`,
+        const dirty = spawnSync("git", ["-C", lease.path, "status", "--porcelain"], {
+          encoding: "utf8",
+          timeout: 15_000,
+        });
+        if (dirty.error !== undefined || dirty.status !== 0) {
+          const detail = (
+            dirty.error?.message ||
+            dirty.stderr ||
+            dirty.stdout ||
+            `git status exit ${String(dirty.status)}`
+          )
+            .toString()
+            .trim();
+          const reason = `worktree status failed (${detail}); quarantined`;
+          this.blockDelivery(task, lease.id, reason, []);
+          this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
+          throw new ToolSurfaceError(
+            "CONFLICT",
+            `cannot deliver task ${task.id}: ${reason}`,
+          );
+        }
+        if (dirty.stdout.trim().length > 0) {
+          const dirtyPaths = dirty.stdout
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .map((line) => line.slice(3).trim() || line);
+          const reason =
+            "worktree has uncommitted changes; quarantined for Captain inspection";
+          this.blockDelivery(task, lease.id, reason, dirtyPaths);
+          this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
+          throw new ToolSurfaceError(
+            "CONFLICT",
+            `cannot deliver task ${task.id}: ${reason}`,
+          );
+        }
+
+        let finalSha: string | undefined;
+        const rev = spawnSync("git", ["-C", lease.path, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+          timeout: 15_000,
+        });
+        if (rev.status === 0) {
+          const sha = rev.stdout.trim();
+          if (sha.length > 0) finalSha = sha;
+        }
+        this.releaseOneWorktreeLease(
+          lease.id,
+          finalSha !== undefined ? { finalSha } : {},
         );
       }
-      if (dirty.stdout.trim().length > 0) {
-        const dirtyPaths = dirty.stdout
-          .split("\n")
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0)
-          .map((line) => line.slice(3).trim() || line);
-        const reason =
-          "worktree has uncommitted changes; quarantined for Captain inspection";
-        this.blockDelivery(task, lease.id, reason, dirtyPaths);
-        this.releaseOneWorktreeLease(lease.id, { forceQuarantine: true });
-        throw new ToolSurfaceError(
-          "CONFLICT",
-          `cannot deliver task ${task.id}: ${reason}`,
-        );
-      }
 
-      let finalSha: string | undefined;
-      const rev = spawnSync("git", ["-C", lease.path, "rev-parse", "HEAD"], {
-        encoding: "utf8",
-        timeout: 15_000,
-      });
-      if (rev.status === 0) {
-        const sha = rev.stdout.trim();
-        if (sha.length > 0) finalSha = sha;
-      }
-      this.releaseOneWorktreeLease(
-        lease.id,
-        finalSha !== undefined ? { finalSha } : {},
+      // Single choke point before durable delivery marker / DONE.
+      task = this.requireTask(task.id);
+      this.assertDoneInvariant(task);
+
+      const runDir = join(this.deps.home, "runs", task.id);
+      mkdirSync(runDir, { recursive: true, mode: 0o700 });
+      writeFileSync(
+        join(runDir, "delivery.json"),
+        JSON.stringify(
+          {
+            mode: task.mode,
+            branch,
+            at: new Date().toISOString(),
+            shape: task.shape,
+          },
+          null,
+          2,
+        ) + "\n",
+        { mode: 0o600 },
       );
+
+      // DONE is only written here; clear the stamp only after the invariant holds.
+      // Sessions and leases are already halted/released — transition will no-op those steps.
+      task = {
+        ...this.transition(task, "DONE", "delivered", { allowDone: true }),
+        branch,
+        deliveryBlocked: null,
+      };
+      this.saveTask(task);
+      deliveryComplete = true;
+      return task;
+    } finally {
+      if (!deliveryComplete) {
+        this.releaseWorktreeLeases({ taskId: input.taskId });
+      }
     }
-
-    // Single choke point before durable delivery marker / DONE.
-    task = this.requireTask(task.id);
-    this.assertDoneInvariant(task);
-
-    const runDir = join(this.deps.home, "runs", task.id);
-    mkdirSync(runDir, { recursive: true, mode: 0o700 });
-    writeFileSync(
-      join(runDir, "delivery.json"),
-      JSON.stringify(
-        {
-          mode: task.mode,
-          branch,
-          at: new Date().toISOString(),
-          shape: task.shape,
-        },
-        null,
-        2,
-      ) + "\n",
-      { mode: 0o600 },
-    );
-
-    // DONE is only written here; clear the stamp only after the invariant holds.
-    task = {
-      ...this.transition(task, "DONE", "delivered", { allowDone: true }),
-      branch,
-      deliveryBlocked: null,
-    };
-    this.saveTask(task);
-    return task;
   }
 
   /**
@@ -1968,6 +2001,12 @@ export class ToolSurface {
       this.assertDoneInvariant(task);
     }
     assertTransition(task.id, from, to);
+    // Terminal exit choke point: halt every live session, then release leases
+    // (stamp deliveryBlocked on dirty quarantine). No-op when deliver_task
+    // already halted/released for DONE.
+    if (isTerminalPhase(to)) {
+      this.haltAndReleaseTask(task.id, reason ?? `phase ${to}`);
+    }
     // Prefer the store copy so a release that stamped deliveryBlocked is not
     // overwritten by a stale caller snapshot. deliveryBlocked is NEVER cleared
     // by a phase transition — only resolve_delivery_block (Captain) or a
