@@ -1290,6 +1290,60 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] `agentos config doctor` lists drifted templates; a daemon restart (which reinstalls shipped defaults) never overwrites a customized template (G7) [R3].
 - [x] Signed self-update with rollback: a forged signature and a swapped payload are both refused with distinct typed codes, a correctly signed release applies, and rollback restores the retained version without the network (G8). The public key is baked into the install, never fetched with the release. [B]
 
+**Phase 9 — Live pipeline visibility & configurable observability (v1.1, 2 wk)** **[R7 — Captain-requested]**
+
+The Captain's framing: *"the purpose of this app is not just extremely good Agentic Engineering, it's visibility that's configurable and gives the user control over what they want to see, whilst letting agents fully build everything they plan out."* Today, when work enters the `no-mistakes` gate, Agent OS goes blind — the only way to know what is happening is to poll `axi status`. That is the one place the product stops being live.
+
+**What the integration can actually stand on** (investigated against `no-mistakes v1.40.0`, not assumed):
+- **Unix socket** `~/.no-mistakes/socket` (0600, owner-only), JSON-RPC-shaped (`id`/`method`/`params`/`result`/`error`). The daemon **does** contain a real pub/sub surface — `ipc.SubscribeParams`, `ipc.Event`, `event_kind`, `RunManager.broadcast`, `[]chan<- ipc.Event`, and a `"dropped event for slow subscriber"` path. This is the only true **push** channel.
+- **Per-step logs** `~/.no-mistakes/logs/<RUN_ULID>/<step>.log` — append-only plain text, held open for write during a run. Tailable today with no reverse-engineering.
+- **`~/.no-mistakes/state.sqlite`** (WAL) — the authoritative structured state: `runs`, `step_results` (incl. `last_activity_at`, `findings_json`, `agent_pid`), `step_rounds`, `agent_invocations`. Safe to read concurrently with `sqlite3 -readonly`.
+- **What does not exist:** no `--json`/`--format` flag anywhere, no `--follow`, no user-configurable hooks or webhooks, no HTTP/TCP listener. The bundled TUI itself appears to *poll* `get_run` at ~300 ms despite the subscribe method existing.
+
+**[R7] Design decisions:**
+- **Adapter, not a second event system.** A `PipelineWatcher` in the orchestrator translates no-mistakes state into Agent OS's own typed `pipeline.*` events on the existing append-only log. The Console then gets live pipeline state through the SSE + projection machinery it already has — one event log, one stream, one projection. Nothing about the Console's live path is special-cased for this.
+- **Push first, poll as the floor, and say which one is running.** Try the socket `subscribe` stream; fall back to FS-watch on the step logs plus a read-only SQLite poll. The active mode is **reported as fact in the UI** — a Captain watching a "live" view that is silently 2 s behind is being misled, which is the same failure the honesty rules elsewhere exist to prevent.
+- **Read-only, always.** The watcher never writes to `~/.no-mistakes/`, never execs `axi run`/`respond`/`abort`. Driving the pipeline stays an explicit act.
+- **Version-drift is expected, not exceptional.** We are reading another tool's private state across versions (v1.41.2 is already out). A compatibility probe runs at attach: on an unrecognised schema the watcher **degrades visibly** — the surface says "pipeline state unreadable on no-mistakes vX" rather than rendering stale rows as current.
+- **Configurable visibility is the point, not a setting.** A new `observability.json5` config surface (#11) defines *visibility profiles*: which event classes reach the Console, at what density, and which raise a wake. The default profile is quiet; the Captain opts into depth. This is the config-layered, hot-reloadable house pattern — not a per-page toggle.
+
+Gates:
+- [ ] Live-vs-polled honesty: with the socket stream available, the surface reports `live`; with it unavailable, it reports `polled` **and the observed lag** — a fixture forcing fallback must flip the label within one cycle.
+- [ ] A pipeline run started outside Agent OS appears in the Console within 1 s of its first step transition, with step, round (`auto-fix 1/3`), and findings count.
+- [ ] Step log output streams incrementally — a line appended to `review.log` is visible without a page action.
+- [ ] Gate-awaiting state is unmistakable: a run parked on a review gate renders as needing a decision, with the findings table and each finding's `action` (`auto-fix` / `no-op` / `ask-user`).
+- [ ] Schema-drift fixture (renamed column / unknown `event_kind`) → visible degradation, never silent staleness; the daemon logs the incompatibility once, not per tick.
+- [ ] Read-only proof: an fs-audit over a full run shows zero writes by Agent OS anywhere under `~/.no-mistakes/`.
+- [ ] Visibility profiles: three shipped profiles (quiet / working / firehose) demonstrably change what reaches the Console and the wake queue, hot-reloaded without a restart.
+- [ ] No unbounded growth: a long run's step log is windowed in the Console with truncation stated, not silently dropped.
+
+**Phase 10 — Auto-balancer (v1.1, 2 wk)** **[R7 — Captain-requested]**
+
+A toggle that spreads work across the Captain's configured models — cost-effective while staying powerful — with the participating set configurable, fusion intact, and the cross-family rule never weakened.
+
+**What the codebase forces this design to be** (verified, §1–§7 of the balancer study):
+- **The Brain is the allocator; the substrate only vetoes.** `resolve_cast` *validates and records* a cast the Brain supplied; it never selects one. Every existing mechanism **refuses** rather than substitutes (`LIMIT_REACHED` throws the whole cast). So the balancer ships as **advisory input the Brain consumes**, plus a substrate-side *validator* — not a server-side cast rewriter, which would be without precedent here and would hide the decision inside the substrate.
+- **There is no cost model.** No price table, no capability tiers, no context-size metadata exists anywhere. `piModelRefSchema` is a bare `provider/model` regex. Worse, observed `costUsd` is **null exactly on subscription connections** — the setups where balancing matters most. A balancer that ranks on observed dollars would rate every Claude Max / ChatGPT-plan leg as free and shovel all load onto plan quota until `LIMIT REACHED` stops the fleet.
+- **Therefore the balancer optimises `window headroom`, not dollars.** The universal signal is per-connection quota-window percent carrying an honesty `tier`. Dollar cost is an *optional refinement*, applied only when `costCoverage !== "absent"`, and never presented as a saving figure we did not measure.
+- **A roster that collapses to one family makes the product illegal to cast.** builder ≠ validator is enforced at cast **and** re-derived at spawn against live sessions; `/opinion` requires ≥2 families with **no override**; plan-fusion requires ≥2 planner families. So the balancer must optimise builder and validator **jointly, never greedily per role**, and its config validator must **refuse a single-family roster** at write time rather than failing tasks later.
+- **One pressure ladder, not two controllers.** Brain handoff already moves one seat on quota pressure, with a sticky override and its own conservative candidate list. A balancer reading the same signals on a different threshold would oscillate — routing work toward the provider the handoff just fled. Phase 10 merges both into **one pure decision function** over one ordered ladder (steer crew → then move the Brain) drawing from **one configured model roster** with per-seat eligibility (brain-capable vs crew-only).
+- **Cast order is load-bearing.** `aggregatorFamily` is the first planner's family. Sorting fusion sides by any cost metric would silently flip which family writes the fused artifact — so the balancer must never reorder fusion casts.
+
+Gates:
+- [ ] Toggle off ⇒ **byte-identical** cast behaviour to today (no advisory injected, no event emitted) — proving the feature is genuinely opt-in.
+- [ ] A single-family roster is **refused at config-write time** with a path-precise reason, not accepted and then failing at cast.
+- [ ] With the toggle on and two healthy families, successive SHIP tasks distribute across the roster instead of pinning one model — measured over N tasks, with the distribution asserted.
+- [ ] Cross-family survives balancing: no balanced cast ever produces a same-family builder/validator, and the balancer **never** sets `familyCheckOverride` to make its own suggestion legal.
+- [ ] `/opinion` and plan-fusion casts keep ≥2 distinct families under balancing; fusion side **order is preserved**, and `aggregatorFamily` is unchanged versus the unbalanced cast.
+- [ ] Headroom-driven, not dollar-driven: with `costCoverage: "absent"` the balancer still balances (on window headroom) and states that cost was not a factor; it never renders an unmeasured saving.
+- [ ] A connection at `LIMIT REACHED` is never suggested, and one **near** its threshold is de-preferred before it trips.
+- [ ] Balancer and Brain handoff do not fight: a fixture with two over-threshold providers converges instead of oscillating, and the Brain seat is moved by the handoff path only — the balancer never calls `brain.handoff()` and never clears `handoffFrom`/`handoffReason`.
+- [ ] Every balancing decision is recorded with its reason and inputs (roster, headroom per candidate, whether cost was usable), so a Captain can ask "why this model?" and get an answer from the log rather than an inference.
+
+**[R7] Revision note (Captain, 2026-07-25).** Two product-shaping requests, planned before any implementation:
+1. *Live visibility into the `no-mistakes` gate* — "when things enter no-mistakes our app has a live view of it rather than just polling". Grounded in an investigation of `no-mistakes v1.40.0`'s actual surfaces rather than assumed capability; the honest finding is that a true push channel exists (socket `subscribe`) but is undocumented and apparently unused even by its own TUI, so the design pushes-first and falls back to a tailed log + read-only SQLite, **stating which mode is live**.
+2. *Auto-balancer toggle* — spread load across configured models, cost-effective but powerful, still enforcing cross-family and fusion. The investigation changed the design materially: there is **no cost model in this product**, and dollar cost is null precisely on subscription plans, so the balancer optimises **quota-window headroom** with dollars as an optional refinement. It is advisory to the Brain rather than a substrate-side cast rewriter, because every existing mechanism refuses rather than substitutes.
+
 **Post-v1 backlog [R4]:** **Linux support** (Secret Service / encrypted-file secrets fallback, systemd packaging, fresh-Linux install gate); **Windows** (different session backend); dual-fused BUILD (§6.6 flag); macOS `sandbox-exec` pane hardening [A].
 
 ---
