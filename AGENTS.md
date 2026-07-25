@@ -11,7 +11,7 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - Merge phase PRs when CI is green using a merge commit (not squash).
 - Use parallel subagents when safe; prefer Grok 4.5 for worker subagents.
 - TypeScript `any` is forbidden; do not introduce deprecated packages or dependencies at any level.
-- Build worker execution around Pi as the single backend harness (not vendor CLIs such as Claude Code, Codex CLI, or Grok Build); use Pi hooks so the user always has live visibility.
+- Build worker execution around Pi as the **default** backend harness; use Pi hooks so the user always has live visibility. **Superseded 2026-07-26 [R8]:** the harness is now the Captain's choice per model — Claude Code, Codex CLI, Kimi CLI, OpenCode or Pi — scoped as Phase 12 in the master plan. Pi stays the default and the capability baseline; every other adapter must DECLARE what it cannot do (cost telemetry, session-dir isolation and the byte-identical clean-room proof all degrade off Pi) so absence renders as a stated absence rather than a blank that reads like zero.
 
 ## Learned Workspace Facts
 

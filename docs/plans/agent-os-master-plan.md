@@ -1344,9 +1344,73 @@ Gates:
 - [ ] Balancer and Brain handoff do not fight: a fixture with two over-threshold providers converges instead of oscillating, and the Brain seat is moved by the handoff path only — the balancer never calls `brain.handoff()` and never clears `handoffFrom`/`handoffReason`.
 - [ ] Every balancing decision is recorded with its reason and inputs (roster, headroom per candidate, whether cost was usable), so a Captain can ask "why this model?" and get an answer from the log rather than an inference.
 
+**[R8] Revision note (Captain, 2026-07-26).** Two additions. (1) *Configurable per-model harness* — Phase 12 — which **supersedes** the founding "Pi as the single backend harness" decision in `AGENTS.md`: Pi remains the default, but the harness becomes the Captain's choice. Scoped from an audit of what the substrate actually depends on from Pi and a researched capability matrix for Claude Code, Codex CLI, Kimi CLI and OpenCode; the honest finding is that cost telemetry, session isolation and the clean-room proof all degrade off Pi, so the design makes each adapter DECLARE its capabilities and renders absence rather than blanks. (2) *External-review remediation* — Phase 13 — from `docs/k3sugestions.md`, independently verified file-by-file; three claims were corrected and the rest scheduled.
+
 **[R7] Revision note (Captain, 2026-07-25).** Two product-shaping requests, planned before any implementation:
 1. *Live visibility into the `no-mistakes` gate* — "when things enter no-mistakes our app has a live view of it rather than just polling". Grounded in an investigation of `no-mistakes v1.40.0`'s actual surfaces rather than assumed capability; the honest finding is that a true push channel exists (socket `subscribe`) but is undocumented and apparently unused even by its own TUI, so the design pushes-first and falls back to a tailed log + read-only SQLite, **stating which mode is live**.
 2. *Auto-balancer toggle* — spread load across configured models, cost-effective but powerful, still enforcing cross-family and fusion. The investigation changed the design materially: there is **no cost model in this product**, and dollar cost is null precisely on subscription plans, so the balancer optimises **quota-window headroom** with dollars as an optional refinement. It is advisory to the Brain rather than a substrate-side cast rewriter, because every existing mechanism refuses rather than substitutes.
+
+**Phase 12 — Configurable per-model harness (v1.2, 4 wk)** **[R8 — Captain-requested, SUPERSEDES the Pi-only decision]**
+
+The Captain's requirement: every model should be runnable through its native CLI or API — Anthropic via Claude Code, Kimi via Kimi CLI, OpenAI via Codex CLI, plus options like OpenCode and Pi — so a Captain picks a model *and separately* picks the harness that delivers it, fully configurable.
+
+**This reverses a founding decision.** `AGENTS.md` records "build worker execution around Pi as the single backend harness (not vendor CLIs)". That stays true as the *default*; Phase 12 makes it a *choice*. Recorded as a superseding decision rather than a silent overwrite.
+
+**What the substrate actually depends on from Pi** (audited, not assumed): the exact version pin; `--session-dir` for per-model session keys; `--thinking` for graded effort; clean-room `--no-skills --no-extensions --no-context-files`; `-e` extension injection; blockable `tool_call` hooks for the seat write-fence; `pi.registerTool()` proxying all 24 Brain tools; `pi.sendMessage()` for wake digests and verbatim gate FAILs; per-message `usage.input/output/cost.total`; and `agent_settled` — a Pi-specific "nothing left to retry" signal that fusion `settledAt` and the zero-token watcher both consume.
+
+**Capability matrix** (researched against installed CLIs and vendor docs; `?` = undetermined):
+
+| | Pi 0.82 | Claude Code | Codex CLI | Kimi CLI | OpenCode |
+|---|---|---|---|---|---|
+| Headless one-shot | FULL | FULL | FULL | FULL | FULL |
+| Structured JSONL | FULL | FULL | FULL | FULL | FULL |
+| **Tokens + USD per request** | **FULL** | PART (run-level `total_cost_usd`; subscription accuracy unverified) | **tokens only — no dollars, ever** | **NO/?** | **FULL** |
+| Session dir separable from auth | FULL | NO (`CLAUDE_CONFIG_DIR` moves auth too) | NO (`CODEX_HOME`) | NO | NO (`XDG_DATA_HOME`) |
+| Supervisor tool bridge | FULL (in-proc) | PART (hooks + MCP) | PART-FULL via `app-server` | PART-FULL via wire mode (experimental) | PART-FULL (plugins + HTTP/SSE) |
+| Arbitrary model | FULL | **NO — Anthropic only** | PART (Responses-API only) | FULL | FULL |
+| Graded thinking | FULL (7) | FULL (5) | PART (config) | **on/off only** | PART (config) |
+| OS sandbox | none (extension fence) | PART | **FULL (Seatbelt/Landlock)** | PART | PART |
+
+**[R8] Design decisions the research forced:**
+- **Harness choice constrains model choice, and the UI must say so.** Claude Code cannot run Sol 5.6 — it is Anthropic-family only. The picker must present *valid pairs*, not two independent dropdowns that can produce an impossible combination.
+- **A `HarnessAdapter` interface, with capability DECLARATION.** Each adapter declares what it can and cannot do; the substrate reads that declaration rather than assuming parity. Absent capability renders as *stated absence*, never as a blank that reads like zero — the same rule that makes `costUsd` render `—` instead of `$0.00`.
+- **Cost degrades honestly, three ways.** Pi/OpenCode report real dollars. Codex reports tokens only, so cost must be *derived from a local price table and labelled `estimated`* — never mixed into a total the Captain reads as their bill. Kimi reports neither, so its cost is `null` and its rows say so.
+- **The clean-room proof weakens and must be re-stated, not quietly kept.** Only Pi can strip every uncontrolled prompt input. Elsewhere the honest claim becomes "identical rendered *instruction* hash + pinned harness version", not byte-identical total model input. `promptsIdentical` must therefore carry the harness and its version, and the Console must show which guarantee it is.
+- **`agent_settled` has no equivalent anywhere.** Each adapter supplies a settled *heuristic* (process exit, `Stop` hook, `turn.completed`) and declares it as a heuristic, so a fusion side that never truly settles cannot masquerade as complete.
+- **Per-seat session isolation collides with auth.** Every non-Pi harness moves its auth store together with its session dir, so per-seat homes would replicate credentials — multiplying the credential surface and defeating the single-key env grant. Adapters must either share a home (declaring the loss of session-key isolation) or the phase must ship a per-harness credential story; do not silently copy auth into per-seat homes.
+- **Kimi CLI is being wound down in favour of `kimi-code`.** Pin the version and expect churn.
+
+Gates:
+- [ ] Adapter conformance suite: every adapter passes the same behavioural suite (spawn, stream, settle, stop) or declares the capability absent — a silent no-op fails.
+- [ ] Capability honesty: a harness lacking cost renders `—` with the reason, and its numbers are never summed into a total presented as a bill; a Codex-derived cost is labelled `estimated` everywhere it appears.
+- [ ] Invalid model+harness pairs are unselectable in the Console and refused by the daemon with a typed error (fixture: Sol 5.6 + Claude Code).
+- [ ] Cross-family and `/opinion` distinct-family rules hold identically regardless of harness — family is still derived server-side from the model ref, never from the harness.
+- [ ] The seat write-fence holds on every adapter (PreToolUse-equivalent), proven by an attempted out-of-jail write per harness.
+- [ ] The Brain tool bridge works on at least one non-Pi adapter end-to-end (MCP or app-server), with per-session authorisation no weaker than the current socket binding.
+- [ ] Clean-room degradation is explicit: the fusion record carries harness + version, and the Console distinguishes "byte-identical" from "identical instruction".
+- [ ] Switching a seat's harness produces a NEW session (no cross-harness transcript replay), asserted the same way the Brain handoff asserts it.
+- [ ] Default remains Pi; with no harness configured, behaviour is byte-identical to today.
+
+**Phase 13 — External-review remediation (v1.2, 2 wk)** **[R8]**
+
+An external model review (`docs/k3sugestions.md`) was independently verified against `main` file-by-file. Most findings held; the verified ones are scheduled here, ranked by whether they can silently break a running system.
+
+Gates:
+- [ ] **Event-loop blocking (VERIFIED, 25 request-reachable `spawnSync` sites).** `GateRunner.run` blocks for up to its 300 s timeout, reachable from `POST /v1/tools/call` *and* from any seat's `ext.tool_call`; also tmux (10 s), worktree add (60 s) and ~5 git calls in `deliverTask`. While blocked, **SSE fan-out, quota probes and the reconcile tick all stop** — the daemon looks alive and is deaf. Convert to async spawn/worker; assert the daemon still answers `/v1/health` and emits SSE *during* a long gate run.
+- [ ] **pi-extension reconnect death (VERIFIED).** On close, one reconnect is scheduled; the retry's own close handler compares `this.socket === socket`, which can never match for a socket that never connected — so a single outage past the 250 ms retry ends telemetry for the process lifetime, while the unbounded `pending` buffer grows forever. Persistent retry with backoff + a bounded buffer that drops with a stated count.
+- [ ] **`SSH_AUTH_SOCK` reaches untrusted gate code (VERIFIED — sharpest security edge).** It is unconditional in the base allowlist, so it flows into `buildGateEnv` — meaning *Brain-authored gate code* inherits the Captain's forwarded agent and can `git push` or sign as them, despite that function's own comment claiming it never inherits the daemon env. Remove it from the gate env, make it opt-in per seat, and document the grant.
+- [ ] **`?limit=-5` dumps the entire log (VERIFIED, understated by the reviewer).** `Math.min(Number(...) || 200, 1000)` passes negatives through, and SQLite treats a negative LIMIT as *unlimited* — one request JSON-parses and serialises every matching envelope. Clamp to a positive range and gate on it.
+- [ ] **Fusion artifact path is an uncontained read (VERIFIED, worse than reported).** `:runId` is unvalidated, but the stronger hole is `side.artifactPath` being read absolute with no containment — anything that can plant a `run.json` gets arbitrary file read over REST. ULID-validate the params *and* containment-check every path read.
+- [ ] **Unbounded in-memory growth (VERIFIED, 6 sites).** Watcher history/queue, both idempotency maps, per-session pending tool results, and the socket-hub read buffer (no newline cap — a peer that never sends `\n` grows the string forever). Bound each with stated eviction.
+- [ ] **Doc-vs-code drift (VERIFIED).** `PROTOCOL_VERSION` still says `1.2.0-phase3`; `sockets.ts` claims frames are "zod-validated both ways" while the extension side bare-casts (`daemonControlFrameSchema` is never used at runtime); `familyOfClaudeAgentSdkModel` claims "always anthropic" and is not. These carry security weight — validate the extension side for real, then make the comments true.
+- [ ] **`protocol` has zero tests (VERIFIED)** despite being what everything else validates against. Add a suite, including pinning tests for the `familyOfModelRef` "other" bucket.
+- [ ] Console: share one SSE connection per page (task detail opens **3**; analytics opens 2, not the 3 reported).
+- [ ] Marketing: the site presents **fabricated customer testimonials as real** — that directly contradicts the honesty discipline the product enforces on itself, and should be removed or labelled before anything else on that list.
+
+**Corrections to the external review, for the record:**
+- *"Nothing enforces single-writer on `events.ndjson`"* — **FALSE**. `acquireHomeLock` runs before `EventStore.open` and refuses a live holder with a typed error. The accurate narrower criticism is that it is a PID lockfile rather than an advisory lock on the log itself.
+- *"3 EventSource connections on analytics"* — analytics opens **2**. Task detail does open 3.
+- *"Phase 2 checkboxes all unchecked"* — was accurate when written; being reconciled in `phase-2b`, with the items needing the Captain's live credentials left open and the reason recorded.
 
 **Post-v1 backlog [R4]:** **Linux support** (Secret Service / encrypted-file secrets fallback, systemd packaging, fresh-Linux install gate); **Windows** (different session backend); dual-fused BUILD (§6.6 flag); macOS `sandbox-exec` pane hardening [A].
 
