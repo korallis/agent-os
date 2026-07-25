@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type {
@@ -89,10 +89,11 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
   const [logState, setLogState] = useState<LoadState>("loading");
   const [logTruncated, setLogTruncated] = useState(false);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  const boundSessionId = useRef(sessionId);
-
-  if (boundSessionId.current !== sessionId) {
-    boundSessionId.current = sessionId;
+  // Adjust state during render when the route id changes (React-recommended;
+  // never via refs — react-hooks/refs forbids ref reads in render).
+  const [boundSessionId, setBoundSessionId] = useState(sessionId);
+  if (boundSessionId !== sessionId) {
+    setBoundSessionId(sessionId);
     setDetail(null);
     setDetailState("loading");
     setLog([]);

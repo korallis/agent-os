@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { FusionRun, FusionRunDetailResponse } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
@@ -46,10 +46,11 @@ export function FusionColumns({ taskId }: { taskId: string }) {
   const [detailFailedRunId, setDetailFailedRunId] = useState<string | null>(null);
   /** RunId currently being fetched (null when idle). */
   const [detailLoadingRunId, setDetailLoadingRunId] = useState<string | null>(null);
-  const boundTaskId = useRef(taskId);
-
-  if (boundTaskId.current !== taskId) {
-    boundTaskId.current = taskId;
+  // Adjust state during render when the task id changes (React-recommended;
+  // never via refs — react-hooks/refs forbids ref reads in render).
+  const [boundTaskId, setBoundTaskId] = useState(taskId);
+  if (boundTaskId !== taskId) {
+    setBoundTaskId(taskId);
     setRuns([]);
     setDetail(null);
     setSelected(null);

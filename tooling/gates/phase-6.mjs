@@ -11,6 +11,8 @@
  *   G6  Task Detail renders the Brain decision lane and validation evidence
  *   G7  quota strip renders from seeded samples and states its honesty tier
  *   G8  empty/error treatments render for an unknown route
+ *   G9  Session Detail renders seat model, pane, attach command, and agent log
+ *       (label+value pairs — never bare values that could match empty-state copy)
  *
  * Real daemon, real Console production build, real browser (Playwright).
  * Usage: node tooling/gates/phase-6.mjs
