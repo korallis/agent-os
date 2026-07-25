@@ -74,6 +74,47 @@ describe("env hygiene (§4.8)", () => {
     expect(granted.env.AGENTOS_SESSION_DIR).not.toBe(ambient);
   });
 
+  it("strips ambient fence path vars unless granted via extraAllow", () => {
+    const ambient = "/tmp/ambient-fence-path-CANARY";
+    const stripped = scrubEnv(
+      {
+        PATH: "/usr/bin",
+        HOME: "/tmp",
+        AGENTOS_HOME: ambient,
+        AGENTOS_SEAT_WORKSPACE: ambient,
+        AGENTOS_GATE_WORKSPACE: ambient,
+      },
+      {},
+    );
+    expect(stripped.env.AGENTOS_HOME).toBeUndefined();
+    expect(stripped.env.AGENTOS_SEAT_WORKSPACE).toBeUndefined();
+    expect(stripped.env.AGENTOS_GATE_WORKSPACE).toBeUndefined();
+
+    const seat = "/tmp/seat-explicit";
+    const gate = "/tmp/gate-explicit";
+    const home = "/tmp/home-explicit";
+    const granted = scrubEnv(
+      {
+        PATH: "/usr/bin",
+        HOME: "/tmp",
+        AGENTOS_HOME: ambient,
+        AGENTOS_SEAT_WORKSPACE: ambient,
+        AGENTOS_GATE_WORKSPACE: ambient,
+      },
+      {
+        extraAllow: {
+          AGENTOS_HOME: home,
+          AGENTOS_SEAT_WORKSPACE: seat,
+          AGENTOS_GATE_WORKSPACE: gate,
+        },
+      },
+    );
+    expect(granted.env.AGENTOS_HOME).toBe(home);
+    expect(granted.env.AGENTOS_SEAT_WORKSPACE).toBe(seat);
+    expect(granted.env.AGENTOS_GATE_WORKSPACE).toBe(gate);
+    expect(Object.values(granted.env).join("\0")).not.toContain(ambient);
+  });
+
   it("flags ambient ANTHROPIC_API_KEY for subscription-sdk path", () => {
     expect(() =>
       assertNoAmbientAnthropicKey({ ANTHROPIC_API_KEY: "sk-ant-ambient" }),

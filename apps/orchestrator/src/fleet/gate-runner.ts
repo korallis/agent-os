@@ -324,52 +324,33 @@ export class GateRunner {
       } else {
         stdout = "PASS\n";
       }
-    } else if (language === "py") {
-      const uv = spawnSync(
-        "uv",
-        ["run", gateFile],
-        {
-          cwd: input.cwd,
-          encoding: "utf8",
-          timeout: this.config.gateTimeoutSeconds * 1000,
-          env: gateEnv,
-        },
-      );
-      status = uv.status ?? 1;
-      stdout = uv.stdout ?? "";
-      stderr = uv.stderr ?? "";
-      if (uv.error !== undefined) {
-        const code = (uv.error as NodeJS.ErrnoException).code;
-        // Missing runtime or a timeout is INFRASTRUCTURE, never a RED verdict:
-        // a gate that never executed has proven nothing about the code.
-        return {
-          outcome: "GATE_ERROR",
-          stdout: "",
-          stderr:
-            code === "ENOENT"
-              ? "uv not found — install uv (hard v1 dependency); this is an infrastructure error, not a gate failure"
-              : `gate runtime error (${code ?? uv.error.message}) — infrastructure error, not a gate failure`,
-          outputHash: hash(""),
-          durationMs: Date.now() - started,
-          failLines: [],
-          gateSourceHash: hash(readFileSync(gateFile, "utf8")),
-          infrastructureError: true,
-        };
-      }
     } else {
-      const node = spawnSync(
-        process.execPath,
-        ["--experimental-strip-types", gateFile],
-        {
-          cwd: input.cwd,
-          encoding: "utf8",
-          timeout: this.config.gateTimeoutSeconds * 1000,
-          env: gateEnv,
-        },
+      const spawnOpts = {
+        cwd: input.cwd,
+        encoding: "utf8" as const,
+        timeout: this.config.gateTimeoutSeconds * 1000,
+        env: gateEnv,
+      };
+      const spawned =
+        language === "py"
+          ? spawnSync("uv", ["run", gateFile], spawnOpts)
+          : spawnSync(
+              process.execPath,
+              ["--experimental-strip-types", gateFile],
+              spawnOpts,
+            );
+      // Shared for every language: missing runtime, timeout, signal, or no
+      // normal exit is infrastructure — partial stdout is never a verdict.
+      const infra = infrastructureFromSpawn(
+        spawned,
+        language === "py" ? "uv" : "node",
+        started,
+        gateFile,
       );
-      status = node.status ?? 1;
-      stdout = node.stdout ?? "";
-      stderr = node.stderr ?? "";
+      if (infra !== null) return infra;
+      status = spawned.status ?? 1;
+      stdout = spawned.stdout ?? "";
+      stderr = spawned.stderr ?? "";
     }
 
     const outcome = parseOutcome(stdout, status);
@@ -417,6 +398,57 @@ export class GateRunner {
 
 function hash(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+/**
+ * Shared post-spawn gate for every language branch. Timeout, ENOENT, signal,
+ * or any non-normal exit is infrastructure — never RED, never FAIL ledger.
+ * Partial stdout from a killed process is discarded (not a verdict).
+ */
+function infrastructureFromSpawn(
+  result: {
+    error?: Error | undefined;
+    status: number | null;
+    signal: NodeJS.Signals | null;
+    stdout?: string | null;
+    stderr?: string | null;
+  },
+  runtime: "uv" | "node",
+  started: number,
+  gateFile: string,
+): GateRunResult | null {
+  const err = result.error as NodeJS.ErrnoException | undefined;
+  const abnormal =
+    err !== undefined ||
+    result.status === null ||
+    (result.signal !== null && result.signal !== undefined);
+  if (!abnormal) return null;
+
+  const code =
+    err?.code ??
+    (result.signal !== null && result.signal !== undefined
+      ? `signal:${result.signal}`
+      : "no-exit");
+  let message: string;
+  if (err?.code === "ENOENT") {
+    message =
+      runtime === "uv"
+        ? "uv not found — install uv (hard v1 dependency); this is an infrastructure error, not a gate failure"
+        : `gate runtime (${runtime}) not found — infrastructure error, not a gate failure`;
+  } else {
+    message = `gate runtime error (${code ?? err?.message ?? "abnormal exit"}) — infrastructure error, not a gate failure`;
+  }
+
+  return {
+    outcome: "GATE_ERROR",
+    stdout: "",
+    stderr: message,
+    outputHash: hash(""),
+    durationMs: Date.now() - started,
+    failLines: [],
+    gateSourceHash: hash(readFileSync(gateFile, "utf8")),
+    infrastructureError: true,
+  };
 }
 
 function parseOutcome(stdout: string, status: number): GateOutcome {

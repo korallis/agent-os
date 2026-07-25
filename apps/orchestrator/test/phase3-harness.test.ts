@@ -259,6 +259,143 @@ describe("spawn env delivery", () => {
       Object.keys(oauthSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
     ).toEqual([]);
   });
+
+  it("never inherits ambient path-fence sentinels into any seat spawn env", () => {
+    const sentinel = "/tmp/ambient-path-fence-CANARY";
+    const pathVars = [
+      "AGENTOS_HOME",
+      "AGENTOS_SEAT_WORKSPACE",
+      "AGENTOS_GATE_WORKSPACE",
+      "AGENTOS_SESSION_DIR",
+      "PI_CODING_AGENT_SESSION_DIR",
+    ] as const;
+    const prev: Partial<Record<(typeof pathVars)[number], string | undefined>> = {};
+    for (const key of pathVars) {
+      prev[key] = process.env[key];
+      process.env[key] = sentinel;
+    }
+
+    try {
+      const home = temp("agentos-path-canary-");
+      const detection: PiDetection = {
+        binary: "/usr/local/bin/pi",
+        version: PI_PINNED_VERSION,
+        pinnedVersion: PI_PINNED_VERSION,
+        versionMatchesPin: true,
+        managedHome: join(home, "pi"),
+        configDirEnv: "PI_CONFIG_DIR",
+        isolationMode: "managed",
+      };
+      const builderSeat = join(home, "worktrees", "builder-1");
+      const gateWs = join(home, "runs", "task", "gate-workspace");
+      const sessionDir = join(home, "sessions", "seat");
+
+      const seats: Array<{
+        role: string;
+        seatWorkspace?: string;
+        gateWorkspace?: string;
+        sessionDir?: string;
+        expectHome: boolean;
+        expectSeat: boolean;
+        expectGate: boolean;
+        expectSession: boolean;
+      }> = [
+        {
+          role: "builder",
+          seatWorkspace: builderSeat,
+          gateWorkspace: gateWs,
+          sessionDir,
+          expectHome: true,
+          expectSeat: true,
+          expectGate: true,
+          expectSession: true,
+        },
+        {
+          role: "validator",
+          seatWorkspace: gateWs,
+          gateWorkspace: gateWs,
+          sessionDir,
+          expectHome: true,
+          expectSeat: true,
+          expectGate: true,
+          expectSession: true,
+        },
+        {
+          role: "brain",
+          sessionDir,
+          expectHome: true,
+          expectSeat: false,
+          expectGate: false,
+          expectSession: true,
+        },
+        {
+          role: "planner",
+          sessionDir,
+          expectHome: false,
+          expectSeat: false,
+          expectGate: false,
+          expectSession: true,
+        },
+        {
+          role: "scout",
+          expectHome: false,
+          expectSeat: false,
+          expectGate: false,
+          expectSession: false,
+        },
+      ];
+
+      for (const seat of seats) {
+        const spec = buildPiSpawnSpec({
+          agentosHome: home,
+          detection,
+          args: ["--mode", "json"],
+          cwd: seat.seatWorkspace ?? home,
+          sessionId: `01JPATHCANARY0000000000${seat.role.slice(0, 2).toUpperCase()}`,
+          role: seat.role,
+          socketPath: join(home, `${seat.role}.sock`),
+          extensionPath: join(home, "ext.js"),
+          grantProviderKey: null,
+          gateWorkspace: seat.gateWorkspace,
+          seatWorkspace: seat.seatWorkspace,
+          sessionDir: seat.sessionDir,
+        });
+        const joined = Object.values(spec.env).join("\0");
+        expect(joined).not.toContain(sentinel);
+        for (const key of pathVars) {
+          expect(spec.env[key]).not.toBe(sentinel);
+        }
+        if (seat.expectHome) {
+          expect(spec.env.AGENTOS_HOME).toBe(home);
+        } else {
+          expect(spec.env.AGENTOS_HOME).toBeUndefined();
+        }
+        if (seat.expectSeat) {
+          expect(spec.env.AGENTOS_SEAT_WORKSPACE).toBe(seat.seatWorkspace);
+        } else {
+          expect(spec.env.AGENTOS_SEAT_WORKSPACE).toBeUndefined();
+        }
+        if (seat.expectGate) {
+          expect(spec.env.AGENTOS_GATE_WORKSPACE).toBe(seat.gateWorkspace);
+        } else {
+          expect(spec.env.AGENTOS_GATE_WORKSPACE).toBeUndefined();
+        }
+        if (seat.expectSession) {
+          expect(spec.env.AGENTOS_SESSION_DIR).toBe(seat.sessionDir);
+          expect(spec.env.PI_CODING_AGENT_SESSION_DIR).toBe(seat.sessionDir);
+        } else {
+          expect(spec.env.AGENTOS_SESSION_DIR).toBeUndefined();
+          expect(spec.env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
+        }
+      }
+    } finally {
+      for (const key of pathVars) {
+        const was = prev[key];
+        if (was === undefined) delete process.env[key];
+        else process.env[key] = was;
+      }
+    }
+  });
 });
 
 describe("missing Pi is an error, not a stub", () => {
@@ -1746,6 +1883,52 @@ console.log("PASS");
     } finally {
       if (prevCanary === undefined) delete process.env[canaryKey];
       else process.env[canaryKey] = prevCanary;
+      if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
+      else process.env.AGENTOS_FAKE_GATE = prevFake;
+    }
+  });
+});
+
+describe("gate runtime infrastructure is never a verdict", () => {
+  it("ts gate timeout discards partial EXPECTED_RED and does not mint RED proof or FAIL ledger", async () => {
+    const { GateRunner } = await import("../src/fleet/gate-runner.js");
+    const home = temp("agentos-ts-gate-timeout-");
+    const runner = new GateRunner(home, {
+      maxValidations: 6,
+      triageAt: 3,
+      gateLanguage: "ts",
+      gateTimeoutSeconds: 1,
+    });
+    const taskId = "01JTSTIMEOUT00000000000001";
+    const prevFake = process.env.AGENTOS_FAKE_GATE;
+    delete process.env.AGENTOS_FAKE_GATE;
+    try {
+      runner.writeGateSource(
+        taskId,
+        `console.log("EXPECTED_RED");
+console.log("FAIL partial output before hang");
+// busy-wait so the gate prints a verdict-shaped line then exceeds timeout
+const end = Date.now() + 60_000;
+while (Date.now() < end) { /* hang */ }
+`,
+        "ts",
+      );
+      const result = runner.run({
+        taskId,
+        target: "baseline",
+        cwd: runner.gateWorkspace(taskId),
+        language: "ts",
+      });
+      expect(result.infrastructureError).toBe(true);
+      expect(result.outcome).toBe("GATE_ERROR");
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(/infrastructure error/i);
+      expect(result.failLines).toEqual([]);
+      expect(runner.getRedProof(taskId)).toBeNull();
+      expect(runner.hasRedProofForCurrentSource(taskId, "ts")).toBe(false);
+      expect(runner.getFailLedger(taskId)).toBeNull();
+      expect(runner.lastFailHash(taskId)).toBeNull();
+    } finally {
       if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
       else process.env.AGENTOS_FAKE_GATE = prevFake;
     }

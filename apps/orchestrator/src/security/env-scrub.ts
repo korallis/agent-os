@@ -40,13 +40,12 @@ const BASE_ALLOWLIST = new Set([
   "COLORTERM",
   "SHELL",
   "SSH_AUTH_SOCK",
-  // AGENTOS_HOME / AGENTOS_SEAT_WORKSPACE are granted only via extraAllow
-  // (default-deny seat fence). Signing keys are never env values.
+  // Path fence vars (AGENTOS_HOME, AGENTOS_SEAT_WORKSPACE, AGENTOS_GATE_WORKSPACE)
+  // and session dirs are granted only via extraAllow — never ambient parent env.
+  // Signing keys are never env values.
   "AGENTOS_SESSION_ID",
   "AGENTOS_SOCKET",
   "AGENTOS_ROLE",
-  "AGENTOS_GATE_WORKSPACE",
-  "AGENTOS_SEAT_WORKSPACE",
   "PI_CONFIG_DIR",
   "PI_HOME",
   "XDG_CONFIG_HOME",
