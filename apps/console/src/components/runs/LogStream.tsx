@@ -63,6 +63,11 @@ function levelOf(envelope: EventEnvelope): Level {
     case "brain.handoff_triggered":
     case "brain.handoff_completed":
       return "INFO";
+    case "net.request":
+      return envelope.event.payload.error !== null ||
+        (envelope.event.payload.status ?? 200) >= 400
+        ? "WARN"
+        : "INFO";
     case "fusion.completed":
       return envelope.event.payload.error != null && envelope.event.payload.error.length > 0
         ? "ERROR"
@@ -126,6 +131,8 @@ function sourceOf(envelope: EventEnvelope): string {
     case "brain.handoff_triggered":
     case "brain.handoff_completed":
       return "brain";
+    case "net.request":
+      return "net";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -263,6 +270,10 @@ function messageOf(envelope: EventEnvelope): string {
       return `Brain handoff ${event.payload.fromModel} → ${event.payload.toModel} (${event.payload.metric} ${event.payload.observedPct}% ≥ ${event.payload.thresholdPct}%)`;
     case "brain.handoff_completed":
       return `Brain handoff complete — ${event.payload.toModel} in new session ${event.payload.toSessionId ?? "(none)"} (${event.payload.reason})`;
+    case "net.request":
+      return event.payload.error !== null
+        ? `${event.payload.method} ${event.payload.url} failed — ${event.payload.error}`
+        : `${event.payload.method} ${event.payload.url} → ${event.payload.status ?? "—"} in ${Math.round(event.payload.durationMs)}ms`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {

@@ -129,6 +129,43 @@ export const quotaUpdatedEventSchema = z.strictObject({
   }),
 });
 
+/**
+ * One outbound HTTP call the daemon actually made (§7 Network I/O Detail,
+ * Figma 41:4815). Today the only outbound traffic Agent OS originates is the
+ * quota probes, and every one of them is recorded here.
+ *
+ * Header capture is deliberately narrow: the Authorization value is stored
+ * redacted to its last four characters and never in full. A credential in the
+ * append-only log would be permanent, and the Phase 8 canary gate scans for
+ * exactly this.
+ */
+export const netRequestEventSchema = z.strictObject({
+  type: z.literal("net.request"),
+  payload: z.strictObject({
+    requestId: ulidSchema,
+    connectionId: ulidSchema.nullable(),
+    provider: piProviderIdSchema,
+    method: z.string(),
+    url: z.string(),
+    /** Derived from the URL scheme — the fetch API does not expose ALPN. */
+    protocol: z.string(),
+    /** null when the call never produced a response (DNS failure, timeout). */
+    status: z.number().int().nullable(),
+    /** Total wall-clock ms for the call, measured around fetch. */
+    durationMs: z.number().min(0),
+    /** Bytes sent / received where measurable; null when not. */
+    requestBytes: z.number().int().min(0).nullable(),
+    responseBytes: z.number().int().min(0).nullable(),
+    /** Request headers with credentials redacted to their last 4 characters. */
+    requestHeaders: z.array(z.tuple([z.string(), z.string()])),
+    responseHeaders: z.array(z.tuple([z.string(), z.string()])),
+    /** Response body, truncated; null when not read or not text. */
+    responseBody: z.string().nullable(),
+    /** Populated when the call failed outright. */
+    error: z.string().nullable(),
+  }),
+});
+
 export const quotaThresholdEventSchema = z.strictObject({
   type: z.literal("quota.threshold"),
   payload: z.strictObject({
@@ -564,6 +601,7 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   providerBillingMismatchEventSchema,
   quotaUpdatedEventSchema,
   quotaThresholdEventSchema,
+  netRequestEventSchema,
   extensionHelloEventSchema,
   extensionUsageEventSchema,
   onboardingStepEventSchema,

@@ -57,6 +57,61 @@ function metric(
   };
 }
 
+/** Header values that carry credentials and must never be logged verbatim. */
+const CREDENTIAL_HEADERS = new Set(["authorization", "cookie", "x-api-key", "api-key"]);
+
+/**
+ * Redact a credential to its last four characters. Enough to tell two keys
+ * apart in the Console; not enough to use. The append-only log is permanent,
+ * so a full value written here could never be taken back.
+ */
+function redactHeaderValue(name: string, value: string): string {
+  if (!CREDENTIAL_HEADERS.has(name.toLowerCase())) return value;
+  const bare = value.startsWith("Bearer ") ? value.slice(7) : value;
+  const tail = bare.slice(-4);
+  return `${value.startsWith("Bearer ") ? "Bearer " : ""}****${tail}`;
+}
+
+function netRequestEvent(input: {
+  ctx: ProbeContext;
+  endpoint: { url: string; method: string };
+  requestHeaders: Record<string, string>;
+  startedAt: number;
+  response: Response | null;
+  body: string | null;
+  error: string | null;
+}): OrchestratorEvent {
+  const { ctx, endpoint, response, body } = input;
+  const responseHeaders: Array<[string, string]> = [];
+  if (response !== null) {
+    response.headers.forEach((value, key) => {
+      responseHeaders.push([key, redactHeaderValue(key, value)]);
+    });
+  }
+  return {
+    type: "net.request",
+    payload: {
+      requestId: nextUlid(),
+      connectionId: ctx.connection.id,
+      provider: ctx.connection.provider,
+      method: endpoint.method,
+      url: endpoint.url,
+      protocol: new URL(endpoint.url).protocol.replace(":", "").toUpperCase(),
+      status: response?.status ?? null,
+      durationMs: Date.now() - input.startedAt,
+      requestBytes: null,
+      responseBytes: body === null ? null : Buffer.byteLength(body, "utf8"),
+      requestHeaders: Object.entries(input.requestHeaders).map(([k, v]) => [
+        k,
+        redactHeaderValue(k, v),
+      ]),
+      responseHeaders,
+      responseBody: body === null ? null : body.slice(0, 20_000),
+      error: input.error,
+    },
+  };
+}
+
 /**
  * Read `<home>/fake-quota/<provider>.json` when present. Test-only seam; the
  * production path never writes this file.
@@ -116,6 +171,7 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
   }
 
   const metrics: QuotaMetric[] = [];
+  const netEvents: OrchestratorEvent[] = [];
   const syncedAt = nowIso(ctx);
   const fetchImpl = ctx.fetchImpl ?? fetch;
 
@@ -146,15 +202,50 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
         continue;
       }
 
-      const response = await fetchImpl(endpoint.url, {
-        method: "GET",
-        redirect: "error",
-        signal: AbortSignal.timeout(15_000),
-        headers: {
-          authorization: `Bearer ${token.token}`,
-          ...token.headers,
-        },
-      });
+      const requestHeaders: Record<string, string> = {
+        authorization: `Bearer ${token.token}`,
+        ...token.headers,
+      };
+      const startedAt = Date.now();
+      let response: Response;
+      try {
+        response = await fetchImpl(endpoint.url, {
+          method: "GET",
+          redirect: "error",
+          signal: AbortSignal.timeout(15_000),
+          headers: requestHeaders,
+        });
+      } catch (error) {
+        // Record the attempt before rethrowing: a probe that never reached the
+        // provider is exactly the case the Captain most needs to see.
+        netEvents.push(
+          netRequestEvent({
+            ctx,
+            endpoint,
+            requestHeaders,
+            startedAt,
+            response: null,
+            body: null,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        throw error;
+      }
+
+      // Read the body once, here, so the recorded size and the parsed metrics
+      // come from the same bytes rather than two separate reads.
+      const rawBody = await response.text();
+      netEvents.push(
+        netRequestEvent({
+          ctx,
+          endpoint,
+          requestHeaders,
+          startedAt,
+          response,
+          body: rawBody,
+          error: null,
+        }),
+      );
 
       if (!response.ok) {
         metrics.push(
@@ -166,7 +257,18 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
         continue;
       }
 
-      const body: unknown = await response.json();
+      let body: unknown;
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        metrics.push(
+          metric("weekly-window-pct", 0, "percent", "estimate", `${endpoint.sourceLabel} · PARSE`, syncedAt, {
+            reason: "probe response was not valid JSON",
+            limitReached: false,
+          }),
+        );
+        continue;
+      }
       metrics.push(...parseProbeBody(provider, endpoint.tier, endpoint.sourceLabel, body, syncedAt, ctx));
     } catch (error) {
       const message = error instanceof Error ? error.message : "probe failed";
@@ -200,7 +302,7 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
     sampledAt: syncedAt,
   };
 
-  const events: OrchestratorEvent[] = [updatedEvent(ctx, sample)];
+  const events: OrchestratorEvent[] = [...netEvents, updatedEvent(ctx, sample)];
   for (const m of metrics) {
     if (m.limitReached) {
       events.push({

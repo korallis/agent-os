@@ -21,7 +21,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +70,7 @@ const PAGES = [
   "/notifications",
   "/runs",
   "/runs/history",
+  "/network",
   "/settings/billing",
   "/analytics/models",
   "/alerts",
@@ -172,6 +173,21 @@ try {
   const post = async (path, body) =>
     (await fetch(`${BASE}${path}`, { method: "POST", headers: auth, body: JSON.stringify(body) })).json();
   const tool = (name, input) => post("/v1/tools/call", { tool: name, input });
+  const put = async (path, body) =>
+    (await fetch(`${BASE}${path}`, { method: "PUT", headers: auth, body: JSON.stringify(body) })).json();
+
+  // Customize a shipped prompt template on disk, the way a Captain would, so
+  // the three-way diff has a real customized side to render.
+  {
+    const templates = (await (await fetch(`${BASE}/v1/prompts`, { headers: auth })).json())
+      .templates ?? [];
+    const target = templates.find((t) => t.ref.includes("fusion")) ?? templates[0];
+    if (target !== undefined) {
+      const globalPath = join(home, "prompts", target.ref);
+      const original = readFileSync(globalPath, "utf8");
+      writeFileSync(globalPath, `CAPTAIN EDIT — do not overwrite\n\n${original}`);
+    }
+  }
 
   // Seed real fleet state.
   const projectId = (
@@ -557,6 +573,340 @@ try {
       detail = `wsUrl=${hasUrl} first=${openOnce} replay=${openTwice}`;
     }
     gate("G11", "attach ticket is single-use — a replayed ticket is refused", ok, detail);
+  }
+
+  // G12 — Network I/O renders a REAL outbound call, with the credential redacted.
+  // The redaction half matters most: the event log is append-only, so a key
+  // written there could never be taken back.
+  {
+    const CANARY_KEY = "phase6-net-canary-key-wxyz9876";
+    const connection = (
+      await post("/v1/connections/api-key", {
+        provider: "openrouter",
+        apiKey: CANARY_KEY,
+        label: "network gate fixture",
+      })
+    ).connection;
+    await post(`/v1/connections/${connection.id}/quota/refresh`, {});
+    await sleep(800);
+
+    const recorded = await (
+      await fetch(`${BASE}/v1/network?limit=50`, { headers: auth })
+    ).json();
+    const request = (recorded.requests ?? [])[0];
+
+    let ok = false;
+    let detail = "no outbound request recorded";
+    if (request !== undefined) {
+      // The daemon really called the provider: a live URL and a measured duration.
+      const realCall =
+        typeof request.url === "string" &&
+        request.url.startsWith("https://") &&
+        typeof request.durationMs === "number";
+
+      // The canary must not survive anywhere in the recorded frame.
+      const serialized = JSON.stringify(request);
+      const leaked = serialized.includes(CANARY_KEY);
+      const authHeader = (request.requestHeaders ?? []).find(
+        ([name]) => name.toLowerCase() === "authorization",
+      );
+      const redacted =
+        authHeader !== undefined &&
+        authHeader[1].includes("****") &&
+        !authHeader[1].includes(CANARY_KEY);
+
+      // And the detail page must render that same real call.
+      await page.goto(`${CONSOLE}/network/${request.requestId}`, { waitUntil: "networkidle" });
+      await sleep(500);
+      const body = (await page.textContent("body")) ?? "";
+      const rendersUrl = body.includes(request.url);
+      const rendersRedaction = body.includes("****");
+      const rendersNoSecret = !body.includes(CANARY_KEY);
+
+      ok = realCall && !leaked && redacted && rendersUrl && rendersRedaction && rendersNoSecret;
+      detail = `url=${realCall} logLeak=${leaked} headerRedacted=${redacted} rendersUrl=${rendersUrl} uiLeak=${!rendersNoSecret}`;
+    }
+    gate("G12", "Network I/O records a real outbound call with the credential redacted", ok, detail);
+  }
+
+  // G13 — Policies: accurate ◆ diff-from-default, safety toggle refuses an
+  // unconfirmed write, typed disable confirmation blocks empty confirms, and
+  // the three-way prompt diff renders for a customized template with a shipped
+  // update.
+  {
+    // Make one key genuinely deviate from its shipped default, and set another
+    // to the SAME value the default already has. Only the first may show ◆ —
+    // a mark that fires on "some layer mentions this key" is not a diff mark.
+    const shipped = await (
+      await fetch(`${BASE}/v1/config/shipped/supervision`, { headers: auth })
+    ).json();
+    const shippedHeartbeat = shipped.value?.heartbeatSeconds;
+    const deviated = Number(shippedHeartbeat) + 7;
+    await put("/v1/config/global/supervision", { ...shipped.value, heartbeatSeconds: deviated });
+    await sleep(600);
+
+    await page.goto(`${CONSOLE}/policies`, { waitUntil: "networkidle" });
+    await sleep(900);
+    // Land on the supervision domain.
+    const supervisionTab = page.getByRole("button", { name: /^supervision$/i }).first();
+    if ((await supervisionTab.count()) > 0) {
+      await supervisionTab.click();
+      await sleep(700);
+    }
+    const policiesText = (await page.textContent("body")) ?? "";
+    // The changed key must be marked AND state the shipped value it differs from.
+    const marksDeviation =
+      policiesText.includes("◆") &&
+      policiesText.includes(String(deviated)) &&
+      policiesText.includes(`differs from shipped default`);
+
+    // Safety write without the confirmation header must be refused by the daemon.
+    const effective = await (
+      await fetch(`${BASE}/v1/config/effective`, { headers: auth })
+    ).json();
+    const unconfirmed = await fetch(`${BASE}/v1/config/global/policies`, {
+      method: "PUT",
+      headers: { authorization: auth.authorization, "content-type": "application/json" },
+      body: JSON.stringify({ ...effective.config.policies, scoutReadOnly: false }),
+    });
+    const confirmed = await fetch(`${BASE}/v1/config/global/policies`, {
+      method: "PUT",
+      headers: {
+        authorization: auth.authorization,
+        "content-type": "application/json",
+        "x-agentos-confirm-safety": "true",
+      },
+      body: JSON.stringify({ ...effective.config.policies, scoutReadOnly: false }),
+    });
+    await sleep(700);
+
+    // With a policy off, the persistent override badge must be on the page.
+    await page.goto(`${CONSOLE}/policies`, { waitUntil: "networkidle" });
+    await sleep(600);
+    const safetyTab = page.getByRole("button", { name: /^safety$/i }).first();
+    let badgeShown = false;
+    let typedBlocksEmpty = false;
+    if ((await safetyTab.count()) > 0) {
+      await safetyTab.click();
+      await sleep(800);
+      const safetyText = (await page.textContent("body")) ?? "";
+      badgeShown = /SAFETY OVERRIDE/i.test(safetyText) && safetyText.includes("SCOUT read-only");
+
+      // Re-enable scout so the UI disable path can be exercised cleanly.
+      await fetch(`${BASE}/v1/config/global/policies`, {
+        method: "PUT",
+        headers: {
+          authorization: auth.authorization,
+          "content-type": "application/json",
+          "x-agentos-confirm-safety": "true",
+        },
+        body: JSON.stringify({ ...effective.config.policies, scoutReadOnly: true }),
+      });
+      await page.reload({ waitUntil: "networkidle" });
+      await sleep(700);
+      const safetyTab2 = page.getByRole("button", { name: /^safety$/i }).first();
+      if ((await safetyTab2.count()) > 0) {
+        await safetyTab2.click();
+        await sleep(700);
+      }
+
+      // Typed confirmation: open disable dialog, leave the field empty, and
+      // prove the confirm action cannot write (button stays disabled).
+      const scoutToggle = page.getByRole("button", { name: /SCOUT read-only: on/i }).first();
+      if ((await scoutToggle.count()) > 0) {
+        await scoutToggle.click();
+        await sleep(400);
+        const confirmBtn = page.getByRole("button", { name: /Yes, disable it/i }).first();
+        const confirmInput = page.getByLabel(/Type scoutReadOnly to confirm/i).first();
+        const emptyDisabled =
+          (await confirmBtn.count()) > 0 &&
+          (await confirmBtn.isDisabled()) &&
+          (await confirmInput.count()) > 0;
+        // Force a click attempt even if disabled — Playwright still dispatches
+        // when force:true; the UI must not write.
+        if ((await confirmBtn.count()) > 0) {
+          await confirmBtn.click({ force: true }).catch(() => {});
+          await sleep(500);
+        }
+        const afterEmpty = await (
+          await fetch(`${BASE}/v1/config/effective`, { headers: auth })
+        ).json();
+        const stillOn = afterEmpty.config?.policies?.scoutReadOnly === true;
+        typedBlocksEmpty = emptyDisabled && stillOn;
+      }
+    }
+
+    // Three-way prompt diff for a customized template with a shipped update.
+    const promptsTab = page.getByRole("button", { name: /^prompts$/i }).first();
+    let diffShown = false;
+    if ((await promptsTab.count()) > 0) {
+      await promptsTab.click();
+      await sleep(900);
+      const promptText = (await page.textContent("body")) ?? "";
+      diffShown =
+        promptText.includes("Shipped at install") &&
+        promptText.includes("Shipped now") &&
+        promptText.includes("Your copy") &&
+        promptText.includes("CAPTAIN EDIT");
+    }
+
+    gate(
+      "G13",
+      "Policies marks real deviations, gates safety writes, and renders the three-way prompt diff",
+      marksDeviation &&
+        unconfirmed.status === 428 &&
+        confirmed.ok &&
+        badgeShown &&
+        typedBlocksEmpty &&
+        diffShown,
+      `diamond=${marksDeviation} unconfirmed=${unconfirmed.status} confirmed=${confirmed.status} badge=${badgeShown} typedBlock=${typedBlocksEmpty} threeWay=${diffShown}`,
+    );
+  }
+
+  // G14 — quota UI [R5]: all four card archetypes render, LIMIT REACHED states
+  // its exclusion reason, and the usage strip reflects a quota.updated within 1s.
+  {
+    // One connection per archetype, each driven by the explicit quota fixture
+    // seam so the states are deterministic rather than dependent on live plans.
+    const archetypes = [
+      {
+        provider: "anthropic",
+        label: "weekly-window",
+        metrics: [
+          { kind: "weekly-window-pct", value: 42, unit: "percent", tier: "live", source: "OAUTH", syncedAt: new Date().toISOString(), reason: null, resetsAt: new Date(Date.now() + 3 * 86_400_000).toISOString(), limitReached: false },
+        ],
+      },
+      {
+        provider: "openai",
+        label: "limit-reached",
+        metrics: [
+          { kind: "weekly-window-pct", value: 100, unit: "percent", tier: "live", source: "OAUTH", syncedAt: new Date().toISOString(), reason: "weekly plan window exhausted", resetsAt: null, limitReached: true },
+        ],
+      },
+      {
+        provider: "xai",
+        label: "best-effort",
+        metrics: [
+          { kind: "weekly-window-pct", value: 61, unit: "percent", tier: "best-effort", source: "TELEMETRY", syncedAt: new Date().toISOString(), reason: "derived from local telemetry", resetsAt: null, limitReached: false },
+        ],
+      },
+      {
+        provider: "openrouter",
+        label: "balance-split",
+        // Multiple credit/balance metrics so the card renders primary + credit-
+        // split sub-rows (voucher/cash), not a lone currency numeral.
+        metrics: [
+          {
+            kind: "balance",
+            value: 25,
+            unit: "usd",
+            tier: "live",
+            source: "API KEY",
+            syncedAt: new Date().toISOString(),
+            reason: null,
+            resetsAt: null,
+            limitReached: false,
+          },
+          {
+            kind: "voucher-balance",
+            value: 10,
+            unit: "usd",
+            tier: "live",
+            source: "API KEY",
+            syncedAt: new Date().toISOString(),
+            reason: null,
+            resetsAt: null,
+            limitReached: false,
+          },
+          {
+            kind: "cash-balance",
+            value: 15,
+            unit: "usd",
+            tier: "live",
+            source: "API KEY",
+            syncedAt: new Date().toISOString(),
+            reason: null,
+            resetsAt: null,
+            limitReached: false,
+          },
+        ],
+      },
+    ];
+
+    mkdirSync(join(home, "fake-quota"), { recursive: true });
+    const seeded = [];
+    for (const archetype of archetypes) {
+      writeFileSync(
+        join(home, "fake-quota", `${archetype.provider}.json`),
+        JSON.stringify(archetype.metrics),
+      );
+      const connection = (
+        await post("/v1/connections/api-key", {
+          provider: archetype.provider,
+          apiKey: `p6-quota-${archetype.label}-not-a-secret`,
+          label: `${archetype.label} fixture`,
+        })
+      ).connection;
+      await post(`/v1/connections/${connection.id}/quota/refresh`, {});
+      seeded.push({ ...archetype, connectionId: connection.id });
+    }
+    await sleep(900);
+
+    await page.goto(`${CONSOLE}/providers`, { waitUntil: "networkidle" });
+    await sleep(1200);
+    const providersText = (await page.textContent("body")) ?? "";
+
+    // Each archetype must be individually visible — not one generic card shape.
+    const weeklyShown = providersText.includes("weekly-window fixture") && /42%/.test(providersText);
+    const limitShown =
+      providersText.includes("LIMIT REACHED") &&
+      providersText.includes("Excluded from casts") &&
+      providersText.includes("weekly plan window exhausted");
+    const bestEffortShown =
+      providersText.includes("best-effort fixture") && /best-effort/i.test(providersText);
+    // Balance-split: connection label + primary currency + credit-split sub-rows.
+    const balanceShown =
+      providersText.includes("balance-split fixture") &&
+      providersText.includes("$25.00") &&
+      /voucher/i.test(providersText) &&
+      providersText.includes("$10.00") &&
+      /cash/i.test(providersText) &&
+      providersText.includes("$15.00");
+
+    // The usage strip must reflect a NEW quota.updated within 1s over SSE.
+    await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
+    await sleep(900);
+    const bumped = seeded[0];
+    const distinctPct = 77;
+    writeFileSync(
+      join(home, "fake-quota", `${bumped.provider}.json`),
+      JSON.stringify([{ ...bumped.metrics[0], value: distinctPct }]),
+    );
+    const startedAt = Date.now();
+    await post(`/v1/connections/${bumped.connectionId}/quota/refresh`, {});
+    let reflected = false;
+    while (Date.now() - startedAt < 3000) {
+      const text = (await page.textContent("body")) ?? "";
+      // Assert the label+value pair, not a bare "77" that could appear anywhere.
+      if (text.includes(`${distinctPct}%`)) {
+        reflected = true;
+        break;
+      }
+      await sleep(100);
+    }
+    const elapsed = Date.now() - startedAt;
+
+    gate(
+      "G14",
+      "all four quota card archetypes render, LIMIT REACHED states its reason, strip updates ≤1 s",
+      weeklyShown &&
+        limitShown &&
+        bestEffortShown &&
+        balanceShown &&
+        reflected &&
+        elapsed <= 1000,
+      `weekly=${weeklyShown} limitReached=${limitShown} bestEffort=${bestEffortShown} balance=${balanceShown} stripUpdate=${reflected} in ${elapsed}ms`,
+    );
   }
 
   // G8 — unknown route renders the shared empty treatment

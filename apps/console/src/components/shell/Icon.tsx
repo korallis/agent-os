@@ -40,7 +40,7 @@ export function Icon({ src, className, tint, alt = "" }: IconProps) {
     );
   }
   return (
-    // Exact Figma asset bytes — do not route through next/image.
+    // Exact Figma asset bytes — next/image would re-encode them.
     // eslint-disable-next-line @next/next/no-img-element
     <img
       src={url}
