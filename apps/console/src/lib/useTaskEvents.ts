@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { EventEnvelope } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
 import { fetchTaskEvents } from "@/lib/fetchTaskEvents";
+import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
 
 export type TaskEventsState = {
   events: EventEnvelope[];
@@ -42,13 +43,11 @@ function payloadTaskId(event: EventEnvelope): string | null {
  */
 export function useTaskEvents(taskId: string): TaskEventsState {
   const { lastEvent } = useEventStream();
-  const [refreshKey, setRefreshKey] = useState("init");
-
-  useEffect(() => {
-    if (lastEvent === null) return;
-    if (payloadTaskId(lastEvent) !== taskId) return;
-    setRefreshKey(lastEvent.id);
-  }, [lastEvent, taskId]);
+  const refreshKey = useStickyRefreshKey(
+    lastEvent,
+    (event) => payloadTaskId(event) === taskId,
+    taskId,
+  );
 
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [truncated, setTruncated] = useState(false);

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { FusionRun, FusionRunDetailResponse } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
+import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
 
 /**
  * Live fusion side-by-side columns (master plan §7.2).
@@ -32,12 +33,11 @@ function shortHash(hash: string | null): string {
 
 export function FusionColumns({ taskId }: { taskId: string }) {
   const { lastEvent } = useEventStream();
-  const [refreshKey, setRefreshKey] = useState("init");
-  useEffect(() => {
-    if (lastEvent === null) return;
-    if (!lastEvent.event.type.startsWith("fusion.")) return;
-    setRefreshKey(lastEvent.id);
-  }, [lastEvent]);
+  const refreshKey = useStickyRefreshKey(
+    lastEvent,
+    (event) => event.event.type.startsWith("fusion."),
+    taskId,
+  );
   const [runs, setRuns] = useState<FusionRun[]>([]);
   const [detail, setDetail] = useState<FusionRunDetailResponse | null>(null);
   const [selected, setSelected] = useState<string | null>(null);

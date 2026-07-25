@@ -5,6 +5,7 @@ import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type { EventEnvelope } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
+import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
 import { useTaskEvents } from "@/lib/useTaskEvents";
 import { FusionColumns } from "@/components/tasks/FusionColumns";
 import { ValidationEvidence } from "@/components/tasks/ValidationEvidence";
@@ -49,7 +50,7 @@ function isTaskDetailRefreshEvent(type: string): boolean {
 }
 
 /**
- * Task detail with live cast/session columns (Phase 3 foundation; fusion columns Phase 6).
+ * Task detail with live cast/session columns, fusion evidence, validation, and Brain lane.
  */
 export function TaskDetail({ taskId }: { taskId: string }) {
   const [task, setTask] = useState<TaskSnapshot | null>(null);
@@ -57,16 +58,14 @@ export function TaskDetail({ taskId }: { taskId: string }) {
   const [stale, setStale] = useState(false);
   const { lastEvent } = useEventStream();
   const taskEvents = useTaskEvents(taskId);
-  const [refreshKey, setRefreshKey] = useState("init");
+  const refreshKey = useStickyRefreshKey(
+    lastEvent,
+    (event) =>
+      isTaskDetailRefreshEvent(event.event.type) && payloadTaskId(event) === taskId,
+    taskId,
+  );
   const boundTaskId = useRef(taskId);
   const everSucceeded = useRef(false);
-
-  useEffect(() => {
-    if (lastEvent === null) return;
-    if (!isTaskDetailRefreshEvent(lastEvent.event.type)) return;
-    if (payloadTaskId(lastEvent) !== taskId) return;
-    setRefreshKey(lastEvent.id);
-  }, [lastEvent, taskId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -76,7 +75,6 @@ export function TaskDetail({ taskId }: { taskId: string }) {
       setTask(null);
       setError(null);
       setStale(false);
-      setRefreshKey("init");
     }
     fetch(`/api/agentos/tasks/${taskId}`, { cache: "no-store" })
       .then(async (res) => {

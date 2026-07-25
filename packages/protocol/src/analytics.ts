@@ -4,7 +4,7 @@ import { modelFamilySchema } from "./providers.js";
 import { quotaSampleSchema } from "./quota.js";
 
 /**
- * Usage & cost analytics (master plan §7.6).
+ * Usage & cost analytics (master plan §7 Token Usage / §8.2 `GET /v1/analytics`).
  *
  * Every field is derived from the append-only event log. A `null` means the
  * value could not be derived — most often because no provider reported cost —

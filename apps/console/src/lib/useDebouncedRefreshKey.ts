@@ -4,6 +4,40 @@ import { useEffect, useRef, useState } from "react";
 import type { EventEnvelope } from "@agent-os/protocol";
 
 /**
+ * Sticky refresh key from the newest relevant SSE frame. Unrelated frames leave
+ * the prior key in place so load effects do not thrash back to `"init"`.
+ *
+ * When `scopeKey` changes (e.g. taskId), the key resets to `"init"` so the
+ * consumer reloads for the new scope. Uses React's render-time state
+ * adjustment (store previous props) rather than an effect.
+ */
+export function useStickyRefreshKey(
+  lastEvent: EventEnvelope | null,
+  isRelevant: (event: EventEnvelope) => boolean,
+  scopeKey?: string,
+): string {
+  const [stored, setStored] = useState<{ scope: string | undefined; key: string }>({
+    scope: scopeKey,
+    key: "init",
+  });
+
+  let nextScope = stored.scope;
+  let nextKey = stored.key;
+  if (stored.scope !== scopeKey) {
+    nextScope = scopeKey;
+    nextKey = "init";
+  }
+  if (lastEvent !== null && isRelevant(lastEvent)) {
+    nextScope = scopeKey;
+    nextKey = lastEvent.id;
+  }
+  if (nextScope !== stored.scope || nextKey !== stored.key) {
+    setStored({ scope: nextScope, key: nextKey });
+  }
+  return nextKey;
+}
+
+/**
  * Builds a refresh key from SSE frames that match a relevance predicate,
  * debounced so chatty streams do not thrash expensive reloads (e.g. analytics
  * scans of a large in-window event set).

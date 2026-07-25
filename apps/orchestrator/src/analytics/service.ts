@@ -28,7 +28,7 @@ export type SessionSpawnPage = {
 };
 
 /**
- * Usage & cost analytics (master plan §7.6 "Analytics").
+ * Usage & cost analytics (master plan §7 Token Usage / §8.2 `GET /v1/analytics`).
  *
  * Every figure is DERIVED from the append-only event log — there are no sampled
  * estimates and no placeholder series. When a number cannot be derived it is

@@ -360,7 +360,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     },
   );
 
-  // ── Analytics (master plan §7.6) ────────────────────────────────────────
+  // ── Analytics (master plan §7 Token Usage / §8.2) ───────────────────────
   app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {
     if (deps.analytics === undefined) {
       sendError(reply, 404, "NOT_FOUND", "analytics service unavailable");
