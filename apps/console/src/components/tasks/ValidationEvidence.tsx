@@ -18,22 +18,24 @@ import type { TaskEventsState } from "@/lib/useTaskEvents";
  * note — a failed fetch never looks like "nothing happened".
  */
 
+type GateOutcome = "PASS" | "FAIL" | "GATE_ERROR" | "EXPECTED_RED";
+
 interface GateResult {
   target: "baseline" | "candidate";
-  outcome: string;
+  outcome: GateOutcome;
   attempt: number;
   outputHash: string | null;
   ts: string;
 }
 
-const OUTCOME_STYLE: Record<string, string> = {
+const OUTCOME_STYLE: Record<GateOutcome, string> = {
   PASS: "border-ok/30 bg-ok/10 text-ok",
   EXPECTED_RED: "border-teal-brand/30 bg-teal-brand/10 text-teal-brand",
   FAIL: "border-danger/30 bg-danger/10 text-danger",
   GATE_ERROR: "border-warn/30 bg-warn/10 text-warn",
 };
 
-const OUTCOME_MEANING: Record<string, string> = {
+const OUTCOME_MEANING: Record<GateOutcome, string> = {
   PASS: "Gate passed against the candidate tree",
   EXPECTED_RED: "Baseline proven semantically red — the gate can detect the absence",
   FAIL: "Candidate rejected by the gate",
@@ -115,7 +117,7 @@ export function ValidationEvidence({
                 <span
                   className={cn(
                     "mt-0.5 shrink-0 rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-                    OUTCOME_STYLE[r.outcome] ?? "border-line-2 bg-line-1 text-fg-2",
+                    OUTCOME_STYLE[r.outcome],
                   )}
                 >
                   {r.outcome}
@@ -126,7 +128,7 @@ export function ValidationEvidence({
                     {r.target === "candidate" && ` · attempt ${r.attempt}`}
                   </span>
                   <span className="text-[11px] text-fg-3">
-                    {OUTCOME_MEANING[r.outcome] ?? "Gate outcome"}
+                    {OUTCOME_MEANING[r.outcome]}
                   </span>
                 </span>
                 <span className="shrink-0 flex flex-col items-end gap-0.5 text-[11px] text-fg-3">

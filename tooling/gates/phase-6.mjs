@@ -13,6 +13,8 @@
  *   G8  empty/error treatments render for an unknown route
  *   G9  Session Detail renders seat model, pane, attach command, and agent log
  *       (label+value pairs — never bare values that could match empty-state copy)
+ *   G10 every PAGES route is reachable by following in-app links from the shell
+ *       (orphaned deep-link-only pages fail the gate)
  *
  * Real daemon, real Console production build, real browser (Playwright).
  * Usage: node tooling/gates/phase-6.mjs
@@ -68,6 +70,9 @@ const PAGES = [
   "/notifications",
   "/runs",
   "/runs/history",
+  "/settings/billing",
+  "/analytics/models",
+  "/alerts",
   "/analytics",
   "/policies",
   "/settings",
@@ -508,6 +513,67 @@ try {
       "unknown route renders the shared Not Found treatment",
       (res?.status() ?? 0) === 404 && text.includes("Not found"),
       `status=${res?.status()}`,
+    );
+  }
+
+  // G10 — every PAGES route is reachable via in-app links from the console shell.
+  // Orphaned deep-link-only pages (repeat of /runs/history and /alerts failures)
+  // must fail the gate instead of waiting for review.
+  {
+    const normalizeHref = (href) => {
+      if (typeof href !== "string" || href.length === 0) return null;
+      if (href.startsWith("http://") || href.startsWith("https://") || href.startsWith("mailto:")) {
+        try {
+          const url = new URL(href, CONSOLE);
+          if (url.origin !== new URL(CONSOLE).origin) return null;
+          href = url.pathname;
+        } catch {
+          return null;
+        }
+      }
+      if (!href.startsWith("/")) return null;
+      const path = href.split("?")[0]?.split("#")[0] ?? "";
+      return path.length > 0 ? path : null;
+    };
+
+    // Seed ONLY the shell entry. Pre-seeding PAGES routes would prove nothing —
+    // those are the routes this gate must discover by following rendered links.
+    const shellEntry = "/fleet";
+    const pagesSet = new Set(PAGES);
+    const discovered = new Set([shellEntry]);
+    const toVisit = [shellEntry];
+    const visited = new Set();
+
+    while (toVisit.length > 0) {
+      const path = toVisit.shift();
+      if (path === undefined || visited.has(path)) continue;
+      visited.add(path);
+      await page.goto(`${CONSOLE}${path}`, { waitUntil: "networkidle" });
+      await sleep(300);
+      const hrefs = await page.$$eval("a[href]", (anchors) =>
+        anchors.map((a) => a.getAttribute("href")).filter((h) => typeof h === "string"),
+      );
+      for (const raw of hrefs) {
+        const target = normalizeHref(raw);
+        if (target === null) continue;
+        discovered.add(target);
+        // Follow any in-app link that might reveal more PAGES routes (nested
+        // subnavs, settings rail). Cap crawl to same-origin paths already
+        // normalized; only enqueue unvisited targets still worth expanding.
+        if (!visited.has(target) && !toVisit.includes(target) && pagesSet.has(target)) {
+          toVisit.push(target);
+        }
+      }
+    }
+
+    const orphaned = PAGES.filter((p) => !discovered.has(p));
+    gate(
+      "G10",
+      "every PAGES route is reachable by following links from the console shell",
+      orphaned.length === 0,
+      orphaned.length === 0
+        ? `reachable=${PAGES.length} from=${shellEntry}`
+        : `orphaned=${orphaned.join(",")}`,
     );
   }
 

@@ -130,7 +130,7 @@ export function NotificationsView() {
 
   return (
     <main className="flex-1 flex flex-col gap-5 p-8">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2.5">
             <Icon src="bell.svg" className="size-5" />
@@ -139,6 +139,12 @@ export function NotificationsView() {
           <p className="text-[13px] text-fg-2">
             The wake queue — what the watcher classified, and what reached the Brain
           </p>
+          <Link
+            href="/alerts"
+            className="text-[12px] text-teal-brand hover:underline underline-offset-2 w-fit"
+          >
+            Recent alerts →
+          </Link>
         </div>
         <div className="flex gap-0.5 bg-panel-2 border border-line-2 rounded-[10px] p-1">
           {(["All", "Needs you", "Delivered", "Absorbed"] as const).map((label) => (

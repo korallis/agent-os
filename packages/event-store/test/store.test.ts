@@ -143,6 +143,42 @@ describe("EventStore", () => {
     store.close();
   });
 
+  it("pages matching event types newest-first without mixed-window false empties", () => {
+    const { store } = EventStore.open(home);
+    const brainDown = (i: number): OrchestratorEvent => ({
+      type: "brain.down",
+      payload: { wakeQueueDepth: i, reason: `r-${i}` },
+    });
+    const sessionLost = (i: number): OrchestratorEvent => ({
+      type: "session.lost",
+      payload: {
+        sessionId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        taskId: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        reason: `lost-${i}`,
+      },
+    });
+    // Flood of non-matching frames would hide sparse alerts under mixed newest pages.
+    for (let i = 0; i < 20; i++) store.append(configChanged(i));
+    store.append(brainDown(1));
+    for (let i = 0; i < 20; i++) store.append(configChanged(100 + i));
+    store.append(sessionLost(2));
+    for (let i = 0; i < 20; i++) store.append(configChanged(200 + i));
+
+    const mixedNewest = store.eventsBeforeId(null, 10);
+    expect(mixedNewest.events.every((e) => e.event.type === "config.changed")).toBe(true);
+
+    const alerts = store.eventsOfTypes(["brain.down", "session.lost"], 10);
+    expect(alerts.events).toHaveLength(2);
+    expect(alerts.truncated).toBe(false);
+    expect(alerts.events.map((e) => e.event.type)).toEqual(["session.lost", "brain.down"]);
+
+    const limited = store.eventsOfTypes(["brain.down", "session.lost"], 1);
+    expect(limited.events).toHaveLength(1);
+    expect(limited.truncated).toBe(true);
+    expect(limited.events[0]?.event.type).toBe("session.lost");
+    store.close();
+  });
+
   it("fans out appended events to subscribers", () => {
     const { store } = EventStore.open(home);
     const seen: number[] = [];

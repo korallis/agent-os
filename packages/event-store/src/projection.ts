@@ -208,6 +208,27 @@ export class SqliteProjection {
   }
 
   /**
+   * Events matching any of the given types, newest-first.
+   * Truncation semantics are about matching frames only — not the full log —
+   * so sparse evidence surfaces (alerts) never misread "no matches in a
+   * mixed newest page" as an empty fleet.
+   */
+  eventsOfTypes(types: readonly string[], limit: number): EventEnvelope[] {
+    if (types.length === 0) return [];
+    if (types.length === 1) return this.eventsByType(types[0]!, limit);
+    const placeholders = types.map(() => "?").join(", ");
+    const rows = this.sqlite
+      .prepare(
+        `SELECT envelope FROM events
+         WHERE type IN (${placeholders})
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(...types, limit) as { envelope: string }[];
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /**
    * Events whose projected task_id matches, optionally filtered by type.
    * Newest-first page so truncation drops the oldest frames for this task.
    * Uses the apply-time task_id column + index (not json_extract per scan).

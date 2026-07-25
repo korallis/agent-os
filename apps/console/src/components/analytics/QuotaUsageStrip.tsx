@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { QuotaSample } from "@agent-os/protocol";
+import { selectPrimaryQuotaMetric } from "@/lib/selectPrimaryQuotaMetric";
 
 /**
  * Live quota strip for Token Usage (§7.3).
@@ -68,7 +69,7 @@ export function QuotaUsageStrip() {
   return (
     <div className="mb-6 flex flex-wrap gap-3">
       {samples.map((s) => {
-        const m = s.metrics[0];
+        const { primary: m } = selectPrimaryQuotaMetric(s.metrics);
         return (
           <div
             key={s.id}
