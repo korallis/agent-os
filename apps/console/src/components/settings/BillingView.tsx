@@ -11,9 +11,11 @@ import type {
   QuotaSample,
 } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
-import { selectPrimaryQuotaMetric } from "@/lib/selectPrimaryQuotaMetric";
 import { useEventStream } from "@/lib/useEventStream";
-import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
+import {
+  isBillingEvent,
+  useDebouncedRefreshKey,
+} from "@/lib/useDebouncedRefreshKey";
 
 /**
  * Settings · Billing — Figma frame `41:6309`.
@@ -51,14 +53,17 @@ const BILLING_LABEL: Record<BillingSurface, { label: string; tone: string; note:
   },
 };
 
+/**
+ * Label under a connection amount. Only attribute a probe source when that
+ * probe actually produced the currency figure shown; never pin a non-currency
+ * primary metric's source to a blank amount.
+ */
 function amountSourceLabel(
   sample: QuotaSample | undefined,
   moneySource: string | undefined,
 ): string {
   if (moneySource !== undefined) return moneySource;
   if (sample === undefined) return "no probe";
-  const { primary } = selectPrimaryQuotaMetric(sample.metrics);
-  if (primary !== undefined) return primary.source;
   return "no currency metric";
 }
 
@@ -94,22 +99,21 @@ function formatTokenCap(value: number): string {
   return value > 0 ? value.toLocaleString() : "none";
 }
 
+function settleStatus(ok: boolean): (prev: LoadState) => LoadState {
+  return (prev) => (ok ? "ready" : prev === "ready" ? prev : "unavailable");
+}
+
 export function BillingView() {
   const { events } = useEventStream();
-  const refreshKey = useStickyRefreshKey(
-    events,
-    (event) =>
-      event.event.type.startsWith("quota.") ||
-      event.event.type.startsWith("provider.") ||
-      event.event.type === "config.changed",
-    "billing",
-  );
+  const refreshKey = useDebouncedRefreshKey(events, isBillingEvent);
   const [connections, setConnections] = useState<ProviderConnection[]>([]);
+  const [connectionsStatus, setConnectionsStatus] = useState<LoadState>("loading");
   const [samples, setSamples] = useState<QuotaSample[]>([]);
+  const [samplesStatus, setSamplesStatus] = useState<LoadState>("loading");
   const [budgets, setBudgets] = useState<BudgetsConfig | null>(null);
+  const [budgetsStatus, setBudgetsStatus] = useState<LoadState>("loading");
   const [analytics, setAnalytics] = useState<AnalyticsSnapshot | null>(null);
   const [analyticsStatus, setAnalyticsStatus] = useState<LoadState>("loading");
-  const [state, setState] = useState<LoadState>("loading");
 
   useEffect(() => {
     let cancelled = false;
@@ -121,31 +125,38 @@ export function BillingView() {
         fetch("/api/agentos/analytics", { cache: "no-store" }),
       ]);
       if (cancelled) return;
-      let anyOk = false;
       const [connRes, quotaRes, configRes, analyticsRes] = results;
+
       if (connRes.status === "fulfilled" && connRes.value.ok) {
-        anyOk = true;
         setConnections(
           ((await connRes.value.json()) as { connections: ProviderConnection[] }).connections,
         );
+        setConnectionsStatus("ready");
+      } else {
+        setConnectionsStatus(settleStatus(false));
       }
+
       if (quotaRes.status === "fulfilled" && quotaRes.value.ok) {
-        anyOk = true;
         setSamples(((await quotaRes.value.json()) as { samples: QuotaSample[] }).samples);
+        setSamplesStatus("ready");
+      } else {
+        setSamplesStatus(settleStatus(false));
       }
+
       if (configRes.status === "fulfilled" && configRes.value.ok) {
-        anyOk = true;
         const body = (await configRes.value.json()) as { config: { budgets: BudgetsConfig } };
         setBudgets(body.config.budgets);
+        setBudgetsStatus("ready");
+      } else {
+        setBudgetsStatus(settleStatus(false));
       }
+
       if (analyticsRes.status === "fulfilled" && analyticsRes.value.ok) {
-        anyOk = true;
         setAnalytics((await analyticsRes.value.json()) as AnalyticsSnapshot);
         setAnalyticsStatus("ready");
       } else {
-        setAnalyticsStatus((prev) => (prev === "ready" ? "ready" : "unavailable"));
+        setAnalyticsStatus(settleStatus(false));
       }
-      setState((prev) => (anyOk ? "ready" : prev === "ready" ? "ready" : "unavailable"));
     };
     void load();
     return () => {
@@ -153,10 +164,25 @@ export function BillingView() {
     };
   }, [refreshKey]);
 
-  if (state === "unavailable") {
+  const allLoading =
+    connectionsStatus === "loading" &&
+    samplesStatus === "loading" &&
+    budgetsStatus === "loading" &&
+    analyticsStatus === "loading";
+  const allFailedEmpty =
+    connectionsStatus === "unavailable" &&
+    samplesStatus === "unavailable" &&
+    budgetsStatus === "unavailable" &&
+    analyticsStatus === "unavailable" &&
+    connections.length === 0 &&
+    samples.length === 0 &&
+    budgets === null &&
+    analytics === null;
+
+  if (allFailedEmpty) {
     return <EmptyState kind="server-error" body="Could not reach agentosd to load billing." />;
   }
-  if (state === "loading") {
+  if (allLoading) {
     return <p className="py-10 text-center text-[13px] text-fg-3">Loading…</p>;
   }
 
@@ -165,6 +191,10 @@ export function BillingView() {
   const coverage = totals?.costCoverage;
   const spend = spendNote(analyticsStatus, coverage, totals);
   const windowDays = analyticsReady ? analytics.windowDays : null;
+  const connectionsUnavailableEmpty =
+    connectionsStatus === "unavailable" && connections.length === 0;
+  const samplesUnavailableEmpty = samplesStatus === "unavailable" && samples.length === 0;
+  const samplesLoadingEmpty = samplesStatus === "loading" && samples.length === 0;
 
   return (
     <div className="flex flex-col gap-5">
@@ -189,24 +219,50 @@ export function BillingView() {
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1">
           <span className="text-[11px] uppercase tracking-wide text-fg-3">Fleet ceiling</span>
           <span className="text-2xl font-semibold text-fg-1">
-            {budgets === null ? "—" : formatUsdCap(budgets.gatewayHardUsd)}
+            {budgets === null
+              ? budgetsStatus === "loading"
+                ? "…"
+                : "—"
+              : formatUsdCap(budgets.gatewayHardUsd)}
           </span>
-          <Link href="/policies" className="text-[11px] text-teal-brand">
-            Edit in Policies ▸ Budgets →
-          </Link>
+          {budgetsStatus === "unavailable" && budgets === null ? (
+            <span className="text-[11px] text-warn">budget config unavailable</span>
+          ) : (
+            <Link href="/policies" className="text-[11px] text-teal-brand">
+              Edit in Policies ▸ Budgets →
+            </Link>
+          )}
         </div>
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1">
           <span className="text-[11px] uppercase tracking-wide text-fg-3">Connections</span>
-          <span className="text-2xl font-semibold text-fg-1">{connections.length}</span>
+          <span className="text-2xl font-semibold text-fg-1">
+            {connectionsUnavailableEmpty
+              ? "—"
+              : connectionsStatus === "loading" && connections.length === 0
+                ? "…"
+                : connections.length}
+          </span>
           <span className="text-[11px] text-fg-3">
-            {connections.filter((c) => c.limitReached).length} at limit
+            {connectionsUnavailableEmpty
+              ? "connections unavailable"
+              : connectionsStatus === "loading" && connections.length === 0
+                ? "loading…"
+                : `${connections.filter((c) => c.limitReached).length} at limit`}
           </span>
         </div>
       </div>
 
       <section className="flex flex-col gap-3">
         <h3 className="text-[15px] font-semibold text-fg-1">How each connection bills</h3>
-        {connections.length === 0 ? (
+        {connectionsStatus === "loading" && connections.length === 0 ? (
+          <p className="text-[13px] text-fg-3">Loading connections…</p>
+        ) : connectionsUnavailableEmpty ? (
+          <EmptyState
+            kind="server-error"
+            title="Connections unavailable"
+            body="Could not load provider connections. Existing links are unknown — do not reconnect until the daemon responds."
+          />
+        ) : connections.length === 0 ? (
           <EmptyState
             kind="no-data"
             title="No connections"
@@ -215,6 +271,11 @@ export function BillingView() {
           />
         ) : (
           <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">
+            {samplesUnavailableEmpty && (
+              <p className="border-b border-warn/20 bg-warn/[0.06] px-4 py-2 text-[11px] text-warn">
+                Quota probes unavailable — amounts cannot be confirmed.
+              </p>
+            )}
             <ul className="divide-y divide-line-1/60">
               {connections.map((c) => {
                 const billing = BILLING_LABEL[c.billingSurface];
@@ -252,7 +313,11 @@ export function BillingView() {
                             : `${money.value} credits`}
                       </span>
                       <span className="text-[10px] uppercase tracking-wide text-fg-3">
-                        {amountSourceLabel(sample, money?.source)}
+                        {samplesLoadingEmpty
+                          ? "loading…"
+                          : samplesUnavailableEmpty
+                            ? "probes unavailable"
+                            : amountSourceLabel(sample, money?.source)}
                       </span>
                     </span>
                   </li>
@@ -266,7 +331,7 @@ export function BillingView() {
         </p>
       </section>
 
-      {budgets !== null && (
+      {budgets !== null ? (
         <section className="rounded-2xl border border-line-2 bg-panel p-5 flex flex-col gap-2">
           <h3 className="text-[15px] font-semibold text-fg-1">Configured ceilings</h3>
           {[
@@ -284,7 +349,12 @@ export function BillingView() {
             </div>
           ))}
         </section>
-      )}
+      ) : budgetsStatus === "unavailable" ? (
+        <section className="rounded-2xl border border-line-2 bg-panel p-5">
+          <h3 className="text-[15px] font-semibold text-fg-1">Configured ceilings</h3>
+          <p className="mt-2 text-[12px] text-warn">Budget configuration unavailable</p>
+        </section>
+      ) : null}
     </div>
   );
 }

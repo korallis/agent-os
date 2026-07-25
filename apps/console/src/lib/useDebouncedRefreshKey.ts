@@ -158,6 +158,19 @@ export function isFleetAnalyticsEvent(eventType: string): boolean {
   );
 }
 
+/**
+ * Billing surface: analytics/spend drivers plus connection list and budget
+ * config. Reuses the fleet analytics predicate so usage frames refresh spend
+ * on a long visit, and adds provider/config for connection and ceiling rows.
+ */
+export function isBillingEvent(eventType: string): boolean {
+  return (
+    isFleetAnalyticsEvent(eventType) ||
+    eventType.startsWith("provider.") ||
+    eventType === "config.changed"
+  );
+}
+
 /** Event types that change the notifications wake feed / needs-you chips. */
 export function isNotificationsEvent(eventType: string): boolean {
   return (
