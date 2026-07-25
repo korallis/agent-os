@@ -4,6 +4,10 @@
  * Boots a real agentosd and asserts Pi pin surface, connections, quota
  * allowlist, onboarding, family classification, and secret canary hygiene.
  *
+ * Fixture-proven completion criteria (usage/lifecycle persist+project,
+ * auth-store integrity, ambient-key block, exact probe enablement) live in
+ * tooling/gates/phase-2b.mjs — run that suite too (pnpm gates / CI does).
+ *
  * Usage: node tooling/gates/phase-2.mjs
  * Exit 0 = all gates green.
  */
