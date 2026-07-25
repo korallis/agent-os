@@ -1,7 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import {
   agentRoleSchema,
@@ -20,6 +20,14 @@ import {
  * also gets the tool bridge (`ext.tool_call` → `ctl.tool_result`) registered
  * as model-visible Pi tools; clean-room crewmates load this extension for
  * telemetry and output capture only — nothing model-visible is injected.
+ *
+ * Path fencing here is defence-in-depth only: it reduces accidental and casual
+ * access by intercepting Pi tool_call args. It is not a containment guarantee
+ * against a determined adversary with arbitrary shell. Real guarantees must
+ * come from the daemon side — RED proof held in daemon state and HMAC-verified
+ * (never re-signed from seat-visible material), the event log never used as an
+ * authorization oracle, and the signing key never present in any spawn env.
+ * Do not remove daemon-side checks on the belief that this fence already covers them.
  */
 
 export const EXTENSION_VERSION = "0.2.0";
@@ -431,12 +439,56 @@ function messageFromEvent(event: unknown): unknown {
   return event;
 }
 
-/** True when `path` resolves inside `root` (../ cannot walk out). */
-export function isPathInsideRoot(root: string, path: string): boolean {
-  const base = resolve(root);
-  const target = resolve(path);
-  const rel = relative(base, target);
+/**
+ * Canonicalize a path for fence comparison by realpath'ing existing components.
+ * Symlinks inside a seat workspace that point outside it are followed so the
+ * fence compares the true target. For a path that does not exist yet, realpath
+ * the nearest existing ancestor and re-append the missing suffix. Throws when
+ * no existing ancestor can be resolved (fail closed).
+ */
+export function realpathForFence(inputPath: string): string {
+  const absolute = resolve(inputPath);
+  if (existsSync(absolute)) {
+    return realpathSync(absolute);
+  }
+  const segments: string[] = [];
+  let cursor = absolute;
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) {
+      throw new Error(`unresolvable path for fence: ${inputPath}`);
+    }
+    segments.unshift(basename(cursor));
+    cursor = parent;
+  }
+  let real = realpathSync(cursor);
+  for (const segment of segments) {
+    real = join(real, segment);
+    if (existsSync(real)) {
+      real = realpathSync(real);
+    }
+  }
+  return real;
+}
+
+/** True when already-canonical `target` lies inside already-canonical `root`. */
+function pathInsideResolvedRoot(root: string, target: string): boolean {
+  const rel = relative(root, target);
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+/**
+ * True when `path` lies inside `root` after realpath canonicalization
+ * (symlinks and ../ cannot walk out). Returns false if either side cannot
+ * be realpath'd — callers that must fail closed should use realpathForFence
+ * directly and treat throws as block.
+ */
+export function isPathInsideRoot(root: string, path: string): boolean {
+  try {
+    return pathInsideResolvedRoot(realpathForFence(root), realpathForFence(path));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -497,6 +549,43 @@ export function pathIsInsideGate(
   }
 }
 
+/**
+ * Shell metacharacters that may precede a path token (whitespace, quotes,
+ * assignment, redirections, pipes, grouping, sequencing). Without treating
+ * `<` `>` etc. as delimiters, `cat</abs/path` yields no candidates.
+ */
+const SHELL_PATH_PREFIX = String.raw`\s"'=<>|()&;`;
+
+/** Path-like shell tokens: absolute, ~/..., $VAR/..., relative with /. */
+const SHELL_PATH_TOKEN_RE = new RegExp(
+  `(?:^|[${SHELL_PATH_PREFIX}])((?:~|\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?)(?:\\/[^${SHELL_PATH_PREFIX}\\\\]*)?|\\/[^${SHELL_PATH_PREFIX}\\\\]+|(?:\\.{1,2}\\/)?(?:[^${SHELL_PATH_PREFIX}\\\\]*\\/)+[^${SHELL_PATH_PREFIX}\\\\]*)`,
+  "g",
+);
+
+/** Absolute-looking fragment after a shell delimiter (for fail-closed residue). */
+const SHELL_ABS_LOOKING_RE = new RegExp(
+  `(?:^|[${SHELL_PATH_PREFIX}\`])(?:\\/|~(?:\\/|$)|\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?\\/)`,
+);
+
+/**
+ * True when a shell command still has absolute-looking content after known
+ * path tokens and simple quotes are stripped — treat as unparseable and
+ * fail closed rather than as no-candidate (allow).
+ */
+export function shellCommandHasUnparseableAbs(
+  command: string,
+  extracted: readonly string[],
+): boolean {
+  if (command.length === 0) return false;
+  let rest = command;
+  for (const token of extracted) {
+    if (token.length === 0) continue;
+    rest = rest.split(token).join(" ");
+  }
+  rest = rest.replace(/'[^']*'/g, " ").replace(/"[^"]*"/g, " ");
+  return SHELL_ABS_LOOKING_RE.test(rest);
+}
+
 /** Collect path-like arguments from a Pi tool call for seat path fencing. */
 export function collectToolPathCandidates(
   toolName: string,
@@ -530,10 +619,7 @@ export function collectToolPathCandidates(
   if (toolName === "bash" || toolName === "shell") {
     const command = typeof input.command === "string" ? input.command : "";
     if (command.length > 0) {
-      // Path-like tokens: absolute, ~/..., $VAR/..., ${VAR}/..., relative with /.
-      const tokenRe =
-        /(?:^|[\s"'=])((?:~|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:\/[^\s"'\\;|&<>]*)?|\/[^\s"'\\;|&<>]+|(?:\.{1,2}\/)?(?:[^\s"'\\;|&<>]*\/)+[^\s"'\\;|&<>]*)/g;
-      for (const match of command.matchAll(tokenRe)) {
+      for (const match of command.matchAll(SHELL_PATH_TOKEN_RE)) {
         const token = match[1];
         if (token !== undefined) push(token);
       }
@@ -546,7 +632,8 @@ export function collectToolPathCandidates(
 /**
  * Default-deny seat fence: a non-Brain seat may touch ONLY its own workspace
  * plus neutral system/temp locations. Any path under AGENTOS_HOME that is not
- * the seat workspace is refused. Unresolvable env tokens fail closed.
+ * the seat workspace is refused. Unresolvable env tokens and realpath failures
+ * fail closed. This is defence-in-depth (see file header), not containment.
  */
 export function seatFenceBlockReason(
   toolName: string,
@@ -557,33 +644,59 @@ export function seatFenceBlockReason(
   env: NodeJS.ProcessEnv = process.env,
   roleLabel: string = "seat",
 ): string | null {
-  const seat = resolve(seatWorkspace);
-  const agentHome = resolve(agentosHome);
+  let realSeat: string;
+  let realHome: string;
+  try {
+    realSeat = realpathForFence(resolve(seatWorkspace));
+    realHome = realpathForFence(resolve(agentosHome));
+  } catch {
+    return `${roleLabel} path fence: unresolvable seat/home root (fail closed)`;
+  }
+
   const neutralRoots: string[] = [];
   for (const key of ["TMPDIR", "TMP", "TEMP"] as const) {
     const value = env[key];
     if (value !== undefined && value.length > 0) {
-      neutralRoots.push(resolve(value));
+      try {
+        neutralRoots.push(realpathForFence(resolve(value)));
+      } catch {
+        // Ignore unresolvable temp roots; they simply never match.
+      }
     }
   }
 
-  for (const candidate of collectToolPathCandidates(toolName, input)) {
+  const candidates = collectToolPathCandidates(toolName, input);
+
+  if (toolName === "bash" || toolName === "shell") {
+    const command = typeof input.command === "string" ? input.command : "";
+    if (shellCommandHasUnparseableAbs(command, candidates)) {
+      return `${roleLabel} path fence: unparseable absolute path in shell command (fail closed)`;
+    }
+  }
+
+  for (const candidate of candidates) {
     let resolved: string;
     try {
       resolved = resolveToolPath(candidate, cwd, env);
     } catch {
       return `${roleLabel} path fence: unresolvable path token (fail closed)`;
     }
+    let realTarget: string;
+    try {
+      realTarget = realpathForFence(resolved);
+    } catch {
+      return `${roleLabel} path fence: unresolvable path (fail closed): ${resolved}`;
+    }
     // Seat workspace is the only allowed root under AGENTOS_HOME.
-    if (isPathInsideRoot(seat, resolved)) continue;
+    if (pathInsideResolvedRoot(realSeat, realTarget)) continue;
     // Default-deny anything else under Agent OS home (secrets, events, sibling
     // runs, gate dir for builders). Checked before neutral temps so a home
     // nested under TMPDIR (common in tests) is never fail-open.
-    if (isPathInsideRoot(agentHome, resolved)) {
-      return `${roleLabel} is tool/fs-blocked outside its seat workspace (${seat}): refused path ${resolved}`;
+    if (pathInsideResolvedRoot(realHome, realTarget)) {
+      return `${roleLabel} is tool/fs-blocked outside its seat workspace (${realSeat}): refused path ${realTarget}`;
     }
     // Neutral system/temp paths outside AGENTOS_HOME.
-    if (neutralRoots.some((root) => isPathInsideRoot(root, resolved))) continue;
+    if (neutralRoots.some((root) => pathInsideResolvedRoot(root, realTarget))) continue;
   }
   return null;
 }
@@ -599,16 +712,36 @@ export function gateWorkspaceBlockReason(
   cwd: string = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  const gate = resolve(gateWorkspace);
-  for (const candidate of collectToolPathCandidates(toolName, input)) {
+  let realGate: string;
+  try {
+    realGate = realpathForFence(resolve(gateWorkspace));
+  } catch {
+    return `builder is tool/fs-blocked from the gate workspace (${gateWorkspace}): unresolvable gate root`;
+  }
+
+  const candidates = collectToolPathCandidates(toolName, input);
+  if (toolName === "bash" || toolName === "shell") {
+    const command = typeof input.command === "string" ? input.command : "";
+    if (shellCommandHasUnparseableAbs(command, candidates)) {
+      return `builder is tool/fs-blocked from the gate workspace (${realGate}): unparseable absolute path in shell command`;
+    }
+  }
+
+  for (const candidate of candidates) {
     let resolved: string;
     try {
       resolved = resolveToolPath(candidate, cwd, env);
     } catch {
-      return `builder is tool/fs-blocked from the gate workspace (${gate}): unresolvable path token`;
+      return `builder is tool/fs-blocked from the gate workspace (${realGate}): unresolvable path token`;
     }
-    if (isPathInsideRoot(gate, resolved)) {
-      return `builder is tool/fs-blocked from the gate workspace (${gate}): refused path ${resolved}`;
+    let realTarget: string;
+    try {
+      realTarget = realpathForFence(resolved);
+    } catch {
+      return `builder is tool/fs-blocked from the gate workspace (${realGate}): unresolvable path ${resolved}`;
+    }
+    if (pathInsideResolvedRoot(realGate, realTarget)) {
+      return `builder is tool/fs-blocked from the gate workspace (${realGate}): refused path ${realTarget}`;
     }
   }
   return null;
@@ -721,24 +854,42 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
     registerAgentOsTools(pi, host);
   }
 
-  // Default-deny seat fence: report via ext.tool_blocked for audit. Fail closed.
-  // Non-Brain seats may access only AGENTOS_SEAT_WORKSPACE (+ neutral temp) under
-  // AGENTOS_HOME — secrets, events, sibling runs, and the gate dir (for builders)
-  // are outside the allowlist.
-  const agentosHome = process.env.AGENTOS_HOME;
-  const seatWorkspace =
-    process.env.AGENTOS_SEAT_WORKSPACE ??
-    process.env.AGENTOS_GATE_WORKSPACE ??
-    "";
-  if (
-    (role === "builder" || role === "validator") &&
-    agentosHome !== undefined &&
-    agentosHome.length > 0 &&
-    seatWorkspace.length > 0
-  ) {
+  // Seat path fence (defence-in-depth — see file header). Report via
+  // ext.tool_blocked for audit. Builder/validator always install a handler:
+  // when fence roots are missing, block every tool_call (fail closed) rather
+  // than skipping registration (fail open).
+  if (role === "builder" || role === "validator") {
     const roleLabel = role === "validator" ? "validator" : "builder";
+    const configuredHome = process.env.AGENTOS_HOME;
+    const configuredSeat =
+      process.env.AGENTOS_SEAT_WORKSPACE ??
+      process.env.AGENTOS_GATE_WORKSPACE ??
+      "";
+    const agentosHome =
+      configuredHome !== undefined && configuredHome.length > 0
+        ? configuredHome
+        : null;
+    const seatWorkspace = configuredSeat.length > 0 ? configuredSeat : null;
+
     pi.on?.("tool_call", (event: unknown) => {
       try {
+        const toolName =
+          event !== null &&
+          typeof event === "object" &&
+          typeof (event as { toolName?: unknown }).toolName === "string"
+            ? (event as { toolName: string }).toolName
+            : "unknown";
+
+        if (agentosHome === null || seatWorkspace === null) {
+          const reason = `${roleLabel} seat fence: missing fence roots (AGENTOS_HOME / AGENTOS_SEAT_WORKSPACE); all tools blocked`;
+          try {
+            host.toolBlocked(toolName.length > 0 ? toolName : "unknown", reason);
+          } catch {
+            // still block
+          }
+          return { block: true, reason };
+        }
+
         if (event === null || typeof event !== "object") {
           const reason = `${roleLabel} seat fence: malformed tool_call event`;
           try {
@@ -748,10 +899,6 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
           }
           return { block: true, reason };
         }
-        const toolName =
-          typeof (event as { toolName?: unknown }).toolName === "string"
-            ? (event as { toolName: string }).toolName
-            : "";
         const rawInput = (event as { input?: unknown }).input;
         const input =
           rawInput !== null && typeof rawInput === "object"
