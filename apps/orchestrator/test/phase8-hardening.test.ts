@@ -159,13 +159,12 @@ describe("Brain budget handoff", () => {
     expect(decision.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
   });
 
-  it("suppresses a second handoff while cooldown is active", () => {
-    const home = temp("agentos-p8-handoff-cd-");
-    mkdirSync(join(home, "config"), { recursive: true });
-    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
-    configService.installDefaults();
-
-    const now = new Date().toISOString();
+  function fleetConnections(now: string): {
+    connections: ProviderConnection[];
+    anthropicId: string;
+    openrouterId: string;
+    xaiId: string;
+  } {
     const conn = (
       id: string,
       provider: ProviderConnection["provider"],
@@ -189,18 +188,28 @@ describe("Brain budget handoff", () => {
       createdAt: now,
       updatedAt: now,
     });
-
     const anthropicId = "01JCONN0000000000000000ANT";
     const openrouterId = "01JCONN0000000000000000ORR";
     const xaiId = "01JCONN0000000000000000XAI";
-    const connections = [
-      conn(anthropicId, "anthropic", "anthropic"),
-      conn(openrouterId, "openrouter", "other"),
-      conn(xaiId, "xai", "xai"),
-    ];
-    const registry = { list: () => connections } as ConnectionRegistry;
+    return {
+      anthropicId,
+      openrouterId,
+      xaiId,
+      connections: [
+        conn(anthropicId, "anthropic", "anthropic"),
+        conn(openrouterId, "openrouter", "other"),
+        conn(xaiId, "xai", "xai"),
+      ],
+    };
+  }
 
-    const windowSample = (connectionId: string, provider: string, pct: number): QuotaSample => ({
+  function windowSample(
+    connectionId: string,
+    provider: string,
+    pct: number,
+    now: string,
+  ): QuotaSample {
+    return {
       id: `01JQUOTA${connectionId.slice(-8)}0000000000`,
       connectionId,
       provider,
@@ -218,14 +227,25 @@ describe("Brain budget handoff", () => {
         },
       ],
       sampledAt: now,
-    });
+    };
+  }
+
+  it("suppresses a second handoff while cooldown is active", () => {
+    const home = temp("agentos-p8-handoff-cd-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    configService.installDefaults();
+
+    const now = new Date().toISOString();
+    const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+    const registry = { list: () => connections } as ConnectionRegistry;
 
     // Both Anthropic and OpenRouter report over threshold so a thrash loop
     // would otherwise bounce the Brain every reconcile tick.
     const samples = [
-      windowSample(anthropicId, "anthropic", 93),
-      windowSample(openrouterId, "openrouter", 91),
-      windowSample(xaiId, "xai", 10),
+      windowSample(anthropicId, "anthropic", 93, now),
+      windowSample(openrouterId, "openrouter", 91, now),
+      windowSample(xaiId, "xai", 10, now),
     ];
 
     const service = new FleetService({
@@ -249,6 +269,81 @@ describe("Brain budget handoff", () => {
     expect(second?.shouldHandoff).toBe(false);
     expect(second?.reason).toContain("cooldown");
     expect(service.brain.getSnapshot().model).toBe("openrouter/anthropic/claude-sonnet-4-5");
+
+    service.stop();
+  });
+
+  it("persists the handoff target across daemon restart", () => {
+    const home = temp("agentos-p8-handoff-dur-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    configService.installDefaults();
+    const now = new Date().toISOString();
+    const { connections } = fleetConnections(now);
+    const registry = { list: () => connections } as ConnectionRegistry;
+
+    const first = new FleetService({
+      home,
+      config: configService,
+      connections: registry,
+      fakeTmux: true,
+      fakeBrain: true,
+    });
+    first.start();
+    // Prefer-order would land on Anthropic; handoff must stick to the refuge.
+    first.brain.handoff("xai/grok-3", "budget threshold crossed");
+    expect(first.brain.getSnapshot().model).toBe("xai/grok-3");
+    first.stop();
+
+    const restarted = new FleetService({
+      home,
+      config: configService,
+      connections: registry,
+      fakeTmux: true,
+      fakeBrain: true,
+    });
+    restarted.start();
+    expect(restarted.brain.handoffTarget()).toBe("xai/grok-3");
+    expect(restarted.brain.getSnapshot().model).toBe("xai/grok-3");
+    restarted.stop();
+  });
+
+  it("does not latch cooldown when the post-handoff seat is down", () => {
+    const home = temp("agentos-p8-handoff-down-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    configService.installDefaults();
+
+    const now = new Date().toISOString();
+    const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+    const registry = { list: () => connections } as ConnectionRegistry;
+    const samples = [
+      windowSample(anthropicId, "anthropic", 93, now),
+      windowSample(openrouterId, "openrouter", 91, now),
+      windowSample(xaiId, "xai", 10, now),
+    ];
+
+    // No fakeBrain and no Pi → start() enters BRAIN_DOWN after handoff.
+    const service = new FleetService({
+      home,
+      config: configService,
+      connections: registry,
+      quotaSamples: () => samples,
+      fakeTmux: true,
+      fakeBrain: false,
+    });
+    service.start();
+    service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+    expect(service.brain.getSnapshot().status).toBe("down");
+
+    const first = service.evaluateBrainHandoff();
+    expect(first?.shouldHandoff).toBe(true);
+    expect(service.brain.getSnapshot().status).toBe("down");
+    expect(service.lastBrainHandoff()).toBeNull();
+
+    const second = service.evaluateBrainHandoff();
+    expect(second?.reason ?? "").not.toContain("cooldown");
+    expect(service.lastBrainHandoff()).toBeNull();
 
     service.stop();
   });

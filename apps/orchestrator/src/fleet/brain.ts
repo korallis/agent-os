@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { monotonicFactory } from "ulid";
 import type {
@@ -24,6 +24,16 @@ const nextUlid = monotonicFactory();
 
 /** Durable SessionKeyStore project id for the orchestrator Brain seat. */
 export const BRAIN_SESSION_PROJECT_ID = "orchestrator";
+
+/** Budget handoff target under AGENTOS_HOME — survives daemon restart. */
+const HANDOFF_STATE_FILE = "handoff.json";
+
+interface DurableHandoff {
+  toModel: string;
+  fromModel: string | null;
+  reason: string;
+  at: string;
+}
 
 /**
  * The Brain is an LLM, not a rule engine — but it acts only through the typed
@@ -63,7 +73,11 @@ export class BrainManager {
   private sink: BrainEventSink = () => undefined;
   private config: BrainConfig;
   private readonly fake: boolean;
-  /** Set by handoff(); overrides cast resolution until the Captain changes it. */
+  private readonly handoffStatePath: string;
+  /**
+   * Set by handoff(); overrides cast resolution until the Captain changes it.
+   * Restored from disk on boot so a restart does not return to the exhausted cast.
+   */
   private handoffModel: string | null = null;
 
   constructor(private readonly deps: BrainManagerDeps) {
@@ -71,6 +85,11 @@ export class BrainManager {
     // Explicit seam only. A missing Pi means the Brain cannot run, which is
     // BRAIN_DOWN — not a window that echoes a string and reports "running".
     this.fake = deps.fakeBrain === true || process.env.AGENTOS_FAKE_BRAIN === "1";
+    const brainDir = join(deps.home, "brain");
+    mkdirSync(brainDir, { recursive: true, mode: 0o700 });
+    this.handoffStatePath = join(brainDir, HANDOFF_STATE_FILE);
+    const durable = this.loadHandoff();
+    this.handoffModel = durable?.toModel ?? null;
     this.snapshot = {
       status: "down",
       sessionId: null,
@@ -81,8 +100,8 @@ export class BrainManager {
       tmuxWindow: null,
       wakeQueueDepth: 0,
       lastReconcileAt: null,
-      handoffFrom: null,
-      handoffReason: null,
+      handoffFrom: durable?.fromModel ?? null,
+      handoffReason: durable?.reason ?? null,
     };
     this.deps.tools.setBrainSnapshot(this.snapshot);
     this.deps.watcher.onDeliver((digest) => this.onWake(digest));
@@ -248,6 +267,12 @@ export class BrainManager {
       return this.getSnapshot();
     }
     this.handoffModel = toModel;
+    this.persistHandoff({
+      toModel,
+      fromModel,
+      reason,
+      at: new Date().toISOString(),
+    });
     // start() tears down the prior pane, mints a fresh session id, and resolves
     // a session dir keyed to the new model — the no-replay guarantee is
     // structural rather than a rule the caller has to remember.
@@ -274,6 +299,36 @@ export class BrainManager {
   /** The model a handoff moved the Brain to, or null when none has happened. */
   handoffTarget(): string | null {
     return this.handoffModel;
+  }
+
+  private loadHandoff(): DurableHandoff | null {
+    if (!existsSync(this.handoffStatePath)) return null;
+    try {
+      const raw = JSON.parse(readFileSync(this.handoffStatePath, "utf8")) as unknown;
+      if (
+        typeof raw !== "object" ||
+        raw === null ||
+        typeof (raw as DurableHandoff).toModel !== "string" ||
+        (raw as DurableHandoff).toModel.length === 0
+      ) {
+        return null;
+      }
+      const record = raw as DurableHandoff;
+      return {
+        toModel: record.toModel,
+        fromModel: typeof record.fromModel === "string" ? record.fromModel : null,
+        reason: typeof record.reason === "string" ? record.reason : "restored handoff",
+        at: typeof record.at === "string" ? record.at : new Date(0).toISOString(),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private persistHandoff(record: DurableHandoff): void {
+    writeFileSync(this.handoffStatePath, `${JSON.stringify(record, null, 2)}\n`, {
+      mode: 0o600,
+    });
   }
 
   /** Enter BRAIN_DOWN — sessions stay alive; wakes queue; no orchestration. */

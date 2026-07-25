@@ -560,8 +560,14 @@ export class FleetService {
         thresholdPct: decision.thresholdPct,
       },
     });
-    this.brain.handoff(decision.toModel, decision.reason);
-    this.lastHandoff = { atMs: Date.now(), toModel: decision.toModel };
+    const after = this.brain.handoff(decision.toModel, decision.reason);
+    // Only latch cooldown when the refuge seat actually came up. A BRAIN_DOWN
+    // land must not block another try — fail toward retry, never stay down quietly.
+    if (after.status === "running") {
+      this.lastHandoff = { atMs: Date.now(), toModel: decision.toModel };
+    } else {
+      this.lastHandoff = null;
+    }
     return decision;
   }
 

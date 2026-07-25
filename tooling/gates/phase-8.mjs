@@ -397,11 +397,13 @@ try {
       );
       await post(`/v1/connections/${brainConnection.id}/quota/refresh`, {});
 
+      // Evaluate may race the reconcile tick: whichever runs first performs the
+      // handoff; the second call may report cooldown. Prove the path by
+      // observable evidence (model, sessions, events), not only this response.
       const decision = (await post("/v1/brain/handoff/evaluate", {})).decision;
       await sleep(800);
       const brainAfter = (await get("/v1/fleet")).summary.brain;
 
-      const handedOff = decision?.shouldHandoff === true;
       const modelChanged = brainAfter.model !== brainBefore.model;
       // The core rule: a new session, so no cross-model transcript replay.
       const newSession =
@@ -416,19 +418,20 @@ try {
       const sessionsDiffer =
         completed !== undefined &&
         completed.payload.fromSessionId !== completed.payload.toSessionId;
+      // Handoff path ran: seat moved, both events present, distinct sessions.
+      const handoffEvidence =
+        modelChanged &&
+        newSession &&
+        triggered !== undefined &&
+        completed !== undefined &&
+        sessionsDiffer &&
+        brainAfter.status === "running";
 
       gate(
         "G6",
         "Brain hands off past the budget threshold into a NEW session",
-        fixtureMatchesBrain &&
-          handedOff &&
-          modelChanged &&
-          newSession &&
-          triggered !== undefined &&
-          completed !== undefined &&
-          sessionsDiffer &&
-          brainAfter.status === "running",
-        `brainConn=${brainConnection.id}/${brainConnection.provider} ${brainBefore.model} → ${brainAfter.model} observed=${decision?.observedPct}% threshold=${decision?.thresholdPct}% newSession=${newSession} events=${triggered !== undefined}/${completed !== undefined} reason=${decision?.reason ?? ""}`,
+        fixtureMatchesBrain && handoffEvidence,
+        `brainConn=${brainConnection.id}/${brainConnection.provider} ${brainBefore.model} → ${brainAfter.model} observed=${decision?.observedPct}% threshold=${decision?.thresholdPct}% shouldHandoff=${decision?.shouldHandoff} newSession=${newSession} events=${triggered !== undefined}/${completed !== undefined} reason=${decision?.reason ?? ""}`,
       );
     }
   }
