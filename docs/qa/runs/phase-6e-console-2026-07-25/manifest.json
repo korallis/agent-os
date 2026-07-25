@@ -1,0 +1,137 @@
+{
+  "capturedAgainst": {
+    "daemonPort": 5313,
+    "consolePort": 3637
+  },
+  "seeded": {
+    "projectId": "01KYDGN918E1SV8WKDK3W0YJ69",
+    "taskA": "01KYDGN91H7HF8MAT607HTR7WH",
+    "taskB": "01KYDGN95M4470C0JNG0WVN2YX",
+    "taskC": "01KYDGN9A4H5PSN60NFSJAD4Q1",
+    "sessionId": "01KYDGN93E6P1AWDWZQRASSG3P",
+    "fusionRunId": "01KYDGN96F1XXYHCAGD7XWRATX",
+    "connectionId": "01KYDGN9DCV7PR419BAHQNARP2"
+  },
+  "shots": [
+    {
+      "name": "fleet-dashboard",
+      "path": "/fleet",
+      "note": "Live fleet: Brain status, active seats, wake queue",
+      "status": 200
+    },
+    {
+      "name": "tasks",
+      "path": "/tasks",
+      "note": "Task list from the daemon's projection",
+      "status": 200
+    },
+    {
+      "name": "task-detail-validation",
+      "path": "/tasks/01KYDGN91H7HF8MAT607HTR7WH",
+      "note": "Brain decision lane + FAIL vs GATE_ERROR evidence",
+      "status": 200
+    },
+    {
+      "name": "task-detail-fusion",
+      "path": "/tasks/01KYDGN95M4470C0JNG0WVN2YX",
+      "note": "Clean-room /fusion columns with byte-identical prompt proof",
+      "status": 200
+    },
+    {
+      "name": "projects",
+      "path": "/projects",
+      "note": "Registered projects and trust state",
+      "status": 200
+    },
+    {
+      "name": "providers",
+      "path": "/providers",
+      "note": "Provider connections with live quota cards",
+      "status": 200
+    },
+    {
+      "name": "analytics",
+      "path": "/analytics",
+      "note": "Usage, cost coverage, billing surface and Brain overhead",
+      "status": 200
+    },
+    {
+      "name": "analytics-models",
+      "path": "/analytics/models",
+      "note": "Measured per-model telemetry",
+      "status": 200
+    },
+    {
+      "name": "runs",
+      "path": "/runs",
+      "note": "Live event stream",
+      "status": 200
+    },
+    {
+      "name": "runs-history",
+      "path": "/runs/history",
+      "note": "Pipeline run history (FAIL and GATE_ERROR counted apart)",
+      "status": 200
+    },
+    {
+      "name": "alerts",
+      "path": "/alerts",
+      "note": "Actionable alerts from type-filtered event replay",
+      "status": 200
+    },
+    {
+      "name": "notifications",
+      "path": "/notifications",
+      "note": "Brain wake queue including zero-token ABSORBED wakes",
+      "status": 200
+    },
+    {
+      "name": "policies",
+      "path": "/policies",
+      "note": "Layered config with per-key source and diff-from-default marks",
+      "status": 200
+    },
+    {
+      "name": "settings",
+      "path": "/settings",
+      "note": "Workspace settings",
+      "status": 200
+    },
+    {
+      "name": "settings-billing",
+      "path": "/settings/billing",
+      "note": "Billing surfaces, measured spend, budget ceilings",
+      "status": 200
+    },
+    {
+      "name": "onboarding",
+      "path": "/onboarding",
+      "note": "First-run wizard against real Pi detection",
+      "status": 200
+    },
+    {
+      "name": "session-detail",
+      "path": "/sessions/01KYDGN93E6P1AWDWZQRASSG3P",
+      "note": "Seat model, tmux pane, attach command, agent log",
+      "status": 200
+    },
+    {
+      "name": "terminal-attach",
+      "path": "/sessions/01KYDGP445D7BHS8TNQSQDTGTX",
+      "note": "Read-only ticketed terminal streaming a live tmux pane",
+      "status": 200
+    },
+    {
+      "name": "fleet-mobile",
+      "path": "/fleet",
+      "note": "390px",
+      "status": 200
+    },
+    {
+      "name": "notifications-mobile",
+      "path": "/notifications",
+      "note": "390px",
+      "status": 200
+    }
+  ]
+}
