@@ -400,3 +400,90 @@ describe("secondmate admission capacity", () => {
   });
 });
 
+describe("secondmate provision constraints", () => {
+  it("refuses a port already recorded for another secondmate or the primary", () => {
+    const home = temp("agentos-p7-port-");
+    const registry = new SecondmateRegistry(home, { primaryPort: 4700 });
+    const first = registry.provision({ name: "infra", domain: "infra", port: 4710 });
+    expect(first.port).toBe(4710);
+    expect(() =>
+      registry.provision({ name: "docs", domain: "docs", port: 4710 }),
+    ).toThrow(/already used by infra/);
+    expect(() =>
+      registry.provision({ name: "clash", domain: "x", port: 4700 }),
+    ).toThrow(/collides with the primary/);
+  });
+
+  it("persists maxConcurrentTasks on the provision record for charter fallback", () => {
+    const home = temp("agentos-p7-cap-record-");
+    const registry = new SecondmateRegistry(home);
+    const fleet = new SecondmateFleet(registry);
+    const record = registry.provision({
+      name: "infra",
+      domain: "infra",
+      maxConcurrentTasks: 7,
+    });
+    expect(record.maxConcurrentTasks).toBe(7);
+    expect(registry.get("infra")?.maxConcurrentTasks).toBe(7);
+
+    writeFileSync(join(record.home, "config", "charter.json5"), "{ this is not valid");
+    const { charter, source } = fleet.readCharter(record);
+    expect(source).toBe("provision-record");
+    expect(charter.maxConcurrentTasks).toBe(7);
+    expect(charter.acceptsRouting).toBe(true);
+  });
+
+  it("fails closed on capacity when the provision record has no durable cap", () => {
+    const home = temp("agentos-p7-cap-missing-");
+    const registry = new SecondmateRegistry(home);
+    const fleet = new SecondmateFleet(registry);
+    const record = registry.provision({ name: "infra", domain: "infra" });
+    // Simulate a pre-cap provision record without maxConcurrentTasks.
+    writeFileSync(
+      join(record.home, "charter.json"),
+      JSON.stringify({
+        name: record.name,
+        home: record.home,
+        port: record.port,
+        domain: record.domain,
+        brainModel: null,
+        createdAt: record.createdAt,
+      }),
+      { mode: 0o600 },
+    );
+    writeFileSync(join(record.home, "config", "charter.json5"), "{ broken");
+    const reloaded = registry.get("infra");
+    expect(reloaded).not.toBeNull();
+    const { charter, source } = fleet.readCharter(reloaded!);
+    expect(source).toBe("provision-record");
+    expect(charter.acceptsRouting).toBe(false);
+    expect(Number.isInteger(charter.maxConcurrentTasks)).toBe(true);
+  });
+});
+
+describe("secondmate api-key grants (non-copy)", () => {
+  it("resolves grants from AGENTOS_SECRETS_HOME without writing under the secondmate home", async () => {
+    const { writeApiKeyFile, resolveProviderKeyGrant, ConnectionRegistry } = await import(
+      "../src/pi/connections.js"
+    );
+    const primary = temp("agentos-p7-secrets-primary-");
+    const smHome = temp("agentos-p7-secrets-sm-");
+    writeApiKeyFile(primary, "openai", "sk-primary-only");
+    process.env.AGENTOS_SECRETS_HOME = primary;
+    try {
+      const registry = new ConnectionRegistry(smHome);
+      registry.createConnection({
+        provider: "openai",
+        kind: "pi-api-key",
+        billingMode: null,
+      });
+      const grant = resolveProviderKeyGrant(smHome, "openai/gpt-4.1", registry);
+      expect(grant).toEqual({ name: "OPENAI_API_KEY", value: "sk-primary-only" });
+      expect(existsSync(join(smHome, "secrets"))).toBe(false);
+      expect(existsSync(join(primary, "secrets", "openai.key"))).toBe(true);
+    } finally {
+      delete process.env.AGENTOS_SECRETS_HOME;
+    }
+  });
+});
+

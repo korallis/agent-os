@@ -162,6 +162,45 @@ describe("spawn env delivery", () => {
       name: "OPENAI_API_KEY",
       value: "sk-openai-cast-secret",
     });
+  });
+
+  it("resolves api-key grants from AGENTOS_SECRETS_HOME for secondmate non-copy path", () => {
+    const primary = temp("agentos-grant-primary-");
+    const secondmate = temp("agentos-grant-sm-");
+    writeApiKeyFile(primary, "openai", "sk-from-primary");
+    process.env.AGENTOS_SECRETS_HOME = primary;
+    try {
+      const registry = new ConnectionRegistry(secondmate);
+      registry.createConnection({
+        provider: "openai",
+        kind: "pi-api-key",
+        billingMode: null,
+      });
+      const apiGrant = resolveProviderKeyGrant(secondmate, "openai/gpt-4.1", registry);
+      expect(apiGrant).toEqual({
+        name: "OPENAI_API_KEY",
+        value: "sk-from-primary",
+      });
+      expect(existsSync(join(secondmate, "secrets"))).toBe(false);
+    } finally {
+      delete process.env.AGENTOS_SECRETS_HOME;
+    }
+  });
+
+  it("api-key cast grant injects provider key into spawn env", () => {
+    const home = temp("agentos-grant-spawn-");
+    writeApiKeyFile(home, "openai", "sk-openai-cast-secret");
+    const registry = new ConnectionRegistry(home);
+    registry.createConnection({
+      provider: "openai",
+      kind: "pi-api-key",
+      billingMode: null,
+    });
+    const apiGrant = resolveProviderKeyGrant(home, "openai/gpt-4.1", registry);
+    expect(apiGrant).toEqual({
+      name: "OPENAI_API_KEY",
+      value: "sk-openai-cast-secret",
+    });
 
     const detection: PiDetection = {
       binary: "/usr/local/bin/pi",

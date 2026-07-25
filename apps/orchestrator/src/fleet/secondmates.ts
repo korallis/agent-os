@@ -28,6 +28,8 @@ export interface SecondmateRecord {
   port: number;
   domain: string;
   brainModel: string | null;
+  /** Durable capacity cap from provision; used when charter.json5 is missing. */
+  maxConcurrentTasks: number;
   createdAt: string;
 }
 
@@ -58,11 +60,15 @@ export class SecondmateRegistry {
   private readonly root: string;
   private readonly runtimeRoot: string;
   private readonly primaryHome: string;
+  private readonly primaryPort: number | null;
   private sink: SecondmateEventSink = () => undefined;
   private readonly children = new Map<string, ChildProcess>();
+  /** Per-name start chain — concurrent start() must not double-spawn. */
+  private readonly startChains = new Map<string, Promise<void>>();
 
-  constructor(agentosHome: string) {
+  constructor(agentosHome: string, options?: { primaryPort?: number }) {
     this.primaryHome = agentosHome;
+    this.primaryPort = options?.primaryPort ?? resolvePrimaryPortFromEnv();
     this.root = join(agentosHome, "secondmates");
     this.runtimeRoot = join(agentosHome, "runtime", "secondmates");
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
@@ -81,7 +87,29 @@ export class SecondmateRegistry {
       const metaPath = join(this.root, entry.name, "charter.json");
       if (!existsSync(metaPath)) continue;
       try {
-        out.push(JSON.parse(readFileSync(metaPath, "utf8")) as SecondmateRecord);
+        const raw = JSON.parse(readFileSync(metaPath, "utf8")) as Partial<SecondmateRecord>;
+        if (
+          typeof raw.name !== "string" ||
+          typeof raw.home !== "string" ||
+          typeof raw.port !== "number" ||
+          typeof raw.domain !== "string"
+        ) {
+          continue;
+        }
+        out.push({
+          name: raw.name,
+          home: raw.home,
+          port: raw.port,
+          domain: raw.domain,
+          brainModel: raw.brainModel ?? null,
+          maxConcurrentTasks:
+            typeof raw.maxConcurrentTasks === "number" &&
+            Number.isInteger(raw.maxConcurrentTasks) &&
+            raw.maxConcurrentTasks >= 1
+              ? raw.maxConcurrentTasks
+              : Number.NaN,
+          createdAt: typeof raw.createdAt === "string" ? raw.createdAt : "",
+        });
       } catch {
         // skip
       }
@@ -114,7 +142,9 @@ export class SecondmateRegistry {
       throw new Error(`secondmate already exists: ${safe}`);
     }
     const existing = this.list();
-    const port = input.port ?? 4710 + existing.length;
+    const port = input.port ?? this.nextFreePort(existing);
+    this.assertPortAvailable(port, existing);
+    const maxConcurrentTasks = input.maxConcurrentTasks ?? 2;
     mkdirSync(home, { recursive: true, mode: 0o700 });
     mkdirSync(join(home, "config"), { recursive: true, mode: 0o700 });
     mkdirSync(join(home, "runs"), { recursive: true, mode: 0o700 });
@@ -124,6 +154,7 @@ export class SecondmateRegistry {
       port,
       domain: input.domain,
       brainModel: input.brainModel ?? null,
+      maxConcurrentTasks,
       createdAt: new Date().toISOString(),
     };
     writeFileSync(join(home, "charter.json"), `${JSON.stringify(record, null, 2)}\n`, {
@@ -135,7 +166,7 @@ export class SecondmateRegistry {
       name: safe,
       domains: [input.domain],
       brainModel: input.brainModel ?? null,
-      maxConcurrentTasks: input.maxConcurrentTasks ?? 2,
+      maxConcurrentTasks,
       acceptsRouting: true,
     };
     writeFileSync(
@@ -163,11 +194,19 @@ export class SecondmateRegistry {
   /** Update persisted provision-record fields after a charter edit. */
   updateRecord(
     name: string,
-    patch: Partial<Pick<SecondmateRecord, "brainModel" | "domain" | "port">>,
+    patch: Partial<
+      Pick<SecondmateRecord, "brainModel" | "domain" | "port" | "maxConcurrentTasks">
+    >,
   ): SecondmateRecord {
     const record = this.get(name);
     if (record === null) {
       throw new Error(`no secondmate named ${name}`);
+    }
+    if (patch.port !== undefined && patch.port !== record.port) {
+      this.assertPortAvailable(
+        patch.port,
+        this.list().filter((r) => r.name !== record.name),
+      );
     }
     const next: SecondmateRecord = {
       ...record,
@@ -177,6 +216,31 @@ export class SecondmateRegistry {
       mode: 0o600,
     });
     return next;
+  }
+
+  /** Refuse a port already claimed by another secondmate or the primary. */
+  private assertPortAvailable(port: number, existing: SecondmateRecord[]): void {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`invalid secondmate port: ${port}`);
+    }
+    if (this.primaryPort !== null && port === this.primaryPort) {
+      throw new Error(`secondmate port ${port} collides with the primary daemon`);
+    }
+    const clash = existing.find((r) => r.port === port);
+    if (clash !== undefined) {
+      throw new Error(`secondmate port ${port} already used by ${clash.name}`);
+    }
+  }
+
+  private nextFreePort(existing: SecondmateRecord[]): number {
+    const used = new Set(existing.map((r) => r.port));
+    if (this.primaryPort !== null) used.add(this.primaryPort);
+    let port = 4710;
+    while (used.has(port)) port += 1;
+    if (port > 65535) {
+      throw new Error("no free secondmate port available");
+    }
+    return port;
   }
 
   /** Path to the daemon token for a secondmate — always outside the audited home. */
@@ -213,8 +277,34 @@ export class SecondmateRegistry {
    * Start a secondmate agentosd with AGENTOS_HOME set to its isolated home.
    * Waits until the runtime token exists and /v1/status is healthy before
    * returning. Daemon token is written under primary runtime/ (outside audit).
+   * Serialized per name so concurrent starts cannot both spawn.
    */
   async start(
+    name: string,
+    options: {
+      agentosdBin: string;
+      sharedPiHome: string;
+      env?: Record<string, string | undefined>;
+      readyTimeoutMs?: number;
+    },
+  ): Promise<SecondmateRuntimeState> {
+    const safe = name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
+    const prev = this.startChains.get(safe) ?? Promise.resolve();
+    const run = prev.then(
+      () => this.startExclusive(safe, options),
+      () => this.startExclusive(safe, options),
+    );
+    this.startChains.set(
+      safe,
+      run.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return run;
+  }
+
+  private async startExclusive(
     name: string,
     options: {
       agentosdBin: string;
@@ -252,6 +342,8 @@ export class SecondmateRegistry {
         AGENTOS_PORT: String(record.port),
         AGENTOS_TOKEN_PATH: tokenPath,
         AGENTOS_PI_HOME: options.sharedPiHome,
+        // Non-copy grant path: API keys resolve from the primary secrets tree.
+        AGENTOS_SECRETS_HOME: this.primaryHome,
       },
       // Ignore stdio so a chatty child cannot fill pipe buffers and stall.
       stdio: ["ignore", "ignore", "ignore"],
@@ -264,12 +356,18 @@ export class SecondmateRegistry {
 
     this.children.set(record.name, child);
     child.on("exit", (code, signal) => {
-      this.children.delete(record.name);
+      const tracked = this.children.get(record.name);
+      if (tracked === child) {
+        this.children.delete(record.name);
+      }
       if (code !== 0 && code !== null) {
-        try {
-          rmSync(this.runtimeStatePath(record.name), { force: true });
-        } catch {
-          // ignore
+        const runtime = this.readRuntime(record.name);
+        if (runtime !== null && runtime.pid === child.pid) {
+          try {
+            rmSync(this.runtimeStatePath(record.name), { force: true });
+          } catch {
+            // ignore
+          }
         }
       }
       void signal;
@@ -295,11 +393,19 @@ export class SecondmateRegistry {
       } catch {
         // ignore
       }
-      this.children.delete(record.name);
-      try {
-        rmSync(this.runtimeStatePath(record.name), { force: true });
-      } catch {
-        // ignore
+      // Only clear bookkeeping owned by this child — a concurrent loser must
+      // not erase the winner's runtime.json / children entry.
+      const tracked = this.children.get(record.name);
+      if (tracked === child) {
+        this.children.delete(record.name);
+      }
+      const runtime = this.readRuntime(record.name);
+      if (runtime !== null && runtime.pid === child.pid) {
+        try {
+          rmSync(this.runtimeStatePath(record.name), { force: true });
+        } catch {
+          // ignore
+        }
       }
       throw error instanceof SecondmateStartError
         ? error
@@ -473,6 +579,14 @@ function isProcessAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+function resolvePrimaryPortFromEnv(): number | null {
+  const env = process.env.AGENTOS_PORT;
+  if (env === undefined || env.length === 0) return null;
+  const parsed = Number(env);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) return null;
+  return parsed;
 }
 
 function sleep(ms: number): Promise<void> {

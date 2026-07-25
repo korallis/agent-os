@@ -288,11 +288,22 @@ export class SecondmateFleet {
   }
 
   private charterFromRecord(record: SecondmateRecord): SecondmateCharter {
+    const cap = record.maxConcurrentTasks;
+    // Fail closed when the provision record has no durable cap — never invent 2.
+    if (typeof cap !== "number" || !Number.isInteger(cap) || cap < 1) {
+      return {
+        name: record.name,
+        domains: record.domain.length > 0 ? [record.domain] : [],
+        brainModel: record.brainModel,
+        maxConcurrentTasks: 1,
+        acceptsRouting: false,
+      };
+    }
     return {
       name: record.name,
       domains: record.domain.length > 0 ? [record.domain] : [],
       brainModel: record.brainModel,
-      maxConcurrentTasks: 2,
+      maxConcurrentTasks: cap,
       acceptsRouting: true,
     };
   }
@@ -311,6 +322,7 @@ export class SecondmateFleet {
     this.registry.updateRecord(record.name, {
       brainModel: validated.brainModel,
       domain: validated.domains[0] ?? record.domain,
+      maxConcurrentTasks: validated.maxConcurrentTasks,
     });
     this.sink({
       type: "secondmate.charter_changed",

@@ -894,7 +894,21 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     // not Pi's internal write atomicity — is what this serialises.
     if (deps.authBroker !== undefined) {
       const baseline = deps.authBroker.authStoreMtimeMs();
-      void deps.authBroker.holdLoginUntilAuthSettled({ baselineMtimeMs: baseline });
+      void deps.authBroker
+        .holdLoginUntilAuthSettled({ baselineMtimeMs: baseline })
+        .catch((error: unknown) => {
+          const message =
+            error instanceof Error ? error.message : "login hold failed";
+          deps.logger.error({ err: error }, `auth broker login hold failed: ${message}`);
+          deps.store.append({
+            type: "captain.escalation",
+            payload: {
+              taskId: null,
+              summary: `login hold failed: ${message}`,
+              severity: "critical",
+            },
+          });
+        });
     }
     return {
       connectionId: connection.id,
@@ -914,7 +928,8 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 400, "BAD_REQUEST", "invalid api-key body");
       return;
     }
-    // Never log the key. Write to 0600 file under AGENTOS_HOME/secrets.
+    // Never log the key. Write to 0600 under resolveSecretsHome (primary when
+    // AGENTOS_SECRETS_HOME is set on a secondmate — never into an audited home).
     writeApiKeyFile(deps.home, body.data.provider, body.data.apiKey);
     const connection = deps.connections.upsertConnection({
       provider: body.data.provider,

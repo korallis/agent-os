@@ -12,6 +12,7 @@
  *   G7  dual-restart reconcile produces no duplicate secondmate records
  *   G8  provision through REST (not out-of-band modules); start waits for ready
  *   G9  maxConcurrentTasks is enforced on the routing path
+ *   G10 secondmate api-key grants resolve from primary secrets without copying
  *
  * Real daemons on real homes; only the model is simulated.
  * Usage: node tooling/gates/phase-7.mjs
@@ -547,6 +548,67 @@ try {
       "maxConcurrentTasks refuses routing when secondmate is at capacity",
       capacityRefused,
       `ok=${capacity.ok} msg=${capacity.error?.message ?? ""} phase=${task2After.task?.phase}`,
+    );
+  }
+
+  // G10 — api-key grant on live secondmate from primary secrets; home stays clean
+  {
+    const secretValue = `sk-p7-grant-${process.pid}`;
+    const primaryKeyRes = await api("/v1/connections/api-key", {
+      method: "POST",
+      body: JSON.stringify({ provider: "openai", apiKey: secretValue }),
+    });
+    // Register connection metadata on the secondmate; writeApiKeyFile must land
+    // under AGENTOS_SECRETS_HOME (primary), never under the secondmate home.
+    let smKeyOk = false;
+    if (smToken !== null) {
+      const smKeyRes = await fetch(`http://127.0.0.1:${SM_PORT}/v1/connections/api-key`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${smToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ provider: "openai", apiKey: secretValue }),
+      });
+      smKeyOk = smKeyRes.ok;
+    }
+    const connectionsPath = join(ROOT, "apps/orchestrator/dist/pi/connections.js");
+    const grantScript = `
+      import { ConnectionRegistry, resolveProviderKeyGrant } from ${JSON.stringify(connectionsPath)};
+      process.env.AGENTOS_SECRETS_HOME = ${JSON.stringify(home)};
+      const smHome = ${JSON.stringify(smHome)};
+      const reg = new ConnectionRegistry(smHome);
+      const grant = resolveProviderKeyGrant(smHome, "openai/gpt-4.1", reg);
+      if (!grant || grant.name !== "OPENAI_API_KEY" || grant.value !== ${JSON.stringify(secretValue)}) {
+        process.stdout.write("miss:" + JSON.stringify(grant && { name: grant.name, len: grant.value?.length }));
+        process.exit(1);
+      }
+      process.stdout.write("granted");
+    `;
+    const grantRun = spawnSync(process.execPath, ["--input-type=module", "-e", grantScript], {
+      encoding: "utf8",
+      env: { ...process.env, AGENTOS_SECRETS_HOME: home },
+    });
+    const grantOk = grantRun.status === 0 && grantRun.stdout.trim() === "granted";
+    const smRoot = join(home, "secondmates");
+    const files = walk(smRoot);
+    const banned = files.filter((f) =>
+      /auth\.json$|daemon\.token$|\/secrets\/|credentials|\.key$/.test(f),
+    );
+    const auditRes = await api("/v1/secondmates/audit");
+    const audit = auditRes.ok ? await auditRes.json() : { ok: false };
+    const primarySecretExists = existsSync(join(home, "secrets", "openai.key"));
+    gate(
+      "G10",
+      "secondmate api-key grant from primary secrets; home stays auth-clean",
+      primaryKeyRes.ok &&
+        smKeyOk &&
+        grantOk &&
+        primarySecretExists &&
+        banned.length === 0 &&
+        audit.ok === true &&
+        smToken !== null,
+      `primaryKey=${primaryKeyRes.status} smKey=${smKeyOk} grant=${grantRun.stdout.trim() || grantRun.stderr.trim()} banned=${banned.length} audit=${audit.ok} primarySecret=${primarySecretExists}`,
     );
   }
 
