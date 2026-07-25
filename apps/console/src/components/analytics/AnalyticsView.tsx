@@ -111,6 +111,8 @@ export function AnalyticsView() {
     0,
   );
   const anyModelCost = models.some((m) => m.costUsd !== null);
+  const useModelCostDonut =
+    totals?.costCoverage === "complete" && anyModelCost && modelCostTotal > 0;
   const windowDays = snapshot?.windowDays ?? 14;
 
   const pendingNote = snapshotStatus === "loading" ? "loading…" : "unavailable";
@@ -154,11 +156,13 @@ export function AnalyticsView() {
   ];
 
   // Only a genuine fleet-wide ceiling may drive the bar — never per-task.
-  // Three distinct states: budgets not loaded, loaded with zero ceiling, configured.
   const fleetCeiling =
     budgetsStatus === "ready" && budgets !== null ? budgets.gatewayHardUsd : null;
   const budgetPct =
-    cost !== null && fleetCeiling !== null && fleetCeiling > 0
+    cost !== null &&
+    totals?.costCoverage === "complete" &&
+    fleetCeiling !== null &&
+    fleetCeiling > 0
       ? Math.min(100, (cost / fleetCeiling) * 100)
       : null;
 
@@ -323,18 +327,24 @@ export function AnalyticsView() {
                 <div className="flex items-center justify-center py-2">
                   <div
                     className="relative size-[150px] rounded-full"
-                    style={{ background: conicFor(models, anyModelCost ? modelCostTotal : 0) }}
+                    style={{
+                      background: conicFor(models, useModelCostDonut ? modelCostTotal : 0),
+                    }}
                   >
                     <div className="absolute inset-[18px] rounded-full bg-panel flex flex-col items-center justify-center">
                       <span className="text-lg font-bold text-fg-1">
-                        {anyModelCost
+                        {useModelCostDonut
                           ? `$${modelCostTotal.toFixed(0)}`
                           : compact(
                               models.reduce((s, m) => s + m.inputTokens + m.outputTokens, 0),
                             )}
                       </span>
                       <span className="text-[10px] text-fg-3">
-                        {anyModelCost ? "reported" : "tokens"}
+                        {useModelCostDonut
+                          ? "reported"
+                          : totals?.costCoverage === "partial"
+                            ? "tokens (cost partial)"
+                            : "tokens"}
                       </span>
                     </div>
                   </div>
@@ -397,12 +407,6 @@ export function AnalyticsView() {
                   <div className="rounded-lg bg-warn/[0.06] border border-warn/20 px-3 py-2 text-[11px] text-warn">
                     ⚠ {budgetPct.toFixed(1)}% of the configured fleet ceiling used
                   </div>
-                )}
-                {totals?.costCoverage === "partial" && (
-                  <p className="text-[11px] text-warn">
-                    partial — {totals.costReportedRequests} of {totals.requests} requests reported
-                    cost; the bar only includes reported spend.
-                  </p>
                 )}
               </div>
             )}

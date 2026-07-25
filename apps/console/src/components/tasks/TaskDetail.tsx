@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { cn } from "@agent-os/ui";
+import type { EventEnvelope } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
 import { useTaskEvents } from "@/lib/useTaskEvents";
 import { FusionColumns } from "@/components/tasks/FusionColumns";
@@ -33,38 +34,76 @@ type TaskSnapshot = {
   createdAt: string;
 };
 
+function payloadTaskId(event: EventEnvelope): string | null {
+  const payload = event.event.payload as { taskId?: string | null };
+  return typeof payload.taskId === "string" ? payload.taskId : null;
+}
+
+function isTaskDetailRefreshEvent(type: string): boolean {
+  return (
+    type.startsWith("task.") ||
+    type.startsWith("session.") ||
+    type.startsWith("gate.") ||
+    type.startsWith("fusion.")
+  );
+}
+
 /**
  * Task detail with live cast/session columns (Phase 3 foundation; fusion columns Phase 6).
  */
 export function TaskDetail({ taskId }: { taskId: string }) {
   const [task, setTask] = useState<TaskSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
   const { lastEvent } = useEventStream();
   const taskEvents = useTaskEvents(taskId);
-  const refreshKey =
-    lastEvent !== null &&
-    (lastEvent.event.type.startsWith("task.") ||
-      lastEvent.event.type.startsWith("session.") ||
-      lastEvent.event.type.startsWith("gate.") ||
-      lastEvent.event.type.startsWith("fusion."))
-      ? lastEvent.id
-      : "init";
+  const [refreshKey, setRefreshKey] = useState("init");
+  const boundTaskId = useRef(taskId);
+  const everSucceeded = useRef(false);
+
+  useEffect(() => {
+    if (lastEvent === null) return;
+    if (!isTaskDetailRefreshEvent(lastEvent.event.type)) return;
+    if (payloadTaskId(lastEvent) !== taskId) return;
+    setRefreshKey(lastEvent.id);
+  }, [lastEvent, taskId]);
 
   useEffect(() => {
     let cancelled = false;
+    if (boundTaskId.current !== taskId) {
+      boundTaskId.current = taskId;
+      everSucceeded.current = false;
+      setTask(null);
+      setError(null);
+      setStale(false);
+      setRefreshKey("init");
+    }
     fetch(`/api/agentos/tasks/${taskId}`, { cache: "no-store" })
       .then(async (res) => {
         if (cancelled) return;
         if (!res.ok) {
-          setError(res.status === 404 ? "not found" : `daemon ${res.status}`);
+          if (!everSucceeded.current) {
+            setError(res.status === 404 ? "not found" : `daemon ${res.status}`);
+            setTask(null);
+          } else {
+            setStale(true);
+          }
           return;
         }
         const body = (await res.json()) as { task: TaskSnapshot };
+        everSucceeded.current = true;
         setTask(body.task);
         setError(null);
+        setStale(false);
       })
       .catch(() => {
-        if (!cancelled) setError("daemon unreachable");
+        if (cancelled) return;
+        if (!everSucceeded.current) {
+          setError("daemon unreachable");
+          setTask(null);
+        } else {
+          setStale(true);
+        }
       });
     return () => {
       cancelled = true;
@@ -113,6 +152,11 @@ export function TaskDetail({ taskId }: { taskId: string }) {
             gate {task.validationAttempt}/{task.maxValidations}
           </span>
         </div>
+        {stale && (
+          <div className="rounded-xl border border-warn/40 bg-warn/10 px-4 py-3 text-[13px] text-warn">
+            Latest refresh failed — showing last loaded snapshot.
+          </div>
+        )}
         {task.needsCaptainSummary !== null && (
           <div className="rounded-xl border border-warn/40 bg-warn/10 px-4 py-3 text-[13px] text-warn">
             NEEDS YOU — {task.needsCaptainSummary}
