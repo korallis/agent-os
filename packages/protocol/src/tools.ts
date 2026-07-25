@@ -131,6 +131,8 @@ export const dispatchFusionInputSchema = z.strictObject({
   instructionTemplateRef: z.string().min(1).max(200).optional(),
   vars: z.record(z.string(), z.string()).default({}),
   instruction: z.string().min(1).max(100_000).optional(),
+  /** Spawn a clean-room Pi per side rather than only recording the run. */
+  spawnSides: z.boolean().default(false),
 });
 export type DispatchFusionInput = z.infer<typeof dispatchFusionInputSchema>;
 

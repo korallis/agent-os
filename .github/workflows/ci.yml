@@ -57,3 +57,6 @@ jobs:
 
       - name: Phase 3 gates
         run: node tooling/gates/phase-3.mjs
+
+      - name: Phase 4 gates
+        run: node tooling/gates/phase-4.mjs

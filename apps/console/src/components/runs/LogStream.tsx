@@ -52,6 +52,9 @@ function levelOf(envelope: EventEnvelope): Level {
     case "tool.invoked":
     case "gate.result":
     case "fusion.dispatched":
+    case "fusion.side_completed":
+    case "fusion.completed":
+    case "prompt.installed":
     case "crew.answered":
     case "bridge.tool_call":
       return "INFO";
@@ -122,7 +125,11 @@ function sourceOf(envelope: EventEnvelope): string {
     case "gate.result":
       return "gate";
     case "fusion.dispatched":
+    case "fusion.side_completed":
+    case "fusion.completed":
       return "fusion";
+    case "prompt.installed":
+      return "prompts";
     case "captain.escalation":
       return "captain";
     default: {
@@ -210,6 +217,12 @@ function messageOf(envelope: EventEnvelope): string {
       return `Gate ${event.payload.target} → ${event.payload.outcome}`;
     case "fusion.dispatched":
       return `Fusion ${event.payload.kind} dispatched`;
+    case "fusion.side_completed":
+      return `Fusion side — ${event.payload.role} ${event.payload.model} (${event.payload.family}) · prompt ${event.payload.promptHash.slice(0, 8)}`;
+    case "fusion.completed":
+      return `Fusion ${event.payload.kind} complete — prompts ${event.payload.promptsIdentical ? "IDENTICAL" : "DIVERGED ⚠"}${event.payload.aggregatorFamily !== null ? ` · aggregator ${event.payload.aggregatorFamily}` : ""}${event.payload.contractOk === null ? "" : event.payload.contractOk ? " · contract OK" : " · CONTRACT FAILED"}`;
+    case "prompt.installed":
+      return `Prompt packs installed — ${event.payload.refs.join(", ")}`;
     case "crew.question":
       return `Crewmate asked — ${event.payload.question}`;
     case "crew.answered":

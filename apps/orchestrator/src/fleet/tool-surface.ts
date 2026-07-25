@@ -34,6 +34,9 @@ import {
   type DaemonControlFrame,
   type FleetSession,
   type FleetStateSnapshot,
+  type FusionRun,
+  type FusionSide,
+  type PromptTemplateInfo,
   type OrchestratorEvent,
   type RoleCast,
   type TaskPhase,
@@ -61,6 +64,16 @@ import type { WorktreePool } from "./worktree-pool.js";
 import type { TmuxController } from "./tmux.js";
 import type { WakeWatcher } from "./watcher.js";
 import type { GateRunner } from "./gate-runner.js";
+import type { FusionRunStore } from "./fusion-runs.js";
+import type { SessionKeyStore } from "./sessions.js";
+import type { PromptService } from "../prompts/service.js";
+
+/** Shipped instruction template per fusion kind (overridable per call/project). */
+const DEFAULT_FUSION_TEMPLATES: Record<"opinion" | "fusion" | "plan-fusion", string> = {
+  opinion: "fusion/opinion.md",
+  fusion: "fusion/fusion.md",
+  "plan-fusion": "fusion/fusion.md",
+};
 
 export type ToolEventSink = (event: OrchestratorEvent) => void;
 
@@ -121,6 +134,10 @@ export interface ToolSurfaceDeps {
   tmux: TmuxController;
   watcher: WakeWatcher;
   gates: GateRunner;
+  fusionRuns: FusionRunStore;
+  sessionKeys: SessionKeyStore;
+  /** Layered prompt packs; absent only in fixtures that never dispatch fusion. */
+  prompts?: PromptService;
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
@@ -150,6 +167,8 @@ export class ToolSurface {
   private readonly failLines = new Map<string, string[]>();
   private readonly questions = new Map<string, PendingQuestion>();
   private brainSessionId: string | null = null;
+  /** runId → owning task, so `ext.usage` can be attributed to a fusion side. */
+  private readonly sessionsByFusionRun = new Map<string, { taskId: string }>();
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -175,6 +194,36 @@ export class ToolSurface {
     this.brain = brain;
     this.brainDown = brain.status === "down";
     this.deps.watcher.setBrainDown(this.brainDown);
+  }
+
+  /**
+   * Attribute an `ext.usage` frame to the fusion side that owns its session.
+   * No-op for sessions that are not part of a fusion run.
+   */
+  attributeFusionUsage(
+    sessionId: string,
+    usage: { inputTokens: number | null; outputTokens: number | null; costUsd: number | null },
+  ): void {
+    for (const [runId, { taskId }] of this.sessionsByFusionRun) {
+      const run = this.deps.fusionRuns.get(taskId, runId);
+      if (run === null) continue;
+      if (!run.sides.some((s) => s.sessionId === sessionId)) continue;
+      this.deps.fusionRuns.recordSideUsage(taskId, runId, sessionId, usage);
+      return;
+    }
+  }
+
+  /** Fusion runs recorded for a task, newest first. */
+  listFusionRuns(taskId: string): FusionRun[] {
+    return this.deps.fusionRuns.listForTask(taskId);
+  }
+
+  /**
+   * Session directory for a {project, role, model} triple. A changed model
+   * yields a different key, so transcripts never cross model families.
+   */
+  ensureSessionKey(input: { projectId: string; role: string; model: string }): string {
+    return this.deps.sessionKeys.ensure(input).dir;
   }
 
   /** The session id whose extension channel is allowed to orchestrate. */
@@ -1147,27 +1196,102 @@ export class ToolSurface {
     });
   }
 
-  private dispatchFusion(raw: Record<string, unknown>): { runId: string; contractOk?: boolean } {
+  /**
+   * `/opinion`, `/fusion` and plan-fusion (master plan §6.3).
+   *
+   * The instruction is rendered ONCE from the layered prompt pack and handed to
+   * every side byte-for-byte. That is the clean-room contract: each family
+   * answers the same question in isolation, and `promptsIdentical` on the run
+   * record is the durable proof — not a claim in a comment.
+   */
+  private dispatchFusion(raw: Record<string, unknown>): {
+    runId: string;
+    promptsIdentical: boolean;
+    aggregatorFamily: string | null;
+    contractOk?: boolean;
+  } {
     const input = dispatchFusionInputSchema.parse(raw);
     const task = this.requireTask(input.taskId);
-    if (input.kind === "plan-fusion") {
-      const families = new Set(input.casts.map((c) => c.family));
-      if (this.cfg().policies.distinctPlannerFamilies && families.size < 2) {
+    const policies = this.cfg().policies;
+
+    // Cross-family invariants: an opinion or a plan-fusion whose sides all
+    // share a family is not a second opinion, it is an echo.
+    const families = new Set(input.casts.map((c) => c.family));
+    if (input.kind === "plan-fusion" && policies.distinctPlannerFamilies && families.size < 2) {
+      throw new ToolSurfaceError("POLICY_VIOLATION", "plan-fusion requires ≥2 distinct families");
+    }
+    if (input.kind === "opinion" && input.casts.length >= 2 && families.size < 2) {
+      throw new ToolSurfaceError(
+        "POLICY_VIOLATION",
+        "/opinion requires ≥2 distinct model families — a same-family panel is not an independent opinion",
+        { families: [...families] },
+      );
+    }
+
+    const runId = nextUlid();
+    const project = this.deps.projects.get(task.projectId);
+
+    // Render the instruction from the layered prompt pack when a ref is given.
+    const templateRef =
+      input.instructionTemplateRef ??
+      (input.instruction === undefined ? DEFAULT_FUSION_TEMPLATES[input.kind] : undefined);
+    let instruction = input.instruction ?? "";
+    let templateInfo: PromptTemplateInfo | null = null;
+    let renderedHash: string | null = null;
+
+    if (templateRef !== undefined && this.deps.prompts !== undefined) {
+      const vars: Record<string, string> = {
+        TASK_TITLE: task.title,
+        TASK_INTENT: task.intent,
+        QUESTION: input.vars.QUESTION ?? task.title,
+        CONTEXT: input.vars.CONTEXT ?? task.intent,
+        ...input.vars,
+      };
+      try {
+        const rendered = this.deps.prompts.render(
+          templateRef,
+          vars,
+          project?.trusted === true ? join(project.path, ".agentos", "prompts") : undefined,
+        );
+        instruction = rendered.rendered;
+        templateInfo = rendered.info;
+        renderedHash = rendered.renderedHash;
+      } catch (error) {
+        // An undefined {{VAR}} or a missing ref is the caller's error, stated
+        // precisely — never a half-rendered instruction sent to a model.
         throw new ToolSurfaceError(
-          "POLICY_VIOLATION",
-          "plan-fusion requires ≥2 distinct families",
+          "VALIDATION_ERROR",
+          error instanceof Error ? error.message : String(error),
+          { templateRef },
         );
       }
     }
-    const runId = nextUlid();
-    const dir = join(this.deps.home, "runs", task.id, "fusion", runId);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const instruction =
-      input.instruction ?? `Fusion kind=${input.kind} for ${task.title}\n`;
-    writeFileSync(join(dir, "instruction.md"), instruction, { mode: 0o600 });
+    if (instruction.length === 0) {
+      instruction = `Fusion kind=${input.kind} for ${task.title}\n`;
+    }
+    const instructionHash = sha256(instruction);
 
-    // When a fused artifact is supplied as instruction for kind=fusion, enforce contract.
-    let contractOk: boolean | undefined;
+    // Every side receives the SAME rendered bytes.
+    const sides: FusionSide[] = input.casts.map((cast) => ({
+      role: cast.role,
+      model: cast.model,
+      family: cast.family,
+      sessionId: null,
+      promptHash: instructionHash,
+      artifactPath: null,
+      inputTokens: null,
+      outputTokens: null,
+      costUsd: null,
+    }));
+    const promptsIdentical = new Set(sides.map((s) => s.promptHash)).size === 1;
+
+    // Aggregator family retention: the fusion agent runs on the ARCHITECT
+    // side's family — the first planner in the cast — and that choice is
+    // recorded on the run rather than silently made.
+    const architect = input.casts.find((c) => c.role === "planner") ?? input.casts[0];
+    const aggregatorFamily = architect?.family ?? null;
+
+    let contractOk: boolean | null = null;
     if (input.kind === "fusion" && input.instruction !== undefined) {
       const contract = enforceFusionContract(input.instruction);
       contractOk = contract.ok;
@@ -1178,17 +1302,83 @@ export class ToolSurface {
           { errors: contract.errors },
         );
       }
-      writeFileSync(join(dir, "fused.md"), input.instruction, { mode: 0o600 });
+    }
+
+    const run: FusionRun = {
+      runId,
+      taskId: task.id,
+      kind: input.kind,
+      templateRef: templateInfo?.ref ?? templateRef ?? null,
+      templateLayer: templateInfo?.layer ?? null,
+      templateHash: templateInfo?.contentHash ?? null,
+      renderedHash,
+      promptsIdentical,
+      sides,
+      aggregatorFamily,
+      contractOk,
+      createdAt: new Date().toISOString(),
+    };
+    this.deps.fusionRuns.create(run);
+    this.deps.fusionRuns.writeInstruction(task.id, runId, instruction);
+    if (input.kind === "fusion" && input.instruction !== undefined) {
+      this.deps.fusionRuns.writeFused(task.id, runId, input.instruction);
     }
 
     this.sink({
       type: "fusion.dispatched",
       payload: { taskId: task.id, kind: input.kind, runId },
     });
+
+    // Optionally spawn one clean-room Pi per side, each with the identical
+    // instruction and its own per-model session key.
+    if (input.spawnSides) {
+      const spawned: FusionSide[] = [];
+      for (const side of sides) {
+        const result = this.spawnCrewmate({
+          taskId: task.id,
+          role: side.role,
+          model: side.model,
+          thinking: input.casts.find((c) => c.role === side.role)?.thinking ?? "medium",
+          cleanRoom: true,
+          vars: {},
+          prompt: instruction,
+        });
+        spawned.push({ ...side, sessionId: result.session.sessionId });
+        this.sink({
+          type: "fusion.side_completed",
+          payload: {
+            taskId: task.id,
+            runId,
+            role: side.role,
+            model: side.model,
+            family: side.family,
+            promptHash: side.promptHash,
+            artifactPath: null,
+          },
+        });
+      }
+      this.deps.fusionRuns.save({ ...run, sides: spawned });
+      this.sessionsByFusionRun.set(runId, { taskId: task.id });
+    }
+
+    this.sink({
+      type: "fusion.completed",
+      payload: {
+        taskId: task.id,
+        runId,
+        kind: input.kind,
+        promptsIdentical,
+        aggregatorFamily,
+        contractOk,
+      },
+    });
+
     if (input.kind === "plan-fusion" && task.phase === "PLANNING") {
       this.transition(task, "PLAN_FUSED", "plan-fusion complete");
     }
-    return contractOk === undefined ? { runId } : { runId, contractOk };
+    return contractOk === null
+      ? { runId, promptsIdentical, aggregatorFamily }
+      : { runId, promptsIdentical, aggregatorFamily, contractOk };
   }
 
   private authorGate(raw: Record<string, unknown>): { taskId: string; gatePath: string } {
@@ -2178,6 +2368,10 @@ function extractTaskId(raw: Record<string, unknown>): string | null {
 
 function hashConfig(config: AgentOsConfig): string {
   return createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 16);
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
 }
 
 /** Repo-relative listing of everything durable under a run directory. */
