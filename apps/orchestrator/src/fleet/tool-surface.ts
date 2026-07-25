@@ -56,6 +56,7 @@ import {
   canRunGate,
   canSpawnBuilder,
   canSpawnScout,
+  canTransition,
   IllegalTransitionError,
   isTerminalPhase,
 } from "../substrate/task-machine.js";
@@ -215,7 +216,13 @@ export class ToolSurface {
   ): void {
     const ref = this.fusionBySessionId.get(sessionId);
     if (ref === undefined) return;
-    this.deps.fusionRuns.recordSideUsage(ref.taskId, ref.runId, sessionId, usage);
+    this.deps.fusionRuns.recordSideUsage(
+      ref.taskId,
+      ref.runId,
+      sessionId,
+      usage,
+      ref.sideIndex,
+    );
   }
 
   /** Fusion runs recorded for a task, newest first. */
@@ -443,19 +450,15 @@ export class ToolSurface {
             );
           }
         }
-        try {
-          this.spawnCrewmate({
-            taskId: task.id,
-            role: castEntry.role,
-            model: castEntry.model,
-            thinking: castEntry.thinking,
-            cleanRoom: castEntry.cleanRoom,
-            vars: {},
-          });
-          respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
-        } catch {
-          // Spawn may be illegal in this phase; Brain reconcile handles the rest.
-        }
+        this.spawnCrewmate({
+          taskId: task.id,
+          role: castEntry.role,
+          model: castEntry.model,
+          thinking: castEntry.thinking,
+          cleanRoom: castEntry.cleanRoom,
+          vars: {},
+        });
+        respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
       }
     }
     return respawned;
@@ -1474,6 +1477,13 @@ export class ToolSurface {
             runId,
             sideIndex: i,
           });
+          // Persist immediately so kill-9 mid-loop can hydrate ownership and
+          // early ext.usage frames can attribute by sideIndex.
+          const latest = this.deps.fusionRuns.get(task.id, runId) ?? run;
+          const withSession = latest.sides.map((s, j) =>
+            j === i ? { ...s, sessionId: s.sessionId ?? sessionId } : s,
+          );
+          this.deps.fusionRuns.save({ ...latest, sides: withSession });
           // Fake-Pi writes per-session output during spawn and never sends
           // agent_settled over the extension channel — finalize as soon as
           // ownership is registered. Real Pi finalizes via settle / session_end.
@@ -1481,9 +1491,9 @@ export class ToolSurface {
             this.completeFusionSide(sessionId);
           }
         } catch (error) {
-          // Partial spawn must not leave a durable in-flight run: finalize
-          // already-spawned sides, mark the rest failed, complete the run,
-          // then rethrow so the tool call still returns the typed error.
+          // Partial spawn must not leave a durable in-flight run: stop any
+          // already-spawned crewmates (pane/socket/lease), finalize sides,
+          // complete the run with error, then rethrow the typed tool error.
           const message =
             error instanceof ToolSurfaceError
               ? error.message
@@ -1500,14 +1510,6 @@ export class ToolSurface {
           throw error;
         }
       }
-      // Persist sessionIds even when no side has settled yet (real Pi path),
-      // without clobbering artifacts completeFusionSide already wrote.
-      const latest = this.deps.fusionRuns.get(task.id, runId) ?? run;
-      const withSessions = latest.sides.map((s, i) => ({
-        ...s,
-        sessionId: s.sessionId ?? spawnedSessionIds[i] ?? null,
-      }));
-      this.deps.fusionRuns.save({ ...latest, sides: withSessions });
     } else {
       // Pure contract / bookkeeping dispatch — no sides to wait on.
       this.emitFusionCompleted(run);
@@ -1522,10 +1524,10 @@ export class ToolSurface {
   }
 
   /**
-   * After a mid-cast spawn failure: capture any unfinished spawned sides,
-   * mark the rest settled (no artifact), and emit fusion.completed with the
-   * failure so Console never sits on "dispatched". Avoids completeFusionSide
-   * so tryCompleteFusionRun cannot emit a success completed first.
+   * After a mid-cast spawn failure: stop already-spawned crewmates (pane,
+   * socket, lease), capture any unfinished spawned sides, mark the rest
+   * settled (no artifact), and emit fusion.completed with the failure so
+   * Console never sits on "dispatched" while an orphan holds a pool slot.
    */
   private failRemainingFusionSides(
     taskId: string,
@@ -1534,6 +1536,27 @@ export class ToolSurface {
     failedAtIndex: number,
     errorMessage: string,
   ): void {
+    for (let i = 0; i < failedAtIndex; i++) {
+      const sessionId = spawnedSessionIds[i];
+      if (sessionId === null) continue;
+      const live = this.sessions.get(sessionId);
+      if (
+        live === undefined ||
+        live.status === "stopped" ||
+        live.status === "lost"
+      ) {
+        continue;
+      }
+      try {
+        this.stopCrewmate({
+          sessionId,
+          reason: `fusion spawn failed at side ${failedAtIndex}: ${errorMessage}`,
+        });
+      } catch {
+        // Best-effort teardown; finalize below even if stop races.
+      }
+    }
+
     const latest = this.deps.fusionRuns.get(taskId, runId);
     if (latest === null) return;
     const now = new Date().toISOString();
@@ -2641,12 +2664,22 @@ export class ToolSurface {
           updatedAt: new Date().toISOString(),
         };
         this.saveTask(withSession);
-        if (!isTerminalPhase(withSession.phase) && withSession.phase !== "SESSION_LOST") {
-          try {
-            this.transition(withSession, "SESSION_LOST", reason);
-          } catch {
-            // Illegal from this phase — session status already persisted.
-          }
+        // Losing one cast side must not declare the whole task lost while
+        // siblings are still healthy — only promote when nothing healthy remains.
+        const healthyLeft = [...this.sessions.values()].some(
+          (s) =>
+            s.taskId === session.taskId &&
+            (s.status === "starting" ||
+              s.status === "running" ||
+              s.status === "settled"),
+        );
+        if (
+          !healthyLeft &&
+          !isTerminalPhase(withSession.phase) &&
+          withSession.phase !== "SESSION_LOST" &&
+          canTransition(withSession.phase, "SESSION_LOST")
+        ) {
+          this.transition(withSession, "SESSION_LOST", reason);
         }
       }
     }

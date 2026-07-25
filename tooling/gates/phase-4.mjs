@@ -17,8 +17,10 @@
  * Usage: node tooling/gates/phase-4.mjs
  */
 
+import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -253,7 +255,8 @@ try {
     );
   }
 
-  // G6 — session-key gate end-to-end: model change → new dir; restart resumes only missing
+  // G6 — session-key gate end-to-end in the daemon (HTTP), not an out-of-process eval:
+  // two models → two dirs; wipe one; live restart reconcile respawns only that role.
   {
     const taskId = await newTask("Session key gate");
     await callTool(token, "resolve_cast", {
@@ -266,42 +269,88 @@ try {
       })),
       familyCheckOverride: false,
     });
-    // Spawn first planner only — creates one session dir via the live ensure path.
-    const spawned = await callTool(token, "spawn_crewmate", {
+    const spawnA = await callTool(token, "spawn_crewmate", {
       taskId,
       role: "planner",
       model: "anthropic/claude-fable-5",
       thinking: "high",
       cleanRoom: true,
     });
-    const evalJs = `
-      import { existsSync, rmSync } from 'node:fs';
-      import { SessionKeyStore } from '${join(ROOT, "apps/orchestrator/dist/fleet/sessions.js")}';
-      const store = new SessionKeyStore(${JSON.stringify(home)});
-      const projectId = ${JSON.stringify(projectId)};
-      const a = store.ensure({ projectId, role: 'planner', model: 'anthropic/claude-fable-5' });
-      const b = store.ensure({ projectId, role: 'planner', model: 'openai/gpt-5.6-sol' });
-      if (a.dir === b.dir) process.exit(2);
-      if (a.key === b.key) process.exit(3);
-      // Restart half: wipe the second model dir; missingRoles must report only that slot.
-      rmSync(b.dir, { recursive: true, force: true });
-      const missing = store.missingRoles(projectId, [
-        { role: 'planner', model: 'anthropic/claude-fable-5' },
-        { role: 'planner', model: 'openai/gpt-5.6-sol' },
-      ]);
-      if (missing.length !== 1) process.exit(4);
-      if (missing[0].model !== 'openai/gpt-5.6-sol') process.exit(5);
-      if (!existsSync(a.dir)) process.exit(6);
-      process.stdout.write('ok');
-    `;
-    const run = spawnSync(process.execPath, ["--input-type=module", "-e", evalJs], {
-      encoding: "utf8",
+    const spawnB = await callTool(token, "spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "high",
+      cleanRoom: true,
     });
+    const sessionA = spawnA.data?.session?.sessionId;
+    const sessionB = spawnB.data?.session?.sessionId;
+    const sessionKeyDir = (role, model) => {
+      const key = createHash("sha256")
+        .update(`${projectId}|${role}|${model}`)
+        .digest("hex")
+        .slice(0, 32);
+      return join(home, "sessions", key);
+    };
+    const dirA = sessionKeyDir("planner", "anthropic/claude-fable-5");
+    const dirB = sessionKeyDir("planner", "openai/gpt-5.6-sol");
+    const dirsDiffer =
+      spawnA.ok === true &&
+      spawnB.ok === true &&
+      typeof sessionA === "string" &&
+      typeof sessionB === "string" &&
+      sessionA !== sessionB &&
+      existsSync(dirA) &&
+      existsSync(dirB) &&
+      dirA !== dirB;
+
+    // Wipe exactly the openai side's session directory on disk.
+    rmSync(dirB, { recursive: true, force: true });
+
+    // Live reconcile via daemon restart (rehydrateRuntime → reconcileMissingCastRoles).
+    child.kill("SIGKILL");
+    await sleep(400);
+    child = startDaemon(home, PORT);
+    token = await waitForHealth(home, PORT);
+
+    const state = await (await api("/v1/fleet/state", token)).json();
+    const taskSessions = (state.state?.sessions ?? []).filter((s) => s.taskId === taskId);
+    const anthropicLive = taskSessions.filter(
+      (s) =>
+        s.model === "anthropic/claude-fable-5" &&
+        (s.status === "running" || s.status === "starting" || s.status === "settled"),
+    );
+    const openaiLive = taskSessions.filter(
+      (s) =>
+        s.model === "openai/gpt-5.6-sol" &&
+        (s.status === "running" || s.status === "starting" || s.status === "settled"),
+    );
+    const openaiLost = taskSessions.some(
+      (s) => s.sessionId === sessionB && s.status === "lost",
+    );
+    const survivorUnchanged =
+      anthropicLive.length === 1 && anthropicLive[0]?.sessionId === sessionA;
+    const exactlyOneNewOpenai =
+      openaiLive.length === 1 &&
+      openaiLive[0]?.sessionId !== sessionB &&
+      openaiLive[0]?.role === "planner" &&
+      openaiLive[0]?.model === "openai/gpt-5.6-sol";
+    const wipedDirRestored = existsSync(dirB);
+    const survivorDirIntact = existsSync(dirA);
+    const taskPhase = (state.state?.tasks ?? []).find((t) => t.id === taskId)?.phase;
+    const taskNotWhollyLost = taskPhase !== "SESSION_LOST";
+
     gate(
       "G6",
       "session-key gate: model change → new dir; restart resumes only the missing role",
-      spawned.ok === true && run.status === 0 && run.stdout.trim() === "ok",
-      `spawn=${spawned.ok} exit=${run.status} out=${run.stdout.trim()} err=${(run.stderr ?? "").slice(0, 120)}`,
+      dirsDiffer &&
+        survivorUnchanged &&
+        exactlyOneNewOpenai &&
+        openaiLost &&
+        wipedDirRestored &&
+        survivorDirIntact &&
+        taskNotWhollyLost,
+      `dirsDiffer=${dirsDiffer} survivor=${anthropicLive[0]?.sessionId === sessionA} newOpenai=${exactlyOneNewOpenai} lost=${openaiLost} phase=${taskPhase}`,
     );
   }
 

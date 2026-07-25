@@ -74,25 +74,32 @@ export class FusionRunStore {
     return path;
   }
 
-  /** Record per-side telemetry as `ext.usage` frames arrive for its session. */
+  /**
+   * Record per-side telemetry as `ext.usage` frames arrive for its session.
+   * Prefer `sideIndex` from the ownership map so early frames still land before
+   * (or without) a durable sessionId on the row.
+   */
   recordSideUsage(
     taskId: string,
     runId: string,
     sessionId: string,
     usage: { inputTokens: number | null; outputTokens: number | null; costUsd: number | null },
+    sideIndex?: number,
   ): void {
     const run = this.get(taskId, runId);
     if (run === null) return;
-    const sides = run.sides.map((side) =>
-      side.sessionId === sessionId
-        ? {
-            ...side,
-            inputTokens: sum(side.inputTokens, usage.inputTokens),
-            outputTokens: sum(side.outputTokens, usage.outputTokens),
-            costUsd: sum(side.costUsd, usage.costUsd),
-          }
-        : side,
-    );
+    const sides = run.sides.map((side, i) => {
+      const matches =
+        sideIndex !== undefined ? i === sideIndex : side.sessionId === sessionId;
+      if (!matches) return side;
+      return {
+        ...side,
+        sessionId: side.sessionId ?? sessionId,
+        inputTokens: sum(side.inputTokens, usage.inputTokens),
+        outputTokens: sum(side.outputTokens, usage.outputTokens),
+        costUsd: sum(side.costUsd, usage.costUsd),
+      };
+    });
     this.save({ ...run, sides });
   }
 

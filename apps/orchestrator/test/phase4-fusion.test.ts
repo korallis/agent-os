@@ -295,6 +295,7 @@ describe("session keys (G6)", () => {
       ]),
     ).toEqual([{ role: "planner", model: "openai/gpt-5.6-sol" }]);
 
+    const phaseBefore = service.tools.getTask(taskId)?.phase;
     const respawned = service.tools.reconcileMissingCastRoles();
     expect(respawned).toEqual([
       {
@@ -305,7 +306,8 @@ describe("session keys (G6)", () => {
     ]);
 
     // Surviving anthropic session id is untouched; wiped openai was marked lost
-    // and a fresh openai session is running.
+    // and a fresh openai session is running. Task must NOT promote to SESSION_LOST
+    // while a healthy sibling remains.
     const anthropicLive = service.tools
       .listSessions()
       .filter(
@@ -328,6 +330,8 @@ describe("session keys (G6)", () => {
           (s.status === "running" || s.status === "starting"),
       ),
     ).toBe(true);
+    expect(service.tools.getTask(taskId)?.phase).not.toBe("SESSION_LOST");
+    expect(service.tools.getTask(taskId)?.phase).toBe(phaseBefore);
     expect(
       service.sessionKeys.missingRoles(projectId, [
         { role: "planner", model: "anthropic/claude-fable-5" },
@@ -383,6 +387,22 @@ describe("fusion run store", () => {
     expect(after?.sides[0]?.inputTokens).toBe(150);
     expect(after?.sides[0]?.outputTokens).toBe(25);
     expect(after?.sides[0]?.costUsd).toBeCloseTo(0.75);
+
+    // sideIndex path stamps sessionId and attributes even when the row had null.
+    store.save({
+      ...after!,
+      sides: [{ ...after!.sides[0]!, sessionId: null, inputTokens: null, outputTokens: null, costUsd: null }],
+    });
+    store.recordSideUsage(
+      run.taskId,
+      run.runId,
+      "01JSESSION000000000000000A",
+      { inputTokens: 11, outputTokens: 2, costUsd: 0.1 },
+      0,
+    );
+    const byIndex = store.get(run.taskId, run.runId);
+    expect(byIndex?.sides[0]?.sessionId).toBe("01JSESSION000000000000000A");
+    expect(byIndex?.sides[0]?.inputTokens).toBe(11);
 
     store.writeFused(
       run.taskId,
@@ -820,5 +840,25 @@ describe("/opinion live path", () => {
     expect(run.sides[0]?.artifactPath).not.toBeNull();
     expect(run.sides[1]?.sessionId).toBeNull();
     expect(run.sides[1]?.settledAt).toBeTruthy();
+
+    // Already-spawned side must be stopped so it does not hold a pool slot.
+    const firstSessionId = run.sides[0]!.sessionId!;
+    const firstSession = service.tools
+      .listSessions()
+      .find((s) => s.sessionId === firstSessionId);
+    expect(firstSession?.status).toBe("stopped");
+    expect(
+      service.tools
+        .listSessions()
+        .filter(
+          (s) =>
+            s.taskId === taskId &&
+            (s.status === "running" || s.status === "starting"),
+        ),
+    ).toHaveLength(0);
+    expect(
+      service.worktrees.list().filter((l) => l.state === "leased"),
+    ).toHaveLength(0);
+    expect(types).toContain("session.stopped");
   });
 });
