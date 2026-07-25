@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 /**
  * Typed tmux wrapper (master plan §5.5).
@@ -50,9 +50,12 @@ export function envPrefixedCommand(argv: string[], env?: Record<string, string>)
 }
 
 export class TmuxController {
-  private readonly socketName: string;
+  /** Exposed so the PTY reader targets the same tmux server the fleet uses. */
+  readonly socketName: string;
   private readonly fake: boolean;
   private readonly fakeWindows = new Map<string, { session: string; window: string; cmd: string }>();
+  /** Optional virtual pane text for fake-mode capture-pane. */
+  private readonly fakePanes = new Map<string, string>();
 
   constructor(options: TmuxOptions = {}) {
     this.socketName =
@@ -144,6 +147,7 @@ export class TmuxController {
   killWindow(target: string): void {
     if (this.fake) {
       this.fakeWindows.delete(target);
+      this.fakePanes.delete(target);
       return;
     }
     this.run(["kill-window", "-t", target]);
@@ -158,6 +162,57 @@ export class TmuxController {
       .split("\n")
       .map((l) => l.trim())
       .includes(target);
+  }
+
+  /**
+   * Read pane contents without blocking the event loop.
+   * Returns null when the window is missing or capture fails (PTY liveness signal).
+   */
+  capturePane(target: string, maxLines = 400): Promise<string | null> {
+    if (this.fake) {
+      if (!this.fakeWindows.has(target)) return Promise.resolve(null);
+      return Promise.resolve(this.fakePanes.get(target) ?? "");
+    }
+    return new Promise((resolve) => {
+      const child = spawn(
+        "tmux",
+        this.args([
+          "capture-pane",
+          "-p",
+          "-t",
+          target,
+          "-S",
+          `-${maxLines}`,
+        ]),
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stdout = "";
+      let settled = false;
+      const finish = (value: string | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        finish(null);
+      }, 5_000);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.on("error", () => finish(null));
+      child.on("close", (code) => {
+        finish(code === 0 ? stdout : null);
+      });
+    });
+  }
+
+  /** Test helper: set virtual pane text for fake-mode capture. */
+  setFakePane(target: string, content: string): void {
+    if (!this.fakeWindows.has(target)) return;
+    this.fakePanes.set(target, content);
   }
 
   /** Test/gate accessor: the exact command line a virtual window was given. */

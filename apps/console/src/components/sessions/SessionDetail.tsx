@@ -9,6 +9,7 @@ import type {
   SessionEventsResponse,
 } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
+import { TerminalAttach } from "@/components/sessions/TerminalAttach";
 import { useEventStream } from "@/lib/useEventStream";
 import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
 
@@ -361,6 +362,8 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
           </p>
         </div>
       )}
+
+      <TerminalAttach sessionId={sessionId} />
 
       <section>
         <div className="flex items-center justify-between mb-3">

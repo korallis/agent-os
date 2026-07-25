@@ -101,6 +101,24 @@ export const sessionEventsResponseSchema = z.strictObject({
 export type SessionEventsResponse = z.infer<typeof sessionEventsResponseSchema>;
 
 /**
+ * POST `/v1/sessions/:id/attach-ticket` — mint a single-use, short-lived ticket
+ * for the read-only PTY WebSocket. The daemon token is never placed in a query
+ * string; a one-shot ticket is, because query strings reach logs and history.
+ */
+export const attachTicketResponseSchema = z.strictObject({
+  sessionId: ulidSchema,
+  ticket: z.string().min(1),
+  expiresAt: isoTimestampSchema,
+  /**
+   * Absolute loopback WS URL the browser opens DIRECTLY on the daemon. The BFF
+   * cannot proxy a WS upgrade, which is exactly why the credential here is a
+   * one-shot ticket rather than the daemon bearer token.
+   */
+  wsUrl: z.string().min(1),
+});
+export type AttachTicketResponse = z.infer<typeof attachTicketResponseSchema>;
+
+/**
  * GET `/v1/runs/history` — per-task gate/fusion aggregates for Pipeline Runs.
  * Counts are computed daemon-side over the full relevant event set (not a
  * paged global replay), so the Console never reconstructs them from a window.

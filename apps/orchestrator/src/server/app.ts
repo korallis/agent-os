@@ -30,6 +30,7 @@ import {
   type OnboardingState,
   type QuotaSample,
   type RunHistoryResponse,
+  type AttachTicketResponse,
   type SessionDetailResponse,
   type SessionEventsResponse,
   type StatusResponse,
@@ -50,6 +51,7 @@ import { resolveAuthJsonPathsWithFallback } from "../security/auth-store.js";
 import type { FleetService } from "../fleet/service.js";
 import type { PromptService } from "../prompts/service.js";
 import type { AnalyticsService } from "../analytics/service.js";
+import type { PtyTicketStore } from "../pty/tickets.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -76,6 +78,8 @@ export interface ServerDeps {
   prompts?: PromptService;
   /** Phase 6 usage & cost analytics derived from the event log. */
   analytics?: AnalyticsService;
+  /** Phase 6 single-use tickets for the read-only PTY WebSocket. */
+  ptyTickets?: PtyTicketStore;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -447,6 +451,30 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       .sort((a, b) => b.task.updatedAt.localeCompare(a.task.updatedAt));
     return { runs };
   });
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/sessions/:id/attach-ticket",
+    (request, reply): AttachTicketResponse | undefined => {
+      if (deps.fleet === undefined || deps.ptyTickets === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "terminal attach unavailable");
+        return undefined;
+      }
+      const session = deps.fleet.tools
+        .listSessions()
+        .find((s) => s.sessionId === request.params.id);
+      if (session === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "session not found");
+        return undefined;
+      }
+      const { ticket, expiresAt } = deps.ptyTickets.issue(session.sessionId);
+      return {
+        sessionId: session.sessionId,
+        ticket,
+        expiresAt: new Date(expiresAt).toISOString(),
+        wsUrl: `ws://127.0.0.1:${deps.port}/v1/pty?ticket=${encodeURIComponent(ticket)}`,
+      };
+    },
+  );
 
   // ── Analytics (master plan §7 Token Usage / §8.2) ───────────────────────
   app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {

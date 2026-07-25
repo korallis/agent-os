@@ -26,6 +26,8 @@ import type { QuotaSample } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
 import { PromptService } from "./prompts/service.js";
 import { AnalyticsService } from "./analytics/service.js";
+import { PtyTicketStore } from "./pty/tickets.js";
+import { attachPtyServer } from "./pty/server.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
@@ -268,6 +270,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       },
     );
 
+    // Read-only terminal attach: single-use tickets minted over authenticated
+    // REST, redeemed once on the WS upgrade. WS is used for PTY only (§8).
+    const ptyTickets = new PtyTicketStore();
+
     const deps = {
       store,
       config,
@@ -283,6 +289,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       fleet,
       prompts,
       analytics,
+      ptyTickets,
     };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });
@@ -291,6 +298,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       typeof address === "object" && address !== null ? address.port : port;
     // With port 0 (tests) the real port is only known after listen.
     deps.port = boundPort;
+
+    const pty = attachPtyServer({
+      server: server.server,
+      tickets: ptyTickets,
+      tmux: fleet.tmux,
+      resolveTarget: (sessionId) =>
+        fleet.tools.listSessions().find((s) => s.sessionId === sessionId)?.tmuxWindow ?? null,
+    });
 
     const quotaScheduler = new QuotaProbeScheduler({
       home,
@@ -354,6 +369,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
             payload: { reason, signal: signal ?? null },
           });
           runningConfig.stop();
+          await pty.close();
           await socketHub.close();
           const closePromise = runningServer.close();
           await new Promise<void>((resolve) => setTimeout(resolve, SSE_SHUTDOWN_GRACE_MS));
