@@ -414,7 +414,22 @@ export class FleetService {
       for (const envelope of envelopes) {
         const event = envelope.event;
         if (event.type !== "gate.red_proven") continue;
-        this.tools.hydrateRedProofFromEvent(event.payload);
+        const payload = event.payload as {
+          taskId: string;
+          gateSourceHash: string;
+          outcome: "EXPECTED_RED" | "FAIL";
+          provenAt: string;
+          hmac?: string;
+        };
+        // Missing HMAC cannot be trusted — refuse rather than re-sign.
+        if (typeof payload.hmac !== "string" || payload.hmac.length === 0) continue;
+        this.tools.hydrateRedProofFromEvent({
+          taskId: payload.taskId,
+          gateSourceHash: payload.gateSourceHash,
+          outcome: payload.outcome,
+          provenAt: payload.provenAt,
+          hmac: payload.hmac,
+        });
       }
     } catch {
       // Corrupt log tails are handled by EventStore boot; best-effort here.

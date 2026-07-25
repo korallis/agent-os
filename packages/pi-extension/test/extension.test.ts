@@ -7,6 +7,7 @@ import agentOsPiExtension, {
   AgentOsExtensionHost,
   extractAssistantText,
   gateWorkspaceBlockReason,
+  seatFenceBlockReason,
   validatorJailBlockReason,
   pathIsInsideGate,
   usageFromAssistantMessage,
@@ -30,6 +31,7 @@ afterEach(() => {
   delete process.env.AGENTOS_ROLE;
   delete process.env.AGENTOS_SESSION_DIR;
   delete process.env.AGENTOS_GATE_WORKSPACE;
+  delete process.env.AGENTOS_SEAT_WORKSPACE;
   delete process.env.AGENTOS_HOME;
 });
 
@@ -321,13 +323,14 @@ describe("builder gate-workspace tool fence", () => {
     const home = "/Users/captain";
     const gate = `${home}/.agentos/runs/task1/gate-workspace`;
     const cwd = `${home}/.agentos/worktrees/builder-1`;
+    const env = { HOME: home } as NodeJS.ProcessEnv;
     expect(
       gateWorkspaceBlockReason(
         "bash",
         { command: `cat ${gate}/gate.py` },
         gate,
         cwd,
-        home,
+        env,
       ),
     ).toMatch(/tool\/fs-blocked/);
     expect(
@@ -336,7 +339,7 @@ describe("builder gate-workspace tool fence", () => {
         { command: "cat ~/.agentos/runs/task1/gate-workspace/gate.py" },
         gate,
         cwd,
-        home,
+        env,
       ),
     ).toMatch(/tool\/fs-blocked/);
     expect(
@@ -345,7 +348,7 @@ describe("builder gate-workspace tool fence", () => {
         { command: "cat $HOME/.agentos/runs/task1/gate-workspace/gate.py" },
         gate,
         cwd,
-        home,
+        env,
       ),
     ).toMatch(/tool\/fs-blocked/);
     expect(
@@ -354,7 +357,7 @@ describe("builder gate-workspace tool fence", () => {
         { command: "cat ../../runs/task1/gate-workspace/secret" },
         gate,
         cwd,
-        home,
+        env,
       ),
     ).toMatch(/tool\/fs-blocked/);
     expect(
@@ -363,21 +366,92 @@ describe("builder gate-workspace tool fence", () => {
         { command: "echo hello > ./src/ok.ts" },
         gate,
         cwd,
-        home,
+        env,
       ),
     ).toBeNull();
+  });
+
+  it("seatFenceBlockReason default-denies secrets and $AGENTOS_HOME tokens", () => {
+    const agentHome = "/Users/captain/.agentos";
+    const seat = `${agentHome}/worktrees/builder-1`;
+    const gate = `${agentHome}/runs/task1/gate-workspace`;
+    const env = {
+      HOME: "/Users/captain",
+      AGENTOS_HOME: agentHome,
+      AGENTOS_SEAT_WORKSPACE: seat,
+      AGENTOS_GATE_WORKSPACE: gate,
+    } as NodeJS.ProcessEnv;
+    expect(
+      seatFenceBlockReason(
+        "read",
+        { path: `${gate}/gate.py` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      seatFenceBlockReason(
+        "bash",
+        { command: "cat $AGENTOS_HOME/secrets/gate-proof.key" },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked|unresolvable|refused/);
+    expect(
+      seatFenceBlockReason(
+        "write",
+        { path: `${agentHome}/events/events.ndjson` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      seatFenceBlockReason(
+        "write",
+        { path: `${seat}/src/ok.ts` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toBeNull();
+    // Unknown env token fails closed.
+    expect(
+      seatFenceBlockReason(
+        "bash",
+        { command: "cat $NOT_A_REAL_ENV_VAR/secret" },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/unresolvable|fail closed/);
   });
 
   it("blocks builder tool_call into gate workspace and emits ext.tool_blocked", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agentos-ext-gate-fence-"));
     dirs.push(dir);
     const gateDir = join(dir, "gate-workspace");
+    const seatDir = join(dir, "worktree");
     const socketPath = join(dir, "hub.sock");
     const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE0";
     process.env.AGENTOS_SOCKET = socketPath;
     process.env.AGENTOS_SESSION_ID = sessionId;
     process.env.AGENTOS_ROLE = "builder";
+    process.env.AGENTOS_HOME = dir;
     process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+    process.env.AGENTOS_SEAT_WORKSPACE = seatDir;
 
     const frames: unknown[] = [];
     let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
@@ -437,7 +511,7 @@ describe("builder gate-workspace tool fence", () => {
     expect(parsed.type).toBe("ext.tool_blocked");
     if (parsed.type === "ext.tool_blocked") {
       expect(parsed.toolName).toBe("read");
-      expect(parsed.reason).toMatch(/gate workspace/);
+      expect(parsed.reason).toMatch(/tool\/fs-blocked|seat workspace/);
     }
   });
 
@@ -445,12 +519,15 @@ describe("builder gate-workspace tool fence", () => {
     const dir = mkdtempSync(join(tmpdir(), "agentos-ext-fence-fail-"));
     dirs.push(dir);
     const gateDir = join(dir, "gate-workspace");
+    const seatDir = join(dir, "worktree");
     const socketPath = join(dir, "hub.sock");
     const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE1";
     process.env.AGENTOS_SOCKET = socketPath;
     process.env.AGENTOS_SESSION_ID = sessionId;
     process.env.AGENTOS_ROLE = "builder";
+    process.env.AGENTOS_HOME = dir;
     process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+    process.env.AGENTOS_SEAT_WORKSPACE = seatDir;
 
     let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
     await new Promise<void>((resolve, reject) => {
@@ -505,6 +582,7 @@ describe("validator write-jail tool fence", () => {
     const agentHome = "/Users/captain/.agentos";
     const gate = `${agentHome}/runs/task1/gate-workspace`;
     const cwd = gate;
+    const env = { HOME: "/Users/captain", AGENTOS_HOME: agentHome } as NodeJS.ProcessEnv;
     expect(
       validatorJailBlockReason(
         "write",
@@ -512,6 +590,7 @@ describe("validator write-jail tool fence", () => {
         gate,
         agentHome,
         cwd,
+        env,
       ),
     ).toBeNull();
     expect(
@@ -521,6 +600,7 @@ describe("validator write-jail tool fence", () => {
         gate,
         agentHome,
         cwd,
+        env,
       ),
     ).toMatch(/write-jailed/);
     expect(
@@ -530,6 +610,7 @@ describe("validator write-jail tool fence", () => {
         gate,
         agentHome,
         cwd,
+        env,
       ),
     ).toMatch(/write-jailed/);
     expect(
@@ -539,8 +620,19 @@ describe("validator write-jail tool fence", () => {
         gate,
         agentHome,
         cwd,
+        env,
       ),
     ).toBeNull();
+    expect(
+      validatorJailBlockReason(
+        "bash",
+        { command: "cat $AGENTOS_HOME/secrets/gate-proof.key" },
+        gate,
+        agentHome,
+        cwd,
+        env,
+      ),
+    ).toMatch(/write-jailed|unresolvable|fail closed/);
   });
 
   it("blocks validator tool_call into validation/ and emits ext.tool_blocked", async () => {
@@ -553,6 +645,7 @@ describe("validator write-jail tool fence", () => {
     process.env.AGENTOS_SESSION_ID = sessionId;
     process.env.AGENTOS_ROLE = "validator";
     process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+    process.env.AGENTOS_SEAT_WORKSPACE = gateDir;
     process.env.AGENTOS_HOME = dir;
 
     const frames: unknown[] = [];

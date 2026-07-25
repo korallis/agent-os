@@ -377,15 +377,18 @@ export class ToolSurface {
 
   /**
    * Rebuild RED proofs from the append-only event log (kill -9 path).
-   * Later events win; task.json install may already have seeded memory.
+   * HMAC is verified against the daemon key — forged or re-signed-without-key
+   * entries are rejected. Later valid events win.
    */
   hydrateRedProofFromEvent(payload: {
     taskId: string;
     gateSourceHash: string;
     outcome: "EXPECTED_RED" | "FAIL";
     provenAt: string;
+    hmac: string;
   }): void {
     const proof = this.deps.gates.installRedProofFromEvent(payload.taskId, payload);
+    if (proof === null) return;
     const task = this.tasks.get(payload.taskId);
     if (task === undefined) return;
     this.tasks.set(payload.taskId, {
@@ -1303,6 +1306,13 @@ export class ToolSurface {
             "Pi detection or extension path missing after preflight",
           );
         }
+        const gateWorkspace =
+          input.role === "builder" || input.role === "validator"
+            ? this.deps.gates.gateWorkspace(task.id)
+            : undefined;
+        // Seat allowlist root: builder = leased worktree; validator = gate workspace.
+        const seatWorkspace =
+          input.role === "builder" || input.role === "validator" ? cwd : undefined;
         const spec = buildPiSpawnSpec({
           agentosHome: this.deps.home,
           detection: piDetection,
@@ -1316,9 +1326,8 @@ export class ToolSurface {
           thinking: input.thinking,
           cleanRoom: input.cleanRoom,
           grantProviderKey: grant,
-          ...(input.role === "builder" || input.role === "validator"
-            ? { gateWorkspace: this.deps.gates.gateWorkspace(task.id) }
-            : {}),
+          ...(gateWorkspace !== undefined ? { gateWorkspace } : {}),
+          ...(seatWorkspace !== undefined ? { seatWorkspace } : {}),
         });
         const win = this.deps.tmux.newWindow({
           windowName,
@@ -2087,10 +2096,12 @@ export class ToolSurface {
       // was proven red at baseline. Editing the gate drops the proof, so a
       // validator cannot weaken the gate after the fact and call the build
       // green (master plan §11 Phase 5: "gate revisions re-prove RED").
-      if (
+      // Captain-stamped redBaselineOverride disables the policy holistically
+      // (spawn + candidate), not only the spawn half.
+      const enforceRedBaseline =
         this.cfg().policies.redBaselineGateRequired &&
-        !this.deps.gates.hasRedProofForCurrentSource(task.id)
-      ) {
+        !this.hasRedBaselineOverride(task);
+      if (enforceRedBaseline && !this.deps.gates.hasRedProofForCurrentSource(task.id)) {
         throw new ToolSurfaceError(
           "GATE_ERROR",
           `gate revision has no RED baseline proof for task ${task.id} — re-run run_gate(baseline) before judging a candidate`,
@@ -2099,11 +2110,14 @@ export class ToolSurface {
       }
     }
 
+    const enforceRedBaselineForRun =
+      this.cfg().policies.redBaselineGateRequired &&
+      !this.hasRedBaselineOverride(task);
     const result = this.deps.gates.run({
       taskId: task.id,
       target: input.target,
       cwd,
-      expectedRed: this.cfg().policies.redBaselineGateRequired,
+      expectedRed: enforceRedBaselineForRun,
     });
 
     this.sink({
@@ -2126,6 +2140,7 @@ export class ToolSurface {
       (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") &&
       proof !== null
     ) {
+      // HMAC travels with the event so hydrate can verify — never re-sign.
       this.sink({
         type: "gate.red_proven",
         payload: {
@@ -2133,6 +2148,7 @@ export class ToolSurface {
           gateSourceHash: proof.gateSourceHash,
           outcome: proof.outcome,
           provenAt: proof.provenAt,
+          hmac: proof.hmac,
         },
       });
     }
@@ -2210,41 +2226,36 @@ export class ToolSurface {
     let message = input.message ?? "";
     let failHash: string | undefined;
     if (input.gateFailRef !== undefined) {
-      // Verbatim FAIL injection. The substrate composes the bytes from the
-      // gate's own ledger and hash-matches them, so the Brain cannot paraphrase,
-      // summarise or soften what the gate actually said.
+      // Verbatim FAIL injection. Substrate injects the ledger's exact bytes and
+      // compares to the stored hash — no split/trim/filter reconstruction.
       const taskId = session.taskId;
-      const lines =
-        taskId !== null ? this.deps.gates.readLastFailLines(taskId) : [];
-      message = lines.join("\n") + (lines.length > 0 ? "\n" : "");
-      if (lines.length === 0) {
-        throw new ToolSurfaceError("NOT_FOUND", "no gate fail lines held for verbatim inject");
-      }
-      // Fail closed: a missing or unreadable expected hash cannot claim
-      // verbatimness. Refuse rather than return failHash as if verified.
       if (taskId === null) {
         throw new ToolSurfaceError(
           "GATE_ERROR",
           "verbatim FAIL hash unavailable — refusing to inject unverifiable gate output",
         );
       }
-      const expected = this.deps.gates.lastFailHash(taskId);
-      if (expected === null || expected.length === 0) {
+      const ledger = this.deps.gates.getFailLedger(taskId);
+      if (ledger === null || ledger.text.length === 0) {
+        throw new ToolSurfaceError("NOT_FOUND", "no gate fail lines held for verbatim inject");
+      }
+      if (ledger.hash.length === 0) {
         throw new ToolSurfaceError(
           "GATE_ERROR",
           "verbatim FAIL hash missing — refusing to inject unverifiable gate output",
           { taskId },
         );
       }
+      message = ledger.text;
       const actual = GateRunner.hashText(message);
-      if (expected !== actual) {
+      if (ledger.hash !== actual) {
         throw new ToolSurfaceError(
           "GATE_ERROR",
           "verbatim FAIL hash mismatch — refusing to inject altered gate output",
-          { expected, actual },
+          { expected: ledger.hash, actual },
         );
       }
-      failHash = actual;
+      failHash = ledger.hash;
     }
     if (message.length === 0) {
       throw new ToolSurfaceError("VALIDATION_ERROR", "message or gateFailRef required");

@@ -311,8 +311,8 @@ print("PASS")
     const builderPath = builder.data?.session?.worktreePath ?? "";
     const blockedAbs = join(gateWorkspace, "gate.py");
 
-    // Drive the real extension entry: builder role + AGENTOS_GATE_WORKSPACE must
-    // block a read of an absolute path inside the gate dir and emit ext.tool_blocked.
+    // Drive the real extension entry: default-deny seat fence must block a read
+    // of an absolute path inside the gate dir and emit ext.tool_blocked.
     const { createServer } = await import("node:net");
     const { agentOsPiExtension } = await import(
       join(ROOT, "packages", "pi-extension", "dist", "index.js")
@@ -347,11 +347,15 @@ print("PASS")
           session: process.env.AGENTOS_SESSION_ID,
           role: process.env.AGENTOS_ROLE,
           gate: process.env.AGENTOS_GATE_WORKSPACE,
+          seat: process.env.AGENTOS_SEAT_WORKSPACE,
+          ahome: process.env.AGENTOS_HOME,
         };
         process.env.AGENTOS_SOCKET = sockPath;
         process.env.AGENTOS_SESSION_ID = builder.data?.session?.sessionId ?? "01ARZ3NDEKTSV4RRFFQ69G5FG4";
         process.env.AGENTOS_ROLE = "builder";
+        process.env.AGENTOS_HOME = home;
         process.env.AGENTOS_GATE_WORKSPACE = gateWorkspace;
+        process.env.AGENTOS_SEAT_WORKSPACE = builderPath || join(home, "worktrees", "builder");
         const pi = {
           version: "0.82.0",
           on: (event, handler) => {
@@ -381,6 +385,10 @@ print("PASS")
             else process.env.AGENTOS_ROLE = prev.role;
             if (prev.gate === undefined) delete process.env.AGENTOS_GATE_WORKSPACE;
             else process.env.AGENTOS_GATE_WORKSPACE = prev.gate;
+            if (prev.seat === undefined) delete process.env.AGENTOS_SEAT_WORKSPACE;
+            else process.env.AGENTOS_SEAT_WORKSPACE = prev.seat;
+            if (prev.ahome === undefined) delete process.env.AGENTOS_HOME;
+            else process.env.AGENTOS_HOME = prev.ahome;
             resolve(result);
           }, 80);
         });
@@ -395,7 +403,8 @@ print("PASS")
     const toolBlockedRecorded =
       toolBlockedFrame !== undefined &&
       toolBlockedFrame.toolName === "read" &&
-      String(toolBlockedFrame.reason ?? "").includes("gate workspace");
+      (String(toolBlockedFrame.reason ?? "").includes("tool/fs-blocked") ||
+        String(toolBlockedFrame.reason ?? "").includes("seat workspace"));
 
     gate(
       "G4",
@@ -460,15 +469,17 @@ raise SystemExit(1)
 
   // G6 — editing the gate drops its RED proof; forged proofs on every seat-writable
   // path (including the sibling validation/ the daemon used to read) are ignored
-  // because authz is process memory + HMAC only. Mid-build re-prove restores.
+  // because authz is process memory + HMAC only. Seat cannot read the signing key
+  // or mint a valid gate.red_proven across restart. Mid-build re-prove restores.
   {
     const { createHash } = await import("node:crypto");
-    const { mkdirSync } = await import("node:fs");
+    const { mkdirSync, appendFileSync } = await import("node:fs");
+    const { createServer } = await import("node:net");
     const taskId = await readyTask(token, projectId, "Gate revision", {
       gateSource: RED_THEN_GREEN_GATE,
     });
     await callTool(token, "run_gate", { taskId, target: "baseline" });
-    await callTool(token, "spawn_crewmate", {
+    const builderSpawn = await callTool(token, "spawn_crewmate", {
       taskId,
       role: "builder",
       model: "openai/gpt-5.6-sol",
@@ -517,6 +528,145 @@ raise SystemExit(1)
     }
     const afterEdit = await callTool(token, "run_gate", { taskId, target: "candidate" });
 
+    // Escalation: builder seat tries to read the signing key (must be tool-blocked).
+    const builderPath = builderSpawn.data?.session?.worktreePath ?? join(home, "worktrees", "x");
+    const keyPath = join(home, "secrets", "gate-proof.key");
+    const { agentOsPiExtension } = await import(
+      join(ROOT, "packages", "pi-extension", "dist", "index.js")
+    );
+    const sockDir = mkdtempSync(join(tmpdir(), "agentos-p5-g6-"));
+    cleanups.push(sockDir);
+    const sockPath = join(sockDir, "ext.sock");
+    const keyBlockFrames = [];
+    let keyToolHandler = null;
+    const keyBlockResult = await new Promise((resolve, reject) => {
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString("utf8");
+          let nl;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line.length === 0) continue;
+            try {
+              keyBlockFrames.push(JSON.parse(line));
+            } catch {
+              // ignore
+            }
+          }
+        });
+      });
+      server.on("error", reject);
+      server.listen(sockPath, () => {
+        const prev = {
+          socket: process.env.AGENTOS_SOCKET,
+          session: process.env.AGENTOS_SESSION_ID,
+          role: process.env.AGENTOS_ROLE,
+          gate: process.env.AGENTOS_GATE_WORKSPACE,
+          seat: process.env.AGENTOS_SEAT_WORKSPACE,
+          ahome: process.env.AGENTOS_HOME,
+        };
+        process.env.AGENTOS_SOCKET = sockPath;
+        process.env.AGENTOS_SESSION_ID =
+          builderSpawn.data?.session?.sessionId ?? "01ARZ3NDEKTSV4RRFFQ69G5FG6";
+        process.env.AGENTOS_ROLE = "builder";
+        process.env.AGENTOS_HOME = home;
+        process.env.AGENTOS_GATE_WORKSPACE = gateWs;
+        process.env.AGENTOS_SEAT_WORKSPACE = builderPath;
+        const pi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") keyToolHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        if (host === undefined || keyToolHandler === null) {
+          server.close();
+          reject(new Error("extension did not register seat fence"));
+          return;
+        }
+        void host.connect().then(() => {
+          const result = keyToolHandler({
+            toolName: "read",
+            toolCallId: "t-key",
+            input: { path: keyPath },
+          });
+          setTimeout(() => {
+            host.close();
+            server.close();
+            if (prev.socket === undefined) delete process.env.AGENTOS_SOCKET;
+            else process.env.AGENTOS_SOCKET = prev.socket;
+            if (prev.session === undefined) delete process.env.AGENTOS_SESSION_ID;
+            else process.env.AGENTOS_SESSION_ID = prev.session;
+            if (prev.role === undefined) delete process.env.AGENTOS_ROLE;
+            else process.env.AGENTOS_ROLE = prev.role;
+            if (prev.gate === undefined) delete process.env.AGENTOS_GATE_WORKSPACE;
+            else process.env.AGENTOS_GATE_WORKSPACE = prev.gate;
+            if (prev.seat === undefined) delete process.env.AGENTOS_SEAT_WORKSPACE;
+            else process.env.AGENTOS_SEAT_WORKSPACE = prev.seat;
+            if (prev.ahome === undefined) delete process.env.AGENTOS_HOME;
+            else process.env.AGENTOS_HOME = prev.ahome;
+            resolve(result);
+          }, 80);
+        });
+      });
+    });
+    const keyBlocked =
+      keyBlockResult &&
+      keyBlockResult.block === true &&
+      String(keyBlockResult.reason ?? "").includes("tool/fs-blocked");
+    const keyToolBlocked = keyBlockFrames.some((f) => f.type === "ext.tool_blocked");
+
+    // Stop the daemon before forging the event log so seq stays monotonic.
+    child.kill("SIGTERM");
+    await sleep(500);
+
+    // Append a forged gate.red_proven (invalid HMAC). Hydrate must refuse it.
+    const eventsPath = join(home, "events", "events.ndjson");
+    mkdirSync(dirname(eventsPath), { recursive: true });
+    let lastSeq = 0;
+    if (existsSync(eventsPath)) {
+      for (const line of readFileSync(eventsPath, "utf8").split("\n")) {
+        if (line.trim().length === 0) continue;
+        try {
+          const env = JSON.parse(line);
+          if (typeof env.seq === "number" && env.seq > lastSeq) lastSeq = env.seq;
+        } catch {
+          // ignore corrupt lines; open will quarantine
+        }
+      }
+    }
+    const forgedEvent = {
+      id: "01ARZ3NDEKTSV4RRFFQ69G5FGE",
+      seq: lastSeq + 1,
+      ts: new Date().toISOString(),
+      event: {
+        type: "gate.red_proven",
+        payload: {
+          taskId,
+          gateSourceHash: forgedHash,
+          outcome: "EXPECTED_RED",
+          provenAt: new Date().toISOString(),
+          hmac: "forged-not-a-real-hmac",
+        },
+      },
+    };
+    appendFileSync(eventsPath, `${JSON.stringify(forgedEvent)}\n`);
+
+    // Restart daemon against the same home and assert candidate still refused.
+    const restartChild = startDaemon(home, PORT);
+    cleanups.push(() => {
+      try {
+        restartChild.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+    });
+    child = restartChild;
+    token = await waitForHealth(home, PORT);
+    const afterRestart = await callTool(token, "run_gate", { taskId, target: "candidate" });
+
     // Re-prove RED from BUILDING, then candidate must be accepted again.
     const reprove = await callTool(token, "run_gate", { taskId, target: "baseline" });
     const afterReprove = await callTool(token, "run_gate", { taskId, target: "candidate" });
@@ -524,16 +674,21 @@ raise SystemExit(1)
 
     gate(
       "G6",
-      "gate revision + forged sibling/validation proof refused; mid-build re-prove restores",
+      "gate revision + forge/key-steal refused across restart; mid-build re-prove restores",
       beforeEdit.ok === true &&
         afterEdit.ok === false &&
         afterEdit.error?.code === "GATE_ERROR" &&
         String(afterEdit.error?.message ?? "").includes("RED baseline proof") &&
+        keyBlocked &&
+        keyToolBlocked &&
+        afterRestart.ok === false &&
+        afterRestart.error?.code === "GATE_ERROR" &&
+        String(afterRestart.error?.message ?? "").includes("RED baseline proof") &&
         reprove.ok === true &&
         (reprove.data?.outcome === "EXPECTED_RED" || reprove.data?.outcome === "FAIL") &&
         afterReprove.ok === true &&
         (phaseAfter === "BUILDING" || phaseAfter === "VALIDATING"),
-      `before=${beforeEdit.ok} after=${afterEdit.error?.code} reprove=${reprove.data?.outcome} restored=${afterReprove.ok} phase=${phaseAfter}`,
+      `before=${beforeEdit.ok} after=${afterEdit.error?.code} keyBlocked=${keyBlocked} restart=${afterRestart.error?.code} reprove=${reprove.data?.outcome} restored=${afterReprove.ok} phase=${phaseAfter}`,
     );
     await releaseTask(token, taskId);
   }

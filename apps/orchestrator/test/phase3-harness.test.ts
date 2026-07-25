@@ -172,49 +172,52 @@ describe("spawn env delivery", () => {
       configDirEnv: "PI_CONFIG_DIR",
       isolationMode: "managed",
     };
+    const builderSeat = join(home, "worktrees", "builder-1");
+    const gateWs = join(home, "runs", "task", "gate-workspace");
     const apiSpec = buildPiSpawnSpec({
       agentosHome: home,
       detection,
       args: ["--mode", "json"],
-      cwd: home,
+      cwd: builderSeat,
       sessionId: "01JSESSGRANT000000000000001",
       role: "builder",
       socketPath: join(home, "s.sock"),
       extensionPath: join(home, "ext.js"),
       grantProviderKey: apiGrant,
-      gateWorkspace: join(home, "runs", "task", "gate-workspace"),
+      gateWorkspace: gateWs,
+      seatWorkspace: builderSeat,
     });
     expect(apiSpec.env.OPENAI_API_KEY).toBe("sk-openai-cast-secret");
     expect(apiSpec.env.ANTHROPIC_API_KEY).toBeUndefined();
-    expect(apiSpec.env.AGENTOS_HOME).toBeUndefined();
-    expect(apiSpec.env.AGENTOS_GATE_WORKSPACE).toBe(
-      join(home, "runs", "task", "gate-workspace"),
-    );
+    // Builders receive AGENTOS_HOME only as the default-deny fence root (never the key).
+    expect(apiSpec.env.AGENTOS_HOME).toBe(home);
+    expect(apiSpec.env.AGENTOS_SEAT_WORKSPACE).toBe(builderSeat);
+    expect(apiSpec.env.AGENTOS_GATE_WORKSPACE).toBe(gateWs);
     const validatorSpec = buildPiSpawnSpec({
       agentosHome: home,
       detection,
       args: ["--mode", "json"],
-      cwd: join(home, "runs", "task", "gate-workspace"),
+      cwd: gateWs,
       sessionId: "01JSESSGRANT0000000000000VA",
       role: "validator",
       socketPath: join(home, "v.sock"),
       extensionPath: join(home, "ext.js"),
       grantProviderKey: null,
-      gateWorkspace: join(home, "runs", "task", "gate-workspace"),
+      gateWorkspace: gateWs,
+      seatWorkspace: gateWs,
     });
-    // Validators get AGENTOS_HOME only as the write-jail fence root, plus the
-    // gate workspace they are allowed to touch.
+    // Validators get AGENTOS_HOME as fence root + seat workspace = gate workspace.
     expect(validatorSpec.env.AGENTOS_HOME).toBe(home);
-    expect(validatorSpec.env.AGENTOS_GATE_WORKSPACE).toBe(
-      join(home, "runs", "task", "gate-workspace"),
-    );
+    expect(validatorSpec.env.AGENTOS_SEAT_WORKSPACE).toBe(gateWs);
+    expect(validatorSpec.env.AGENTOS_GATE_WORKSPACE).toBe(gateWs);
     expect(
       Object.keys(apiSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
     ).toEqual(["OPENAI_API_KEY"]);
     // Durable spawn manifest records key names only (values stay in runtime env).
     expect(apiSpec.envKeys).toContain("OPENAI_API_KEY");
     expect(apiSpec.envKeys).not.toContain("sk-openai-cast-secret");
-    expect(apiSpec.envKeys).not.toContain("AGENTOS_HOME");
+    expect(apiSpec.envKeys).toContain("AGENTOS_HOME");
+    expect(apiSpec.envKeys).toContain("AGENTOS_SEAT_WORKSPACE");
 
     const brainSpec = buildPiSpawnSpec({
       agentosHome: home,
@@ -229,6 +232,7 @@ describe("spawn env delivery", () => {
     });
     expect(brainSpec.env.AGENTOS_HOME).toBe(home);
     expect(brainSpec.env.AGENTOS_GATE_WORKSPACE).toBeUndefined();
+    expect(brainSpec.env.AGENTOS_SEAT_WORKSPACE).toBeUndefined();
 
     const oauthHome = temp("agentos-oauth-grant-");
     const oauthRegistry = new ConnectionRegistry(oauthHome);

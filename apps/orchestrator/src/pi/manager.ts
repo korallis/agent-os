@@ -125,12 +125,16 @@ export interface BuildSpawnOptions {
   /** Clean-room: add --no-skills --no-extensions --no-context-files, then re-add -e. */
   cleanRoom?: boolean;
   /**
-   * Absolute path to the task gate workspace.
-   * - Builders: AGENTOS_GATE_WORKSPACE so the extension can deny tool paths inside it.
-   * - Validators: AGENTOS_GATE_WORKSPACE + AGENTOS_HOME so the extension can
-   *   write-jail them (allow only the gate workspace under Agent OS home).
+   * Absolute path to the task gate workspace (validators author/run gates here).
+   * Passed as AGENTOS_GATE_WORKSPACE; validators also use it as the seat workspace.
    */
   gateWorkspace?: string;
+  /**
+   * Absolute path the seat is allowed to touch under AGENTOS_HOME.
+   * Builders: leased worktree. Validators: gate workspace.
+   * Default-deny fence: anything else under AGENTOS_HOME is refused.
+   */
+  seatWorkspace?: string;
 }
 
 /**
@@ -148,9 +152,13 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
     AGENTOS_SOCKET: options.socketPath,
     AGENTOS_ROLE: options.role,
   };
-  // AGENTOS_HOME: Brain (layout awareness) and validators (write-jail fence root).
-  // Builders never receive it — they only need AGENTOS_GATE_WORKSPACE to deny.
-  if (options.role === "brain" || options.role === "validator") {
+  // AGENTOS_HOME: Brain (layout) + every non-Brain seat (default-deny fence root).
+  // The signing key is never placed in env — only the home path for path compare.
+  if (
+    options.role === "brain" ||
+    options.role === "validator" ||
+    options.role === "builder"
+  ) {
     extraAllow.AGENTOS_HOME = options.agentosHome;
   }
   if (
@@ -158,6 +166,12 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
     options.gateWorkspace !== undefined
   ) {
     extraAllow.AGENTOS_GATE_WORKSPACE = options.gateWorkspace;
+  }
+  if (
+    (options.role === "builder" || options.role === "validator") &&
+    options.seatWorkspace !== undefined
+  ) {
+    extraAllow.AGENTOS_SEAT_WORKSPACE = options.seatWorkspace;
   }
   if (options.sessionDir !== undefined) {
     // Extension captures side output under AGENTOS_SESSION_DIR/outputs/.

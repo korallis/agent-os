@@ -431,15 +431,23 @@ function messageFromEvent(event: unknown): unknown {
   return event;
 }
 
+/** True when `path` resolves inside `root` (../ cannot walk out). */
+export function isPathInsideRoot(root: string, path: string): boolean {
+  const base = resolve(root);
+  const target = resolve(path);
+  const rel = relative(base, target);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
 /**
- * Expand ~ / $HOME / ${HOME} / $AGENTOS_GATE_WORKSPACE then resolve against cwd.
- * Used so bash tokens cannot walk into the gate tree via relative or home paths.
+ * Expand ~ and every `$VAR` / `${VAR}` against the seat's real env, then resolve
+ * against cwd. Missing or empty env vars fail closed (throw) so unknown tokens
+ * are never treated as relative in-jail paths.
  */
 export function resolveToolPath(
   candidate: string,
   cwd: string,
-  home: string = process.env.HOME ?? "",
-  gateWorkspace: string = process.env.AGENTOS_GATE_WORKSPACE ?? "",
+  env: NodeJS.ProcessEnv = process.env,
 ): string {
   let token = candidate.trim();
   if (
@@ -448,21 +456,28 @@ export function resolveToolPath(
   ) {
     token = token.slice(1, -1);
   }
-  if (token === "~") {
-    token = home;
-  } else if (token.startsWith("~/")) {
-    token = `${home}${token.slice(1)}`;
-  } else if (token.startsWith("${HOME}")) {
-    token = `${home}${token.slice("${HOME}".length)}`;
-  } else if (token.startsWith("$HOME")) {
-    token = `${home}${token.slice("$HOME".length)}`;
-  } else if (gateWorkspace.length > 0) {
-    if (token.startsWith("${AGENTOS_GATE_WORKSPACE}")) {
-      token = `${gateWorkspace}${token.slice("${AGENTOS_GATE_WORKSPACE}".length)}`;
-    } else if (token.startsWith("$AGENTOS_GATE_WORKSPACE")) {
-      token = `${gateWorkspace}${token.slice("$AGENTOS_GATE_WORKSPACE".length)}`;
+
+  const requireEnv = (name: string): string => {
+    const value = env[name];
+    if (value === undefined || value.length === 0) {
+      throw new Error(`unset or empty environment variable: ${name}`);
     }
+    return value;
+  };
+
+  if (token === "~") {
+    token = requireEnv("HOME");
+  } else if (token.startsWith("~/")) {
+    token = `${requireEnv("HOME")}${token.slice(1)}`;
   }
+
+  token = token.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) =>
+    requireEnv(name),
+  );
+  token = token.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, name: string) =>
+    requireEnv(name),
+  );
+
   return resolve(cwd, token);
 }
 
@@ -471,16 +486,18 @@ export function pathIsInsideGate(
   candidate: string,
   gateRoot: string,
   cwd: string,
-  home: string = process.env.HOME ?? "",
+  env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   if (candidate.length === 0) return false;
-  const resolved = resolveToolPath(candidate, cwd, home, gateRoot);
-  const gate = resolve(gateRoot);
-  const rel = relative(gate, resolved);
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+  try {
+    const resolved = resolveToolPath(candidate, cwd, env);
+    return isPathInsideRoot(gateRoot, resolved);
+  } catch {
+    return false;
+  }
 }
 
-/** Collect path-like arguments from a Pi tool call for gate-workspace denial. */
+/** Collect path-like arguments from a Pi tool call for seat path fencing. */
 export function collectToolPathCandidates(
   toolName: string,
   input: Record<string, unknown>,
@@ -513,9 +530,9 @@ export function collectToolPathCandidates(
   if (toolName === "bash" || toolName === "shell") {
     const command = typeof input.command === "string" ? input.command : "";
     if (command.length > 0) {
-      // Path-like tokens: absolute, ~/..., $HOME/..., ${HOME}/..., relative with /.
+      // Path-like tokens: absolute, ~/..., $VAR/..., ${VAR}/..., relative with /.
       const tokenRe =
-        /(?:^|[\s"'=])((?:~|\$\{?HOME\}?|\$\{?AGENTOS_GATE_WORKSPACE\}?)(?:\/[^\s"'\\;|&<>]*)?|(?:\.{1,2}\/)?(?:[^\s"'\\;|&<>]*\/)+[^\s"'\\;|&<>]*)/g;
+        /(?:^|[\s"'=])((?:~|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:\/[^\s"'\\;|&<>]*)?|\/[^\s"'\\;|&<>]+|(?:\.{1,2}\/)?(?:[^\s"'\\;|&<>]*\/)+[^\s"'\\;|&<>]*)/g;
       for (const match of command.matchAll(tokenRe)) {
         const token = match[1];
         if (token !== undefined) push(token);
@@ -527,21 +544,70 @@ export function collectToolPathCandidates(
 }
 
 /**
- * If any resolved path falls inside the gate workspace, return a block reason.
- * Otherwise null. Paths are expanded (~, $HOME) and resolved against cwd so
- * relative and home-relative bash argv cannot bypass the fence.
+ * Default-deny seat fence: a non-Brain seat may touch ONLY its own workspace
+ * plus neutral system/temp locations. Any path under AGENTOS_HOME that is not
+ * the seat workspace is refused. Unresolvable env tokens fail closed.
+ */
+export function seatFenceBlockReason(
+  toolName: string,
+  input: Record<string, unknown>,
+  seatWorkspace: string,
+  agentosHome: string,
+  cwd: string = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+  roleLabel: string = "seat",
+): string | null {
+  const seat = resolve(seatWorkspace);
+  const agentHome = resolve(agentosHome);
+  const neutralRoots: string[] = [];
+  for (const key of ["TMPDIR", "TMP", "TEMP"] as const) {
+    const value = env[key];
+    if (value !== undefined && value.length > 0) {
+      neutralRoots.push(resolve(value));
+    }
+  }
+
+  for (const candidate of collectToolPathCandidates(toolName, input)) {
+    let resolved: string;
+    try {
+      resolved = resolveToolPath(candidate, cwd, env);
+    } catch {
+      return `${roleLabel} path fence: unresolvable path token (fail closed)`;
+    }
+    // Seat workspace is the only allowed root under AGENTOS_HOME.
+    if (isPathInsideRoot(seat, resolved)) continue;
+    // Default-deny anything else under Agent OS home (secrets, events, sibling
+    // runs, gate dir for builders). Checked before neutral temps so a home
+    // nested under TMPDIR (common in tests) is never fail-open.
+    if (isPathInsideRoot(agentHome, resolved)) {
+      return `${roleLabel} is tool/fs-blocked outside its seat workspace (${seat}): refused path ${resolved}`;
+    }
+    // Neutral system/temp paths outside AGENTOS_HOME.
+    if (neutralRoots.some((root) => isPathInsideRoot(root, resolved))) continue;
+  }
+  return null;
+}
+
+/**
+ * Builder denylist helper kept for tests: refuse paths inside the gate tree.
+ * Production fencing uses {@link seatFenceBlockReason} (default-deny allowlist).
  */
 export function gateWorkspaceBlockReason(
   toolName: string,
   input: Record<string, unknown>,
   gateWorkspace: string,
   cwd: string = process.cwd(),
-  home: string = process.env.HOME ?? "",
+  env: NodeJS.ProcessEnv = process.env,
 ): string | null {
   const gate = resolve(gateWorkspace);
   for (const candidate of collectToolPathCandidates(toolName, input)) {
-    if (pathIsInsideGate(candidate, gate, cwd, home)) {
-      const resolved = resolveToolPath(candidate, cwd, home, gate);
+    let resolved: string;
+    try {
+      resolved = resolveToolPath(candidate, cwd, env);
+    } catch {
+      return `builder is tool/fs-blocked from the gate workspace (${gate}): unresolvable path token`;
+    }
+    if (isPathInsideRoot(gate, resolved)) {
       return `builder is tool/fs-blocked from the gate workspace (${gate}): refused path ${resolved}`;
     }
   }
@@ -553,19 +619,20 @@ export function pathIsInsideRoot(
   candidate: string,
   root: string,
   cwd: string,
-  home: string = process.env.HOME ?? "",
-  gateWorkspace: string = process.env.AGENTOS_GATE_WORKSPACE ?? "",
+  env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   if (candidate.length === 0) return false;
-  const resolved = resolveToolPath(candidate, cwd, home, gateWorkspace);
-  const base = resolve(root);
-  const rel = relative(base, resolved);
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+  try {
+    const resolved = resolveToolPath(candidate, cwd, env);
+    return isPathInsideRoot(root, resolved);
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Validator write-jail: allow paths inside the gate workspace; deny anything
- * else that resolves under AGENTOS_HOME. Fail closed when resolution fails.
+ * Validator write-jail: allow only the seat workspace under AGENTOS_HOME.
+ * Implemented as the default-deny seat fence with gate workspace as the seat.
  */
 export function validatorJailBlockReason(
   toolName: string,
@@ -573,35 +640,24 @@ export function validatorJailBlockReason(
   gateWorkspace: string,
   agentosHome: string,
   cwd: string = process.cwd(),
-  home: string = process.env.HOME ?? "",
+  env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  const gate = resolve(gateWorkspace);
-  const agentHome = resolve(agentosHome);
-  for (const candidate of collectToolPathCandidates(toolName, input)) {
-    let resolved: string;
-    try {
-      resolved = resolveToolPath(candidate, cwd, home, gate);
-    } catch {
-      return `validator write-jail: failed to resolve path token (fail closed)`;
-    }
-    const insideGate =
-      relative(gate, resolved) === "" ||
-      (() => {
-        const rel = relative(gate, resolved);
-        return !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
-      })();
-    if (insideGate) continue;
-    const insideAgentHome =
-      relative(agentHome, resolved) === "" ||
-      (() => {
-        const rel = relative(agentHome, resolved);
-        return !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
-      })();
-    if (insideAgentHome) {
-      return `validator is write-jailed to the gate workspace (${gate}): refused path ${resolved}`;
-    }
+  const reason = seatFenceBlockReason(
+    toolName,
+    input,
+    gateWorkspace,
+    agentosHome,
+    cwd,
+    env,
+    "validator",
+  );
+  if (reason === null) return null;
+  if (reason.includes("unresolvable")) {
+    return `validator write-jail: unresolvable path token (fail closed)`;
   }
-  return null;
+  const gate = resolve(gateWorkspace);
+  const refused = reason.match(/refused path (.+)$/)?.[1] ?? "";
+  return `validator is write-jailed to the gate workspace (${gate}): refused path ${refused}`;
 }
 
 /**
@@ -665,61 +721,26 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
     registerAgentOsTools(pi, host);
   }
 
-  // Path fences: report via ext.tool_blocked for audit. Fail closed on error.
-  const gateWorkspace = process.env.AGENTOS_GATE_WORKSPACE;
+  // Default-deny seat fence: report via ext.tool_blocked for audit. Fail closed.
+  // Non-Brain seats may access only AGENTOS_SEAT_WORKSPACE (+ neutral temp) under
+  // AGENTOS_HOME — secrets, events, sibling runs, and the gate dir (for builders)
+  // are outside the allowlist.
   const agentosHome = process.env.AGENTOS_HOME;
-  if (role === "builder" && gateWorkspace !== undefined && gateWorkspace.length > 0) {
-    pi.on?.("tool_call", (event: unknown) => {
-      try {
-        if (event === null || typeof event !== "object") {
-          const reason = "builder gate-dir fence: malformed tool_call event";
-          try {
-            host.toolBlocked("unknown", reason);
-          } catch {
-            // still block
-          }
-          return { block: true, reason };
-        }
-        const toolName =
-          typeof (event as { toolName?: unknown }).toolName === "string"
-            ? (event as { toolName: string }).toolName
-            : "";
-        const rawInput = (event as { input?: unknown }).input;
-        const input =
-          rawInput !== null && typeof rawInput === "object"
-            ? (rawInput as Record<string, unknown>)
-            : {};
-        const reason = gateWorkspaceBlockReason(toolName, input, gateWorkspace);
-        if (reason === null) return undefined;
-        host.toolBlocked(toolName.length > 0 ? toolName : "unknown", reason);
-        return { block: true, reason };
-      } catch (err) {
-        const reason =
-          err instanceof Error
-            ? `builder gate-dir fence error: ${err.message}`
-            : "builder gate-dir fence error: unexpected failure";
-        try {
-          host.toolBlocked("unknown", reason);
-        } catch {
-          // still block even if audit emit fails
-        }
-        return { block: true, reason };
-      }
-    });
-  }
-
-  // Validator write-jail: allow only the gate workspace under AGENTOS_HOME.
+  const seatWorkspace =
+    process.env.AGENTOS_SEAT_WORKSPACE ??
+    process.env.AGENTOS_GATE_WORKSPACE ??
+    "";
   if (
-    role === "validator" &&
-    gateWorkspace !== undefined &&
-    gateWorkspace.length > 0 &&
+    (role === "builder" || role === "validator") &&
     agentosHome !== undefined &&
-    agentosHome.length > 0
+    agentosHome.length > 0 &&
+    seatWorkspace.length > 0
   ) {
+    const roleLabel = role === "validator" ? "validator" : "builder";
     pi.on?.("tool_call", (event: unknown) => {
       try {
         if (event === null || typeof event !== "object") {
-          const reason = "validator write-jail: malformed tool_call event";
+          const reason = `${roleLabel} seat fence: malformed tool_call event`;
           try {
             host.toolBlocked("unknown", reason);
           } catch {
@@ -736,20 +757,26 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
           rawInput !== null && typeof rawInput === "object"
             ? (rawInput as Record<string, unknown>)
             : {};
-        const reason = validatorJailBlockReason(
-          toolName,
-          input,
-          gateWorkspace,
-          agentosHome,
-        );
+        const reason =
+          role === "validator"
+            ? validatorJailBlockReason(toolName, input, seatWorkspace, agentosHome)
+            : seatFenceBlockReason(
+                toolName,
+                input,
+                seatWorkspace,
+                agentosHome,
+                process.cwd(),
+                process.env,
+                "builder",
+              );
         if (reason === null) return undefined;
         host.toolBlocked(toolName.length > 0 ? toolName : "unknown", reason);
         return { block: true, reason };
       } catch (err) {
         const reason =
           err instanceof Error
-            ? `validator write-jail error: ${err.message}`
-            : "validator write-jail error: unexpected failure";
+            ? `${roleLabel} seat fence error: ${err.message}`
+            : `${roleLabel} seat fence error: unexpected failure`;
         try {
           host.toolBlocked("unknown", reason);
         } catch {

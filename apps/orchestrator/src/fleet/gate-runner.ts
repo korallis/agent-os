@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { TaskFailLedger, TaskRedProof, ValidationConfig } from "@agent-os/protocol";
@@ -118,12 +118,27 @@ export class GateRunner {
     if (this.proofSecret !== null) return this.proofSecret;
     const dir = join(this.home, "secrets");
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      // best-effort owner-only
+    }
     const path = join(dir, "gate-proof.key");
     if (existsSync(path)) {
       this.proofSecret = readFileSync(path);
+      try {
+        chmodSync(path, 0o600);
+      } catch {
+        // best-effort owner-only
+      }
     } else {
       const secret = randomBytes(32);
       writeFileSync(path, secret, { mode: 0o600 });
+      try {
+        chmodSync(path, 0o600);
+      } catch {
+        // best-effort owner-only
+      }
       this.proofSecret = secret;
     }
     return this.proofSecret;
@@ -194,18 +209,27 @@ export class GateRunner {
   }
 
   /**
-   * Install a proof recovered from the append-only event log. Re-signs with the
-   * daemon secret so the event stream does not need to carry the HMAC material.
+   * Install a proof recovered from the append-only event log.
+   * Verifies the stored HMAC against the daemon key — never re-signs disk or
+   * log content (re-signing would turn the event log into an authorization oracle).
    */
   installRedProofFromEvent(
     taskId: string,
-    input: { gateSourceHash: string; outcome: "EXPECTED_RED" | "FAIL"; provenAt: string },
-  ): RedProof {
-    return this.recordRedProof(taskId, {
+    input: {
+      gateSourceHash: string;
+      outcome: "EXPECTED_RED" | "FAIL";
+      provenAt: string;
+      hmac: string;
+    },
+  ): RedProof | null {
+    const proof: RedProof = {
       gateSourceHash: input.gateSourceHash,
       outcome: input.outcome,
       provenAt: input.provenAt,
-    });
+      hmac: input.hmac,
+    };
+    if (!this.installRedProof(taskId, proof)) return null;
+    return proof;
   }
 
   /**

@@ -40,12 +40,13 @@ const BASE_ALLOWLIST = new Set([
   "COLORTERM",
   "SHELL",
   "SSH_AUTH_SOCK",
-  // AGENTOS_HOME is granted only via extraAllow (Brain + validator fence root).
-  // Builders must not inherit a path into ~/.agentos/runs/*/gate-workspace.
+  // AGENTOS_HOME / AGENTOS_SEAT_WORKSPACE are granted only via extraAllow
+  // (default-deny seat fence). Signing keys are never env values.
   "AGENTOS_SESSION_ID",
   "AGENTOS_SOCKET",
   "AGENTOS_ROLE",
   "AGENTOS_GATE_WORKSPACE",
+  "AGENTOS_SEAT_WORKSPACE",
   "PI_CONFIG_DIR",
   "PI_HOME",
   "XDG_CONFIG_HOME",
