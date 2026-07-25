@@ -290,10 +290,12 @@ Invariants (all retained; enforcement locus clarified **[R3]**):
 - Role sessions keyed `{projectId, role, provider/model}`; no cross-model transcript replay — structural via Pi session dirs. **[CONSENSUS + R2]**
 - VALIDATOR repo-read-only; BUILDER one worktree, cannot touch gate artifacts, never runs the gate as authority — **only the substrate's gate run counts, and the gate never trusts any LLM, including the Brain**. **[CONSENSUS + R3]**
 - Corrections are verbatim FAIL lines: the substrate injects gate output directly on `send_to_crew(gateFail)` — the Brain routes, it cannot rewrite. **[CONSENSUS, enforcement R3]**
-- Baseline RED must be semantic; `GATE_ERROR` never counts as RED; final PASS from the RED-proven gate hash. [B]
+- Baseline RED must be semantic; `GATE_ERROR` never counts as RED and **does not consume a validation attempt** (infrastructure failure proves nothing about the code — run result carries an explicit `infrastructureError` flag). Final PASS is only meaningful against a RED-proven **gate source hash**. [B]+[Phase 5]
+- RED proof is keyed to the sha256 of the gate **source** (HMAC-signed, daemon memory + `gate.red_proven` log replay — never seat-writable disk alone). Editing the gate invalidates the proof; revisions must re-prove RED before a candidate run. **[Phase 5]**
 - Turn ends are structural (`agent_settled`), never guessed. **[R2]**
-- Halt at `maxValidations` → `VALIDATION_EXHAUSTED`; `+yolo` does not override (policy default; weakening it is possible only by the Captain and is evidence-stamped). **[CONSENSUS + R3]**
+- Halt at `maxValidations` → `VALIDATION_EXHAUSTED` from **BUILDING or VALIDATING** (a candidate can FAIL directly from BUILDING); `+yolo` does not override (policy default; weakening it is possible only by the Captain and is evidence-stamped). **[CONSENSUS + R3 + Phase 5]**
 - **[R3]** Task/gate **state remains a typed state machine** recorded by the substrate: events are the source of truth, transitions are validated, illegal transitions are rejected as typed tool errors. The Brain chooses *which* legal transition to take; it cannot invent transitions.
+- Cross-family builder≠validator is enforced at **`resolve_cast` and again at spawn** (family re-derived server-side from the model string); Captain overrides are evidence-stamped in `policyOverrides` and honoured at both sites. **[Phase 5]**
 
 ### 2.4 Fleet / secondmate topology (mermaid)
 
@@ -423,7 +425,7 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 
 pnpm workspaces + Turborepo (§2.1). Marketing lives at `apps/marketing` (verbatim migration from the former root `src/`); shared design-system primitives live in `packages/ui`. [A]
 
-**Phase 4 as-built** (fleet substrate, Brain tool surface, `/opinion`·`/fusion`·plan-fusion primitives, layered prompt packs, real Pi harness path, live tasks/projects boards) is the current tree; later-phase modules below remain planned. Authoritative route inventory: §7. Executable gates: `tooling/gates/phase-{1,2,3,4}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
+**Phase 5 as-built** (cross-family auto-validation in the task lifecycle: RED-before-builder, HMAC source-hash RED proofs, dual-site same-family refusal, uv/PEP 723 + `gate.ts` runners, verbatim FAIL inject, halt at cap from BUILDING/VALIDATING) is the current daemon tree; Phase 4 fleet/fusion substrate remains. Console auto-validate evidence columns, Fleet chart/table fixtures, and Analytics panels remain Phase 6. Authoritative route inventory: §7. Executable gates: `tooling/gates/phase-{1,2,3,4,5}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
 
 ```
 agent-os/
@@ -433,7 +435,7 @@ agent-os/
 ├── tsconfig.base.json                # strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes
 ├── eslint.config.mjs                 # @typescript-eslint/no-explicit-any: error
 ├── .github/workflows/
-│   ├── ci.yml                        # typecheck/lint/build/test + phase-1/2/3/4 gates
+│   ├── ci.yml                        # typecheck/lint/build/test + phase-1…5 gates
 │   └── pi-canary.yml                 # weekly: harness contract suite vs latest Pi [R2]
 ├── docs/{plans,qa,screenshots}/
 ├── apps/
@@ -485,11 +487,11 @@ agent-os/
 │   └── fusion-core/                  # pure fusion contract/templates/attribution (no I/O) [B]
 ├── scripts/verify-no-deprecated.mjs
 └── tooling/
-    ├── gates/phase-{1,2,3,4}.mjs     # executable phase gates
+    ├── gates/phase-{1,2,3,4,5}.mjs   # executable phase gates
     └── screenshots/capture-console.mjs  # Playwright PR evidence (pnpm screenshots)
 ```
 
-**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); Phase 4 ships `dispatch_fusion` executors for opinion / fusion / plan-fusion plus `fleet/fusion-runs.ts`, `fleet/sessions.ts`, and `prompts/service.ts` — `/auto-validate` remains Phase 5; Console fusion side-by-side columns remain Phase 6.
+**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); Phase 4 ships `dispatch_fusion` executors for opinion / fusion / plan-fusion plus `fleet/fusion-runs.ts`, `fleet/sessions.ts`, and `prompts/service.ts`. **Phase 5** ships lifecycle auto-validate (`gate-runner` + tool-surface RED proofs / FAIL ledgers / seat fences; `tooling/gates/phase-5.mjs` G1–G9). Console fusion side-by-side columns and auto-validate evidence UI remain Phase 6.
 ---
 
 ## 4. Provider Connection Subsystem
@@ -656,7 +658,9 @@ QUEUED → DISPATCH_RESOLVED | BLOCKED_DISPATCH
        → DELIVERING → DONE
 Any state → NEEDS_CAPTAIN → resumed | CANCELLED
 Any state → FAILED (cause enum) | SESSION_LOST → reconciled
-VALIDATING at cap → VALIDATION_EXHAUSTED [B]
+BUILDING | VALIDATING at cap → VALIDATION_EXHAUSTED [B]+[Phase 5]
+  (default policy: no skip DISPATCH_RESOLVED/PLAN_FUSED → BUILDING without RED;
+   those edges restore only when redBaselineGateRequired is off or Captain-overridden)
 BRAIN_DOWN (fleet-level flag, §5.8) — substrate-only degraded mode [R3]
 ```
 
@@ -669,12 +673,12 @@ BRAIN_DOWN (fleet-level flag, §5.8) — substrate-only degraded mode [R3]
 | `read_fleet_state` | `() → StateSnapshot` | — (read-only; the Brain's reconcile primitive) |
 | `read_task` / `read_run_artifacts` | `(id) → detail/manifest` | path-jailed |
 | `resolve_cast` | `(taskId, roles → {model, thinking})` → validated cast | **cross-family invariants, budgets, health/quota eligibility — violating cast = typed error**; [R5] consumes live probe data — a `LIMIT REACHED` connection is excluded with a Console-visible reason + typed error detail |
-| `spawn_crewmate` | `(taskId, role, cast, promptTemplateRef, vars)` | guard policy attach; clean-room flags; env scrub; pool lease |
+| `spawn_crewmate` | `(taskId, role, cast, promptTemplateRef, vars, redBaselineOverride?)` | guard policy attach; clean-room flags; env scrub; pool lease; **builder requires current RED proof unless overridden (stamped); family re-check at spawn** |
 | `stop_crewmate` / `respawn_crewmate` | `(sessionId, reason)` | respawn cap (config #5); evidence-stamped |
 | `dispatch_fusion` | `(kind: opinion\|fusion\|plan-fusion, casts, instructionTemplateRef, vars)` | ≥2 families for plan-fusion; artifact contracts |
 | `author_gate` | `(taskId, validatorCast)` | validator write-jail; gate-before-build ordering |
-| `run_gate` | `(taskId, target: baseline\|candidate)` | **deterministic gate runner; RED/hash rules; Brain cannot alter gate output** |
-| `send_to_crew` | `(sessionId, message \| gateFailRef)` | `gateFailRef` injects verbatim substrate-held FAIL lines — not Brain-paraphrasable |
+| `run_gate` | `(taskId, target: baseline\|candidate)` | **deterministic gate runner; RED/source-hash rules; `GATE_ERROR` ≠ attempt; Brain cannot alter gate output** |
+| `send_to_crew` | `(sessionId, message \| gateFailRef)` | `gateFailRef` injects verbatim substrate-held FAIL lines — hash-matched at inject; not Brain-paraphrasable |
 | `answer_crewmate` | `(questionId, answer)` | routes `ask_captain` answers |
 | `deliver_task` | `(taskId)` | mode tail (pipeline/direct-pr/local-only); `ao/*` branch rules; git guardrails |
 | `escalate_to_captain` / `notify_captain` | `(taskId?, summary, severity)` | NEEDS_CAPTAIN transition; Console + OS notification |
@@ -798,7 +802,7 @@ Unchanged from Rev 2 in substance; instructions now come from editable templates
 
 **Default runner — [R4, Captain-directed research flips Rev-1 D5 to [B]]: `gate.py` executed via `uv run` with PEP 723 inline script metadata.** `gate.ts` (`node --experimental-strip-types`) remains available as the per-project policy override (`validation.gateLanguage`, config #6). Evidence (2026-07, verified): Node 24's type stripping is stable and flag-free but has **no inline-dependency mechanism** — a standalone `gate.ts` needing libraries must lean on the product's or target repo's `node_modules`, coupling grader to gradee; uv's PEP 723 support declares deps in the script header and resolves them into an **isolated cached venv** (~200 ms cached runs, ~3 s cold — negligible vs LLM latencies) with zero environment pollution, and uv auto-fetches Python itself. LLM validators author Python verification scripts with the highest reliability across families, and fusion-harness proved exactly this gate pattern in production. Bonus independence layer: grader runtime (Python/uv) ≠ product runtime (Node). Isolation also reduces false `GATE_ERROR`s from environment drift. **`uv` becomes a hard v1 dependency** (doctor check + install docs). *This closes Rev-1's gate-language open question; [A]'s "Node is guaranteed by construction" argument is superseded — uv makes Python-with-deps guaranteed by construction too, without touching the product's dependency graph.*
 
-Protocol **unchanged** ([B], wholesale): `gate-manifest.json`, named `EXPECTED_RED`, `PASS|FAIL|GATE_ERROR` lines, semantic RED, content-hash freeze, validator-only revisions re-proving RED at `ao/baseline/<taskId>`, verbatim FAIL delivery (substrate-injected). Loop budgets `maxValidations` 6 / `triageAt` 3 — config #6, [B]'s 3/2 as the documented frugal preset.
+Protocol ([B] + Phase 5 as-built): named `EXPECTED_RED`, `PASS|FAIL|GATE_ERROR` lines, semantic RED only (never infrastructure), **gate-source sha256** as revision identity with daemon-HMAC RED proofs (`gate.red_proven` + process memory; seat disk is cache only), validator-only revisions re-proving RED before candidate, verbatim FAIL delivery (substrate-composed, hash-matched at inject). Loop budgets `maxValidations` 6 / `triageAt` 3 — config #6, [B]'s 3/2 as the documented frugal preset.
 
 ### 6.5 Isolation & sessions — Pi mechanics **[R2]**
 
@@ -1214,15 +1218,15 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] Aggregator family retention: fusion agent runs on the architect side's family (first planner in the cast); recorded on the run record (G5). [B]
 - [x] **Template gates [R3]:** editing `prompts/fusion/fusion.md` (global) changes the next run's rendered instruction (hash-verified, G7); a project prompt override wins over global (G9); `{{VAR}}` interpolation rejects undefined variables with a typed error (G8); customized-template detection + three-way diff data served (`shippedAtInstall` hash — install text not retained; G10).
 
-**Phase 5 — Cross-family auto-validation (3 wk)** — unchanged from Rev 2:
-- [ ] `GATE_ERROR` ≠ RED; named `EXPECTED_RED` before builder starts. [B]
-- [ ] Baseline-pass fixture → `GATE DEFECT`, no builder spawn. [A]
-- [ ] Same-family builder/validator impossible via API, CLI, profile import, recovery, **and Brain tool calls** [R3]; override stamped.
-- [ ] Builder tool+fs-blocked from gate dir; validator write-jailed. [B]+[R2]
-- [ ] Verbatim FAIL lines substrate-injected, hash-matched. [B]+[R3]
-- [ ] Gate revisions re-prove RED before candidate runs. **[CONSENSUS]**
-- [ ] **`uv` gate-runtime gates [R4]:** a `gate.py` with PEP 723 inline deps runs in an isolated cached venv — a gate importing a library absent from the target repo executes without touching the product's `node_modules`/venv (isolation fixture); cached re-runs complete well under gate timeout margins; missing `uv` fails `doctor` at setup, and is reported as an infrastructure error, never as a gate `RED`; a project with `validation.gateLanguage: "ts"` runs `gate.ts` via `node --experimental-strip-types` (override honored).
-- [ ] E2E: plan-fusion → build → GREEN within cap; unresolved fixture halts exactly at the configured cap (and at a *reconfigured* cap — config honored [R3]).
+**Phase 5 — Cross-family auto-validation (3 wk)** — daemon + gates shipped (`tooling/gates/phase-5.mjs` G1–G9; vitest harness coverage in `phase3-harness` / related). Console auto-validate evidence rendering remains Phase 6 (deliberately deferred).
+- [x] `GATE_ERROR` ≠ RED; named `EXPECTED_RED` before builder starts. [B] (G1, G2)
+- [x] Baseline-pass fixture → `GATE DEFECT`, no builder spawn. [A] (G2)
+- [x] Same-family builder/validator impossible via API, CLI, profile import, recovery, **and Brain tool calls** [R3]; override stamped. (G3 + spawn re-check; family re-derived server-side)
+- [x] Builder tool+fs-blocked from gate dir; validator write-jailed. [B]+[R2] (G4)
+- [x] Verbatim FAIL lines substrate-injected, hash-matched. [B]+[R3] (G5)
+- [x] Gate revisions re-prove RED before candidate runs. **[CONSENSUS]** (G6 — proof keyed to gate source hash; forged seat disk ignored)
+- [x] **`uv` gate-runtime gates [R4]:** a `gate.py` with PEP 723 inline deps runs in an isolated cached venv — a gate importing a library absent from the target repo executes without touching the product's `node_modules`/venv (isolation fixture); missing `uv` fails `doctor` at setup, and is reported as an infrastructure error, never as a gate `RED`; a project with `validation.gateLanguage: "ts"` runs `gate.ts` via `node --experimental-strip-types` (override honored). (G7, G8)
+- [x] E2E: unresolved fixture halts exactly at the configured cap (and at a *reconfigured* cap — config honored [R3]). (G9; `BUILDING → VALIDATION_EXHAUSTED` edge so the cap is reachable when FAIL lands from BUILDING)
 
 **Phase 6 — Console completion (2 wk)** — Rev-2 gates plus Policies page [R3]:
 - [ ] Playwright: all **9** pages render from a seeded daemon; Fleet reflects change ≤1 s. [A]
