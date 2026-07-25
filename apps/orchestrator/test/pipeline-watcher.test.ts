@@ -153,4 +153,120 @@ describe("PipelineWatcher", () => {
     expect(watcher.status().transport).toBe("unavailable");
     watcher.stop();
   });
+
+  it("marks the view unreadable when state.sqlite disappears mid-session", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-missing-db-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+    });
+    watcher.start();
+    expect(watcher.status().compatibility.ok).toBe(true);
+    expect(events.some((e) => e.type === "pipeline.run_updated")).toBe(true);
+
+    events.length = 0;
+    rmSync(join(gateHome, "state.sqlite"), { force: true });
+    rmSync(join(gateHome, "state.sqlite-wal"), { force: true });
+    rmSync(join(gateHome, "state.sqlite-shm"), { force: true });
+    watcher.tick();
+
+    expect(watcher.status().compatibility.ok).toBe(false);
+    expect(watcher.status().transport).toBe("unavailable");
+    expect(events.some((e) => e.type === "pipeline.unavailable")).toBe(true);
+    watcher.stop();
+  });
+
+  it("on recovery force-emits current runs so the Console observes a frame", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-recover-"));
+    homes.push(gateHome);
+    let db = buildGate(gateHome);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', NULL, 'round 1', ?, NULL, NULL)`,
+    ).run(now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+    });
+    watcher.start();
+    expect(events.filter((e) => e.type === "pipeline.run_updated")).toHaveLength(1);
+
+    // Break the schema so the view becomes unreadable.
+    db = new Database(join(gateHome, "state.sqlite"));
+    db.exec("ALTER TABLE step_results RENAME COLUMN findings_json TO findings_blob");
+    db.close();
+    events.length = 0;
+    // Force a probe failure path: compatibility was ok; tick will eventually fail reads.
+    // Directly re-check after the rename.
+    watcher.checkCompatibility();
+    expect(watcher.status().compatibility.ok).toBe(false);
+    watcher.tick();
+    expect(events.some((e) => e.type === "pipeline.unavailable")).toBe(true);
+
+    // Restore the column name and recover.
+    db = new Database(join(gateHome, "state.sqlite"));
+    db.exec("ALTER TABLE step_results RENAME COLUMN findings_blob TO findings_json");
+    db.close();
+    events.length = 0;
+    watcher.tick();
+
+    expect(watcher.status().compatibility.ok).toBe(true);
+    expect(watcher.status().transport === "wal-assisted" || watcher.status().transport === "interval-only").toBe(
+      true,
+    );
+    const recovered = events.filter((e) => e.type === "pipeline.run_updated");
+    expect(recovered.length).toBe(1);
+    if (recovered[0]?.type === "pipeline.run_updated") {
+      expect(recovered[0].payload.runId).toBe("run1");
+    }
+    watcher.stop();
+  });
+
+  it("emits unavailable when watchPipeline is turned off", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-watch-off-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+    });
+    watcher.start();
+    expect(watcher.status().transport).not.toBe("unavailable");
+
+    events.length = 0;
+    watcher.applyConfig({ watchPipeline: false, pollMs: 1000 });
+    expect(watcher.status().transport).toBe("unavailable");
+    expect(events.some((e) => e.type === "pipeline.unavailable")).toBe(true);
+    watcher.stop();
+  });
 });

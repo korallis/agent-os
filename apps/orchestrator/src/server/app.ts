@@ -772,13 +772,18 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       return;
     }
     const status = deps.pipeline.status();
-    // Schema drift / unreadable gate: never serve prior snapshots as current.
-    if (!status.compatibility.ok) {
+    // Whenever the view is not currently readable — schema drift, watching
+    // disabled, missing DB, repeated read failures — serve empty, not last-known.
+    if (!status.compatibility.ok || status.transport === "unavailable") {
       void reply;
       return {
         runs: [],
         unavailable: true as const,
-        reason: status.compatibility.reason,
+        reason:
+          status.compatibility.reason ??
+          (status.transport === "unavailable"
+            ? "pipeline watcher is not reading the gate"
+            : null),
       };
     }
     const { events } = deps.store.eventsOfTypes(["pipeline.run_updated"], 500);

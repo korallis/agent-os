@@ -92,6 +92,7 @@ export function PipelineView() {
   const [runs, setRuns] = useState<PipelineRunSnapshot[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [logs, setLogs] = useState<Record<string, string>>({});
+  const [recoveryPoll, setRecoveryPoll] = useState(0);
   const { events } = useEventStream();
 
   const logChars = status?.profile?.pipelineLogChars ?? 20_000;
@@ -103,6 +104,29 @@ export function PipelineView() {
         envelope.event.type === "pipeline.run_updated" ||
         envelope.event.type === "pipeline.unavailable",
     )?.id ?? "none";
+
+  // Profile / watch knobs land as config.changed and must re-fetch status so
+  // pipelineLogChars and transport updates take effect without a run frame.
+  const observabilityConfigCursor =
+    events.find(
+      (envelope) =>
+        envelope.event.type === "config.changed" &&
+        envelope.event.payload.domain === "observability",
+    )?.id ?? "none";
+
+  const viewUnreadable =
+    status !== null &&
+    (!status.compatibility.ok || status.transport === "unavailable");
+
+  // While unreadable, poll so recovery is observed even when no new run frame
+  // arrives (empty gate after the DB returns, watch re-enabled with no runs).
+  useEffect(() => {
+    if (!viewUnreadable) return;
+    const id = setInterval(() => {
+      setRecoveryPoll((n) => n + 1);
+    }, 2000);
+    return () => clearInterval(id);
+  }, [viewUnreadable]);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,15 +144,17 @@ export function PipelineView() {
         };
         if (cancelled) return;
         setStatus(statusBody.pipeline);
-        // Never paint prior snapshots when the gate is unreadable.
-        if (
+        // Never paint prior snapshots when the gate is not currently readable.
+        const unreadable =
           statusBody.pipeline.compatibility.ok === false ||
-          runsBody.unavailable === true
-        ) {
+          statusBody.pipeline.transport === "unavailable" ||
+          runsBody.unavailable === true;
+        if (unreadable) {
           setRuns([]);
         } else {
           setRuns(runsBody.runs);
         }
+        setFailed(false);
       } catch {
         if (!cancelled) setFailed(true);
       }
@@ -136,29 +162,28 @@ export function PipelineView() {
     return () => {
       cancelled = true;
     };
-  }, [pipelineCursor]);
+  }, [pipelineCursor, observabilityConfigCursor, recoveryPoll]);
 
-  // Incremental log output, accumulated per run+step from the live stream.
-  // Retention is driven by the active observability profile's pipelineLogChars.
+  // Rebuild log text purely from the live buffer — never fold the whole buffer
+  // onto prior state (that duplicated every chunk on each stream update).
+  // Retention is driven by the active observability profile's pipelineLogChars;
+  // a smaller retention re-bounds what is already on screen.
   useEffect(() => {
-    const appended = events.filter((e) => e.event.type === "pipeline.log_appended");
-    if (appended.length === 0) return;
     const retention = Math.max(0, logChars);
-    setLogs((current) => {
-      const next = { ...current };
-      // Oldest-first so the accumulated text reads in order.
-      for (const envelope of [...appended].reverse()) {
-        if (envelope.event.type !== "pipeline.log_appended") continue;
-        const { runId, step, chunk } = envelope.event.payload;
-        const key = `${runId}:${step}`;
-        if (retention === 0) {
-          next[key] = "";
-          continue;
-        }
-        next[key] = `${next[key] ?? ""}${chunk}`.slice(-retention);
-      }
-      return next;
-    });
+    if (retention === 0) {
+      setLogs({});
+      return;
+    }
+    const appended = events.filter((e) => e.event.type === "pipeline.log_appended");
+    const next: Record<string, string> = {};
+    // events is newest-first; accumulate oldest-first so text reads in order.
+    for (const envelope of [...appended].reverse()) {
+      if (envelope.event.type !== "pipeline.log_appended") continue;
+      const { runId, step, chunk } = envelope.event.payload;
+      const key = `${runId}:${step}`;
+      next[key] = `${next[key] ?? ""}${chunk}`.slice(-retention);
+    }
+    setLogs(next);
   }, [events, logChars]);
 
   const unavailableEvent = useMemo(
@@ -177,9 +202,10 @@ export function PipelineView() {
   }
 
   const incompatible = status !== null && !status.compatibility.ok;
-  // Suppress the run list whenever compatibility is false — the banner claims
-  // nothing below is current, so nothing below may be rendered as current.
-  const visibleRuns = incompatible ? [] : (runs ?? []);
+  const transportDown = status !== null && status.transport === "unavailable";
+  // Suppress the run list whenever the view is not readable — a banner that
+  // says nothing below is current must not sit above last-known rows.
+  const visibleRuns = incompatible || transportDown ? [] : (runs ?? []);
 
   return (
     <div className="flex flex-col gap-5">

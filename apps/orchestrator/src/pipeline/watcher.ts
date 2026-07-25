@@ -216,8 +216,14 @@ export class PipelineWatcher {
   applyConfig(options: { watchPipeline: boolean; pollMs: number }): void {
     this.pollMs = options.pollMs;
     if (!options.watchPipeline) {
+      const wasReading = this.started || this.transport !== "unavailable";
       this.stop();
       this.transport = "unavailable";
+      // Drop any claim that prior snapshots are still current, and wake the
+      // Console so it stops painting last-known rows under UNAVAILABLE.
+      if (wasReading) {
+        this.markUnavailable("pipeline watching is disabled");
+      }
       return;
     }
     if (!this.started) {
@@ -238,6 +244,11 @@ export class PipelineWatcher {
   start(): void {
     this.stop();
     this.started = true;
+    // A (re)start must re-project current runs — fingerprints from a prior
+    // session would suppress the frames the Console needs to leave unreadable.
+    this.lastFingerprint.clear();
+    this.incompatibilityReported = false;
+    this.structuredReadFailures = 0;
     const compat = this.checkCompatibility();
     if (!compat.ok) {
       this.transport = "unavailable";
@@ -308,19 +319,27 @@ export class PipelineWatcher {
     });
   }
 
+  /** Mark the view unreadable and emit once so nothing is shown as current. */
+  private markUnavailable(reason: string, missingColumns: string[] = []): void {
+    this.compatibility = {
+      ok: false,
+      reason,
+      missingColumns,
+    };
+    this.transport = "unavailable";
+    this.incompatibilityReported = false;
+    this.reportIncompatibility();
+  }
+
   private markStructuredReadFailed(error: unknown): void {
     this.structuredReadFailures += 1;
     if (this.structuredReadFailures < MAX_STRUCTURED_READ_FAILURES) return;
-    this.compatibility = {
-      ok: false,
-      reason:
-        error instanceof Error
-          ? `structured pipeline read failed repeatedly: ${error.message}`
-          : "structured pipeline read failed repeatedly",
-      missingColumns: this.compatibility.missingColumns,
-    };
-    this.transport = "unavailable";
-    this.reportIncompatibility();
+    this.markUnavailable(
+      error instanceof Error
+        ? `structured pipeline read failed repeatedly: ${error.message}`
+        : "structured pipeline read failed repeatedly",
+      this.compatibility.missingColumns,
+    );
   }
 
   /** One structured read. Bounded, absorbing, and silent when nothing moved. */
@@ -330,17 +349,26 @@ export class PipelineWatcher {
       if (!this.compatibility.ok) {
         const compat = this.checkCompatibility();
         if (!compat.ok) {
+          this.transport = "unavailable";
           this.reportIncompatibility();
           return;
         }
-        // Recovered — a later no-mistakes version restored what we need.
+        // Recovered — restore transport and force-emit current runs so the
+        // Console observes a frame and leaves the unreadable banner.
         this.incompatibilityReported = false;
         this.structuredReadFailures = 0;
+        this.lastFingerprint.clear();
         this.attachWalWatch();
         this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
+        this.restartTimer();
       }
       db = this.open();
-      if (db === null) return;
+      if (db === null) {
+        // After a healthy period, a missing or unopenable DB must not leave
+        // last-known rows serving under a quietly growing lag.
+        this.markUnavailable(`no-mistakes state not found at ${this.dbPath()}`);
+        return;
+      }
 
       const runs = db
         .prepare(
