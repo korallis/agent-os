@@ -2,8 +2,8 @@
 
 > **Provenance:** FUSED MASTER PLAN produced by the FUSION agent from two independent plans:
 > **[A]** = PLAN A (`plan-a-fable.md`, architect: Claude Fable 5, thinking high) · **[B]** = PLAN B (`plan-b-sol.md`, architect: GPT-5.6 Sol, medium).
-> **[CONSENSUS]** marks positions both plans reached independently. **[R2]** marks the Pi single-harness revision; **[R3]** marks the LLM-Brain + full-configurability revision; **[R4]** marks the Captain's decisions revision; **[R5]**/**[R5.1]** mark the live quota & balance metering revision and its detection-driven amendment; **[R6]** marks the guided onboarding wizard + Claude Agent SDK subscription-billing revision (all Captain's directives). Divergences are resolved inline with attribution and a one-to-two-sentence rationale; materially contested losers are preserved as "Rejected alternative" notes. A mandatory **Consensus & Divergence** ledger closes the document.
-> **Status:** Revision 6.3 — Figma canonical UI spec, 2026-07-24.
+> **[CONSENSUS]** marks positions both plans reached independently. **[R2]** marks the Pi single-harness revision; **[R3]** marks the LLM-Brain + full-configurability revision; **[R4]** marks the Captain's decisions revision; **[R5]**/**[R5.1]** mark the live quota & balance metering revision and its detection-driven amendment; **[R6]** marks the guided onboarding wizard + Claude Agent SDK subscription-billing revision; **[R7]** marks live pipeline visibility + auto-balancer roadmap; **[R8]** marks the configurable per-model harness (reverses Pi-only) + external-review remediation (all Captain's directives). Divergences are resolved inline with attribution and a one-to-two-sentence rationale; materially contested losers are preserved as "Rejected alternative" notes. A mandatory **Consensus & Divergence** ledger closes the document.
+> **Status:** Revision 8 — configurable per-model harness (R8) + R7 roadmap, 2026-07-26.
 
 ---
 
@@ -1344,7 +1344,11 @@ Gates:
 - [ ] Balancer and Brain handoff do not fight: a fixture with two over-threshold providers converges instead of oscillating, and the Brain seat is moved by the handoff path only — the balancer never calls `brain.handoff()` and never clears `handoffFrom`/`handoffReason`.
 - [ ] Every balancing decision is recorded with its reason and inputs (roster, headroom per candidate, whether cost was usable), so a Captain can ask "why this model?" and get an answer from the log rather than an inference.
 
-**[R8] Revision note (Captain, 2026-07-26).** Two additions. (1) *Configurable per-model harness* — Phase 12 — which **supersedes** the founding "Pi as the single backend harness" decision in `AGENTS.md`: Pi remains the default, but the harness becomes the Captain's choice. Scoped from an audit of what the substrate actually depends on from Pi and a researched capability matrix for Claude Code, Codex CLI, Kimi CLI and OpenCode; the honest finding is that cost telemetry, session isolation and the clean-room proof all degrade off Pi, so the design makes each adapter DECLARE its capabilities and renders absence rather than blanks. (2) *External-review remediation* — Phase 13 — from `docs/k3sugestions.md`, independently verified file-by-file; three claims were corrected and the rest scheduled.
+**Phase 11 — Structural WEDGED ladder & config hot-reload (shipped)** — branch `phase-11/wedged-ladder-and-audit`
+
+Not a new product surface: closes the last open **Phase 3** criterion and a latent substrate bug that gate work exposed. The branch ships (1) the structural **WEDGED** ladder — live pane, silence past `supervision.staleMinutes.build`, distinct from `SESSION_LOST` — bounded by `supervision.respawnPerStage` (respawn once, evidence-stamped, then escalate); (2) wiring so config hot-reload actually reaches the fleet (`FleetService.reloadConfig` is called on valid reloads: watcher thresholds, worktree pool, gate runner, Brain cast, reconcile cadence), not only `/v1/config/effective`. Recorded here so the phase sequence stays continuous and the `phase-11/…` branch name does not point at a missing roadmap slot.
+
+**[R8] Revision note (Captain, 2026-07-26).** Two additions. (1) *Configurable per-model harness* — Phase 12 — which **supersedes** the founding "Pi as the single backend harness" decision in `AGENTS.md`: Pi remains the default, but the harness becomes the Captain's choice. Scoped from an audit of what the substrate actually depends on from Pi and a researched capability matrix for Claude Code, Codex CLI, Kimi CLI and OpenCode; the honest finding is that cost telemetry, session isolation and the clean-room proof all degrade off Pi, so the design makes each adapter DECLARE its capabilities and renders absence rather than blanks. (2) *External-review remediation* — Phase 13 — from `docs/k3sugestions.md`, independently verified file-by-file; three claims were corrected and the rest scheduled. Full ledger entry in §14.
 
 **[R7] Revision note (Captain, 2026-07-25).** Two product-shaping requests, planned before any implementation:
 1. *Live visibility into the `no-mistakes` gate* — "when things enter no-mistakes our app has a live view of it rather than just polling". Grounded in an investigation of `no-mistakes v1.40.0`'s actual surfaces rather than assumed capability; the honest finding is that a true push channel exists (socket `subscribe`) but is undocumented and apparently unused even by its own TUI, so the design pushes-first and falls back to a tailed log + read-only SQLite, **stating which mode is live**.
@@ -1364,7 +1368,7 @@ The Captain's requirement: every model should be runnable through its native CLI
 |---|---|---|---|---|---|
 | Headless one-shot | FULL | FULL | FULL | FULL | FULL |
 | Structured JSONL | FULL | FULL | FULL | FULL | FULL |
-| **Tokens + USD per request** | **FULL** | PART (run-level `total_cost_usd`; subscription accuracy unverified) | **tokens only — no dollars, ever** | **NO/?** | **FULL** |
+| **Tokens + USD per request** | **FULL** | PART (run-level `total_cost_usd`; under subscription OAuth → **ESTIMATED/unverified** until proven bill-accurate) | **tokens only — no dollars, ever** | **NO/?** | **FULL** |
 | Session dir separable from auth | FULL | NO (`CLAUDE_CONFIG_DIR` moves auth too) | NO (`CODEX_HOME`) | NO | NO (`XDG_DATA_HOME`) |
 | Supervisor tool bridge | FULL (in-proc) | PART (hooks + MCP) | PART-FULL via `app-server` | PART-FULL via wire mode (experimental) | PART-FULL (plugins + HTTP/SSE) |
 | Arbitrary model | FULL | **NO — Anthropic only** | PART (Responses-API only) | FULL | FULL |
@@ -1374,7 +1378,7 @@ The Captain's requirement: every model should be runnable through its native CLI
 **[R8] Design decisions the research forced:**
 - **Harness choice constrains model choice, and the UI must say so.** Claude Code cannot run Sol 5.6 — it is Anthropic-family only. The picker must present *valid pairs*, not two independent dropdowns that can produce an impossible combination.
 - **A `HarnessAdapter` interface, with capability DECLARATION.** Each adapter declares what it can and cannot do; the substrate reads that declaration rather than assuming parity. Absent capability renders as *stated absence*, never as a blank that reads like zero — the same rule that makes `costUsd` render `—` instead of `$0.00`.
-- **Cost degrades honestly, three ways.** Pi/OpenCode report real dollars. Codex reports tokens only, so cost must be *derived from a local price table and labelled `estimated`* — never mixed into a total the Captain reads as their bill. Kimi reports neither, so its cost is `null` and its rows say so.
+- **Cost degrades honestly, four ways.** Pi/OpenCode report real per-request dollars (bill-grade when present). Codex reports tokens only, so cost must be *derived from a local price table and labelled `estimated`* — never mixed into a total the Captain reads as their bill. **Claude Code** emits run-level `total_cost_usd`; under subscription OAuth its accuracy is **unverified** and the figure is not per-request, so it is classified **`estimated` (unverified)** — same rendering rule as Codex — unless and until accuracy is proven against a real subscription bill. Kimi reports neither, so its cost is `null` and its rows say so. A number the Captain might read as their bill must be *provably* a bill.
 - **The clean-room proof weakens and must be re-stated, not quietly kept.** Only Pi can strip every uncontrolled prompt input. Elsewhere the honest claim becomes "identical rendered *instruction* hash + pinned harness version", not byte-identical total model input. `promptsIdentical` must therefore carry the harness and its version, and the Console must show which guarantee it is.
 - **`agent_settled` has no equivalent anywhere.** Each adapter supplies a settled *heuristic* (process exit, `Stop` hook, `turn.completed`) and declares it as a heuristic, so a fusion side that never truly settles cannot masquerade as complete.
 - **Per-seat session isolation collides with auth.** Every non-Pi harness moves its auth store together with its session dir, so per-seat homes would replicate credentials — multiplying the credential surface and defeating the single-key env grant. Adapters must either share a home (declaring the loss of session-key isolation) or the phase must ship a per-harness credential story; do not silently copy auth into per-seat homes.
@@ -1382,7 +1386,7 @@ The Captain's requirement: every model should be runnable through its native CLI
 
 Gates:
 - [ ] Adapter conformance suite: every adapter passes the same behavioural suite (spawn, stream, settle, stop) or declares the capability absent — a silent no-op fails.
-- [ ] Capability honesty: a harness lacking cost renders `—` with the reason, and its numbers are never summed into a total presented as a bill; a Codex-derived cost is labelled `estimated` everywhere it appears.
+- [ ] Capability honesty: a harness lacking cost renders `—` with the reason, and its numbers are never summed into a total presented as a bill; a Codex-derived cost **and** a Claude Code subscription cost (run-level `total_cost_usd`, accuracy unverified) are labelled `estimated` everywhere they appear — never as a bare dollar total that reads as a bill — unless Claude Code accuracy is later proven against a real subscription.
 - [ ] Invalid model+harness pairs are unselectable in the Console and refused by the daemon with a typed error (fixture: Sol 5.6 + Claude Code).
 - [ ] Cross-family and `/opinion` distinct-family rules hold identically regardless of harness — family is still derived server-side from the model ref, never from the harness.
 - [ ] The seat write-fence holds on every adapter (PreToolUse-equivalent), proven by an attempted out-of-jail write per harness.
@@ -1625,6 +1629,26 @@ Consolidated in §13.2. **Still open after R4:** Brain wake-batching/token budge
 
 **What it supersedes:** R6.2's "no admin shell / marketing-idiom editorial pages" reading is **overridden wherever the Figma file shows dashboard chrome — the Figma file wins** (and its Workspace frames do show an icon rail and top bar). What survives of R6.2: components in `packages/ui`, no bespoke lookalikes, marketing render-parity. All §7 ASCII wireframes demote to information-architecture references — visual truth lives in Figma. **R6.3.1 (Captain's answer to R6.3-Q1): "skip"** — the out-of-scope frames (Login, Pricing/Checkout, Team Members, Knowledge Base) are not implemented; only frames mapping to the local single-user product are built; they remain in the inventory as `SKIPPED` future/marketing candidates. No open R6.3 questions remain.
 
+### Revision 7 (Captain's roadmap) — live pipeline visibility + auto-balancer **[R7]**
+
+**Directive:** (1) when work enters `no-mistakes`, the app has a *live* view rather than polling only; (2) an auto-balancer toggle spreads load across configured models while staying powerful, fusion-intact, and never weakening cross-family rules.
+
+**What it adds (roadmap Phases 9–10):** a `PipelineWatcher` that translates no-mistakes state into Agent OS `pipeline.*` events (push-first via socket `subscribe`, poll/FS-watch + read-only SQLite as floor, mode stated in the UI); `observability.json5` visibility profiles; a Brain-advisory balancer over **quota-window headroom** (not dollars — `costUsd` is null on the subscription plans where balancing matters most), with a single pressure ladder shared with Brain handoff so the two controllers cannot fight.
+
+**What it does not reverse:** R2–R6.3 architecture, Pi as the sole worker harness (that reverse is R8), Figma as UI SoT, or the honesty tiers on cost and quota.
+
+### Revision 8 (Captain's directive) — configurable per-model harness; Pi remains default **[R8]**
+
+**Directive:** every model should be runnable through its native CLI or API — Anthropic via Claude Code, Kimi via Kimi CLI, OpenAI via Codex CLI, plus OpenCode and Pi — so model and harness are chosen separately and both are fully configurable.
+
+**What it reverses:** the founding **[R2]** decision that Pi is the *single* tool-executing worker harness and that vendor CLIs are not worker harnesses. That decision was also recorded in `AGENTS.md` and is amended there in the same change set. A ledger that omits a founding reverse is how the reverse is quietly forgotten.
+
+**What survives of R2:** **Pi remains the default harness and the capability baseline.** Every other adapter must DECLARE what it cannot do (cost telemetry, session-dir isolation, and the byte-identical clean-room proof all degrade off Pi) so absence renders as a stated absence rather than a blank that reads like zero. With no harness configured, behaviour stays byte-identical to today.
+
+**Why the reverse:** the Captain wants harness choice as a first-class product control, not a re-pivot of the monorepo. Research forced material design constraints rather than a clean multi-CLI drop-in: harness choice constrains model choice (Claude Code is Anthropic-only — valid *pairs*, not independent dropdowns); cost degrades four ways (Pi/OpenCode real $; Codex and Claude Code subscription costs **`estimated`/unverified**; Kimi null); clean-room weakens to "identical rendered instruction + pinned harness version" off Pi; `agent_settled` has no equivalent elsewhere; per-seat isolation collides with auth on every non-Pi harness.
+
+**What it adds:** Phase 12 (`HarnessAdapter` + capability declaration + gates) and Phase 13 (external-review remediation from `docs/k3sugestions.md`, with three false claims corrected). Phase 11 is recorded in §11 as the shipped `phase-11/wedged-ladder-and-audit` branch that closed the last open Phase 3 criterion (WEDGED ladder + fleet config hot-reload), not as part of this revision's product surface.
+
 ---
 
-*End of FUSED MASTER PLAN — Revision 6.3.*
+*End of FUSED MASTER PLAN — Revision 8.*
