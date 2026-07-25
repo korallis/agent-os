@@ -5,8 +5,8 @@
  *   W1  a `pi-api-key` connection completes the wizard end-to-end
  *   W2  a fixture `pi-oauth` connection completes it too, on a different path
  *   W3  the wizard resumes at the same step after a daemon restart [R6]
- *   W4  extra-usage billing is labelled consistently on the card, the task, and
- *       analytics — one connection, one label, everywhere it appears
+ *   W4  extra-usage billing is labelled consistently on the provider card, the
+ *       billing screen and analytics — and absent everywhere when none bills that way
  *
  * Its own file for the same reason the terminal gate is: this drives a wizard
  * from a genuinely fresh home and restarts the daemon mid-flow, which does not
