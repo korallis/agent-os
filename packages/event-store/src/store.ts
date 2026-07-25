@@ -131,14 +131,29 @@ export class EventStore {
   }
 
   /**
-   * Time-bounded forward scan: events at or after `sinceTs`, oldest-first.
-   * `truncated` is true when more events exist in the window than `limit`.
+   * Time-bounded scan: events at or after `sinceTs`, newest-first.
+   * When the page is truncated, the oldest in-window frames are dropped so
+   * recent usage/throughput stay visible. `truncated` is true when more events
+   * exist in the window than `limit`.
    */
   eventsSince(
     sinceTs: string,
     limit: number,
   ): { events: EventEnvelope[]; truncated: boolean } {
     const events = this.projection.eventsSinceTs(sinceTs, limit + 1);
+    const truncated = events.length > limit;
+    return { events: truncated ? events.slice(0, limit) : events, truncated };
+  }
+
+  /**
+   * Newest-first page of a single event type (not day-windowed).
+   * Used for session.spawned attribution across the full durable log.
+   */
+  eventsByType(
+    type: string,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const events = this.projection.eventsByType(type, limit + 1);
     const truncated = events.length > limit;
     return { events: truncated ? events.slice(0, limit) : events, truncated };
   }

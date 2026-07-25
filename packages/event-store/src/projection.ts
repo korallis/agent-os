@@ -168,15 +168,15 @@ export class SqliteProjection {
   }
 
   /**
-   * Events at or after an ISO timestamp, oldest-first within the page.
-   * Used by analytics so a day window is not silently the oldest N frames.
+   * Events at or after an ISO timestamp, newest-first within the page.
+   * Truncation therefore drops the oldest in-window frames, not the newest.
    */
   eventsSinceTs(sinceTs: string, limit: number): EventEnvelope[] {
     const rows = this.db
       .select({ envelope: events.envelope })
       .from(events)
       .where(gte(events.ts, sinceTs))
-      .orderBy(events.seq)
+      .orderBy(desc(events.seq))
       .limit(limit)
       .all();
     return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
@@ -188,6 +188,21 @@ export class SqliteProjection {
       .prepare("SELECT COUNT(*) AS n FROM events WHERE ts >= ?")
       .get(sinceTs) as { n: number };
     return row.n;
+  }
+
+  /**
+   * Events of a given type, newest-first (not day-windowed).
+   * Used for session.spawned attribution of long-lived sessions.
+   */
+  eventsByType(type: string, limit: number): EventEnvelope[] {
+    const rows = this.db
+      .select({ envelope: events.envelope })
+      .from(events)
+      .where(eq(events.type, type))
+      .orderBy(desc(events.seq))
+      .limit(limit)
+      .all();
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
   }
 
   seqOfEventId(id: string): number | null {

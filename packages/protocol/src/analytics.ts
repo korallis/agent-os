@@ -87,8 +87,8 @@ export const analyticsSnapshotSchema = z.strictObject({
   generatedAt: isoTimestampSchema,
   windowDays: z.number().int().min(1).max(365),
   /**
-   * True when the event-store read hit its bound and newer (or older) frames
-   * in the requested window were not scanned. Surfaces partial history honestly.
+   * True when the event-store read hit its bound. Pages are newest-first, so
+   * truncation omits older frames inside the window — never the newest tail.
    */
   truncated: z.boolean(),
   totals: analyticsTotalsSchema,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EventEnvelope } from "@agent-os/protocol";
-import { AnalyticsService } from "../src/analytics/service.js";
+import { AnalyticsService, type SessionSpawnFact } from "../src/analytics/service.js";
 
 function envelope(
   seq: number,
@@ -25,32 +25,10 @@ function dayOffset(daysAgo: number): string {
 describe("AnalyticsService window + cost honesty", () => {
   it("scopes totals/models/agents to the same day window as daily", () => {
     const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FA1";
-    const events: EventEnvelope[] = [
-      envelope(1, dayOffset(20), {
-        type: "session.spawned",
-        payload: {
-          sessionId,
-          taskId: "01ARZ3NDEKTSV4RRFFQ69G5FB1",
-          role: "builder",
-          model: "openai/gpt-4.1",
-          family: "openai",
-          tmuxWindow: "w1",
-          worktreePath: null,
-        },
-      }),
-      // Outside the 7-day window
-      envelope(2, dayOffset(20), {
-        type: "ext.usage",
-        payload: {
-          sessionId,
-          provider: "openai",
-          model: "gpt-4.1",
-          inputTokens: 9_000,
-          outputTokens: 1_000,
-          costUsd: 1.5,
-        },
-      }),
-      // Inside the window
+    // Production shape: readEvents returns only the day-window page (no
+    // pre-window session.spawned and no out-of-window usage). Session role
+    // comes only from the separate non-windowed spawn lookup.
+    const windowEvents: EventEnvelope[] = [
       envelope(3, dayOffset(1), {
         type: "ext.usage",
         payload: {
@@ -83,9 +61,19 @@ describe("AnalyticsService window + cost honesty", () => {
       }),
     ];
 
+    const sessionSpawns: SessionSpawnFact[] = [
+      {
+        sessionId,
+        role: "builder",
+        model: "openai/gpt-4.1",
+        taskId: "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+      },
+    ];
+
     const service = new AnalyticsService(
-      () => ({ events, truncated: false }),
+      () => ({ events: windowEvents, truncated: false }),
       () => [],
+      () => sessionSpawns,
     );
     const snap = service.snapshot({ days: 7 });
 
@@ -100,8 +88,47 @@ describe("AnalyticsService window + cost honesty", () => {
     expect(snap.totals.tasksTotal).toBe(1);
     expect(snap.models).toHaveLength(1);
     expect(snap.models[0]?.costUsd).toBe(0.25);
+    // Pre-window session.spawned must still attribute in-window usage.
     expect(snap.agents[0]?.role).toBe("builder");
     expect(snap.agents[0]?.costUsd).toBe(0.25);
+  });
+
+  it("attributes in-window usage to pre-window sessions via side lookup only", () => {
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FA9";
+    // Window page has usage but no session.spawned (spawn was 20 days ago).
+    const windowEvents: EventEnvelope[] = [
+      envelope(2, dayOffset(0), {
+        type: "ext.usage",
+        payload: {
+          sessionId,
+          provider: "openai",
+          model: "gpt-4.1",
+          inputTokens: 10,
+          outputTokens: 5,
+          costUsd: 0.01,
+        },
+      }),
+    ];
+    const withoutLookup = new AnalyticsService(
+      () => ({ events: windowEvents, truncated: false }),
+      () => [],
+      () => [],
+    );
+    expect(withoutLookup.snapshot({ days: 7 }).agents[0]?.role).toBe("unattributed");
+
+    const withLookup = new AnalyticsService(
+      () => ({ events: windowEvents, truncated: false }),
+      () => [],
+      () => [
+        {
+          sessionId,
+          role: "validator",
+          model: "openai/gpt-4.1",
+          taskId: null,
+        },
+      ],
+    );
+    expect(withLookup.snapshot({ days: 7 }).agents[0]?.role).toBe("validator");
   });
 
   it("tracks partial cost coverage without treating null as zero bill", () => {
@@ -157,6 +184,7 @@ describe("AnalyticsService window + cost honesty", () => {
     expect(snap.totals.requests).toBe(2);
     expect(snap.models[0]?.costUsd).toBe(0.1);
     expect(snap.models[0]?.costReportedRequests).toBe(1);
+    expect(snap.models[0]?.requests).toBe(2);
   });
 
   it("reports absent cost and nullable per-row cost when nothing reported", () => {

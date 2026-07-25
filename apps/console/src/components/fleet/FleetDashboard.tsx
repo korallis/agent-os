@@ -441,6 +441,13 @@ export function FleetDashboard() {
 
   return (
     <div className="flex flex-col gap-5 p-8 pt-6">
+      {analytics?.truncated === true && (
+        <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
+          Event history for this window was truncated at the analytics read bound —
+          Token Consumption and Top Agents keep the newest frames and may omit older
+          ones inside the {analytics.windowDays}-day range.
+        </div>
+      )}
       {summary !== null && (
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
           {[

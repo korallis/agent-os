@@ -14,6 +14,13 @@ export type AnalyticsEventPage = {
   truncated: boolean;
 };
 
+export type SessionSpawnFact = {
+  sessionId: string;
+  role: string;
+  model: string;
+  taskId: string | null;
+};
+
 /**
  * Usage & cost analytics (master plan §7.6 "Analytics").
  *
@@ -25,12 +32,18 @@ export type AnalyticsEventPage = {
  * All aggregates (totals, models, agents, daily) share the same day window.
  * Cost is tracked as reported-vs-missing per bucket so a Claude Max
  * subscription that contributes null cost never silently reads as $0.00.
+ *
+ * Role attribution uses a separate (not day-filtered) session.spawned lookup
+ * so long-lived sessions spawned before the window still bucket correctly.
  */
 export class AnalyticsService {
   /**
    * @param readEvents pulls a time-bounded page of the durable log; the daemon
-   *   passes a reader that scans from the window start and surfaces truncation.
+   *   passes a reader that scans newest-first from the window start and surfaces
+   *   truncation when the bound is hit (oldest in-window frames dropped).
    * @param readQuota live quota samples (not windowed — current fleet state).
+   * @param readSessionSpawns session.spawned facts outside the day filter, so
+   *   in-window usage from pre-window sessions is attributed to the real role.
    */
   constructor(
     private readonly readEvents: (options: {
@@ -38,6 +51,7 @@ export class AnalyticsService {
       limit: number;
     }) => AnalyticsEventPage,
     private readonly readQuota: () => QuotaSample[],
+    private readonly readSessionSpawns: () => SessionSpawnFact[] = () => [],
   ) {}
 
   snapshot(options: { days?: number; limit?: number } = {}): AnalyticsSnapshot {
@@ -48,13 +62,16 @@ export class AnalyticsService {
     const windowSet = new Set(windowDays);
 
     /** sessionId → its spawn facts, so usage frames can be attributed. */
-    const sessions = new Map<
-      string,
-      { role: string; model: string; taskId: string | null }
-    >();
+    const sessions = new Map<string, SessionSpawnFact>();
+    // Side lookup first: covers sessions spawned before the analytics window.
+    for (const spawn of this.readSessionSpawns()) {
+      sessions.set(spawn.sessionId, spawn);
+    }
+    // Overlay any in-window spawns (same shape as production dual-read).
     for (const envelope of events) {
       if (envelope.event.type === "session.spawned") {
         sessions.set(envelope.event.payload.sessionId, {
+          sessionId: envelope.event.payload.sessionId,
           role: envelope.event.payload.role,
           model: envelope.event.payload.model,
           taskId: envelope.event.payload.taskId,

@@ -225,8 +225,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
 
     // Analytics is a pure reader over durable state — no separate accounting
     // store to drift out of sync with the event log. The reader is time-bounded
-    // to the requested window (newest window, not the oldest N frames) and
-    // surfaces truncation when the bound is hit.
+    // to the requested window (newest-first so truncation drops oldest frames)
+    // and surfaces truncation when the bound is hit. Session attribution uses a
+    // separate non-windowed session.spawned lookup.
     const analytics = new AnalyticsService(
       ({ days, limit }) => {
         const since = new Date();
@@ -243,6 +244,25 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         };
       },
       () => [...quotaSamples.values()],
+      () => {
+        const { events: spawns } = eventStore.eventsByType("session.spawned", 100_000);
+        const facts: Array<{
+          sessionId: string;
+          role: string;
+          model: string;
+          taskId: string | null;
+        }> = [];
+        for (const envelope of spawns) {
+          if (envelope.event.type !== "session.spawned") continue;
+          facts.push({
+            sessionId: envelope.event.payload.sessionId,
+            role: envelope.event.payload.role,
+            model: envelope.event.payload.model,
+            taskId: envelope.event.payload.taskId,
+          });
+        }
+        return facts;
+      },
     );
 
     const deps = {

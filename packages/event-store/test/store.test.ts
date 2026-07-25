@@ -137,6 +137,8 @@ describe("EventStore", () => {
     const windowed = store.eventsSince(since, 4);
     expect(windowed.events).toHaveLength(4);
     expect(windowed.truncated).toBe(true);
+    // Newest-first: truncation drops the oldest in-window frames.
+    expect(windowed.events.map((e) => e.seq)).toEqual([10, 9, 8, 7]);
     expect(store.countSince(since)).toBe(10);
     store.close();
   });

@@ -28,8 +28,15 @@ function compact(value: number): string {
   return String(value);
 }
 
-function formatRowCost(costUsd: number | null): string {
-  if (costUsd === null) return "—";
+function formatRowCost(
+  costUsd: number | null,
+  costReportedRequests: number,
+  requests: number,
+): string {
+  if (costUsd === null || costReportedRequests === 0) return "—";
+  if (costReportedRequests < requests) {
+    return `$${costUsd.toFixed(2)} partial`;
+  }
   return `$${costUsd.toFixed(2)}`;
 }
 
@@ -145,7 +152,8 @@ export function AnalyticsView() {
       {snapshot?.truncated === true && (
         <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
           Event history for this window was truncated at the analytics read bound —
-          figures may omit older frames inside the {windowDays}-day range.
+          figures keep the newest frames and may omit older ones inside the{" "}
+          {windowDays}-day range.
         </div>
       )}
 
@@ -226,7 +234,13 @@ export function AnalyticsView() {
                     <span className="w-[100px] text-fg-1">
                       {compact(agent.inputTokens + agent.outputTokens)}
                     </span>
-                    <span className="w-[90px] text-fg-1">{formatRowCost(agent.costUsd)}</span>
+                    <span className="w-[90px] text-fg-1">
+                      {formatRowCost(
+                        agent.costUsd,
+                        agent.costReportedRequests,
+                        agent.requests,
+                      )}
+                    </span>
                     <span className="w-[80px] text-fg-2">{agent.sharePct}%</span>
                     <span className="w-[90px] text-fg-2">{agent.requests}</span>
                   </div>
@@ -276,9 +290,11 @@ export function AnalyticsView() {
                       <span className="font-mono truncate">{model.model}</span>
                     </span>
                     <span className="font-medium text-fg-1 shrink-0 ml-2">
-                      {model.costUsd !== null
-                        ? `$${model.costUsd.toFixed(2)}`
-                        : compact(model.inputTokens + model.outputTokens)}
+                      {formatRowCost(
+                        model.costUsd,
+                        model.costReportedRequests,
+                        model.requests,
+                      )}
                     </span>
                   </div>
                 ))}

@@ -115,6 +115,7 @@ try {
       AGENTOS_FAKE_PI: "1",
       AGENTOS_FAKE_BRAIN: "1",
       AGENTOS_FAKE_GATE: "1",
+      AGENTOS_FAKE_GIT: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -206,9 +207,12 @@ try {
     ],
     { withGateEvidence: true },
   );
-  await seedTask("Second console task", [
+  const taskBTitle = "Second console task";
+  const taskB = await seedTask(taskBTitle, [
     { role: "builder", model: "xai/grok-4.5", thinking: "medium", cleanRoom: true },
   ]);
+  // Complete a task so analytics tasksDone is a real non-zero figure.
+  await tool("deliver_task", { taskId: taskB });
 
   // Fake-pi spawn classifies a PROGRESS wake absorbed by the zero-token watcher.
   const absorbedSummary = `progress on ${taskATitle}`;
@@ -305,22 +309,38 @@ try {
     );
   }
 
-  // G4 — Analytics numbers equal the daemon's own
+  // G4 — Analytics numbers equal the daemon's own (never bare digits)
   {
     const snapshot = await (await fetch(`${BASE}/v1/analytics`, { headers: auth })).json();
     await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
     await sleep(600);
     const text = (await page.textContent("body")) ?? "";
-    const tasksDone = String(snapshot.totals.tasksDone);
-    const requests = String(snapshot.totals.requests);
-    // Cost must render as an em dash when no provider reported it.
+    const windowDays = snapshot.windowDays ?? 14;
+    // Distinctive label+value notes — never assert on a bare digit alone.
+    const createdNote = `${snapshot.totals.tasksTotal} created · last ${windowDays}d`;
+    const requestsNote = `${snapshot.totals.requests} requests · last ${windowDays}d`;
+    const tokensUsed =
+      (snapshot.totals.inputTokens ?? 0) + (snapshot.totals.outputTokens ?? 0);
+    const tokensRendered =
+      tokensUsed >= 1_000_000
+        ? `${(tokensUsed / 1_000_000).toFixed(1)}M`
+        : tokensUsed >= 1_000
+          ? `${(tokensUsed / 1_000).toFixed(1)}K`
+          : String(tokensUsed);
+    // Seed path must produce a completed task and at least one usage frame.
+    const seeded =
+      snapshot.totals.tasksDone >= 1 && snapshot.totals.requests >= 1 && tokensUsed > 0;
     const costHonest =
       snapshot.totals.costUsd === null ? text.includes("not reported by providers") : true;
     gate(
       "G4",
       "Analytics renders the daemon's own figures, and states absence honestly",
-      text.includes(tasksDone) && text.includes(requests) && costHonest,
-      `tasksDone=${tasksDone} requests=${requests} costNull=${snapshot.totals.costUsd === null}`,
+      seeded &&
+        text.includes(createdNote) &&
+        text.includes(requestsNote) &&
+        text.includes(tokensRendered) &&
+        costHonest,
+      `createdNote=${createdNote} requestsNote=${requestsNote} tokens=${tokensRendered} tasksDone=${snapshot.totals.tasksDone}`,
     );
   }
 
