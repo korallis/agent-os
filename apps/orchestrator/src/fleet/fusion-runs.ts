@@ -9,7 +9,7 @@ import type { FusionRun, FusionRunDetailResponse, FusionSide } from "@agent-os/p
  * Layout: `<home>/runs/<taskId>/fusion/<runId>/`
  *   run.json            — the FusionRun record (casts, hashes, telemetry)
  *   instruction.md      — the rendered instruction every side received
- *   side-<role>.md      — each side's artifact
+ *   side-<i>-<model>.md — each side's artifact (index + model, never role alone)
  *   fused.md            — the fused artifact (kind=fusion)
  *
  * Files are the truth; the REST surface is a reader of them.
@@ -50,8 +50,20 @@ export class FusionRunStore {
     return path;
   }
 
-  writeSideArtifact(taskId: string, runId: string, role: string, content: string): string {
-    const path = join(this.dir(taskId, runId), `side-${sanitize(role)}.md`);
+  /**
+   * Persist one side's answer. Filename includes side index and model so a
+   * dual-planner /opinion (two roles named "planner") never collides.
+   */
+  writeSideArtifact(
+    taskId: string,
+    runId: string,
+    sideIndex: number,
+    model: string,
+    content: string,
+  ): string {
+    const dir = this.dir(taskId, runId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const path = join(dir, `side-${sideIndex}-${sanitize(model)}.md`);
     writeFileSync(path, content, { mode: 0o600 });
     return path;
   }
@@ -107,7 +119,10 @@ export class FusionRunStore {
     const fused = read("fused.md");
     const sideArtifacts = run.sides
       .map((side: FusionSide) => {
-        const content = read(`side-${sanitize(side.role)}.md`);
+        const content =
+          side.artifactPath !== null && existsSync(side.artifactPath)
+            ? readFileSync(side.artifactPath, "utf8")
+            : null;
         return content === null
           ? null
           : { role: side.role, model: side.model, content };
@@ -127,11 +142,16 @@ export class FusionRunStore {
   }
 }
 
-function sanitize(role: string): string {
-  return role.replace(/[^A-Za-z0-9._-]/g, "_");
+function sanitize(part: string): string {
+  return part.replace(/[^A-Za-z0-9._-]/g, "_");
 }
 
 function sum(a: number | null, b: number | null): number | null {
   if (a === null && b === null) return null;
   return (a ?? 0) + (b ?? 0);
+}
+
+/** Basename helper for tests / callers that only have a path. */
+export function sideArtifactBasename(sideIndex: number, model: string): string {
+  return `side-${sideIndex}-${sanitize(model)}.md`;
 }

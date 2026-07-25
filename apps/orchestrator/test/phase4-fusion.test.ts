@@ -1,15 +1,20 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SHIPPED_PROMPTS_DIR } from "../src/daemon.js";
-import { PromptService, PromptResolutionError } from "../src/prompts/service.js";
-import { SessionKeyStore } from "../src/fleet/sessions.js";
+import { SHIPPED_DEFAULTS_DIR, SHIPPED_PROMPTS_DIR } from "../src/daemon.js";
+import { ConfigService } from "../src/config/service.js";
+import { FleetService } from "../src/fleet/service.js";
 import { FusionRunStore } from "../src/fleet/fusion-runs.js";
+import { SessionKeyStore } from "../src/fleet/sessions.js";
+import { PromptService, PromptResolutionError } from "../src/prompts/service.js";
+import { buildPiSpawnSpec, type PiDetection } from "../src/pi/manager.js";
+import type { OrchestratorEvent } from "@agent-os/protocol";
 
 /**
- * Phase 4 units: layered prompt packs, per-model session keys, and the fusion
- * run store that carries the clean-room proof.
+ * Phase 4 units + live-path gates: layered prompt packs, session-key gate (G6),
+ * /opinion clean-room dispatch with side artifacts and settle-time events.
  */
 
 const temps: string[] = [];
@@ -27,6 +32,82 @@ function prompts(): { service: PromptService; globalDir: string } {
   const service = new PromptService(SHIPPED_PROMPTS_DIR, globalDir);
   service.installDefaults();
   return { service, globalDir };
+}
+
+function gitRepo(): string {
+  const dir = temp("agentos-p4-repo-");
+  const git = (...args: string[]): void => {
+    execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
+  };
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  git("config", "user.email", "p4@agent-os.test");
+  git("config", "user.name", "Phase4");
+  writeFileSync(join(dir, "README.md"), "# p4 fixture\n");
+  git("add", "-A");
+  git("commit", "-qm", "seed");
+  return dir;
+}
+
+function fleet(): { service: FleetService; events: OrchestratorEvent[] } {
+  const home = temp("agentos-p4-home-");
+  mkdirSync(join(home, "config"), { recursive: true });
+  const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+  config.installDefaults();
+  const promptService = new PromptService(SHIPPED_PROMPTS_DIR, join(home, "prompts"));
+  promptService.installDefaults();
+  const events: OrchestratorEvent[] = [];
+  const service = new FleetService({
+    home,
+    config,
+    prompts: promptService,
+    fakeTmux: true,
+    fakeBrain: true,
+    fakePi: true,
+  });
+  service.onEvent((e) => events.push(e));
+  service.start();
+  return { service, events };
+}
+
+function seedShipTask(service: FleetService): { taskId: string; projectId: string } {
+  const project = service.projects.register({
+    name: "p4",
+    path: gitRepo(),
+    mode: "local-only",
+    trusted: true,
+  });
+  const created = service.tools.invoke("create_task", {
+    spec: {
+      shape: "SHIP",
+      title: "Should we ship?",
+      intent: "Compare two plans.",
+      projectId: project.id,
+      mode: "local-only",
+      yolo: true,
+    },
+  });
+  expect(created.ok).toBe(true);
+  const taskId = (created.data as { id: string }).id;
+  const cast = service.tools.invoke("resolve_cast", {
+    taskId,
+    roles: [
+      {
+        role: "planner",
+        model: "anthropic/claude-fable-5",
+        thinking: "high",
+        cleanRoom: true,
+      },
+      {
+        role: "planner",
+        model: "openai/gpt-5.6-sol",
+        thinking: "low",
+        cleanRoom: true,
+      },
+    ],
+    familyCheckOverride: false,
+  });
+  expect(cast.ok).toBe(true);
+  return { taskId, projectId: project.id };
 }
 
 afterEach(() => {
@@ -97,7 +178,7 @@ describe("prompt packs", () => {
   });
 });
 
-describe("session keys", () => {
+describe("session keys (G6)", () => {
   it("gives a different directory per model so transcripts never cross families", () => {
     const store = new SessionKeyStore(temp("agentos-p4-sessions-"));
     const anthropic = store.ensure({
@@ -128,6 +209,110 @@ describe("session keys", () => {
       { role: "planner", model: "openai/gpt-5.6-sol" },
     ]);
     expect(missing).toEqual([{ role: "planner", model: "openai/gpt-5.6-sol" }]);
+  });
+
+  it("wires session dirs into live spawns and hands AGENTOS_SESSION_DIR to Pi", () => {
+    const { service } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    const spawn = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
+    expect(spawn.ok).toBe(true);
+
+    const keyA = SessionKeyStore.computeKey({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    });
+    const keyB = SessionKeyStore.computeKey({
+      projectId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+    });
+    expect(keyA).not.toBe(keyB);
+    expect(existsSync(join(service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    }).dir, "session.json"))).toBe(true);
+
+    // Model change → new session directory (live ensure path).
+    const dirA = service.tools.ensureSessionKey({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    });
+    const dirB = service.tools.ensureSessionKey({
+      projectId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+    });
+    expect(dirA).not.toBe(dirB);
+
+    // buildPiSpawnSpec carries AGENTOS_SESSION_DIR through the scrubbed env.
+    const detection: PiDetection = {
+      binary: "/usr/bin/true",
+      version: "0.0.0-test",
+      pinnedVersion: "0.82.0" as PiDetection["pinnedVersion"],
+      versionMatchesPin: false,
+      managedHome: temp("agentos-p4-pi-home-"),
+      configDirEnv: "PI_CONFIG_DIR",
+      isolationMode: "managed",
+    };
+    const spec = buildPiSpawnSpec({
+      agentosHome: temp("agentos-p4-spec-home-"),
+      detection,
+      args: ["-p", "hi", "--model", "openai/gpt-4.1"],
+      cwd: temp("agentos-p4-spec-cwd-"),
+      sessionId: "01JSESSION000000000000000A",
+      role: "planner",
+      socketPath: "/tmp/agentos-test.sock",
+      extensionPath: join(temp("agentos-p4-ext-"), "ext.js"),
+      sessionDir: dirB,
+      cleanRoom: true,
+    });
+    expect(spec.env.AGENTOS_SESSION_DIR).toBe(dirB);
+    expect(spec.envKeys).toContain("AGENTOS_SESSION_DIR");
+
+    // Restart resumes only the missing role: one model ensured, the other is missing.
+    const missing = service.sessionKeys.missingRoles(projectId, [
+      { role: "planner", model: "anthropic/claude-fable-5" },
+      { role: "planner", model: "openai/gpt-5.6-sol" },
+    ]);
+    // Both were ensured above via ensureSessionKey — empty missing set.
+    expect(missing).toEqual([]);
+
+    // Wipe the openai session dir and prove missingRoles + reconcile respawn only that slot.
+    rmSync(dirB, { recursive: true, force: true });
+    const missingAfterWipe = service.sessionKeys.missingRoles(projectId, [
+      { role: "planner", model: "anthropic/claude-fable-5" },
+      { role: "planner", model: "openai/gpt-5.6-sol" },
+    ]);
+    expect(missingAfterWipe).toEqual([
+      { role: "planner", model: "openai/gpt-5.6-sol" },
+    ]);
+
+    const before = service.tools.listSessions().length;
+    const respawned = service.tools.reconcileMissingCastRoles();
+    expect(respawned).toEqual([
+      {
+        taskId,
+        role: "planner",
+        model: "openai/gpt-5.6-sol",
+      },
+    ]);
+    expect(service.tools.listSessions().length).toBeGreaterThan(before);
+    expect(
+      service.sessionKeys.missingRoles(projectId, [
+        { role: "planner", model: "anthropic/claude-fable-5" },
+        { role: "planner", model: "openai/gpt-5.6-sol" },
+      ]),
+    ).toEqual([]);
   });
 });
 
@@ -185,5 +370,200 @@ describe("fusion run store", () => {
     );
     const detail = store.detail(run.taskId, run.runId);
     expect(detail?.spans.map((s) => s.tag)).toEqual(["ARCHITECT", "BUILDER", "FUSION"]);
+  });
+
+  it("discriminates dual-planner side artifacts by index and model", () => {
+    const home = temp("agentos-p4-sides-");
+    const store = new FusionRunStore(home);
+    const taskId = "01JTASK0000000000000000001";
+    const runId = "01JZZZZZZZZZZZZZZZZZZZZZZY";
+    const path0 = store.writeSideArtifact(
+      taskId,
+      runId,
+      0,
+      "anthropic/claude-fable-5",
+      "side-a\n",
+    );
+    const path1 = store.writeSideArtifact(
+      taskId,
+      runId,
+      1,
+      "openai/gpt-5.6-sol",
+      "side-b\n",
+    );
+    expect(path0).not.toBe(path1);
+    expect(path0).toContain("side-0-");
+    expect(path1).toContain("side-1-");
+    expect(readFileSync(path0, "utf8")).toBe("side-a\n");
+    expect(readFileSync(path1, "utf8")).toBe("side-b\n");
+  });
+});
+
+describe("/opinion live path", () => {
+  it("spawns clean-room sides by default, writes artifacts, and completes only after settle", () => {
+    const { service, events } = fleet();
+    const { taskId } = seedShipTask(service);
+
+    const result = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      casts: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          thinking: "high",
+          family: "anthropic",
+          cleanRoom: true,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          thinking: "low",
+          family: "openai",
+          cleanRoom: true,
+        },
+      ],
+      // Default path — no spawnSides flag.
+    });
+    expect(result.ok).toBe(true);
+    const data = result.data as {
+      runId: string;
+      promptsIdentical: boolean;
+      spawned: boolean;
+    };
+    expect(data.spawned).toBe(true);
+    expect(data.promptsIdentical).toBe(true);
+
+    const types = events.map((e) => e.type);
+    expect(types).toContain("fusion.dispatched");
+    expect(types.filter((t) => t === "fusion.side_completed")).toHaveLength(2);
+    expect(types).toContain("fusion.completed");
+
+    // dispatched must precede completed; side_completed before completed.
+    const dispatchedAt = types.indexOf("fusion.dispatched");
+    const completedAt = types.lastIndexOf("fusion.completed");
+    const firstSide = types.indexOf("fusion.side_completed");
+    expect(dispatchedAt).toBeGreaterThanOrEqual(0);
+    expect(firstSide).toBeGreaterThan(dispatchedAt);
+    expect(completedAt).toBeGreaterThan(firstSide);
+
+    const sideEvents = events.filter((e) => e.type === "fusion.side_completed");
+    for (const e of sideEvents) {
+      if (e.type !== "fusion.side_completed") continue;
+      expect(e.payload.artifactPath).not.toBeNull();
+      expect(existsSync(e.payload.artifactPath!)).toBe(true);
+      expect(readFileSync(e.payload.artifactPath!, "utf8")).toMatch(/fake-pi/);
+    }
+
+    const run = service.fusionRuns.get(taskId, data.runId);
+    expect(run).not.toBeNull();
+    expect(run!.sides).toHaveLength(2);
+    expect(run!.sides.every((s) => s.artifactPath !== null)).toBe(true);
+    expect(run!.sides.every((s) => s.sessionId !== null)).toBe(true);
+    expect(run!.sides[0]!.artifactPath).not.toBe(run!.sides[1]!.artifactPath);
+
+    // Distinct session keys per model on the live spawn path.
+    const projectId = service.tools.getTask(taskId)!.projectId;
+    const dir0 = service.tools.ensureSessionKey({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    });
+    const dir1 = service.tools.ensureSessionKey({
+      projectId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+    });
+    expect(dir0).not.toBe(dir1);
+
+    const detail = service.fusionRuns.detail(taskId, data.runId);
+    expect(detail?.sideArtifacts).toHaveLength(2);
+    expect(detail?.sideArtifacts.map((s) => s.model).sort()).toEqual([
+      "anthropic/claude-fable-5",
+      "openai/gpt-5.6-sol",
+    ]);
+
+    // Thinking resolved per cast index: session records keep each planner's level.
+    const sessions = service.tools.listSessions().filter((s) => s.taskId === taskId);
+    const byModel = new Map(sessions.map((s) => [s.model, s.thinking]));
+    expect(byModel.get("anthropic/claude-fable-5")).toBe("high");
+    expect(byModel.get("openai/gpt-5.6-sol")).toBe("low");
+  });
+
+  it("treats kind=fusion with an artifact as a contract check (no default spawn)", () => {
+    const { service, events } = fleet();
+    const { taskId } = seedShipTask(service);
+    events.length = 0;
+
+    const artifact = [
+      "[ARCHITECT]",
+      "keep the plan",
+      "[BUILDER]",
+      "index the work",
+      "[FUSION]",
+      "both agree",
+      "## Consensus & Divergence",
+      "Agree on scope.",
+      "## Decision ledger",
+      "- ship the plan",
+      "",
+    ].join("\n");
+
+    const result = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "fusion",
+      casts: [
+        {
+          role: "fusion",
+          model: "anthropic/claude-fable-5",
+          thinking: "medium",
+          family: "anthropic",
+          cleanRoom: true,
+        },
+      ],
+      instruction: artifact,
+    });
+    expect(result.ok).toBe(true);
+    const data = result.data as { spawned: boolean; contractOk: boolean };
+    expect(data.spawned).toBe(false);
+    expect(data.contractOk).toBe(true);
+
+    const types = events.map((e) => e.type);
+    expect(types).toContain("fusion.dispatched");
+    expect(types).toContain("fusion.completed");
+    expect(types).not.toContain("fusion.side_completed");
+    expect(types).not.toContain("session.spawned");
+  });
+
+  it("honors spawnSides: false bookkeeping opt-out for /opinion", () => {
+    const { service, events } = fleet();
+    const { taskId } = seedShipTask(service);
+    events.length = 0;
+
+    const result = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      spawnSides: false,
+      casts: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          thinking: "high",
+          family: "anthropic",
+          cleanRoom: true,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          thinking: "high",
+          family: "openai",
+          cleanRoom: true,
+        },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    expect((result.data as { spawned: boolean }).spawned).toBe(false);
+    expect(events.map((e) => e.type)).not.toContain("fusion.side_completed");
+    expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 });

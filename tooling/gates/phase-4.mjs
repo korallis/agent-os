@@ -2,12 +2,12 @@
 /**
  * Phase 4 executable gates (master plan §11 Phase 4) — fusion primitives.
  *
- *   G1  `/opinion` records per-side artifacts and telemetry
+ *   G1  `/opinion` default path spawns sides and writes per-side artifacts
  *   G2  clean-room: every side receives byte-identical rendered bytes
  *   G3  same-family `/opinion` panel is refused (an echo is not an opinion)
  *   G4  `/fusion` contract enforcement — missing spans → FUSION_CONTRACT
  *   G5  aggregator family retention: recorded, and equals the architect family
- *   G6  session keys: a changed model yields a different session dir
+ *   G6  session-key gate: model change → new dir; restart resumes only missing role
  *   G7  template edit (global layer) changes the next run's rendered instruction
  *   G8  `{{VAR}}` with an undefined variable → typed VALIDATION_ERROR
  *   G9  project prompt override wins over global
@@ -142,7 +142,7 @@ try {
     { role: "planner", model: "openai/gpt-5.6-sol", thinking: "high", family: "openai", cleanRoom: true },
   ];
 
-  // G1 + G2 + G5 — /opinion sides, clean-room byte identity, aggregator family
+  // G1 + G2 + G5 — /opinion default path, clean-room byte identity, aggregator family
   {
     const taskId = await newTask("Opinion gate");
     await callTool(token, "resolve_cast", {
@@ -155,12 +155,12 @@ try {
       })),
       familyCheckOverride: false,
     });
+    // Default path — no spawnSides flag; opinion must spawn clean-room sides.
     const res = await callTool(token, "dispatch_fusion", {
       taskId,
       kind: "opinion",
       casts: CROSS_FAMILY,
       vars: { QUESTION: "Should the event log stay NDJSON?", CONTEXT: "100k events/day." },
-      spawnSides: true,
     });
     const runs = await (await api(`/v1/tasks/${taskId}/fusion`, token)).json();
     const run = runs.runs?.[0];
@@ -168,11 +168,20 @@ try {
       await api(`/v1/tasks/${taskId}/fusion/${res.data.runId}`, token)
     ).json();
 
+    const sideArtifacts = detail.sideArtifacts ?? [];
+    const sidesWithArtifacts = (run?.sides ?? []).filter((s) => s.artifactPath != null);
+    const distinctArtifactPaths = new Set(sidesWithArtifacts.map((s) => s.artifactPath));
     gate(
       "G1",
-      "/opinion records per-side artifacts + telemetry slots",
-      res.ok === true && run?.sides?.length === 2 && detail.instruction !== null,
-      `sides=${run?.sides?.length} instruction=${detail.instruction !== null}`,
+      "/opinion default path writes per-side artifacts (index+model, no role collision)",
+      res.ok === true &&
+        res.data?.spawned === true &&
+        run?.sides?.length === 2 &&
+        detail.instruction !== null &&
+        sideArtifacts.length === 2 &&
+        sidesWithArtifacts.length === 2 &&
+        distinctArtifactPaths.size === 2,
+      `spawned=${res.data?.spawned} sides=${run?.sides?.length} artifacts=${sideArtifacts.length} paths=${distinctArtifactPaths.size}`,
     );
 
     const hashes = new Set((run?.sides ?? []).map((s) => s.promptHash));
@@ -244,17 +253,45 @@ try {
     );
   }
 
-  // G6 — session keys differ per model
+  // G6 — session-key gate end-to-end: model change → new dir; restart resumes only missing
   {
-    const state = await (await api("/v1/fleet/state", token)).json();
-    void state;
+    const taskId = await newTask("Session key gate");
+    await callTool(token, "resolve_cast", {
+      taskId,
+      roles: CROSS_FAMILY.map(({ role, model, thinking, cleanRoom }) => ({
+        role,
+        model,
+        thinking,
+        cleanRoom,
+      })),
+      familyCheckOverride: false,
+    });
+    // Spawn first planner only — creates one session dir via the live ensure path.
+    const spawned = await callTool(token, "spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
     const evalJs = `
+      import { existsSync, rmSync } from 'node:fs';
       import { SessionKeyStore } from '${join(ROOT, "apps/orchestrator/dist/fleet/sessions.js")}';
-      const a = SessionKeyStore.computeKey({ projectId: 'P', role: 'planner', model: 'anthropic/claude-fable-5' });
-      const b = SessionKeyStore.computeKey({ projectId: 'P', role: 'planner', model: 'openai/gpt-5.6-sol' });
-      const c = SessionKeyStore.computeKey({ projectId: 'P', role: 'planner', model: 'anthropic/claude-fable-5' });
-      if (a === b) process.exit(2);
-      if (a !== c) process.exit(3);
+      const store = new SessionKeyStore(${JSON.stringify(home)});
+      const projectId = ${JSON.stringify(projectId)};
+      const a = store.ensure({ projectId, role: 'planner', model: 'anthropic/claude-fable-5' });
+      const b = store.ensure({ projectId, role: 'planner', model: 'openai/gpt-5.6-sol' });
+      if (a.dir === b.dir) process.exit(2);
+      if (a.key === b.key) process.exit(3);
+      // Restart half: wipe the second model dir; missingRoles must report only that slot.
+      rmSync(b.dir, { recursive: true, force: true });
+      const missing = store.missingRoles(projectId, [
+        { role: 'planner', model: 'anthropic/claude-fable-5' },
+        { role: 'planner', model: 'openai/gpt-5.6-sol' },
+      ]);
+      if (missing.length !== 1) process.exit(4);
+      if (missing[0].model !== 'openai/gpt-5.6-sol') process.exit(5);
+      if (!existsSync(a.dir)) process.exit(6);
       process.stdout.write('ok');
     `;
     const run = spawnSync(process.execPath, ["--input-type=module", "-e", evalJs], {
@@ -262,9 +299,9 @@ try {
     });
     gate(
       "G6",
-      "session key changes with the model (no cross-model transcript replay)",
-      run.status === 0 && run.stdout.trim() === "ok",
-      `exit=${run.status}`,
+      "session-key gate: model change → new dir; restart resumes only the missing role",
+      spawned.ok === true && run.status === 0 && run.stdout.trim() === "ok",
+      `spawn=${spawned.ok} exit=${run.status} out=${run.stdout.trim()} err=${(run.stderr ?? "").slice(0, 120)}`,
     );
   }
 

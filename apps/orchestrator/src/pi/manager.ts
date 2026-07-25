@@ -108,6 +108,11 @@ export interface BuildSpawnOptions {
   socketPath: string;
   /** Extension path (agent-os) always passed with -e. */
   extensionPath: string;
+  /**
+   * Per-model session directory from SessionKeyStore. Handed to Pi as
+   * AGENTOS_SESSION_DIR so transcripts never cross model families.
+   */
+  sessionDir?: string;
   /** Optional single API key grant. */
   grantProviderKey?: { name: ProviderKeyEnvName; value: string } | null;
   /** Clean-room: add --no-skills --no-extensions --no-context-files, then re-add -e. */
@@ -130,6 +135,9 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
     AGENTOS_SOCKET: options.socketPath,
     AGENTOS_ROLE: options.role,
   };
+  if (options.sessionDir !== undefined) {
+    extraAllow.AGENTOS_SESSION_DIR = options.sessionDir;
+  }
   if (options.detection.configDirEnv !== null) {
     extraAllow[options.detection.configDirEnv] = options.detection.managedHome;
   }

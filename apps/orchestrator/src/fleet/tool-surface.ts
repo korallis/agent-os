@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { monotonicFactory } from "ulid";
 import { ZodError } from "zod";
@@ -167,8 +167,16 @@ export class ToolSurface {
   private readonly failLines = new Map<string, string[]>();
   private readonly questions = new Map<string, PendingQuestion>();
   private brainSessionId: string | null = null;
-  /** runId → owning task, so `ext.usage` can be attributed to a fusion side. */
-  private readonly sessionsByFusionRun = new Map<string, { taskId: string }>();
+  /**
+   * sessionId → fusion side ownership for O(1) usage attribution and settle
+   * completion. Entries are removed when the side settles or the session stops.
+   */
+  private readonly fusionBySessionId = new Map<
+    string,
+    { taskId: string; runId: string; sideIndex: number }
+  >();
+  /** sessionId → SessionKeyStore directory for this spawn. */
+  private readonly sessionDirs = new Map<string, string>();
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -204,13 +212,9 @@ export class ToolSurface {
     sessionId: string,
     usage: { inputTokens: number | null; outputTokens: number | null; costUsd: number | null },
   ): void {
-    for (const [runId, { taskId }] of this.sessionsByFusionRun) {
-      const run = this.deps.fusionRuns.get(taskId, runId);
-      if (run === null) continue;
-      if (!run.sides.some((s) => s.sessionId === sessionId)) continue;
-      this.deps.fusionRuns.recordSideUsage(taskId, runId, sessionId, usage);
-      return;
-    }
+    const ref = this.fusionBySessionId.get(sessionId);
+    if (ref === undefined) return;
+    this.deps.fusionRuns.recordSideUsage(ref.taskId, ref.runId, sessionId, usage);
   }
 
   /** Fusion runs recorded for a task, newest first. */
@@ -371,6 +375,52 @@ export class ToolSurface {
       lost.push(session.sessionId);
     }
     return lost;
+  }
+
+  /**
+   * Boot/restart reconcile for the session-key gate (master plan §6.5 / G6).
+   *
+   * For each non-terminal task that already has crewmate sessions, compare the
+   * resolved cast against SessionKeyStore and respawn ONLY roles whose session
+   * directory is absent — surviving dirs (and their live panes) are left alone.
+   */
+  reconcileMissingCastRoles(): Array<{ taskId: string; role: string; model: string }> {
+    const respawned: Array<{ taskId: string; role: string; model: string }> = [];
+    for (const task of this.listTasks()) {
+      if (isTerminalPhase(task.phase)) continue;
+      if (task.cast.length === 0 || task.sessions.length === 0) continue;
+
+      const expected = task.cast.map((c) => ({ role: c.role, model: c.model }));
+      const missing = this.deps.sessionKeys.missingRoles(task.projectId, expected);
+      for (const slot of missing) {
+        const castEntry = task.cast.find(
+          (c) => c.role === slot.role && c.model === slot.model,
+        );
+        if (castEntry === undefined) continue;
+        const alreadyLive = [...this.sessions.values()].some(
+          (s) =>
+            s.taskId === task.id &&
+            s.role === slot.role &&
+            s.model === slot.model &&
+            (s.status === "starting" || s.status === "running" || s.status === "settled"),
+        );
+        if (alreadyLive) continue;
+        try {
+          this.spawnCrewmate({
+            taskId: task.id,
+            role: castEntry.role,
+            model: castEntry.model,
+            thinking: castEntry.thinking,
+            cleanRoom: castEntry.cleanRoom,
+            vars: {},
+          });
+          respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
+        } catch {
+          // Spawn may be illegal in this phase; Brain reconcile handles the rest.
+        }
+      }
+    }
+    return respawned;
   }
 
   invoke(
@@ -975,13 +1025,29 @@ export class ToolSurface {
       );
     }
 
+    // Per-model session key: a model change yields a new directory so transcripts
+    // never cross families. Handed to Pi as AGENTOS_SESSION_DIR.
+    const sessionDir = this.deps.sessionKeys.ensure({
+      projectId: task.projectId,
+      role: input.role,
+      model: input.model,
+    }).dir;
+    this.sessionDirs.set(sessionId, sessionDir);
+
     try {
       const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
 
       let tmuxWindow = `agentos:${windowName}`;
       if (fake) {
-        // Stay alive so pane-liveness reconcile does not spuriously SESSION_LOST
-        // the moment a short-lived `echo` exits under real tmux.
+        // Deterministic side output so fusion gates can assert artifacts without
+        // a paid model. Stay alive so pane-liveness reconcile does not spuriously
+        // SESSION_LOST the moment a short-lived `echo` exits under real tmux.
+        const fakeOutput = join(sessionDir, "output.md");
+        writeFileSync(
+          fakeOutput,
+          `fake-pi ${input.role} ${input.model} session=${sessionId}\n`,
+          { mode: 0o600 },
+        );
         this.deps.tmux.newWindow({
           windowName,
           argv: [
@@ -1041,6 +1107,7 @@ export class ToolSurface {
           role: input.role,
           socketPath,
           extensionPath: this.deps.extensionPath,
+          sessionDir,
           cleanRoom: input.cleanRoom,
           grantProviderKey: grant,
         });
@@ -1117,6 +1184,9 @@ export class ToolSurface {
       });
 
       // Fake Pi auto-settles for zero-token idle proofs and local-only SHIP.
+      // Status stays "running" (historical harness contract); the wake is what
+      // the Brain sees. Fusion sides finalize via completeFusionSide after the
+      // dispatch path registers ownership.
       if (fake) {
         this.deps.watcher.classify({
           class: "AGENT_SETTLED",
@@ -1128,6 +1198,7 @@ export class ToolSurface {
 
       return { session: fleetSession, task: this.requireTask(task.id) };
     } catch (error) {
+      this.sessionDirs.delete(sessionId);
       if (sessionSocketOpened) {
         void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
       }
@@ -1150,6 +1221,7 @@ export class ToolSurface {
     this.deps.tmux.killWindow(session.tmuxWindow);
     void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId: input.sessionId });
+    this.clearFusionSession(input.sessionId);
     const now = new Date().toISOString();
     // Re-read after release so cleared worktreePath refs are not re-stamped.
     const released = this.sessions.get(input.sessionId) ?? session;
@@ -1209,6 +1281,7 @@ export class ToolSurface {
     promptsIdentical: boolean;
     aggregatorFamily: string | null;
     contractOk?: boolean;
+    spawned: boolean;
   } {
     const input = dispatchFusionInputSchema.parse(raw);
     const task = this.requireTask(input.taskId);
@@ -1227,6 +1300,11 @@ export class ToolSurface {
         { families: [...families] },
       );
     }
+
+    // Default spawn policy by kind (§6.3): opinion / plan-fusion spawn clean-room
+    // sides; fusion with a completed artifact is a contract check only.
+    const spawnSides =
+      input.spawnSides ?? (input.kind === "opinion" || input.kind === "plan-fusion");
 
     const runId = nextUlid();
     const project = this.deps.projects.get(task.projectId);
@@ -1329,56 +1407,177 @@ export class ToolSurface {
       payload: { taskId: task.id, kind: input.kind, runId },
     });
 
-    // Optionally spawn one clean-room Pi per side, each with the identical
-    // instruction and its own per-model session key.
-    if (input.spawnSides) {
+    // Spawn one clean-room Pi per side, each with the identical instruction and
+    // its own per-model session key. side_completed / completed fire on settle.
+    if (spawnSides) {
       const spawned: FusionSide[] = [];
-      for (const side of sides) {
+      for (let i = 0; i < sides.length; i++) {
+        const side = sides[i]!;
+        const cast = input.casts[i]!;
         const result = this.spawnCrewmate({
           taskId: task.id,
           role: side.role,
           model: side.model,
-          thinking: input.casts.find((c) => c.role === side.role)?.thinking ?? "medium",
-          cleanRoom: true,
+          thinking: cast.thinking,
+          cleanRoom: cast.cleanRoom,
           vars: {},
           prompt: instruction,
         });
-        spawned.push({ ...side, sessionId: result.session.sessionId });
-        this.sink({
-          type: "fusion.side_completed",
-          payload: {
-            taskId: task.id,
-            runId,
-            role: side.role,
-            model: side.model,
-            family: side.family,
-            promptHash: side.promptHash,
-            artifactPath: null,
-          },
+        const sessionId = result.session.sessionId;
+        spawned.push({ ...side, sessionId });
+        this.fusionBySessionId.set(sessionId, {
+          taskId: task.id,
+          runId,
+          sideIndex: i,
         });
+        // Fake-Pi writes output.md during spawn and never sends agent_settled
+        // over the extension channel — finalize the side as soon as ownership
+        // is registered. Real Pi finalizes via markSessionStatus / session_end.
+        if (this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1") {
+          this.completeFusionSide(sessionId);
+        }
       }
-      this.deps.fusionRuns.save({ ...run, sides: spawned });
-      this.sessionsByFusionRun.set(runId, { taskId: task.id });
+      // Persist sessionIds even when no side has settled yet (real Pi path),
+      // without clobbering artifacts completeFusionSide already wrote.
+      const latest = this.deps.fusionRuns.get(task.id, runId) ?? run;
+      const withSessions = latest.sides.map((s, i) => ({
+        ...s,
+        sessionId: s.sessionId ?? spawned[i]?.sessionId ?? null,
+      }));
+      this.deps.fusionRuns.save({ ...latest, sides: withSessions });
+    } else {
+      // Pure contract / bookkeeping dispatch — no sides to wait on.
+      this.emitFusionCompleted(run);
+      if (input.kind === "plan-fusion" && task.phase === "PLANNING") {
+        this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+      }
     }
 
+    return contractOk === null
+      ? { runId, promptsIdentical, aggregatorFamily, spawned: spawnSides }
+      : { runId, promptsIdentical, aggregatorFamily, contractOk, spawned: spawnSides };
+  }
+
+  /**
+   * Capture a fusion side's output when its session settles, emit
+   * fusion.side_completed, and finish the run when every side is done.
+   */
+  private completeFusionSide(sessionId: string): void {
+    const ref = this.fusionBySessionId.get(sessionId);
+    if (ref === undefined) return;
+
+    const run = this.deps.fusionRuns.get(ref.taskId, ref.runId);
+    if (run === null) {
+      this.fusionBySessionId.delete(sessionId);
+      return;
+    }
+
+    const side = run.sides[ref.sideIndex];
+    if (side === undefined) {
+      this.fusionBySessionId.delete(sessionId);
+      return;
+    }
+    if (side.artifactPath !== null) {
+      // Already recorded (e.g. double settle from agent_settled + session_end).
+      this.fusionBySessionId.delete(sessionId);
+      this.tryCompleteFusionRun(ref.taskId, ref.runId);
+      return;
+    }
+
+    const content = this.readSideOutput(sessionId, side);
+    const artifactPath = this.deps.fusionRuns.writeSideArtifact(
+      ref.taskId,
+      ref.runId,
+      ref.sideIndex,
+      side.model,
+      content,
+    );
+
+    const sides = run.sides.map((s, i) =>
+      i === ref.sideIndex
+        ? { ...s, sessionId, artifactPath }
+        : s.sessionId === sessionId
+          ? { ...s, artifactPath }
+          : s,
+    );
+    // Ensure this session id is stamped even if spawn registration raced.
+    const withSession = sides.map((s, i) =>
+      i === ref.sideIndex && s.sessionId === null ? { ...s, sessionId } : s,
+    );
+    this.deps.fusionRuns.save({ ...run, sides: withSession });
+
     this.sink({
-      type: "fusion.completed",
+      type: "fusion.side_completed",
       payload: {
-        taskId: task.id,
-        runId,
-        kind: input.kind,
-        promptsIdentical,
-        aggregatorFamily,
-        contractOk,
+        taskId: ref.taskId,
+        runId: ref.runId,
+        role: side.role,
+        model: side.model,
+        family: side.family,
+        promptHash: side.promptHash,
+        artifactPath,
       },
     });
 
-    if (input.kind === "plan-fusion" && task.phase === "PLANNING") {
-      this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+    this.fusionBySessionId.delete(sessionId);
+    this.tryCompleteFusionRun(ref.taskId, ref.runId);
+  }
+
+  private readSideOutput(
+    sessionId: string,
+    side: FusionSide,
+  ): string {
+    const sessionDir = this.sessionDirs.get(sessionId);
+    if (sessionDir !== undefined) {
+      const outputPath = join(sessionDir, "output.md");
+      if (existsSync(outputPath)) {
+        try {
+          return readFileSync(outputPath, "utf8");
+        } catch {
+          // fall through
+        }
+      }
     }
-    return contractOk === null
-      ? { runId, promptsIdentical, aggregatorFamily }
-      : { runId, promptsIdentical, aggregatorFamily, contractOk };
+    return `[settled] role=${side.role} model=${side.model} session=${sessionId}\n`;
+  }
+
+  private tryCompleteFusionRun(taskId: string, runId: string): void {
+    const run = this.deps.fusionRuns.get(taskId, runId);
+    if (run === null) return;
+    if (!run.sides.every((s) => s.artifactPath !== null)) return;
+
+    // Drop any residual session → run mappings for this run.
+    for (const [sid, ref] of this.fusionBySessionId) {
+      if (ref.runId === runId) this.fusionBySessionId.delete(sid);
+    }
+
+    this.emitFusionCompleted(run);
+
+    if (run.kind === "plan-fusion") {
+      const task = this.tasks.get(taskId);
+      if (task !== undefined && task.phase === "PLANNING") {
+        this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+      }
+    }
+  }
+
+  private emitFusionCompleted(run: FusionRun): void {
+    this.sink({
+      type: "fusion.completed",
+      payload: {
+        taskId: run.taskId,
+        runId: run.runId,
+        kind: run.kind,
+        promptsIdentical: run.promptsIdentical,
+        aggregatorFamily: run.aggregatorFamily,
+        contractOk: run.contractOk,
+      },
+    });
+  }
+
+  private clearFusionSession(sessionId: string): void {
+    this.fusionBySessionId.delete(sessionId);
+    this.sessionDirs.delete(sessionId);
   }
 
   private authorGate(raw: Record<string, unknown>): { taskId: string; gatePath: string } {
@@ -2269,6 +2468,9 @@ export class ToolSurface {
     if (status === "settled" && session.role === "scout") {
       this.auditScoutSession(sessionId);
     }
+    if (status === "settled") {
+      this.completeFusionSide(sessionId);
+    }
   }
 
   /** Mark a session lost (pane-died / reconcile). */
@@ -2280,6 +2482,7 @@ export class ToolSurface {
     this.releaseWorktreeLeases({ sessionId });
     const released = this.sessions.get(sessionId) ?? session;
     this.sessions.set(sessionId, { ...released, status: "lost" });
+    this.clearFusionSession(sessionId);
     this.sink({
       type: "session.lost",
       payload: { sessionId, taskId: session.taskId, reason },
@@ -2312,8 +2515,12 @@ export class ToolSurface {
    * Clean Pi exit (ext.lifecycle session_end): release the worktree lease so
    * settle-and-exit does not exhaust the pool. Reuses the shared release helper
    * (verified-reset when clean, quarantine + deliveryBlocked when dirty).
+   * Also settles any fusion side still waiting on this session.
    */
   releaseSessionOnEnd(sessionId: string): void {
+    // session_end without a prior agent_settled still finalizes fusion sides.
+    this.completeFusionSide(sessionId);
+    this.clearFusionSession(sessionId);
     this.releaseWorktreeLeases({ sessionId });
   }
 

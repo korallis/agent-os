@@ -400,13 +400,15 @@ export class FleetService {
 
   /**
    * kill -9 restart-proof path: rebind control sockets for surviving sessions,
-   * mark dead panes lost, reclaim orphaned worktree leases stuck in `leased`.
+   * mark dead panes lost, reclaim orphaned worktree leases stuck in `leased`,
+   * and respawn only cast roles whose session-key directory is absent (G6).
    */
   private rehydrateRuntime(): void {
     this.tools.rebindSessionListeners();
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
     this.reclaimOrphanedWorktreeLeases();
+    this.tools.reconcileMissingCastRoles();
   }
 
   private startReconcileTick(): void {
