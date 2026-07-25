@@ -244,7 +244,7 @@ describe("Brain budget handoff", () => {
 
   function windowSample(
     connectionId: string,
-    provider: string,
+    provider: QuotaSample["provider"],
     pct: number,
     now: string,
   ): QuotaSample {
