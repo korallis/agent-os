@@ -3,10 +3,11 @@
  * Phase 2 completion gates (master plan §11 Phase 2) — the criteria that can be
  * proven with fixtures, against a real daemon.
  *
- *   P1  extension frames (`ext.hello`, lifecycle, `ext.usage`) persist AND project
+ *   P1  extension usage + lifecycle frames persist AND project into analytics
+ *       (fake-Pi fixture path; live extension socket is covered by real-Pi flows)
  *   P2  auth-store integrity: Agent OS never opens `auth.json` for write, and no
  *       durable frame carries token material (canary sweep)
- *   P3  env hygiene: an ambient cast-matching key is detected and reported
+ *   P3  env hygiene: an ambient cast-matching key is detected and blocks complete
  *   P5  onboarding detection auto-enables probes for exactly the detected
  *       providers, and leaves the others off
  *
@@ -71,14 +72,15 @@ let daemon;
 
 try {
   const home = mkdtempSync(join(tmpdir(), "agentos-p2b-home-"));
-  const piHome = mkdtempSync(join(tmpdir(), "agentos-p2b-pi-"));
-  cleanups.push(home, piHome);
+  cleanups.push(home);
 
-  // A fixture Pi auth store: two providers present, others absent. The token
-  // value is the canary — the daemon may READ this file, never write it, and
-  // must never copy its contents into anything durable.
-  mkdirSync(join(piHome, "agent"), { recursive: true });
-  const authJsonPath = join(piHome, "agent", "auth.json");
+  // Fixture Pi auth store on the managed path the daemon actually reads:
+  // managedPiHome(AGENTOS_HOME) → $AGENTOS_HOME/pi/agent/auth.json.
+  // Two providers present, others absent. The token value is the canary — the
+  // daemon may READ this file, never write it, and must never copy its contents
+  // into anything durable.
+  const authJsonPath = join(home, "pi", "agent", "auth.json");
+  mkdirSync(dirname(authJsonPath), { recursive: true });
   writeFileSync(
     authJsonPath,
     JSON.stringify(
@@ -96,6 +98,9 @@ try {
   daemon = spawn(process.execPath, [DAEMON_BIN], {
     env: {
       ...process.env,
+      // Isolate shared ~/.pi fallback so host credentials cannot pollute
+      // detection / enable-probes "exactly" assertions.
+      HOME: home,
       AGENTOS_HOME: home,
       AGENTOS_PORT: String(PORT),
       AGENTOS_TMUX_SOCKET: TMUX_SOCKET,
@@ -103,7 +108,6 @@ try {
       AGENTOS_FAKE_BRAIN: "1",
       AGENTOS_FAKE_GATE: "1",
       AGENTOS_FAKE_GIT: "1",
-      AGENTOS_PI_HOME: piHome,
       // P3: an ambient key that matches a cast the fleet could resolve.
       ANTHROPIC_API_KEY: "sk-ant-ambient-fixture-not-a-secret",
     },
@@ -127,6 +131,20 @@ try {
   const get = async (path) => (await fetch(`${BASE}${path}`, { headers: auth })).json();
   const post = async (path, body) =>
     (await fetch(`${BASE}${path}`, { method: "POST", headers: auth, body: JSON.stringify(body) })).json();
+  const postRaw = async (path, body) => {
+    const res = await fetch(`${BASE}${path}`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(body),
+    });
+    let json = null;
+    try {
+      json = await res.json();
+    } catch {
+      json = null;
+    }
+    return { status: res.status, json };
+  };
 
   // ── P5 — onboarding detection auto-enables exactly the detected providers ─
   {
@@ -154,7 +172,7 @@ try {
     }
 
     await post("/v1/onboarding", { action: "refresh-doctor" });
-    await post("/v1/onboarding", { action: "enable-probes" });
+    const enableRes = await postRaw("/v1/onboarding", { action: "enable-probes" });
     await sleep(800);
     const effective = await get("/v1/config/effective");
     const providers = effective.config?.quota?.providers ?? {};
@@ -164,14 +182,17 @@ try {
       .sort();
     // The fixture store holds anthropic + xai. Others must stay OFF: enabling a
     // probe for a provider the Captain never connected would poll an endpoint
-    // they never authorised.
+    // they never authorised. Both directions required — missing enables are
+    // failures too (empty enable-probes must not pass).
     const detected = ["anthropic", "xai"];
     const unexpected = enabled.filter((p) => !detected.includes(p));
+    const missing = detected.filter((p) => !enabled.includes(p));
+    const enableOk = enableRes.status >= 200 && enableRes.status < 300;
     gate(
       "P5",
       "onboarding enables probes for exactly the detected providers and leaves the rest off",
-      unexpected.length === 0,
-      `enabled=[${enabled.join(",")}] unexpectedlyEnabled=[${unexpected.join(",")}]`,
+      enableOk && unexpected.length === 0 && missing.length === 0,
+      `enableStatus=${enableRes.status} enabled=[${enabled.join(",")}] unexpectedlyEnabled=[${unexpected.join(",")}] missing=[${missing.join(",")}]`,
     );
   }
 
@@ -216,20 +237,24 @@ try {
       (e) => e.event?.payload?.inputTokens !== undefined,
     );
 
-    // Projected: the derived analytics view reflects those same tokens, which is
-    // what "persisted + projected" actually means — a frame in the log that no
-    // projection reads is not wired up.
+    // Projected: the derived analytics view must equal the sum of persisted
+    // ext.usage inputTokens — non-zero alone would admit double-counts or drops.
     const analytics = await get("/v1/analytics?days=1");
     const projectedTokens = analytics.totals?.inputTokens ?? 0;
+    const summedUsageTokens = usageFrames.reduce(
+      (sum, e) => sum + (typeof e.event.payload.inputTokens === "number" ? e.event.payload.inputTokens : 0),
+      0,
+    );
 
     gate(
       "P1",
       "extension usage + lifecycle frames are persisted AND projected into analytics",
       usageFrames.length > 0 &&
         (spawns.events ?? []).length > 0 &&
-        projectedTokens > 0 &&
+        projectedTokens === summedUsageTokens &&
+        summedUsageTokens > 0 &&
         usageFrames.every((e) => typeof e.event.payload.inputTokens === "number"),
-      `usageFrames=${usageFrames.length} spawnFrames=${(spawns.events ?? []).length} projectedInputTokens=${projectedTokens}`,
+      `usageFrames=${usageFrames.length} spawnFrames=${(spawns.events ?? []).length} projectedInputTokens=${projectedTokens} summedUsageInputTokens=${summedUsageTokens}`,
     );
   }
 
@@ -241,6 +266,9 @@ try {
     // Canary sweep across everything durable the daemon owns.
     const offenders = [];
     for (const file of walk(home)) {
+      // The planted fixture itself holds the canary; only non-auth.json durable
+      // copies are leaks.
+      if (file === authJsonPath) continue;
       let contents;
       try {
         contents = readFileSync(file, "utf8");
@@ -278,18 +306,19 @@ try {
     const verify = await post("/v1/onboarding", { action: "verify-claude-sdk" });
     const anthropic = (verify.state?.providers ?? []).find((p) => p.provider === "anthropic");
     const sdk = anthropic?.claudeSdk;
-    // noAmbientApiKey false === the ambient key was detected, and the wizard
-    // therefore cannot complete the subscription path. Silently proceeding would
-    // switch a Claude Max subscription onto API billing without the Captain
-    // ever being told — a bill they never agreed to.
-    const detected = sdk !== undefined && sdk.noAmbientApiKey === false;
-    const blocksCompletion = detected && sdk.catalogHealthcheck !== true;
+    // noAmbientApiKey false === the ambient key was detected.
+    const ambientDetected = sdk !== undefined && sdk.noAmbientApiKey === false;
+    // Product gate: complete must refuse with ONBOARDING_BLOCKED (not a proxy
+    // like catalogHealthcheck, which can be true with an ambient key present).
+    const completeRes = await postRaw("/v1/onboarding", { action: "complete" });
+    const blocksCompletion =
+      completeRes.status === 409 && completeRes.json?.error?.code === "ONBOARDING_BLOCKED";
 
     gate(
       "P3",
       "an ambient ANTHROPIC_API_KEY is detected and blocks the subscription-sdk path",
-      detected && blocksCompletion,
-      `ambientDetected=${detected} completionBlocked=${blocksCompletion} claudeSdk=${JSON.stringify(sdk ?? null).slice(0, 120)}`,
+      ambientDetected && blocksCompletion,
+      `ambientDetected=${ambientDetected} completeStatus=${completeRes.status} completeCode=${completeRes.json?.error?.code ?? "none"} claudeSdk=${JSON.stringify(sdk ?? null).slice(0, 120)}`,
     );
   }
 
