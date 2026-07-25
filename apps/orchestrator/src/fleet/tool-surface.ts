@@ -257,6 +257,17 @@ export class ToolSurface {
   private readonly routingInProgress = new Set<string>();
   /** `${taskId}:${role}` → wedge respawns already consumed (ladder ledger). */
   private readonly wedgeRespawns = new Map<string, number>();
+  /**
+   * sessionIds whose wedge ladder has completed in this process (emit + outcome).
+   * Durable-wedged seats rehydrated after a crash are reconsidered once until
+   * they land here — prevents stranding and per-tick re-escalate spam.
+   */
+  private readonly wedgeLadderCompleted = new Set<string>();
+  /**
+   * Hot activity stamps waiting for a coalesced durable write. lastActivityAt
+   * stays current in memory; lastEventAt is flushed on reconcile / saveTask.
+   */
+  private readonly pendingActivityAt = new Map<string, string>();
 
 
   constructor(private readonly deps: ToolSurfaceDeps) {
@@ -623,13 +634,23 @@ export class ToolSurface {
    * spend, and the second wedge is far more likely to be the task than the seat.
    */
   reconcileWedgedSessions(now = Date.now()): Array<{ sessionId: string; action: string }> {
+    // Coalesce hot activity stamps before idle checks so the durable clock
+    // is approximately current without per-frame task.json writes.
+    this.flushPendingActivity();
+
     const supervision = this.deps.config.effective().config.supervision;
     const thresholdMinutes = supervision.staleMinutes.build;
     const respawnCap = supervision.respawnPerStage;
     const acted: Array<{ sessionId: string; action: string }> = [];
 
     for (const session of [...this.sessions.values()]) {
-      if (session.status !== "running" && session.status !== "starting") continue;
+      // Re-admit durable-wedged seats that never finished the ladder in this
+      // process (crash between classify and outcome, or pre-fix stranded rows).
+      const reopened =
+        session.status === "wedged" && !this.wedgeLadderCompleted.has(session.sessionId);
+      if (session.status !== "running" && session.status !== "starting" && !reopened) {
+        continue;
+      }
       // A missing pane is SESSION_LOST, not wedged — that path already exists
       // and means something different to the Captain.
       if (!this.deps.tmux.hasWindow(session.tmuxWindow)) continue;
@@ -638,31 +659,43 @@ export class ToolSurface {
       const idleMs = now - Date.parse(since);
       if (!Number.isFinite(idleMs)) continue;
       const idleMinutes = idleMs / 60_000;
-      if (idleMinutes < thresholdMinutes) continue;
+      // Already-classified (reopened) seats skip the idle gate — they need the
+      // outcome half of the ladder completed, not a second silence wait.
+      if (!reopened && idleMinutes < thresholdMinutes) continue;
 
       const used = this.getWedgeRespawns(session.taskId, session.role);
       const canRespawn = used < respawnCap;
-      this.persistSessionWedged(session);
+
+      // In-memory only until the outcome is known — durable wedged before
+      // respawn/escalate strands the seat if we crash mid-ladder (rehydrate
+      // would skip running|starting-only candidates with an unspent ledger).
+      this.sessions.set(session.sessionId, { ...session, status: "wedged" });
 
       let action: "respawned" | "escalated";
       let escalateSummary: string | null = null;
       if (canRespawn) {
         try {
+          // Spend the bound before spawn so a crash cannot leave the
+          // respawn-once ledger unspent after a partial success.
+          this.setWedgeRespawns(session.taskId, session.role, used + 1);
           this.respawnCrewmate({
             sessionId: session.sessionId,
             reason: `structural WEDGED — no activity for ${Math.round(idleMinutes)}m (threshold ${thresholdMinutes}m)`,
           });
-          this.setWedgeRespawns(session.taskId, session.role, used + 1);
           action = "respawned";
         } catch {
           action = "escalated";
           escalateSummary = `Seat ${session.role} wedged and could not be respawned — no activity for ${Math.round(idleMinutes)}m`;
+          const current = this.sessions.get(session.sessionId) ?? session;
+          this.persistSessionWedged(current);
         }
       } else {
         // Cap consumed: the Captain decides, because a second wedge on the same
         // role is far more likely to be the task than the seat.
         action = "escalated";
         escalateSummary = `Seat ${session.role} wedged again after ${used} respawn${used === 1 ? "" : "s"} — no activity for ${Math.round(idleMinutes)}m. The task, not the model, is the likely cause.`;
+        const current = this.sessions.get(session.sessionId) ?? session;
+        this.persistSessionWedged(current);
       }
 
       this.emitSessionWedged(session, {
@@ -672,6 +705,7 @@ export class ToolSurface {
         respawnCap,
         action,
       });
+      this.wedgeLadderCompleted.add(session.sessionId);
       if (escalateSummary !== null) {
         this.escalate({
           taskId: session.taskId ?? undefined,
@@ -712,6 +746,7 @@ export class ToolSurface {
   }
 
   private persistSessionWedged(session: FleetSession): void {
+    this.pendingActivityAt.delete(session.sessionId);
     this.sessions.set(session.sessionId, { ...session, status: "wedged" });
     if (session.taskId === null) return;
     const task = this.tasks.get(session.taskId);
@@ -2106,6 +2141,7 @@ export class ToolSurface {
     if (session === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
     }
+    this.pendingActivityAt.delete(input.sessionId);
     if (session.role === "scout") {
       this.auditScoutSession(input.sessionId);
     }
@@ -2601,6 +2637,7 @@ export class ToolSurface {
       return;
     }
 
+    this.pendingActivityAt.delete(sessionId);
     try {
       this.deps.tmux.killWindow(session.tmuxWindow);
     } catch {
@@ -4315,11 +4352,12 @@ export class ToolSurface {
   }
 
   private saveTask(task: TaskSnapshot): void {
-    this.tasks.set(task.id, task);
-    if (task.idempotencyKey !== null) {
-      this.idempotency.set(task.idempotencyKey, task);
+    const merged = this.absorbPendingActivity(task);
+    this.tasks.set(merged.id, merged);
+    if (merged.idempotencyKey !== null) {
+      this.idempotency.set(merged.idempotencyKey, merged);
     }
-    this.persistTask(task);
+    this.persistTask(merged);
   }
 
   private persistTask(task: TaskSnapshot): void {
@@ -4331,6 +4369,49 @@ export class ToolSurface {
     renameSync(tmp, target);
   }
 
+  /**
+   * Fold coalesced activity stamps into a task snapshot and clear them.
+   * Called from every saveTask so status/ledger writes cannot clobber a
+   * hotter in-memory lastActivityAt with a stale lastEventAt.
+   */
+  private absorbPendingActivity(task: TaskSnapshot): TaskSnapshot {
+    let any = false;
+    const sessions = task.sessions.map((s) => {
+      const pending = this.pendingActivityAt.get(s.sessionId);
+      if (pending === undefined) return s;
+      this.pendingActivityAt.delete(s.sessionId);
+      // Never clobber a newer durable stamp (e.g. stop/status write) with an
+      // older coalesced frame that was still sitting in the dirty map.
+      if (s.lastEventAt !== null && s.lastEventAt >= pending) return s;
+      any = true;
+      return { ...s, lastEventAt: pending };
+    });
+    if (!any) return task;
+    return {
+      ...task,
+      sessions,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Persist dirty activity stamps (one task.json write per affected task). */
+  private flushPendingActivity(): void {
+    if (this.pendingActivityAt.size === 0) return;
+    const taskIds = new Set<string>();
+    for (const sessionId of this.pendingActivityAt.keys()) {
+      const session = this.sessions.get(sessionId);
+      if (session?.taskId !== null && session?.taskId !== undefined) {
+        taskIds.add(session.taskId);
+      } else {
+        this.pendingActivityAt.delete(sessionId);
+      }
+    }
+    for (const taskId of taskIds) {
+      const task = this.tasks.get(taskId);
+      if (task !== undefined) this.saveTask(task);
+    }
+  }
+
   /** Record a session status reported by its extension (running → settled). */
   markSessionStatus(sessionId: string, status: FleetSession["status"]): void {
     const session = this.sessions.get(sessionId);
@@ -4340,10 +4421,12 @@ export class ToolSurface {
     if (session.status === "stopped" || session.status === "lost" || session.status === "wedged") {
       return;
     }
+    const now = new Date().toISOString();
+    this.pendingActivityAt.delete(sessionId);
     this.sessions.set(sessionId, {
       ...session,
       status,
-      lastActivityAt: new Date().toISOString(),
+      lastActivityAt: now,
     });
     const task = session.taskId !== null ? this.tasks.get(session.taskId) : undefined;
     if (task !== undefined) {
@@ -4351,10 +4434,10 @@ export class ToolSurface {
         ...task,
         sessions: task.sessions.map((s) =>
           s.sessionId === sessionId
-            ? { ...s, status, lastEventAt: new Date().toISOString() }
+            ? { ...s, status, lastEventAt: now }
             : s,
         ),
-        updatedAt: new Date().toISOString(),
+        updatedAt: now,
       });
     }
     if (status === "settled" && session.role === "scout") {
@@ -4369,6 +4452,8 @@ export class ToolSurface {
    * Stamp lastActivityAt from an observable frame (lifecycle progress, usage,
    * crewmate tool call) without changing status. null lastActivityAt means the
    * seat has produced nothing since spawn — only real frames clear that.
+   * Durable lastEventAt is coalesced (dirty map + flush on reconcile/saveTask)
+   * so busy seats cannot fsync the full task snapshot on every progress frame.
    */
   touchSessionActivity(sessionId: string): void {
     const session = this.sessions.get(sessionId);
@@ -4383,15 +4468,7 @@ export class ToolSurface {
     const now = new Date().toISOString();
     this.sessions.set(sessionId, { ...session, lastActivityAt: now });
     if (session.taskId === null) return;
-    const task = this.tasks.get(session.taskId);
-    if (task === undefined) return;
-    this.saveTask({
-      ...task,
-      sessions: task.sessions.map((s) =>
-        s.sessionId === sessionId ? { ...s, lastEventAt: now } : s,
-      ),
-      updatedAt: now,
-    });
+    this.pendingActivityAt.set(sessionId, now);
   }
 
   /** Mark a session lost (pane-died / reconcile). */
@@ -4399,6 +4476,7 @@ export class ToolSurface {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
     if (session.status === "lost" || session.status === "stopped") return;
+    this.pendingActivityAt.delete(sessionId);
     // Finalize any in-flight fusion side so a pane-lost side cannot leave the
     // run stranded on fusion.dispatched. Pass reason so a lost last side is
     // not reported as a clean success. Ownership stays until the whole run
