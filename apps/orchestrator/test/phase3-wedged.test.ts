@@ -574,5 +574,159 @@ describe("structural WEDGED ladder", () => {
       expect(wedged.payload.respawnsUsed).toBe(0);
     }
     expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+  });
+
+  it("discharges a durable pending Captain notify for a stopped seat without re-wedging", () => {
+    const { service, events, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    // Simulate stop-then-spawn-fail that recorded the obligation but never
+    // sank captain.escalation (process death / throw after record).
+    const task = service.tools.getTask(taskId)!;
+    const summary = `Seat ${role} wedged and could not be respawned — no activity for 60m`;
+    service.tools.hydrateTask({
+      ...task,
+      wedgeRespawnsByRole: { [role]: 1 },
+      wedgePendingCaptainNotifies: [
+        {
+          sessionId,
+          role,
+          summary,
+          severity: "critical",
+          recordedAt: new Date().toISOString(),
+        },
+      ],
+      sessions: task.sessions.map((s) =>
+        s.sessionId === sessionId ? { ...s, status: "stopped" } : s,
+      ),
+      updatedAt: new Date().toISOString(),
+    });
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "stopped",
+    );
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    const esc = events.find((e) => e.type === "captain.escalation");
+    if (esc?.type === "captain.escalation") {
+      expect(esc.payload.summary).toBe(summary);
+      expect(esc.payload.severity).toBe("critical");
+    }
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "stopped",
+    );
+    expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+
+    // Exactly once: a second reconcile must not re-emit.
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+
+    // Survives rehydrate: empty pending, no free re-notify.
+    const durable = JSON.parse(
+      readFileSync(join(home, "runs", taskId, "task.json"), "utf8"),
+    ) as { wedgePendingCaptainNotifies: unknown[] };
+    expect(durable.wedgePendingCaptainNotifies).toEqual([]);
+  });
+
+  it("discharges pending Captain notify after rehydrate even when the pane is gone", () => {
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    const task = service.tools.getTask(taskId)!;
+    const summary = `Seat ${role} wedged again after 0 respawns — deferred notify`;
+    const stamped = {
+      ...task,
+      wedgePendingCaptainNotifies: [
+        {
+          sessionId,
+          role,
+          summary,
+          severity: "critical" as const,
+          recordedAt: new Date().toISOString(),
+        },
+      ],
+      sessions: task.sessions.map((s) =>
+        s.sessionId === sessionId ? { ...s, status: "wedged" as const } : s,
+      ),
+      updatedAt: new Date().toISOString(),
+    };
+    service.tools.hydrateTask(stamped);
+    // hydrateTask is memory-only — persist so a bounce can reload the obligation.
+    writeFileSync(
+      join(home, "runs", taskId, "task.json"),
+      `${JSON.stringify(service.tools.getTask(taskId), null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    // Fresh fake tmux has no windows — pane is gone; notify must still discharge.
+    const restarted = fleet({ home, start: false });
+    const events: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => events.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies).toHaveLength(1);
+    const rehydrated = restarted.service.tools
+      .listSessions()
+      .find((s) => s.sessionId === sessionId);
+    expect(rehydrated?.status).toBe("wedged");
+    expect(restarted.service.tmux.hasWindow(rehydrated!.tmuxWindow)).toBe(false);
+
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    const esc = events.find((e) => e.type === "captain.escalation");
+    if (esc?.type === "captain.escalation") {
+      expect(esc.payload.summary).toBe(summary);
+    }
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      0,
+    );
+    expect(restarted.service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+
+    events.length = 0;
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+  });
+
+  it("records pending notify before escalate so a failed sink is retried next tick", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    // Force escalate to throw once after the durable pending is recorded.
+    let failOnce = true;
+    const tools = service.tools as unknown as {
+      escalate: (raw: Record<string, unknown>) => unknown;
+    };
+    const originalEscalate = tools.escalate.bind(service.tools);
+    tools.escalate = (raw: Record<string, unknown>) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("simulated escalate sink failure");
+      }
+      return originalEscalate(raw);
+    };
+
+    events.length = 0;
+    try {
+      const acted = service.tools.reconcileWedgedSessions(Date.now());
+      expect(acted[0]?.action).toBe("escalated");
+      expect(events.some((e) => e.type === "session.wedged")).toBe(true);
+      expect(events.some((e) => e.type === "captain.escalation")).toBe(false);
+      const pending = service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? [];
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.sessionId).toBe(sessionId);
+      expect(pending[0]?.role).toBe(role);
+
+      // Next tick discharges the durable obligation without needing a live seat.
+      events.length = 0;
+      service.tools.reconcileWedgedSessions(Date.now());
+      expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+      expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+      expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    } finally {
+      tools.escalate = originalEscalate;
+    }
   });
 });

@@ -462,12 +462,14 @@ export class ToolSurface {
   /** Hydrate from durable task store (daemon boot). Rebuilds in-memory session rows. */
   hydrateTask(task: TaskSnapshot): void {
     const wedgeRespawnsByRole = task.wedgeRespawnsByRole ?? {};
+    const wedgePendingCaptainNotifies = task.wedgePendingCaptainNotifies ?? [];
     const normalized: TaskSnapshot = {
       ...task,
       deliveryBlocked: task.deliveryBlocked ?? null,
       redProof: task.redProof ?? null,
       lastFailLedger: task.lastFailLedger ?? null,
       wedgeRespawnsByRole,
+      wedgePendingCaptainNotifies,
     };
     this.tasks.set(normalized.id, normalized);
     if (normalized.idempotencyKey !== null) {
@@ -645,11 +647,24 @@ export class ToolSurface {
    *   burns the role's only respawn and removes the evidence the Captain
    *   would have wanted to look at — so we never reach stop on a known-
    *   illegal spawn, and nothing is spent.
+   *
+   * Captain-notify durability (one invariant):
+   * - Once the substrate has decided the Captain must be told, that obligation
+   *   is recorded on the task (`wedgePendingCaptainNotifies`) before the
+   *   attempt, survives seat state (stopped / lost / wedged / dead pane),
+   *   process death and restart, and is discharged exactly once when
+   *   `captain.escalation` is actually sunk. Seat shape is secondary to that.
    */
   reconcileWedgedSessions(now = Date.now()): Array<{ sessionId: string; action: string }> {
     // Coalesce hot activity stamps before idle checks so the durable clock
     // is approximately current without per-frame task.json writes.
     this.flushPendingActivity();
+
+    // Discharge outstanding Captain-notify obligations first — independent of
+    // any seat. Stopped / dead-pane / reopened-wedged seats never re-enter the
+    // classify loop in a way that can complete notify; this pass is the only
+    // path that can finish a pending obligation after restart or partial fail.
+    this.dischargePendingWedgeCaptainNotifies();
 
     const supervision = this.deps.config.effective().config.supervision;
     const thresholdMinutes = supervision.staleMinutes.build;
@@ -664,9 +679,11 @@ export class ToolSurface {
       if (session.status !== "running" && session.status !== "starting" && !reopened) {
         continue;
       }
-      // A missing pane is SESSION_LOST, not wedged — that path already exists
-      // and means something different to the Captain.
-      if (!this.deps.tmux.hasWindow(session.tmuxWindow)) continue;
+      // A missing pane on a live seat is SESSION_LOST, not wedged — that path
+      // already exists and means something different to the Captain. Reopened
+      // durable-wedged seats still need ladder completion (escalate-only) even
+      // when the pane is gone; do not require a live window for that outcome.
+      if (!reopened && !this.deps.tmux.hasWindow(session.tmuxWindow)) continue;
 
       const since = session.lastActivityAt ?? session.startedAt;
       const idleMs = now - Date.parse(since);
@@ -686,11 +703,25 @@ export class ToolSurface {
       // In-memory only until the outcome is known — durable wedged before
       // respawn/escalate strands the seat if we crash mid-ladder (rehydrate
       // would skip running|starting-only candidates with an unspent ledger).
-      this.sessions.set(session.sessionId, { ...session, status: "wedged" });
+      // Reopened seats keep their durable wedged status; do not rewrite.
+      if (!reopened) {
+        this.sessions.set(session.sessionId, { ...session, status: "wedged" });
+      }
 
       let action: "respawned" | "escalated";
       let escalateSummary: string | null = null;
-      if (canRespawn && spawnLegal) {
+      // Reopened durable-wedged seats already took the escalate branch (that is
+      // the only path that persists status=wedged). Finish escalate-only —
+      // never re-attempt respawn or re-wedge a terminal row.
+      if (reopened) {
+        action = "escalated";
+        const existingPending = task?.wedgePendingCaptainNotifies?.find(
+          (n) => n.sessionId === session.sessionId,
+        );
+        escalateSummary =
+          existingPending?.summary ??
+          `Seat ${session.role} wedged — completing deferred Captain notify (no activity for ${Math.round(idleMinutes)}m)`;
+      } else if (canRespawn && spawnLegal) {
         try {
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
           this.respawnCrewmate({
@@ -705,7 +736,8 @@ export class ToolSurface {
           // respawnCrewmate stops first; once status is stopped/lost the seat
           // was consumed even if spawn failed — spend stands. Leave those
           // terminal rows alone: rewriting them as wedged with a dead pane
-          // strands a seat nothing reconsiders.
+          // strands a seat nothing reconsiders. Captain notify is recorded
+          // durably below and discharged without requiring a live/wedged seat.
           if (current.status !== "stopped" && current.status !== "lost") {
             this.setWedgeRespawns(session.taskId, session.role, used);
             this.persistSessionWedged(current);
@@ -733,6 +765,17 @@ export class ToolSurface {
       // Evidence must agree with the durable ledger after the outcome (including
       // any rollback for a pre-stop failure).
       const respawnsUsed = this.getWedgeRespawns(session.taskId, session.role);
+      // Captain-notify obligation is recorded BEFORE evidence emit / sink so a
+      // throw or process death cannot leave the Captain uninformed. Cleared
+      // only after captain.escalation is actually sunk.
+      if (escalateSummary !== null && session.taskId !== null) {
+        this.recordPendingWedgeCaptainNotify(session.taskId, {
+          sessionId: session.sessionId,
+          role: session.role,
+          summary: escalateSummary,
+          severity: "critical",
+        });
+      }
       this.emitSessionWedged(session, {
         idleMinutes,
         thresholdMinutes,
@@ -741,11 +784,24 @@ export class ToolSurface {
         action,
       });
       if (escalateSummary !== null) {
-        this.escalate({
-          taskId: session.taskId ?? undefined,
-          summary: escalateSummary,
-          severity: "critical",
-        });
+        if (session.taskId !== null) {
+          const discharged = this.dischargePendingWedgeCaptainNotify(
+            session.taskId,
+            session.sessionId,
+          );
+          if (!discharged) {
+            // Leave out of wedgeLadderCompleted so a later tick (or the top-of-
+            // reconcile discharge pass) retries. Seat state is irrelevant.
+            acted.push({ sessionId: session.sessionId, action });
+            continue;
+          }
+        } else {
+          this.escalate({
+            taskId: undefined,
+            summary: escalateSummary,
+            severity: "critical",
+          });
+        }
       }
       // Only after a successful escalate (or a finished no-escalate respawn).
       // The reconcile tick swallows errors — marking complete first would leave
@@ -817,6 +873,93 @@ export class ToolSurface {
       ),
       updatedAt: now,
     });
+  }
+
+  /**
+   * Durable record that the Captain must be told about this wedge outcome.
+   * Idempotent per sessionId (latest summary wins). Survives seat mutation and
+   * daemon restart until dischargePendingWedgeCaptainNotify clears it.
+   */
+  private recordPendingWedgeCaptainNotify(
+    taskId: string,
+    entry: {
+      sessionId: string;
+      role: string;
+      summary: string;
+      severity: "info" | "warn" | "critical";
+    },
+  ): void {
+    const task = this.tasks.get(taskId);
+    if (task === undefined) return;
+    const now = new Date().toISOString();
+    const prior = (task.wedgePendingCaptainNotifies ?? []).filter(
+      (n) => n.sessionId !== entry.sessionId,
+    );
+    this.saveTask({
+      ...task,
+      wedgePendingCaptainNotifies: [
+        ...prior,
+        {
+          sessionId: entry.sessionId,
+          role: entry.role,
+          summary: entry.summary,
+          severity: entry.severity,
+          recordedAt: now,
+        },
+      ],
+      updatedAt: now,
+    });
+  }
+
+  /**
+   * Sink captain.escalation for one pending entry and clear it only on success.
+   * Returns false when there was nothing to discharge, or the attempt threw
+   * (entry left in place for a later tick).
+   */
+  private dischargePendingWedgeCaptainNotify(taskId: string, sessionId: string): boolean {
+    const task = this.tasks.get(taskId);
+    if (task === undefined) return false;
+    const pending = task.wedgePendingCaptainNotifies ?? [];
+    const entry = pending.find((n) => n.sessionId === sessionId);
+    if (entry === undefined) return false;
+    try {
+      this.escalate({
+        taskId,
+        summary: entry.summary,
+        severity: entry.severity,
+      });
+    } catch {
+      return false;
+    }
+    // Re-read after escalate (may have rewritten the task) and clear this entry.
+    const after = this.tasks.get(taskId);
+    if (after === undefined) return true;
+    const remaining = (after.wedgePendingCaptainNotifies ?? []).filter(
+      (n) => n.sessionId !== sessionId,
+    );
+    if (remaining.length !== (after.wedgePendingCaptainNotifies ?? []).length) {
+      this.saveTask({
+        ...after,
+        wedgePendingCaptainNotifies: remaining,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    this.wedgeLadderCompleted.add(sessionId);
+    return true;
+  }
+
+  /**
+   * Complete every outstanding wedge Captain-notify on every task, regardless
+   * of seat status. Called at the top of reconcileWedgedSessions so stopped /
+   * lost / dead-pane outcomes cannot strand the obligation.
+   */
+  private dischargePendingWedgeCaptainNotifies(): void {
+    for (const task of [...this.tasks.values()]) {
+      const pending = [...(task.wedgePendingCaptainNotifies ?? [])];
+      for (const entry of pending) {
+        this.dischargePendingWedgeCaptainNotify(task.id, entry.sessionId);
+      }
+    }
   }
 
   private emitSessionWedged(
@@ -1425,6 +1568,7 @@ export class ToolSurface {
       redProof: null,
       lastFailLedger: null,
       wedgeRespawnsByRole: {},
+      wedgePendingCaptainNotifies: [],
       idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
       updatedAt: now,

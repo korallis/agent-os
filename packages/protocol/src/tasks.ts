@@ -174,6 +174,23 @@ export const taskSnapshotSchema = z.strictObject({
    * Survives daemon restart so the respawn-once spend bound cannot reset on bounce.
    */
   wedgeRespawnsByRole: z.record(z.string(), z.number().int().min(0)).default({}),
+  /**
+   * Outstanding captain.escalation obligations from the WEDGED ladder.
+   * Recorded when the substrate decides the Captain must be told; cleared only
+   * after captain.escalation is sunk. Survives seat state, process death, and
+   * restart — discharged exactly once on a later reconcile tick if needed.
+   */
+  wedgePendingCaptainNotifies: z
+    .array(
+      z.strictObject({
+        sessionId: z.string().min(1),
+        role: z.string().min(1),
+        summary: z.string().min(1),
+        severity: z.enum(["info", "warn", "critical"]),
+        recordedAt: isoTimestampSchema,
+      }),
+    )
+    .default([]),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
