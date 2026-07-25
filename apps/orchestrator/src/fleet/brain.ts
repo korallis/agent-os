@@ -8,6 +8,7 @@ import type {
   WakeDigest,
 } from "@agent-os/protocol";
 import type { ConnectionRegistry } from "../pi/connections.js";
+import { resolveProviderKeyGrant } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
 import { buildPiSpawnSpec } from "../pi/manager.js";
 import { familyFromModel } from "../substrate/family.js";
@@ -161,6 +162,11 @@ export class BrainManager {
       this.deps.tools.setBrainSessionId(sessionId);
 
       try {
+        const grant = resolveProviderKeyGrant(
+          this.deps.home,
+          model,
+          this.deps.connections,
+        );
         const spec = buildPiSpawnSpec({
           agentosHome: this.deps.home,
           detection: this.deps.pi,
@@ -171,6 +177,7 @@ export class BrainManager {
           socketPath,
           extensionPath: this.deps.extensionPath,
           cleanRoom: false,
+          grantProviderKey: grant,
         });
         const win = this.deps.tmux.newWindow({
           windowName,

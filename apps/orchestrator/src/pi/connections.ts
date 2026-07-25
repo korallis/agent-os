@@ -14,6 +14,7 @@ import {
   type ConnectionKind,
 } from "@agent-os/protocol";
 import { hasReadableClaudeCodeCredential } from "../security/claude-code-credentials.js";
+import type { ProviderKeyEnvName } from "../security/env-scrub.js";
 import { listDetectedProviders } from "./manager.js";
 
 const nextUlid = monotonicFactory();
@@ -401,4 +402,51 @@ export function readApiKeyFile(home: string, provider: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Map Pi provider id (model prefix) to the env name Pi expects for API-key auth. */
+const PROVIDER_KEY_ENV_BY_ID: Partial<Record<PiProviderId | string, ProviderKeyEnvName>> = {
+  anthropic: "ANTHROPIC_API_KEY",
+  openai: "OPENAI_API_KEY",
+  openrouter: "OPENROUTER_API_KEY",
+  xai: "XAI_API_KEY",
+  google: "GOOGLE_API_KEY",
+  "vercel-ai-gateway": "VERCEL_AI_GATEWAY_API_KEY",
+  "kimi-coding": "KIMI_API_KEY",
+  "azure-openai-responses": "AZURE_OPENAI_API_KEY",
+};
+
+export type ProviderKeyGrant = { name: ProviderKeyEnvName; value: string };
+
+/**
+ * Resolve at most one cast-matching provider API key for a Pi spawn grant.
+ * Only pi-api-key connections yield a grant; OAuth uses PI_CONFIG_DIR / auth.json.
+ * Never logs the secret value; never puts it in manifests (envKeys only).
+ */
+export function resolveProviderKeyGrant(
+  agentosHome: string,
+  model: string,
+  connections:
+    | {
+        list(): ReadonlyArray<{ provider: string; kind: ConnectionKind | string }>;
+      }
+    | undefined
+    | null,
+): ProviderKeyGrant | null {
+  const slash = model.indexOf("/");
+  const provider = (slash === -1 ? model : model.slice(0, slash)).trim();
+  if (provider.length === 0) return null;
+
+  const apiKeyConn = connections
+    ?.list()
+    .find((c) => c.provider === provider && c.kind === "pi-api-key");
+  if (apiKeyConn === undefined) return null;
+
+  const name = PROVIDER_KEY_ENV_BY_ID[provider];
+  if (name === undefined) return null;
+
+  const value = readApiKeyFile(agentosHome, provider);
+  if (value === null || value.length === 0) return null;
+
+  return { name, value };
 }

@@ -1,13 +1,19 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PI_PINNED_VERSION } from "@agent-os/protocol";
 import { ConfigService } from "../src/config/service.js";
 import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
 import { FleetService } from "../src/fleet/service.js";
 import { envPrefixedCommand } from "../src/fleet/tmux.js";
+import {
+  resolveProviderKeyGrant,
+  writeApiKeyFile,
+  ConnectionRegistry,
+} from "../src/pi/connections.js";
+import { buildPiSpawnSpec, type PiDetection } from "../src/pi/manager.js";
 import { scrubEnv } from "../src/security/env-scrub.js";
 
 /**
@@ -136,6 +142,77 @@ describe("spawn env delivery", () => {
   it("quotes values so a hostile path cannot break out of the command line", () => {
     const command = envPrefixedCommand(["pi"], { EVIL: "a'; rm -rf /; echo '" });
     expect(command).toContain(`EVIL='a'\\''; rm -rf /; echo '\\'''`);
+  });
+
+  it("api-key cast grant injects exactly one matching provider key; oauth cast grants none", () => {
+    const home = temp("agentos-grant-");
+    writeApiKeyFile(home, "openai", "sk-openai-cast-secret");
+    const registry = new ConnectionRegistry(home);
+    registry.createConnection({
+      provider: "openai",
+      kind: "pi-api-key",
+      billingMode: null,
+    });
+
+    const apiGrant = resolveProviderKeyGrant(home, "openai/gpt-4.1", registry);
+    expect(apiGrant).toEqual({
+      name: "OPENAI_API_KEY",
+      value: "sk-openai-cast-secret",
+    });
+
+    const detection: PiDetection = {
+      binary: "/usr/local/bin/pi",
+      version: PI_PINNED_VERSION,
+      pinnedVersion: PI_PINNED_VERSION,
+      versionMatchesPin: true,
+      managedHome: join(home, "pi"),
+      configDirEnv: "PI_CONFIG_DIR",
+      isolationMode: "managed",
+    };
+    const apiSpec = buildPiSpawnSpec({
+      agentosHome: home,
+      detection,
+      args: ["--mode", "json"],
+      cwd: home,
+      sessionId: "01JSESSGRANT000000000000001",
+      role: "builder",
+      socketPath: join(home, "s.sock"),
+      extensionPath: join(home, "ext.js"),
+      grantProviderKey: apiGrant,
+    });
+    expect(apiSpec.env.OPENAI_API_KEY).toBe("sk-openai-cast-secret");
+    expect(apiSpec.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(
+      Object.keys(apiSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
+    ).toEqual(["OPENAI_API_KEY"]);
+    // Durable spawn manifest records key names only (values stay in runtime env).
+    expect(apiSpec.envKeys).toContain("OPENAI_API_KEY");
+    expect(apiSpec.envKeys).not.toContain("sk-openai-cast-secret");
+
+    const oauthHome = temp("agentos-oauth-grant-");
+    const oauthRegistry = new ConnectionRegistry(oauthHome);
+    oauthRegistry.createConnection({
+      provider: "openai",
+      kind: "pi-oauth",
+      billingMode: null,
+    });
+    const oauthGrant = resolveProviderKeyGrant(oauthHome, "openai/gpt-4.1", oauthRegistry);
+    expect(oauthGrant).toBeNull();
+    const oauthSpec = buildPiSpawnSpec({
+      agentosHome: oauthHome,
+      detection: { ...detection, managedHome: join(oauthHome, "pi") },
+      args: ["--mode", "json"],
+      cwd: oauthHome,
+      sessionId: "01JSESSGRANT000000000000002",
+      role: "builder",
+      socketPath: join(oauthHome, "s.sock"),
+      extensionPath: join(oauthHome, "ext.js"),
+      grantProviderKey: oauthGrant,
+    });
+    expect(oauthSpec.env.OPENAI_API_KEY).toBeUndefined();
+    expect(
+      Object.keys(oauthSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
+    ).toEqual([]);
   });
 });
 
@@ -487,6 +564,74 @@ describe("deliver_task dirty worktree fail-closed", () => {
     const task = service.tools.invoke("read_task", { taskId });
     expect(task.ok).toBe(true);
     expect((task.data as { phase: string }).phase).not.toBe("DONE");
+  });
+
+  it("refuses a second deliver_task after dirty quarantine (never reaches DONE)", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "dirty-deliver-retry",
+      shape: "SHIP",
+      role: "builder",
+    });
+
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const path = (spawned.data as { session: { worktreePath: string } }).session.worktreePath;
+    writeFileSync(join(path, "builder-wip.txt"), "still uncommitted\n");
+
+    const first = service.tools.invoke("deliver_task", { taskId });
+    expect(first.ok).toBe(false);
+    expect(first.error?.code).toBe("CONFLICT");
+
+    const second = service.tools.invoke("deliver_task", { taskId });
+    expect(second.ok).toBe(false);
+    expect(second.error?.code).toBe("CONFLICT");
+
+    const task = service.tools.invoke("read_task", { taskId });
+    expect(task.ok).toBe(true);
+    const snap = task.data as {
+      phase: string;
+      deliveryBlocked: { leaseId: string; reason: string } | null;
+    };
+    expect(snap.phase).not.toBe("DONE");
+    expect(snap.phase).toBe("DELIVERING");
+    expect(snap.deliveryBlocked).not.toBeNull();
+    expect(snap.deliveryBlocked?.reason).toContain("uncommitted");
+
+    // delivery.json must not exist for a refused delivery
+    const marker = `${sep}worktrees${sep}`;
+    const homeIdx = path.indexOf(marker);
+    expect(homeIdx).toBeGreaterThan(0);
+    const home = path.slice(0, homeIdx);
+    expect(() => readFileSync(join(home, "runs", taskId, "delivery.json"), "utf8")).toThrow();
+  });
+});
+
+describe("brain pane death reconcile", () => {
+  it("respawns the Brain when its tmux window is gone", () => {
+    const service = fleet({ fakePi: true });
+    const before = service.brain.getSnapshot();
+    expect(before.status).toBe("running");
+    expect(before.tmuxWindow).not.toBeNull();
+    const priorSession = before.sessionId;
+    const window = before.tmuxWindow!;
+    service.tmux.killWindow(window);
+    expect(service.tmux.hasWindow(window)).toBe(false);
+
+    service.reconcile();
+
+    const after = service.brain.getSnapshot();
+    expect(after.status).toBe("running");
+    expect(after.sessionId).not.toBe(priorSession);
+    expect(after.lastReconcileAt).not.toBeNull();
+    expect(after.tmuxWindow).not.toBeNull();
+    expect(service.tmux.hasWindow(after.tmuxWindow!)).toBe(true);
   });
 });
 

@@ -20,6 +20,7 @@
  *   G10 a non-Brain session cannot orchestrate over the extension bridge
  *   G11 the spawn command line starts from `env -i` and carries no stray key
  *   G12 SIGKILL crewmate window → SESSION_LOST + lease reclaim within one reconcile cycle
+ *   G13 SIGKILL Brain pane mid-BUILDING → fresh Brain reconciles (read_fleet_state)
  *
  * Usage: node tooling/gates/phase-3.mjs
  * Exit 0 = all gates green.
@@ -411,6 +412,35 @@ try {
       "SIGKILL crewmate window → SESSION_LOST + lease reclaim within one reconcile cycle",
       killed && lost && leaseReclaimed && lostEvents >= 1,
       `killed=${killed} lost=${lost} lease=${lease?.state ?? "gone"} events=${lostEvents} phase=${task.task?.phase}`,
+    );
+  }
+
+  // G13 — kill Brain pane mid-BUILDING → fresh Brain reconciles
+  {
+    const before = await (await api(BASE, "/v1/brain", token)).json();
+    const priorSessionId = before.brain?.sessionId;
+    const priorWindow = before.brain?.tmuxWindow;
+    let killed = false;
+    if (typeof priorWindow === "string") {
+      const kill = spawnSync("tmux", ["-L", TMUX_SOCKET, "kill-window", "-t", priorWindow], {
+        encoding: "utf8",
+      });
+      killed = kill.status === 0;
+    }
+    // One reconcile cycle at heartbeatSeconds=1, plus margin for the tick.
+    await sleep(2500);
+    const after = await (await api(BASE, "/v1/brain", token)).json();
+    const brain = after.brain;
+    const respawned =
+      brain?.status === "running" &&
+      brain?.lastReconcileAt !== null &&
+      typeof brain?.sessionId === "string" &&
+      brain.sessionId !== priorSessionId;
+    gate(
+      "G13",
+      "SIGKILL Brain pane → fresh Brain reconciles (read_fleet_state)",
+      killed && respawned,
+      `killed=${killed} status=${brain?.status} prior=${priorSessionId} next=${brain?.sessionId} reconciled=${brain?.lastReconcileAt !== null}`,
     );
   }
 

@@ -324,9 +324,24 @@ export class FleetService {
   /**
    * Fallback liveness sweep (master plan: pane-scraping demotes to fallback).
    * Public so gates/tests can force one reconcile cycle without waiting.
+   * Covers both crewmate sessions and the Brain (which is not a FleetSession).
    */
   reconcile(): string[] {
-    return this.tools.reconcileDeadPanes();
+    const lost = this.tools.reconcileDeadPanes();
+    this.reconcileBrainPane();
+    return lost;
+  }
+
+  /**
+   * If the Brain pane is gone while status is starting/running, respawn so the
+   * fresh Brain's first act is read_fleet_state (or enterDown when blocked).
+   */
+  private reconcileBrainPane(): void {
+    const snap = this.brain.getSnapshot();
+    if (snap.status !== "running" && snap.status !== "starting") return;
+    if (snap.tmuxWindow === null) return;
+    if (this.tmux.hasWindow(snap.tmuxWindow)) return;
+    this.brain.start("pane-died");
   }
 
   private hydrateTasks(): void {

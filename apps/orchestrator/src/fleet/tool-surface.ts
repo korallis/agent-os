@@ -43,6 +43,7 @@ import {
 } from "@agent-os/protocol";
 import type { ConfigService } from "../config/service.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
+import { resolveProviderKeyGrant } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
 import { buildPiSpawnSpec } from "../pi/manager.js";
 import { familyFromModel } from "../substrate/family.js";
@@ -246,10 +247,15 @@ export class ToolSurface {
 
   /** Hydrate from durable task store (daemon boot). Rebuilds in-memory session rows. */
   hydrateTask(task: TaskSnapshot): void {
-    this.tasks.set(task.id, task);
-    if (task.idempotencyKey !== null) {
-      this.idempotency.set(task.idempotencyKey, task);
+    const normalized: TaskSnapshot = {
+      ...task,
+      deliveryBlocked: task.deliveryBlocked ?? null,
+    };
+    this.tasks.set(normalized.id, normalized);
+    if (normalized.idempotencyKey !== null) {
+      this.idempotency.set(normalized.idempotencyKey, normalized);
     }
+    task = normalized;
     for (const s of task.sessions) {
       const fleetSession: FleetSession = {
         sessionId: s.sessionId,
@@ -496,6 +502,7 @@ export class ToolSurface {
       branch: null,
       worktreePath: null,
       needsCaptainSummary: null,
+      deliveryBlocked: null,
       idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
       updatedAt: now,
@@ -802,6 +809,11 @@ export class ToolSurface {
         const prompt =
           input.prompt ??
           `Agent OS role=${input.role}. Task: ${task.title}\n\n${task.intent}`;
+        const grant = resolveProviderKeyGrant(
+          this.deps.home,
+          input.model,
+          this.deps.connections,
+        );
         const spec = buildPiSpawnSpec({
           agentosHome: this.deps.home,
           detection: this.deps.pi,
@@ -812,6 +824,7 @@ export class ToolSurface {
           socketPath,
           extensionPath: this.deps.extensionPath,
           cleanRoom: input.cleanRoom,
+          grantProviderKey: grant,
         });
         const win = this.deps.tmux.newWindow({
           windowName,
@@ -1354,30 +1367,28 @@ export class ToolSurface {
       );
     }
 
+    // Sticky refuse: quarantine clears lease.taskId, so retry must not skip the
+    // clean-tree gate and mark DONE. Captain rework/cancel clears the block.
+    if (task.deliveryBlocked !== null) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `cannot deliver task ${task.id}: delivery blocked (${task.deliveryBlocked.reason}); Captain must resolve before delivery`,
+        {
+          leaseId: task.deliveryBlocked.leaseId,
+          dirtyPaths: task.deliveryBlocked.dirtyPaths,
+        },
+      );
+    }
+
     if (task.phase !== "DELIVERING") {
       task = this.transition(task, "DELIVERING", "deliver_task");
     }
 
     const branch = task.branch ?? `ao/${task.id.slice(0, 10).toLowerCase()}`;
-    const runDir = join(this.deps.home, "runs", task.id);
-    mkdirSync(runDir, { recursive: true, mode: 0o700 });
-    writeFileSync(
-      join(runDir, "delivery.json"),
-      JSON.stringify(
-        {
-          mode: task.mode,
-          branch,
-          at: new Date().toISOString(),
-          shape: task.shape,
-        },
-        null,
-        2,
-      ) + "\n",
-      { mode: 0o600 },
-    );
 
     // Only verified-reset when porcelain is clean. Dirty trees quarantine and
     // surface CONFLICT so uncommitted builder work is never discarded on DONE.
+    // delivery.json is written only after every lease clears the clean gate.
     for (const lease of this.deps.worktrees.list().filter((l) => l.taskId === task.id)) {
       if (process.env.AGENTOS_FAKE_GIT === "1") {
         this.deps.worktrees.release(lease.id, {});
@@ -1389,7 +1400,6 @@ export class ToolSurface {
         timeout: 15_000,
       });
       if (dirty.error !== undefined || dirty.status !== 0) {
-        this.deps.worktrees.release(lease.id, { forceQuarantine: true });
         const detail = (
           dirty.error?.message ||
           dirty.stderr ||
@@ -1398,16 +1408,27 @@ export class ToolSurface {
         )
           .toString()
           .trim();
-        throw new ToolSurfaceError(
-          "CONFLICT",
-          `cannot deliver task ${task.id}: worktree status failed (${detail}); quarantined`,
-        );
-      }
-      if (dirty.stdout.trim().length > 0) {
+        const reason = `worktree status failed (${detail}); quarantined`;
+        this.blockDelivery(task, lease.id, reason, []);
         this.deps.worktrees.release(lease.id, { forceQuarantine: true });
         throw new ToolSurfaceError(
           "CONFLICT",
-          `cannot deliver task ${task.id}: worktree has uncommitted changes; quarantined for Captain inspection`,
+          `cannot deliver task ${task.id}: ${reason}`,
+        );
+      }
+      if (dirty.stdout.trim().length > 0) {
+        const dirtyPaths = dirty.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .map((line) => line.slice(3).trim() || line);
+        const reason =
+          "worktree has uncommitted changes; quarantined for Captain inspection";
+        this.blockDelivery(task, lease.id, reason, dirtyPaths);
+        this.deps.worktrees.release(lease.id, { forceQuarantine: true });
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot deliver task ${task.id}: ${reason}`,
         );
       }
 
@@ -1426,12 +1447,49 @@ export class ToolSurface {
       );
     }
 
+    const runDir = join(this.deps.home, "runs", task.id);
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(runDir, "delivery.json"),
+      JSON.stringify(
+        {
+          mode: task.mode,
+          branch,
+          at: new Date().toISOString(),
+          shape: task.shape,
+        },
+        null,
+        2,
+      ) + "\n",
+      { mode: 0o600 },
+    );
+
     task = {
       ...this.transition(task, "DONE", "delivered"),
       branch,
+      deliveryBlocked: null,
     };
     this.saveTask(task);
     return task;
+  }
+
+  /** Persist a sticky delivery refusal on the task (survives lease quarantine). */
+  private blockDelivery(
+    task: TaskSnapshot,
+    leaseId: string,
+    reason: string,
+    dirtyPaths: string[],
+  ): void {
+    this.saveTask({
+      ...task,
+      deliveryBlocked: {
+        leaseId,
+        reason,
+        dirtyPaths,
+        blockedAt: new Date().toISOString(),
+      },
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   private escalate(raw: Record<string, unknown>): { ok: true } {
@@ -1515,11 +1573,25 @@ export class ToolSurface {
   ): TaskSnapshot {
     const from = task.phase;
     assertTransition(task.id, from, to);
+    // Captain rework / terminate clears a sticky dirty-delivery refuse. Staying
+    // in DELIVERING (or NEEDS_CAPTAIN alone) does not — deliver_task keeps refusing.
+    const clearDeliveryBlock =
+      task.deliveryBlocked !== null &&
+      (to === "CANCELLED" ||
+        to === "FAILED" ||
+        to === "BUILDING" ||
+        to === "QUEUED" ||
+        to === "DISPATCH_RESOLVED" ||
+        to === "PLANNING" ||
+        to === "GATE_AUTHORING" ||
+        to === "VALIDATING" ||
+        to === "WAITING_WORKTREE");
     const updated: TaskSnapshot = {
       ...task,
       phase: to,
       failureCause: to === "FAILED" ? (task.failureCause ?? "UNKNOWN") : task.failureCause,
       needsCaptainSummary: to === "NEEDS_CAPTAIN" ? (reason ?? task.needsCaptainSummary) : task.needsCaptainSummary,
+      deliveryBlocked: clearDeliveryBlock ? null : task.deliveryBlocked,
       updatedAt: new Date().toISOString(),
     };
     this.saveTask(updated);
