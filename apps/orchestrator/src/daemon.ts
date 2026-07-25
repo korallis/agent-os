@@ -29,15 +29,32 @@ const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
 export const SHIPPED_DEFAULTS_DIR = join(here, "..", "defaults");
 
-function resolveExtensionPath(): string {
+/** Preferred on-disk location of the built Pi extension (operator-facing path). */
+export const EXPECTED_EXTENSION_DIST = join(
+  here,
+  "..",
+  "..",
+  "..",
+  "packages",
+  "pi-extension",
+  "dist",
+  "extension.js",
+);
+
+/**
+ * Resolve a built @agent-os/pi-extension entry. Returns undefined when no dist
+ * file exists so Brain/crewmate spawn fail closed (PI_UNAVAILABLE / BRAIN_DOWN)
+ * instead of launching Pi with `-e <missing>`.
+ */
+export function resolveExtensionPath(): string | undefined {
   const candidates = [
-    join(here, "..", "..", "..", "packages", "pi-extension", "dist", "extension.js"),
+    EXPECTED_EXTENSION_DIST,
     join(here, "..", "node_modules", "@agent-os", "pi-extension", "dist", "extension.js"),
   ];
   for (const c of candidates) {
     if (existsSync(c)) return c;
   }
-  return candidates[0] ?? "agent-os-extension.js";
+  return undefined;
 }
 
 /** Grace period before force-destroying hijacked SSE sockets on shutdown. */
@@ -164,12 +181,18 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     }
 
     const extensionPath = resolveExtensionPath();
+    if (extensionPath === undefined) {
+      logger.warn(
+        { expected: EXPECTED_EXTENSION_DIST },
+        "agent-os Pi extension dist not found — Brain and crewmate spawn will fail closed (PI_UNAVAILABLE / BRAIN_DOWN); build packages/pi-extension first",
+      );
+    }
     const fleet = new FleetService({
       home,
       config,
       connections,
       pi,
-      extensionPath,
+      ...(extensionPath !== undefined ? { extensionPath } : {}),
       sockets: socketHub,
       fakeTmux: process.env.AGENTOS_FAKE_TMUX === "1",
       fakePi: process.env.AGENTOS_FAKE_PI === "1",

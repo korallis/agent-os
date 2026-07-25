@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { monotonicFactory } from "ulid";
 import type {
@@ -139,7 +140,11 @@ export class BrainManager {
       });
       this.deps.tools.setBrainSessionId(sessionId);
     } else {
-      if (this.deps.pi?.binary == null || this.deps.extensionPath === undefined) {
+      if (
+        this.deps.pi?.binary == null ||
+        this.deps.extensionPath === undefined ||
+        !existsSync(this.deps.extensionPath)
+      ) {
         this.enterDown(
           this.deps.pi?.binary == null
             ? "Pi is not installed — run onboarding to install the pinned Pi"

@@ -367,7 +367,8 @@ export class FleetService {
   private rehydrateRuntime(): void {
     this.tools.rebindSessionListeners();
     this.tools.reconcileDeadPanes();
-    this.worktrees.reclaimOrphanedLeases((sessionId) => {
+    // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
+    this.tools.reclaimOrphanedLeases((sessionId) => {
       if (sessionId === null) return false;
       const session = this.tools.listSessions().find((s) => s.sessionId === sessionId);
       if (session === undefined) return false;

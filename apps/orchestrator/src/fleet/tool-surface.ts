@@ -553,14 +553,16 @@ export class ToolSurface {
 
   private cancelTask(raw: Record<string, unknown>): TaskSnapshot {
     const input = cancelTaskInputSchema.parse(raw);
-    const task = this.requireTask(input.taskId);
+    this.requireTask(input.taskId);
     this.releaseWorktreeLeases({ taskId: input.taskId });
-    return this.transition(task, "CANCELLED", input.reason);
+    // Re-read after release so a quarantine stamp is visible, then clear on CANCELLED.
+    return this.transition(this.requireTask(input.taskId), "CANCELLED", input.reason);
   }
 
   /**
    * Reclaim worktree slots for a session and/or task. No finalSha so the pool
-   * verified-resets clean trees and quarantines dirty ones.
+   * verified-resets clean trees and quarantines dirty ones. Task-linked
+   * quarantine stamps deliveryBlocked on the owning task.
    */
   private releaseWorktreeLeases(filter: {
     sessionId?: string;
@@ -575,12 +577,64 @@ export class ToolSurface {
         filter.taskId !== null &&
         lease.taskId === filter.taskId;
       if (!sessionMatch && !taskMatch) continue;
-      try {
-        this.deps.worktrees.release(lease.id);
-      } catch {
-        // best-effort — do not block stop/lost/cancel on a reclaim race
-      }
+      this.releaseOneWorktreeLease(lease.id);
     }
+  }
+
+  /**
+   * Boot/reconcile: release leases whose session is gone. Uses the shared
+   * release helper so dirty quarantine stamps deliveryBlocked on the task.
+   */
+  reclaimOrphanedLeases(isLiveSession: (sessionId: string | null) => boolean): number {
+    let reclaimed = 0;
+    for (const lease of this.deps.worktrees.list()) {
+      if (lease.state !== "leased" && lease.state !== "reclaiming") continue;
+      if (isLiveSession(lease.sessionId)) continue;
+      this.releaseOneWorktreeLease(lease.id);
+      reclaimed += 1;
+    }
+    return reclaimed;
+  }
+
+  /**
+   * Release a single lease. When the tree quarantines and was task-linked,
+   * stamp deliveryBlocked on the owning task so deliver_task cannot mark DONE
+   * after the lease association is cleared.
+   */
+  private releaseOneWorktreeLease(leaseId: string): void {
+    const lease = this.deps.worktrees.list().find((l) => l.id === leaseId);
+    if (lease === undefined) return;
+    const owningTaskId = lease.taskId;
+    let result;
+    try {
+      result = this.deps.worktrees.release(leaseId);
+    } catch {
+      // best-effort — do not block stop/lost/cancel on a reclaim race
+      return;
+    }
+    if (result.state !== "quarantined" || owningTaskId === null) return;
+    const task = this.tasks.get(owningTaskId);
+    if (task === undefined || isTerminalPhase(task.phase)) return;
+    if (task.deliveryBlocked !== null) return;
+    const dirtyPaths = this.readDirtyPaths(result.path);
+    const reason =
+      result.quarantineReason ??
+      "worktree quarantined on release; uncommitted builder work preserved";
+    this.blockDelivery(task, leaseId, reason, dirtyPaths);
+  }
+
+  private readDirtyPaths(worktreePath: string): string[] {
+    if (process.env.AGENTOS_FAKE_GIT === "1") return [];
+    const dirty = spawnSync("git", ["-C", worktreePath, "status", "--porcelain"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    if (dirty.error !== undefined || dirty.status !== 0) return [];
+    return dirty.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => line.slice(3).trim() || line);
   }
 
   private readTask(raw: Record<string, unknown>): TaskSnapshot {
@@ -783,7 +837,10 @@ export class ToolSurface {
             "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
           );
         }
-        if (this.deps.extensionPath === undefined) {
+        if (
+          this.deps.extensionPath === undefined ||
+          !existsSync(this.deps.extensionPath)
+        ) {
           throw new ToolSurfaceError(
             "PI_UNAVAILABLE",
             "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
@@ -911,11 +968,7 @@ export class ToolSurface {
         void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
       }
       if (leaseId !== null) {
-        try {
-          this.deps.worktrees.release(leaseId);
-        } catch {
-          // best-effort reclaim so a spawn failure cannot exhaust the pool
-        }
+        this.releaseOneWorktreeLease(leaseId);
       }
       throw error;
     }
@@ -1367,18 +1420,8 @@ export class ToolSurface {
       );
     }
 
-    // Sticky refuse: quarantine clears lease.taskId, so retry must not skip the
-    // clean-tree gate and mark DONE. Captain rework/cancel clears the block.
-    if (task.deliveryBlocked !== null) {
-      throw new ToolSurfaceError(
-        "CONFLICT",
-        `cannot deliver task ${task.id}: delivery blocked (${task.deliveryBlocked.reason}); Captain must resolve before delivery`,
-        {
-          leaseId: task.deliveryBlocked.leaseId,
-          dirtyPaths: task.deliveryBlocked.dirtyPaths,
-        },
-      );
-    }
+    // Sticky refuse before any side effects (DELIVERING transition / delivery.json).
+    this.assertNotDeliveryBlocked(task);
 
     if (task.phase !== "DELIVERING") {
       task = this.transition(task, "DELIVERING", "deliver_task");
@@ -1447,6 +1490,10 @@ export class ToolSurface {
       );
     }
 
+    // Single choke point before durable delivery marker / DONE.
+    task = this.requireTask(task.id);
+    this.assertDoneInvariant(task);
+
     const runDir = join(this.deps.home, "runs", task.id);
     mkdirSync(runDir, { recursive: true, mode: 0o700 });
     writeFileSync(
@@ -1465,7 +1512,7 @@ export class ToolSurface {
     );
 
     task = {
-      ...this.transition(task, "DONE", "delivered"),
+      ...this.transition(task, "DONE", "delivered", { allowDone: true }),
       branch,
       deliveryBlocked: null,
     };
@@ -1490,6 +1537,40 @@ export class ToolSurface {
       },
       updatedAt: new Date().toISOString(),
     });
+  }
+
+  private assertNotDeliveryBlocked(task: TaskSnapshot): void {
+    if (task.deliveryBlocked === null) return;
+    throw new ToolSurfaceError(
+      "CONFLICT",
+      `cannot deliver task ${task.id}: delivery blocked (${task.deliveryBlocked.reason}); Captain must resolve before delivery`,
+      {
+        leaseId: task.deliveryBlocked.leaseId,
+        dirtyPaths: task.deliveryBlocked.dirtyPaths,
+      },
+    );
+  }
+
+  /**
+   * Delivery invariant (single choke point): a task may only reach DONE via
+   * deliver_task, with a clean tree, no outstanding deliveryBlocked stamp, and
+   * its leases released.
+   */
+  private assertDoneInvariant(task: TaskSnapshot): void {
+    this.assertNotDeliveryBlocked(task);
+    const outstanding = this.deps.worktrees
+      .list()
+      .filter(
+        (l) =>
+          l.taskId === task.id &&
+          (l.state === "leased" || l.state === "reclaiming"),
+      );
+    if (outstanding.length > 0) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `cannot mark task ${task.id} DONE: ${String(outstanding.length)} worktree lease(s) still held`,
+      );
+    }
   }
 
   private escalate(raw: Record<string, unknown>): { ok: true } {
@@ -1555,6 +1636,18 @@ export class ToolSurface {
     const input = advancePhaseInputSchema.parse(raw);
     const task = this.requireTask(input.taskId);
     const to = input.to as TaskPhase;
+    if (to === "DONE") {
+      throw new ToolSurfaceError(
+        "ILLEGAL_TRANSITION",
+        `task ${task.id} may only reach DONE via deliver_task (clean tree, no deliveryBlocked, leases released)`,
+      );
+    }
+    if (to === "CANCELLED") {
+      throw new ToolSurfaceError(
+        "ILLEGAL_TRANSITION",
+        `task ${task.id} may only reach CANCELLED via cancel_task`,
+      );
+    }
     return this.transition(task, to, input.reason ?? null);
   }
 
@@ -1570,28 +1663,42 @@ export class ToolSurface {
     task: TaskSnapshot,
     to: TaskPhase,
     reason: string | null,
+    options: { allowDone?: boolean } = {},
   ): TaskSnapshot {
     const from = task.phase;
+    // DONE is only reachable through deliver_task after assertDoneInvariant.
+    if (to === "DONE" && options.allowDone !== true) {
+      throw new ToolSurfaceError(
+        "ILLEGAL_TRANSITION",
+        `task ${task.id} may only reach DONE via deliver_task (clean tree, no deliveryBlocked, leases released)`,
+      );
+    }
+    if (to === "DONE") {
+      this.assertDoneInvariant(task);
+    }
     assertTransition(task.id, from, to);
+    // Prefer the store copy so a release that stamped deliveryBlocked is not
+    // overwritten by a stale caller snapshot.
+    const stored = this.tasks.get(task.id);
+    const stickyBlock = stored?.deliveryBlocked ?? task.deliveryBlocked;
     // Captain rework / terminate clears a sticky dirty-delivery refuse. Staying
     // in DELIVERING (or NEEDS_CAPTAIN alone) does not — deliver_task keeps refusing.
     const clearDeliveryBlock =
-      task.deliveryBlocked !== null &&
-      (to === "CANCELLED" ||
-        to === "FAILED" ||
-        to === "BUILDING" ||
-        to === "QUEUED" ||
-        to === "DISPATCH_RESOLVED" ||
-        to === "PLANNING" ||
-        to === "GATE_AUTHORING" ||
-        to === "VALIDATING" ||
-        to === "WAITING_WORKTREE");
+      to === "CANCELLED" ||
+      to === "FAILED" ||
+      to === "BUILDING" ||
+      to === "QUEUED" ||
+      to === "DISPATCH_RESOLVED" ||
+      to === "PLANNING" ||
+      to === "GATE_AUTHORING" ||
+      to === "VALIDATING" ||
+      to === "WAITING_WORKTREE";
     const updated: TaskSnapshot = {
       ...task,
       phase: to,
       failureCause: to === "FAILED" ? (task.failureCause ?? "UNKNOWN") : task.failureCause,
       needsCaptainSummary: to === "NEEDS_CAPTAIN" ? (reason ?? task.needsCaptainSummary) : task.needsCaptainSummary,
-      deliveryBlocked: clearDeliveryBlock ? null : task.deliveryBlocked,
+      deliveryBlocked: clearDeliveryBlock ? null : stickyBlock,
       updatedAt: new Date().toISOString(),
     };
     this.saveTask(updated);

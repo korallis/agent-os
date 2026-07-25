@@ -1,11 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PI_PINNED_VERSION } from "@agent-os/protocol";
 import { ConfigService } from "../src/config/service.js";
-import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
+import { EXPECTED_EXTENSION_DIST, resolveExtensionPath, SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
 import { FleetService } from "../src/fleet/service.js";
 import { envPrefixedCommand } from "../src/fleet/tmux.js";
 import {
@@ -613,6 +613,179 @@ describe("deliver_task dirty worktree fail-closed", () => {
   });
 });
 
+describe("delivery invariant choke points", () => {
+  it("stamps deliveryBlocked when stop_crewmate quarantines a dirty tree", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "dirty-stop-block",
+      shape: "SHIP",
+      role: "builder",
+    });
+
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const session = (spawned.data as { session: { sessionId: string; worktreePath: string } })
+      .session;
+    writeFileSync(join(session.worktreePath, "wip.txt"), "uncommitted after stop\n");
+
+    const stopped = service.tools.invoke("stop_crewmate", {
+      sessionId: session.sessionId,
+      reason: "captain stop",
+    });
+    expect(stopped.ok).toBe(true);
+
+    const lease = service.worktrees.list().find((l) => l.path === session.worktreePath);
+    expect(lease?.state).toBe("quarantined");
+
+    const task = service.tools.invoke("read_task", { taskId });
+    expect(task.ok).toBe(true);
+    const snap = task.data as {
+      phase: string;
+      deliveryBlocked: { leaseId: string; reason: string } | null;
+    };
+    expect(snap.phase).not.toBe("DONE");
+    expect(snap.deliveryBlocked).not.toBeNull();
+
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(deliver.error?.code).toBe("CONFLICT");
+    expect((service.tools.invoke("read_task", { taskId }).data as { phase: string }).phase).not.toBe(
+      "DONE",
+    );
+  });
+
+  it("refuses advance_phase to DONE in favour of deliver_task", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "advance-done-block",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+
+    const toDelivering = service.tools.invoke("advance_phase", {
+      taskId,
+      to: "DELIVERING",
+      reason: "brain shortcut",
+    });
+    expect(toDelivering.ok).toBe(true);
+
+    const toDone = service.tools.invoke("advance_phase", {
+      taskId,
+      to: "DONE",
+      reason: "skip deliver_task",
+    });
+    expect(toDone.ok).toBe(false);
+    expect(toDone.error?.code).toBe("ILLEGAL_TRANSITION");
+    expect(toDone.error?.message).toContain("deliver_task");
+    expect((service.tools.invoke("read_task", { taskId }).data as { phase: string }).phase).toBe(
+      "DELIVERING",
+    );
+  });
+
+  it("refuses advance_phase to DONE while a dirty tree is outstanding", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "advance-dirty-done",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const session = (spawned.data as { session: { sessionId: string; worktreePath: string } })
+      .session;
+    writeFileSync(join(session.worktreePath, "wip.txt"), "still dirty\n");
+
+    const stopped = service.tools.invoke("stop_crewmate", {
+      sessionId: session.sessionId,
+      reason: "lost",
+    });
+    expect(stopped.ok).toBe(true);
+
+    const toDelivering = service.tools.invoke("advance_phase", {
+      taskId,
+      to: "DELIVERING",
+      reason: "try deliver via phase",
+    });
+    // BUILDING → DELIVERING is legal on the state machine; DONE is not via advance_phase.
+    if (toDelivering.ok) {
+      const toDone = service.tools.invoke("advance_phase", {
+        taskId,
+        to: "DONE",
+        reason: "bypass dirty",
+      });
+      expect(toDone.ok).toBe(false);
+      expect(toDone.error?.code).toBe("ILLEGAL_TRANSITION");
+    } else {
+      // SESSION_LOST path after stop may already have moved phase — still refuse DONE.
+      const toDone = service.tools.invoke("advance_phase", {
+        taskId,
+        to: "DONE",
+        reason: "bypass dirty",
+      });
+      expect(toDone.ok).toBe(false);
+      expect(toDone.error?.code).toBe("ILLEGAL_TRANSITION");
+    }
+
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(deliver.error?.code).toMatch(/CONFLICT|ILLEGAL_TRANSITION/);
+    expect((service.tools.invoke("read_task", { taskId }).data as { phase: string }).phase).not.toBe(
+      "DONE",
+    );
+  });
+
+  it("refuses advance_phase to CANCELLED in favour of cancel_task", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId } = seedTask(service, {
+      name: "advance-cancel-block",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const cancelled = service.tools.invoke("advance_phase", {
+      taskId,
+      to: "CANCELLED",
+      reason: "skip cancel_task",
+    });
+    expect(cancelled.ok).toBe(false);
+    expect(cancelled.error?.code).toBe("ILLEGAL_TRANSITION");
+    expect(cancelled.error?.message).toContain("cancel_task");
+  });
+});
+
+describe("resolveExtensionPath fail-closed", () => {
+  it("returns undefined when no built extension dist exists on the candidate paths", () => {
+    // When the monorepo dist is present this still documents the contract: the
+    // function never invents a non-existent path. A missing first candidate is
+    // covered by the existsSync gate; if neither candidate exists, result is undefined.
+    const resolved = resolveExtensionPath();
+    if (resolved !== undefined) {
+      expect(existsSync(resolved)).toBe(true);
+    } else {
+      expect(existsSync(EXPECTED_EXTENSION_DIST)).toBe(false);
+    }
+  });
+});
+
 describe("brain pane death reconcile", () => {
   it("respawns the Brain when its tmux window is gone", () => {
     const service = fleet({ fakePi: true });
@@ -819,6 +992,9 @@ describe("brain spawn failure", () => {
   it("enters BRAIN_DOWN and clears authorized session when Pi spawn fails", () => {
     const home = temp("agentos-brain-spawn-");
     mkdirSync(join(home, "config"), { recursive: true });
+    // Extension must exist on disk so spawn reaches tmux (missing dist fails closed earlier).
+    const extensionPath = join(home, "extension.js");
+    writeFileSync(extensionPath, "export default {};\n");
     const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
     config.installDefaults();
 
@@ -837,7 +1013,7 @@ describe("brain spawn failure", () => {
         configDirEnv: "PI_CONFIG_DIR",
         isolationMode: "managed",
       },
-      extensionPath: join(home, "extension.js"),
+      extensionPath,
       sockets: {
         sessionSocketPath: (sessionId) => join(home, "sockets", `${sessionId}.sock`),
         openSession: (sessionId) => join(home, "sockets", `${sessionId}.sock`),
