@@ -185,8 +185,9 @@ function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
         }
         failures = 0;
         if (captured !== last) {
-          seq += 1;
-          if (safeSend(ws, JSON.stringify({ type: "pane", seq, content: captured }))) {
+          const next = seq + 1;
+          if (safeSend(ws, JSON.stringify({ type: "pane", seq: next, content: captured }))) {
+            seq = next;
             last = captured;
           } else if (
             ws.readyState === WebSocket.CLOSING ||

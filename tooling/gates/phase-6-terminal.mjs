@@ -178,28 +178,26 @@ try {
   const contiguous = (seqs) =>
     seqs.length > 1 && seqs.every((value, index) => value === seqs[0] + index);
 
+  const streamOk = (seqs, sawContent) =>
+    seqs.length >= 1 &&
+    seqs[0] === 1 &&
+    sawContent &&
+    (paneChanges ? contiguous(seqs) : seqs.length === 1 || contiguous(seqs));
+
   const first = await streamFor(6000);
   gate(
     "T1",
     "frames are sequenced from 1 with real pane content, and every frame received is contiguous",
-    first.seqs.length >= 1 &&
-      first.seqs[0] === 1 &&
-      first.sawContent &&
-      // Contiguity is only meaningful once more than one frame arrived; a
-      // single frame from an unchanging pane is correct, not a gap.
-      (first.seqs.length === 1 || contiguous(first.seqs)),
-    `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${first.seqs.length === 1 ? "n/a (pane did not change)" : contiguous(first.seqs)} content=${first.sawContent} paneTickerStarted=${paneChanges}`,
+    streamOk(first.seqs, first.sawContent),
+    `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${paneChanges ? contiguous(first.seqs) : first.seqs.length === 1 ? "n/a (pane did not change)" : contiguous(first.seqs)} content=${first.sawContent} paneTickerStarted=${paneChanges}`,
   );
 
   const second = await streamFor(4000);
   gate(
     "T2",
     "a reconnect resumes the same pane and restarts its own numbering at 1",
-    second.seqs.length >= 1 &&
-      second.seqs[0] === 1 &&
-      second.sawContent &&
-      (second.seqs.length === 1 || contiguous(second.seqs)),
-    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${second.seqs.length === 1 ? "n/a" : contiguous(second.seqs)} samePane=${second.sawContent}`,
+    streamOk(second.seqs, second.sawContent),
+    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs)} samePane=${second.sawContent}`,
   );
 
   if (!paneChanges) {

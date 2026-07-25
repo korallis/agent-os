@@ -50,6 +50,9 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
       setStatus("idle");
       setPane("");
       setMessage(null);
+      lastSeqRef.current = 0;
+      setFrames(0);
+      setDropped(0);
     }
   }, [sessionId]);
 
@@ -120,7 +123,7 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
             // Captain should be told rather than shown a quietly stale pane.
             if (typeof frame.seq === "number") {
               const expected = lastSeqRef.current + 1;
-              if (lastSeqRef.current > 0 && frame.seq > expected) {
+              if (frame.seq > expected) {
                 setDropped((count) => count + (frame.seq as number) - expected);
               }
               lastSeqRef.current = frame.seq;
@@ -128,6 +131,14 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
             setFrames((count) => count + 1);
             setPane(frame.content);
           } else if (frame.type === "closed") {
+            if (
+              typeof frame.lastSeq === "number" &&
+              frame.lastSeq > lastSeqRef.current
+            ) {
+              setDropped(
+                (count) => count + (frame.lastSeq as number) - lastSeqRef.current,
+              );
+            }
             setStatus("closed");
             setMessage(frame.reason ?? "Stream closed.");
           } else if (frame.type === "notice") {
