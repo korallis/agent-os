@@ -101,6 +101,7 @@ function fixtureRepo() {
   return dir;
 }
 
+let exitCode = 0;
 const cleanups = [];
 let child;
 
@@ -540,10 +541,15 @@ try {
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} gates passed`);
-  process.exit(failed.length === 0 ? 0 : 1);
+  // Set the code; exit AFTER the finally block has torn everything down.
+  // process.exit() does not unwind `finally`, so exiting here would orphan the
+  // daemon, the tmux server and the temp homes on every single run — including
+  // the successful ones. Accumulated orphans starve later gates of ports and
+  // CPU, which surfaces as unrelated gates failing for no visible reason.
+  exitCode = failed.length === 0 ? 0 : 1;
 } catch (error) {
   console.error(error);
-  process.exit(1);
+  exitCode = 1;
 } finally {
   try {
     child?.kill("SIGTERM");
@@ -559,3 +565,5 @@ try {
     }
   }
 }
+
+process.exit(exitCode);

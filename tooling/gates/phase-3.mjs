@@ -144,6 +144,7 @@ async function createTask(base, token, projectId, spec = {}) {
 
 let home;
 let child;
+let exitCode = 0;
 const cleanups = [];
 const PORT = 4700 + Math.floor(Math.random() * 1000) + 200;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -492,10 +493,15 @@ try {
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} gates passed`);
-  process.exit(failed.length === 0 ? 0 : 1);
+  // Set the code; exit AFTER the finally block has torn everything down.
+  // process.exit() does not unwind `finally`, so exiting here would orphan the
+  // daemon, the tmux server and the temp homes on every single run — including
+  // the successful ones. Accumulated orphans starve later gates of ports and
+  // CPU, which surfaces as unrelated gates failing for no visible reason.
+  exitCode = failed.length === 0 ? 0 : 1;
 } catch (error) {
   console.error(error);
-  process.exit(1);
+  exitCode = 1;
 } finally {
   try {
     child?.kill("SIGTERM");
@@ -511,3 +517,5 @@ try {
     }
   }
 }
+
+process.exit(exitCode);
