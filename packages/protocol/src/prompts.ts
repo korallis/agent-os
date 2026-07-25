@@ -53,6 +53,12 @@ export const fusionSideSchema = z.strictObject({
    */
   promptHash: z.string(),
   artifactPath: z.string().nullable(),
+  /**
+   * When the side settled (agent_settled / session_end / stop / lost). Distinct
+   * from artifactPath so a side can finish without model output rather than
+   * inventing a placeholder artifact.
+   */
+  settledAt: isoTimestampSchema.nullable().optional(),
   inputTokens: z.number().int().min(0).nullable(),
   outputTokens: z.number().int().min(0).nullable(),
   costUsd: z.number().min(0).nullable(),

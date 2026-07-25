@@ -1,5 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "typebox";
 import {
   agentRoleSchema,
@@ -362,9 +364,75 @@ function registerAgentOsTools(pi: PiExtensionApi, host: AgentOsExtensionHost): v
 }
 
 /**
+ * Extract plain-text blocks from a finalized Pi assistant message.
+ * Best-effort: unknown shapes yield an empty string rather than throwing.
+ */
+export function extractAssistantText(message: unknown): string {
+  if (message === null || typeof message !== "object") return "";
+  const role = (message as { role?: unknown }).role;
+  if (role !== "assistant") return "";
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block === null || typeof block !== "object") continue;
+    const typed = block as { type?: unknown; text?: unknown };
+    if (typed.type === "text" && typeof typed.text === "string") {
+      parts.push(typed.text);
+    }
+  }
+  return parts.join("");
+}
+
+/**
+ * Map a Pi assistant message's usage into the extension frame shape.
+ * Returns null when the message is not an assistant turn with usable totals.
+ */
+export function usageFromAssistantMessage(message: unknown): {
+  provider: string;
+  model: string;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costUsd: number | null;
+  contextUsedPct: number | null;
+} | null {
+  if (message === null || typeof message !== "object") return null;
+  const m = message as {
+    role?: unknown;
+    provider?: unknown;
+    model?: unknown;
+    usage?: {
+      input?: unknown;
+      output?: unknown;
+      cost?: { total?: unknown };
+    };
+  };
+  if (m.role !== "assistant" || m.usage === undefined) return null;
+  return {
+    provider: typeof m.provider === "string" ? m.provider : "unknown",
+    model: typeof m.model === "string" ? m.model : "unknown",
+    inputTokens: typeof m.usage.input === "number" ? m.usage.input : null,
+    outputTokens: typeof m.usage.output === "number" ? m.usage.output : null,
+    costUsd:
+      typeof m.usage.cost?.total === "number" ? m.usage.cost.total : null,
+    contextUsedPct: null,
+  };
+}
+
+function messageFromEvent(event: unknown): unknown {
+  if (event !== null && typeof event === "object" && "message" in event) {
+    return (event as { message: unknown }).message;
+  }
+  return event;
+}
+
+/**
  * Pi extension entry — Pi loads this when passed with `-e`.
- * Uses AGENTOS_SOCKET / AGENTOS_SESSION_ID / AGENTOS_ROLE from the scrubbed
- * spawn env. Registers the agent-os tool surface when `pi.registerTool` exists.
+ * Uses AGENTOS_SOCKET / AGENTOS_SESSION_ID / AGENTOS_ROLE / AGENTOS_SESSION_DIR
+ * from the scrubbed spawn env. Registers the agent-os tool surface when
+ * `pi.registerTool` exists. Persists assistant text to
+ * `$AGENTOS_SESSION_DIR/output.md` for fusion side artifacts.
  */
 export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtensionHost | undefined {
   const socketPath = process.env.AGENTOS_SOCKET;
@@ -372,6 +440,21 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
   if (socketPath === undefined || sessionId === undefined) {
     return undefined;
   }
+
+  const sessionDir = process.env.AGENTOS_SESSION_DIR;
+  const assistantChunks: string[] = [];
+
+  const persistOutput = (): void => {
+    if (sessionDir === undefined || sessionDir.length === 0) return;
+    try {
+      mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(sessionDir, "output.md"), assistantChunks.join("\n\n"), {
+        mode: 0o600,
+      });
+    } catch {
+      // Best-effort: never throw into Pi.
+    }
+  };
 
   const parsedRole = agentRoleSchema.safeParse(process.env.AGENTOS_ROLE);
   const host = new AgentOsExtensionHost({
@@ -397,10 +480,41 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
   pi.on?.("agent_start", () => host.lifecycle("session_start"));
   pi.on?.("turn_start", () => host.lifecycle("turn_start"));
   pi.on?.("turn_end", () => host.lifecycle("turn_end"));
-  pi.on?.("agent_settled", () => host.lifecycle("agent_settled"));
   pi.on?.("tool_execution_start", () => host.lifecycle("tool_call"));
   pi.on?.("tool_execution_end", () => host.lifecycle("tool_result"));
+
+  // Pi 0.82+: message_end carries the finalized assistant message (text + usage).
+  pi.on?.("message_end", (event: unknown) => {
+    try {
+      const message = messageFromEvent(event);
+      const text = extractAssistantText(message);
+      if (text.length > 0) {
+        assistantChunks.push(text);
+      }
+      const usage = usageFromAssistantMessage(message);
+      if (usage !== null) {
+        host.usage(usage);
+      }
+    } catch {
+      // Best-effort: never throw into Pi.
+    }
+  });
+
+  pi.on?.("agent_settled", () => {
+    try {
+      persistOutput();
+    } catch {
+      // Best-effort.
+    }
+    host.lifecycle("agent_settled");
+  });
+
   pi.on?.("agent_end", () => {
+    try {
+      persistOutput();
+    } catch {
+      // Best-effort.
+    }
     host.lifecycle("session_end");
     host.close();
   });

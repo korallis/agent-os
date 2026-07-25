@@ -298,6 +298,11 @@ describe("session keys (G6)", () => {
     ]);
 
     const before = service.tools.listSessions().length;
+    const survivingAnthropic = service.tools
+      .listSessions()
+      .filter((s) => s.model === "anthropic/claude-fable-5")
+      .map((s) => s.sessionId)
+      .sort();
     const respawned = service.tools.reconcileMissingCastRoles();
     expect(respawned).toEqual([
       {
@@ -306,7 +311,20 @@ describe("session keys (G6)", () => {
         model: "openai/gpt-5.6-sol",
       },
     ]);
+    // Exactly the missing role is respawned; the surviving anthropic session is untouched.
     expect(service.tools.listSessions().length).toBeGreaterThan(before);
+    expect(
+      service.tools
+        .listSessions()
+        .filter((s) => s.model === "anthropic/claude-fable-5")
+        .map((s) => s.sessionId)
+        .sort(),
+    ).toEqual(survivingAnthropic);
+    expect(
+      service.tools.listSessions().some(
+        (s) => s.model === "openai/gpt-5.6-sol" && (s.status === "running" || s.status === "starting"),
+      ),
+    ).toBe(true);
     expect(
       service.sessionKeys.missingRoles(projectId, [
         { role: "planner", model: "anthropic/claude-fable-5" },
@@ -565,5 +583,124 @@ describe("/opinion live path", () => {
     expect((result.data as { spawned: boolean }).spawned).toBe(false);
     expect(events.map((e) => e.type)).not.toContain("fusion.side_completed");
     expect(events.map((e) => e.type)).toContain("fusion.completed");
+  });
+
+  it("rebuilds fusion ownership, keeps late usage, finalizes stop without placeholders", () => {
+    const { service, events } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    const spawnA = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
+    const spawnB = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      cleanRoom: true,
+    });
+    expect(spawnA.ok).toBe(true);
+    expect(spawnB.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session.sessionId;
+    const sessionB = (spawnB.data as { session: { sessionId: string } }).session.sessionId;
+
+    // Durable in-flight fusion run as if the daemon restarted mid-flight.
+    const runId = "01JZZZZZZZZZZZZZZZZZZZZZZX";
+    service.fusionRuns.create({
+      runId,
+      taskId,
+      kind: "opinion",
+      templateRef: "fusion/opinion.md",
+      templateLayer: "global",
+      templateHash: "h",
+      renderedHash: "r",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          family: "anthropic",
+          sessionId: sessionA,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: sessionB,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: new Date().toISOString(),
+    });
+
+    const dirA = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    }).dir;
+    writeFileSync(join(dirA, "output.md"), "hydrated side answer\n", { mode: 0o600 });
+
+    // Boot reconcile path: rebuild ownership from run.json (no live dispatch map).
+    service.tools.hydrateFusionOwnership();
+
+    events.length = 0;
+    service.tools.markSessionStatus(sessionA, "settled");
+    const afterA = service.fusionRuns.get(taskId, runId);
+    expect(afterA?.sides[0]?.settledAt).toBeTruthy();
+    expect(afterA?.sides[0]?.artifactPath).not.toBeNull();
+    expect(readFileSync(afterA!.sides[0]!.artifactPath!, "utf8")).toBe("hydrated side answer\n");
+    expect(afterA?.sides[1]?.settledAt == null).toBe(true);
+    expect(events.map((e) => e.type)).toContain("fusion.side_completed");
+    expect(events.map((e) => e.type)).not.toContain("fusion.completed");
+
+    // Late usage after settle still attributes (ownership not dropped at first settle).
+    service.tools.attributeFusionUsage(sessionA, {
+      inputTokens: 7,
+      outputTokens: 3,
+      costUsd: 0.01,
+    });
+    expect(service.fusionRuns.get(taskId, runId)?.sides[0]?.inputTokens).toBe(7);
+
+    // No real model output for side B — drop the fake-pi seam file so stop
+    // finalizes with artifactPath null rather than a placeholder.
+    const dirB = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+    }).dir;
+    rmSync(join(dirB, "output.md"), { force: true });
+
+    events.length = 0;
+    const stopped = service.tools.invoke("stop_crewmate", {
+      sessionId: sessionB,
+      reason: "test stop",
+    });
+    expect(stopped.ok).toBe(true);
+    const afterStop = service.fusionRuns.get(taskId, runId);
+    expect(afterStop?.sides[1]?.settledAt).toBeTruthy();
+    expect(afterStop?.sides[1]?.artifactPath).toBeNull();
+    expect(events.map((e) => e.type)).toContain("fusion.side_completed");
+    expect(events.map((e) => e.type)).toContain("fusion.completed");
+
+    const sideBEvent = events.find((e) => e.type === "fusion.side_completed");
+    if (sideBEvent?.type === "fusion.side_completed") {
+      expect(sideBEvent.payload.artifactPath).toBeNull();
+      expect(sideBEvent.payload.model).toBe("openai/gpt-5.6-sol");
+    }
   });
 });

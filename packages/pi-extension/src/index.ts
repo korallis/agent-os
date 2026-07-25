@@ -1,6 +1,8 @@
 export {
   AgentOsExtensionHost,
   EXTENSION_VERSION,
+  extractAssistantText,
+  usageFromAssistantMessage,
   type ExtensionHostOptions,
   type PiExtensionApi,
 } from "./extension.js";

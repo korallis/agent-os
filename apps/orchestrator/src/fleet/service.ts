@@ -404,6 +404,9 @@ export class FleetService {
    * and respawn only cast roles whose session-key directory is absent (G6).
    */
   private rehydrateRuntime(): void {
+    // Rebuild in-flight fusion side ownership from durable run.json so a
+    // restart still receives artifacts + fusion.completed for live sides.
+    this.tools.hydrateFusionOwnership();
     this.tools.rebindSessionListeners();
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.

@@ -65,7 +65,7 @@ import type { TmuxController } from "./tmux.js";
 import type { WakeWatcher } from "./watcher.js";
 import type { GateRunner } from "./gate-runner.js";
 import type { FusionRunStore } from "./fusion-runs.js";
-import type { SessionKeyStore } from "./sessions.js";
+import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
 
 /** Shipped instruction template per fusion kind (overridable per call/project). */
@@ -169,7 +169,8 @@ export class ToolSurface {
   private brainSessionId: string | null = null;
   /**
    * sessionId → fusion side ownership for O(1) usage attribution and settle
-   * completion. Entries are removed when the side settles or the session stops.
+   * completion. Entries stay until the run completes or the session stops so
+   * late ext.usage frames after agent_settled are still attributed.
    */
   private readonly fusionBySessionId = new Map<
     string,
@@ -341,6 +342,36 @@ export class ToolSurface {
         startedAt: s.startedAt,
       };
       this.sessions.set(s.sessionId, fleetSession);
+    }
+  }
+
+  /**
+   * Rebuild fusion side ownership from durable run.json after a daemon restart.
+   * Sides with a sessionId that have not yet settled remain in-flight so
+   * settle/session_end can still write artifacts and emit fusion.completed.
+   */
+  hydrateFusionOwnership(): void {
+    for (const task of this.tasks.values()) {
+      for (const run of this.deps.fusionRuns.listForTask(task.id)) {
+        run.sides.forEach((side, sideIndex) => {
+          if (side.sessionId === null) return;
+          if (side.settledAt != null || side.artifactPath !== null) return;
+          this.fusionBySessionId.set(side.sessionId, {
+            taskId: task.id,
+            runId: run.runId,
+            sideIndex,
+          });
+          const key = SessionKeyStore.computeKey({
+            projectId: task.projectId,
+            role: side.role,
+            model: side.model,
+          });
+          const record = this.deps.sessionKeys.get(key);
+          if (record !== null) {
+            this.sessionDirs.set(side.sessionId, record.dir);
+          }
+        });
+      }
     }
   }
 
@@ -1218,6 +1249,9 @@ export class ToolSurface {
     if (session.role === "scout") {
       this.auditScoutSession(input.sessionId);
     }
+    // Finalize any in-flight fusion side before dropping ownership so a stop
+    // cannot leave the run stranded on fusion.dispatched.
+    this.completeFusionSide(input.sessionId);
     this.deps.tmux.killWindow(session.tmuxWindow);
     void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId: input.sessionId });
@@ -1461,6 +1495,8 @@ export class ToolSurface {
   /**
    * Capture a fusion side's output when its session settles, emit
    * fusion.side_completed, and finish the run when every side is done.
+   * Ownership stays until the run completes or the session stops so late
+   * usage frames after agent_settled are still attributed.
    */
   private completeFusionSide(sessionId: string): void {
     const ref = this.fusionBySessionId.get(sessionId);
@@ -1477,34 +1513,36 @@ export class ToolSurface {
       this.fusionBySessionId.delete(sessionId);
       return;
     }
-    if (side.artifactPath !== null) {
+    if (side.settledAt != null || side.artifactPath !== null) {
       // Already recorded (e.g. double settle from agent_settled + session_end).
-      this.fusionBySessionId.delete(sessionId);
       this.tryCompleteFusionRun(ref.taskId, ref.runId);
       return;
     }
 
-    const content = this.readSideOutput(sessionId, side);
-    const artifactPath = this.deps.fusionRuns.writeSideArtifact(
-      ref.taskId,
-      ref.runId,
-      ref.sideIndex,
-      side.model,
-      content,
-    );
+    const content = this.readSideOutput(sessionId);
+    const artifactPath =
+      content === null
+        ? null
+        : this.deps.fusionRuns.writeSideArtifact(
+            ref.taskId,
+            ref.runId,
+            ref.sideIndex,
+            side.model,
+            content,
+          );
 
+    const settledAt = new Date().toISOString();
     const sides = run.sides.map((s, i) =>
       i === ref.sideIndex
-        ? { ...s, sessionId, artifactPath }
-        : s.sessionId === sessionId
-          ? { ...s, artifactPath }
-          : s,
+        ? {
+            ...s,
+            sessionId: s.sessionId ?? sessionId,
+            artifactPath,
+            settledAt,
+          }
+        : s,
     );
-    // Ensure this session id is stamped even if spawn registration raced.
-    const withSession = sides.map((s, i) =>
-      i === ref.sideIndex && s.sessionId === null ? { ...s, sessionId } : s,
-    );
-    this.deps.fusionRuns.save({ ...run, sides: withSession });
+    this.deps.fusionRuns.save({ ...run, sides });
 
     this.sink({
       type: "fusion.side_completed",
@@ -1519,34 +1557,36 @@ export class ToolSurface {
       },
     });
 
-    this.fusionBySessionId.delete(sessionId);
     this.tryCompleteFusionRun(ref.taskId, ref.runId);
   }
 
-  private readSideOutput(
-    sessionId: string,
-    side: FusionSide,
-  ): string {
+  /**
+   * Read the extension-written side answer from the session directory.
+   * Returns null when no real output was captured — never fabricates a
+   * placeholder so absent model work is not misreported as an artifact.
+   */
+  private readSideOutput(sessionId: string): string | null {
     const sessionDir = this.sessionDirs.get(sessionId);
-    if (sessionDir !== undefined) {
-      const outputPath = join(sessionDir, "output.md");
-      if (existsSync(outputPath)) {
-        try {
-          return readFileSync(outputPath, "utf8");
-        } catch {
-          // fall through
-        }
-      }
+    if (sessionDir === undefined) return null;
+    const outputPath = join(sessionDir, "output.md");
+    if (!existsSync(outputPath)) return null;
+    try {
+      return readFileSync(outputPath, "utf8");
+    } catch {
+      return null;
     }
-    return `[settled] role=${side.role} model=${side.model} session=${sessionId}\n`;
   }
 
   private tryCompleteFusionRun(taskId: string, runId: string): void {
     const run = this.deps.fusionRuns.get(taskId, runId);
     if (run === null) return;
-    if (!run.sides.every((s) => s.artifactPath !== null)) return;
+    // A side is done when it has settled (possibly without an artifact) or,
+    // for older records, when an artifact path was already written.
+    if (!run.sides.every((s) => s.settledAt != null || s.artifactPath !== null)) {
+      return;
+    }
 
-    // Drop any residual session → run mappings for this run.
+    // Drop session → run mappings for this run once every side is done.
     for (const [sid, ref] of this.fusionBySessionId) {
       if (ref.runId === runId) this.fusionBySessionId.delete(sid);
     }
@@ -2478,6 +2518,9 @@ export class ToolSurface {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
     if (session.status === "lost" || session.status === "stopped") return;
+    // Finalize any in-flight fusion side before dropping ownership so a
+    // pane-lost side cannot leave the run stranded on fusion.dispatched.
+    this.completeFusionSide(sessionId);
     void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId });
     const released = this.sessions.get(sessionId) ?? session;
