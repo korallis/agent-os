@@ -785,6 +785,193 @@ describe("secondmate provision constraints", () => {
   });
 });
 
+describe("handover crash recovery and post-accept finalization", () => {
+  it("reconcileAcceptedHandovers releases primary after durable remote accept", async () => {
+    const home = temp("agentos-p7-handover-reconcile-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await service.start();
+    const project = service.projects.register({
+      name: "h",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "handover incomplete",
+        intent: "crash after remote accept",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    expect((created.data as { phase: string }).phase).not.toBe("CANCELLED");
+
+    // Simulate kill-9 after remote accept was durable, before primary CANCELLED.
+    const remoteTaskId = "01ARZ3NDEKTSV4RRFFQ69G5FHA";
+    const handoverDir = join(home, "runs", taskId);
+    mkdirSync(handoverDir, { recursive: true });
+    writeFileSync(
+      join(handoverDir, "handover.json"),
+      `${JSON.stringify({
+        taskId,
+        secondmateName: "infra",
+        domain: "infra",
+        status: "accepted",
+        remoteTaskId,
+        updatedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const finished = service.tools.reconcileAcceptedHandovers();
+    expect(finished).toContain(taskId);
+    const after = service.tools.invoke("read_task", { taskId });
+    expect(after.ok).toBe(true);
+    expect((after.data as { phase: string }).phase).toBe("CANCELLED");
+  });
+
+  it("route_to_secondmate reports accepted when primary is already terminal after accept", async () => {
+    const home = temp("agentos-p7-handover-terminal-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await service.start();
+    service.provisionSecondmate({ name: "infra", domain: "infra" });
+    const project = service.projects.register({
+      name: "h2",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "already terminal",
+        intent: "accept then terminal",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    const remoteTaskId = "01ARZ3NDEKTSV4RRFFQ69G5FHB";
+    mkdirSync(join(home, "runs", taskId), { recursive: true });
+    writeFileSync(
+      join(home, "runs", taskId, "handover.json"),
+      `${JSON.stringify({
+        taskId,
+        secondmateName: "infra",
+        domain: "infra",
+        status: "accepted",
+        remoteTaskId,
+        updatedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+    // Primary already terminal (e.g. concurrent cancel) after remote accepted.
+    const cancelled = service.tools.invoke("cancel_task", {
+      taskId,
+      reason: "concurrent cancel during handover",
+    });
+    expect(cancelled.ok).toBe(true);
+    expect((cancelled.data as { phase: string }).phase).toBe("CANCELLED");
+
+    const routed = await service.tools.invokeAsync("route_to_secondmate", {
+      name: "infra",
+      taskId,
+      domain: "infra",
+    });
+    expect(routed.ok).toBe(true);
+    expect(routed.data).toMatchObject({
+      accepted: true,
+      remoteTaskId,
+      taskId,
+      name: "infra",
+    });
+  });
+
+  it("boot rehydrate finishes durable accepted handovers without re-POSTing", async () => {
+    const home = temp("agentos-p7-handover-boot-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const first = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await first.start();
+    const project = first.projects.register({
+      name: "boot",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = first.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "boot reconcile",
+        intent: "kill-9 window",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    const remoteTaskId = "01ARZ3NDEKTSV4RRFFQ69G5FHC";
+    mkdirSync(join(home, "runs", taskId), { recursive: true });
+    writeFileSync(
+      join(home, "runs", taskId, "handover.json"),
+      `${JSON.stringify({
+        taskId,
+        secondmateName: "infra",
+        domain: "infra",
+        status: "accepted",
+        remoteTaskId,
+        updatedAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    // Fresh process memory (daemon restart) — rehydrate must CANCELLED the primary.
+    const restarted = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await restarted.start();
+    const after = restarted.tools.invoke("read_task", { taskId });
+    expect(after.ok).toBe(true);
+    expect((after.data as { phase: string }).phase).toBe("CANCELLED");
+  });
+});
+
 describe("secondmate api-key grants (non-copy)", () => {
   it("resolves grants from AGENTOS_SECRETS_HOME without writing under the secondmate home", async () => {
     const { writeApiKeyFile, resolveProviderKeyGrant, ConnectionRegistry } = await import(

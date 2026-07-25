@@ -9,6 +9,7 @@
  *   G4  broker serialises across PROCESSES, and production PiAuthBroker holds it
  *   G5  routing hands the task over — present on secondmate, released on primary
  *   G5b concurrent route_to_secondmate: task exists once; loser is already-routing
+ *   G5c crash window: durable accept + non-terminal primary → boot finishes CANCELLED once
  *   G6  /bearings answers within 5 s; tool returns real results; unreachable is fact
  *   G7  dual-restart reconcile produces no duplicate secondmate records
  *   G8  provision through REST (not out-of-band modules); start waits for ready
@@ -577,6 +578,87 @@ try {
         remotePresent === true &&
         remoteTaskCount === 1,
       `winners=${winners.length} losers=${losers.length} loserMsg=${loserMsg} primaryPhase=${after.task?.phase} remoteCount=${remoteTaskCount}`,
+    );
+
+    // G5c — kill-9 between remote accept and primary CANCELLED: durable handover.json
+    // is reconciled on boot; primary ends CANCELLED; remote stays a single task
+    // (idempotency key prevents a second remote create on re-drive).
+    let g5cOk = false;
+    let g5cDetail = "skipped";
+    if (smToken && routed.ok && routed.data?.remoteTaskId) {
+      const crashTask = await (
+        await api("/v1/tasks", {
+          method: "POST",
+          body: JSON.stringify({
+            spec: {
+              shape: "SHIP",
+              title: "Crash window",
+              intent: "accepted remotely, primary not released",
+              projectId: project.project.id,
+              mode: "local-only",
+              yolo: true,
+            },
+          }),
+        })
+      ).json();
+      const crashTaskId = crashTask.task?.id;
+      // Remote already at capacity (1); simulate accept by writing durable record
+      // that points at the existing remote task (same work landed once).
+      const handoverDir = join(home, "runs", crashTaskId);
+      mkdirSync(handoverDir, { recursive: true });
+      writeFileSync(
+        join(handoverDir, "handover.json"),
+        `${JSON.stringify({
+          taskId: crashTaskId,
+          secondmateName: "infra",
+          domain: "infra",
+          status: "accepted",
+          remoteTaskId: routed.data.remoteTaskId,
+          updatedAt: new Date().toISOString(),
+        })}\n`,
+        { mode: 0o600 },
+      );
+      const mid = await (await api(`/v1/tasks/${crashTaskId}`)).json();
+      const midNonTerminal = mid.task?.phase !== "CANCELLED";
+      // Restart primary (secondmate keeps running) so boot reconcile runs.
+      child.kill("SIGKILL");
+      await sleep(400);
+      child = startDaemon(home, PORT);
+      const tokenAfter = await waitForHealth(home, PORT);
+      auth.authorization = `Bearer ${tokenAfter}`;
+      const afterBoot = await (
+        await fetch(`http://127.0.0.1:${PORT}/v1/tasks/${crashTaskId}`, {
+          headers: { authorization: `Bearer ${tokenAfter}` },
+        })
+      ).json();
+      let remoteStillOnce = false;
+      let remoteCountAfter = -1;
+      try {
+        const remote = await fetch(
+          `http://127.0.0.1:${SM_PORT}/v1/tasks/${routed.data.remoteTaskId}`,
+          { headers: { authorization: `Bearer ${smToken}` } },
+        );
+        const listRes = await fetch(`http://127.0.0.1:${SM_PORT}/v1/tasks`, {
+          headers: { authorization: `Bearer ${smToken}` },
+        });
+        const listBody = listRes.ok ? await listRes.json() : {};
+        const tasks = listBody.tasks ?? listBody.items ?? [];
+        remoteCountAfter = Array.isArray(tasks) ? tasks.length : -1;
+        remoteStillOnce = remote.ok && remoteCountAfter === 1;
+      } catch {
+        remoteStillOnce = false;
+      }
+      g5cOk =
+        midNonTerminal &&
+        afterBoot.task?.phase === "CANCELLED" &&
+        remoteStillOnce;
+      g5cDetail = `midPhase=${mid.task?.phase} afterPhase=${afterBoot.task?.phase} remoteCount=${remoteCountAfter}`;
+    }
+    gate(
+      "G5c",
+      "durable accept + boot reconcile: primary CANCELLED once; no dual ownership",
+      g5cOk,
+      g5cDetail,
     );
 
     // G9 — second route while at capacity (maxConcurrentTasks: 1) must refuse

@@ -225,6 +225,8 @@ export class FleetService {
     if (this.options.authBroker !== undefined) {
       await this.tools.reconcileMissingCastRolesAsync();
     }
+    // Re-drive handovers that crashed after pending intent (idempotent remote POST).
+    await this.tools.reconcilePendingHandoversAsync();
     await this.brain.start("daemon-boot");
     this.startReconcileTick();
   }
@@ -665,6 +667,8 @@ export class FleetService {
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
     this.reclaimOrphanedWorktreeLeases();
+    // Finish handovers accepted remotely but not yet CANCELLED on primary.
+    this.tools.reconcileAcceptedHandovers();
     if (this.options.authBroker === undefined) {
       this.tools.reconcileMissingCastRoles();
     }

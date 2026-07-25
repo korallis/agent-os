@@ -1,10 +1,17 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { monotonicFactory } from "ulid";
 import { ZodError } from "zod";
 import { spawnSync } from "node:child_process";
-import { readdirSync } from "node:fs";
 import JSON5 from "json5";
 import { enforceFusionContract } from "@agent-os/fusion-core";
 import {
@@ -140,6 +147,20 @@ export interface ToolCallResult {
   error?: ToolError;
   durationMs: number;
 }
+
+/**
+ * Durable secondmate handover intent/acceptance under runs/<taskId>/handover.json.
+ * Written before (pending) and immediately after (accepted) the remote POST so a
+ * crash between remote accept and primary CANCELLED cannot leave dual ownership.
+ */
+export type HandoverRecord = {
+  taskId: string;
+  secondmateName: string;
+  domain: string;
+  status: "pending" | "accepted";
+  remoteTaskId: string | null;
+  updatedAt: string;
+};
 
 export interface ToolSurfaceDeps {
   home: string;
@@ -3574,6 +3595,10 @@ export class ToolSurface {
    * refusing to route. Named routing checks the target's own charter (domains +
    * acceptsRouting); routeFor is for auto-pick/discovery only.
    * Capacity (maxConcurrentTasks) is enforced on the live secondmate.
+   *
+   * Crash-safety: write pending intent before the remote POST, then durable
+   * acceptance (with remoteTaskId) before primary CANCELLED. Boot reconcile
+   * finishes incomplete releases; re-drive uses the remote idempotency key.
    */
   private async routeToSecondmate(raw: Record<string, unknown>): Promise<{
     name: string;
@@ -3587,9 +3612,21 @@ export class ToolSurface {
       throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
     }
     const task = this.requireTask(input.taskId);
+    const prior = this.readHandoverRecord(task.id);
+    if (prior !== null && prior.status === "accepted" && prior.remoteTaskId !== null) {
+      if (prior.secondmateName !== input.name) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `task ${task.id} already handed to secondmate ${prior.secondmateName}`,
+        );
+      }
+      // Includes already-terminal primary: remote accept is final; never false-fail.
+      return this.finalizeAcceptedHandover(prior);
+    }
     if (isTerminalPhase(task.phase)) {
       throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
     }
+
     if (this.routingInProgress.has(task.id)) {
       throw new ToolSurfaceError(
         "CONFLICT",
@@ -3601,6 +3638,10 @@ export class ToolSurface {
     try {
       const live = this.requireTask(input.taskId);
       if (isTerminalPhase(live.phase)) {
+        const accepted = this.readHandoverRecord(task.id);
+        if (accepted?.status === "accepted" && accepted.remoteTaskId !== null) {
+          return this.finalizeAcceptedHandover(accepted);
+        }
         throw new ToolSurfaceError("CONFLICT", `task ${live.id} is terminal (${live.phase})`);
       }
 
@@ -3661,6 +3702,16 @@ export class ToolSurface {
         throw new ToolSurfaceError("NOT_FOUND", `project not found: ${task.projectId}`);
       }
 
+      // Durable intent before the remote POST so a crash can re-drive safely.
+      this.writeHandoverRecord({
+        taskId: task.id,
+        secondmateName: record.name,
+        domain: input.domain,
+        status: "pending",
+        remoteTaskId: null,
+        updatedAt: new Date().toISOString(),
+      });
+
       let remoteTaskId: string;
       try {
         const handed = await this.deps.secondmates.fleet.handoverTask({
@@ -3677,6 +3728,7 @@ export class ToolSurface {
         });
         remoteTaskId = handed.remoteTaskId;
       } catch (error) {
+        this.clearHandoverRecord(task.id);
         const message =
           error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError
             ? error.message
@@ -3703,33 +3755,183 @@ export class ToolSurface {
         throw new SecondmateHandoverError(message);
       }
 
-      // Accepted on the secondmate — only now release ownership on the primary.
-      this.haltAndReleaseTask(task.id, `routed to secondmate ${record.name}`);
-      this.transition(
-        this.requireTask(task.id),
-        "CANCELLED",
-        `routed to secondmate ${record.name} as ${remoteTaskId}`,
-      );
-      this.sink({
-        type: "secondmate.routed",
-        payload: {
-          name: record.name,
-          taskId: task.id,
-          domain: input.domain,
-          accepted: true,
-          reason: null,
-          remoteTaskId,
-        },
-      });
-      return {
-        name: record.name,
+      // Remote accept is durable before primary release (crash window closed).
+      const acceptance: HandoverRecord = {
         taskId: task.id,
-        remoteTaskId,
-        accepted: true,
+        secondmateName: record.name,
         domain: input.domain,
+        status: "accepted",
+        remoteTaskId,
+        updatedAt: new Date().toISOString(),
       };
+      this.writeHandoverRecord(acceptance);
+      return this.finalizeAcceptedHandover(acceptance);
     } finally {
       this.routingInProgress.delete(task.id);
+    }
+  }
+
+  /**
+   * After remote accept is durable: release primary ownership if still live.
+   * If the primary is already terminal, still report accepted — never a false
+   * failure after work has landed on the secondmate.
+   */
+  private finalizeAcceptedHandover(record: HandoverRecord): {
+    name: string;
+    taskId: string;
+    remoteTaskId: string;
+    accepted: boolean;
+    domain: string;
+  } {
+    if (record.remoteTaskId === null) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `handover for task ${record.taskId} is missing remoteTaskId`,
+      );
+    }
+    const task = this.tasks.get(record.taskId);
+    if (task !== undefined && !isTerminalPhase(task.phase)) {
+      // Terminal transition choke point owns halt/release.
+      this.transition(
+        task,
+        "CANCELLED",
+        `routed to secondmate ${record.secondmateName} as ${record.remoteTaskId}`,
+      );
+    }
+    this.sink({
+      type: "secondmate.routed",
+      payload: {
+        name: record.secondmateName,
+        taskId: record.taskId,
+        domain: record.domain,
+        accepted: true,
+        reason: null,
+        remoteTaskId: record.remoteTaskId,
+      },
+    });
+    return {
+      name: record.secondmateName,
+      taskId: record.taskId,
+      remoteTaskId: record.remoteTaskId,
+      accepted: true,
+      domain: record.domain,
+    };
+  }
+
+  /**
+   * Boot: finish handovers whose remote accept was durable but primary release
+   * did not complete (kill -9 between acceptance write and CANCELLED).
+   */
+  reconcileAcceptedHandovers(): string[] {
+    const finished: string[] = [];
+    for (const task of this.tasks.values()) {
+      if (isTerminalPhase(task.phase)) continue;
+      const rec = this.readHandoverRecord(task.id);
+      if (rec === null || rec.status !== "accepted" || rec.remoteTaskId === null) continue;
+      this.finalizeAcceptedHandover(rec);
+      finished.push(task.id);
+    }
+    return finished;
+  }
+
+  /**
+   * Boot: re-drive handovers that crashed after pending intent (remote POST uses
+   * idempotency key routed-from-primary:<taskId>) then finalize primary release.
+   */
+  async reconcilePendingHandoversAsync(): Promise<string[]> {
+    if (this.deps.secondmates === undefined) return [];
+    const finished: string[] = [];
+    for (const task of [...this.tasks.values()]) {
+      if (isTerminalPhase(task.phase)) continue;
+      const rec = this.readHandoverRecord(task.id);
+      if (rec === null || rec.status !== "pending") continue;
+      if (this.routingInProgress.has(task.id)) continue;
+      this.routingInProgress.add(task.id);
+      try {
+        const record = this.deps.secondmates.registry.get(rec.secondmateName);
+        if (record === null) continue;
+        const project = this.deps.projects.get(task.projectId);
+        if (project === null) continue;
+        try {
+          const handed = await this.deps.secondmates.fleet.handoverTask({
+            record,
+            task,
+            project: {
+              name: project.name,
+              path: project.path,
+              mode: project.mode,
+              trusted: project.trusted,
+              yolo: project.yolo,
+            },
+            domain: rec.domain,
+          });
+          const acceptance: HandoverRecord = {
+            taskId: task.id,
+            secondmateName: rec.secondmateName,
+            domain: rec.domain,
+            status: "accepted",
+            remoteTaskId: handed.remoteTaskId,
+            updatedAt: new Date().toISOString(),
+          };
+          this.writeHandoverRecord(acceptance);
+          this.finalizeAcceptedHandover(acceptance);
+          finished.push(task.id);
+        } catch {
+          // Leave pending for a later pass; never cancel without remote accept.
+        }
+      } finally {
+        this.routingInProgress.delete(task.id);
+      }
+    }
+    return finished;
+  }
+
+  private handoverPath(taskId: string): string {
+    return join(this.deps.home, "runs", taskId, "handover.json");
+  }
+
+  private writeHandoverRecord(record: HandoverRecord): void {
+    const dir = join(this.deps.home, "runs", record.taskId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = this.handoverPath(record.taskId);
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, target);
+  }
+
+  private readHandoverRecord(taskId: string): HandoverRecord | null {
+    const path = this.handoverPath(taskId);
+    if (!existsSync(path)) return null;
+    try {
+      const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<HandoverRecord>;
+      if (
+        typeof raw.taskId !== "string" ||
+        typeof raw.secondmateName !== "string" ||
+        typeof raw.domain !== "string" ||
+        (raw.status !== "pending" && raw.status !== "accepted")
+      ) {
+        return null;
+      }
+      return {
+        taskId: raw.taskId,
+        secondmateName: raw.secondmateName,
+        domain: raw.domain,
+        status: raw.status,
+        remoteTaskId: typeof raw.remoteTaskId === "string" ? raw.remoteTaskId : null,
+        updatedAt:
+          typeof raw.updatedAt === "string" ? raw.updatedAt : new Date().toISOString(),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private clearHandoverRecord(taskId: string): void {
+    const path = this.handoverPath(taskId);
+    try {
+      if (existsSync(path)) unlinkSync(path);
+    } catch {
+      // best-effort
     }
   }
 
