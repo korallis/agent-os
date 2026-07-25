@@ -50,6 +50,9 @@ function fleet(options: { fakePi?: boolean } = {}): FleetService {
   mkdirSync(join(home, "config"), { recursive: true });
   const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
   config.installDefaults();
+  // Phase-3 harness is not about red-baseline ordering; keep the looser spawn
+  // path so these cases stay focused on worktrees/env/session isolation.
+  config.writeGlobal("policies", "{ redBaselineGateRequired: false }\n");
   const service = new FleetService({
     home,
     config,
@@ -169,25 +172,67 @@ describe("spawn env delivery", () => {
       configDirEnv: "PI_CONFIG_DIR",
       isolationMode: "managed",
     };
+    const builderSeat = join(home, "worktrees", "builder-1");
+    const gateWs = join(home, "runs", "task", "gate-workspace");
     const apiSpec = buildPiSpawnSpec({
       agentosHome: home,
       detection,
       args: ["--mode", "json"],
-      cwd: home,
+      cwd: builderSeat,
       sessionId: "01JSESSGRANT000000000000001",
       role: "builder",
       socketPath: join(home, "s.sock"),
       extensionPath: join(home, "ext.js"),
       grantProviderKey: apiGrant,
+      gateWorkspace: gateWs,
+      seatWorkspace: builderSeat,
     });
     expect(apiSpec.env.OPENAI_API_KEY).toBe("sk-openai-cast-secret");
     expect(apiSpec.env.ANTHROPIC_API_KEY).toBeUndefined();
+    // Builders receive AGENTOS_HOME only as the default-deny fence root (never the key).
+    expect(apiSpec.env.AGENTOS_HOME).toBe(home);
+    expect(apiSpec.env.AGENTOS_SEAT_WORKSPACE).toBe(builderSeat);
+    expect(apiSpec.env.AGENTOS_GATE_WORKSPACE).toBe(gateWs);
+    const validatorSpec = buildPiSpawnSpec({
+      agentosHome: home,
+      detection,
+      args: ["--mode", "json"],
+      cwd: gateWs,
+      sessionId: "01JSESSGRANT0000000000000VA",
+      role: "validator",
+      socketPath: join(home, "v.sock"),
+      extensionPath: join(home, "ext.js"),
+      grantProviderKey: null,
+      gateWorkspace: gateWs,
+      seatWorkspace: gateWs,
+    });
+    // Validators get AGENTOS_HOME as fence root + seat workspace = gate workspace.
+    expect(validatorSpec.env.AGENTOS_HOME).toBe(home);
+    expect(validatorSpec.env.AGENTOS_SEAT_WORKSPACE).toBe(gateWs);
+    expect(validatorSpec.env.AGENTOS_GATE_WORKSPACE).toBe(gateWs);
     expect(
       Object.keys(apiSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
     ).toEqual(["OPENAI_API_KEY"]);
     // Durable spawn manifest records key names only (values stay in runtime env).
     expect(apiSpec.envKeys).toContain("OPENAI_API_KEY");
     expect(apiSpec.envKeys).not.toContain("sk-openai-cast-secret");
+    expect(apiSpec.envKeys).toContain("AGENTOS_HOME");
+    expect(apiSpec.envKeys).toContain("AGENTOS_SEAT_WORKSPACE");
+
+    const brainSpec = buildPiSpawnSpec({
+      agentosHome: home,
+      detection,
+      args: ["--mode", "json"],
+      cwd: home,
+      sessionId: "01JSESSGRANT0000000000000BR",
+      role: "brain",
+      socketPath: join(home, "brain.sock"),
+      extensionPath: join(home, "ext.js"),
+      grantProviderKey: null,
+    });
+    expect(brainSpec.env.AGENTOS_HOME).toBe(home);
+    expect(brainSpec.env.AGENTOS_GATE_WORKSPACE).toBeUndefined();
+    expect(brainSpec.env.AGENTOS_SEAT_WORKSPACE).toBeUndefined();
 
     const oauthHome = temp("agentos-oauth-grant-");
     const oauthRegistry = new ConnectionRegistry(oauthHome);
@@ -213,6 +258,144 @@ describe("spawn env delivery", () => {
     expect(
       Object.keys(oauthSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
     ).toEqual([]);
+  });
+
+  it("never inherits ambient path-fence sentinels into any seat spawn env", () => {
+    const sentinel = "/tmp/ambient-path-fence-CANARY";
+    const pathVars = [
+      "AGENTOS_HOME",
+      "AGENTOS_SEAT_WORKSPACE",
+      "AGENTOS_GATE_WORKSPACE",
+      "AGENTOS_SESSION_DIR",
+      "PI_CODING_AGENT_SESSION_DIR",
+    ] as const;
+    const prev: Partial<Record<(typeof pathVars)[number], string | undefined>> = {};
+    for (const key of pathVars) {
+      prev[key] = process.env[key];
+      process.env[key] = sentinel;
+    }
+
+    try {
+      const home = temp("agentos-path-canary-");
+      const detection: PiDetection = {
+        binary: "/usr/local/bin/pi",
+        version: PI_PINNED_VERSION,
+        pinnedVersion: PI_PINNED_VERSION,
+        versionMatchesPin: true,
+        managedHome: join(home, "pi"),
+        configDirEnv: "PI_CONFIG_DIR",
+        isolationMode: "managed",
+      };
+      const builderSeat = join(home, "worktrees", "builder-1");
+      const gateWs = join(home, "runs", "task", "gate-workspace");
+      const sessionDir = join(home, "sessions", "seat");
+
+      const seats: Array<{
+        role: string;
+        seatWorkspace?: string;
+        gateWorkspace?: string;
+        sessionDir?: string;
+        expectHome: boolean;
+        expectSeat: boolean;
+        expectGate: boolean;
+        expectSession: boolean;
+      }> = [
+        {
+          role: "builder",
+          seatWorkspace: builderSeat,
+          gateWorkspace: gateWs,
+          sessionDir,
+          expectHome: true,
+          expectSeat: true,
+          expectGate: true,
+          expectSession: true,
+        },
+        {
+          role: "validator",
+          seatWorkspace: gateWs,
+          gateWorkspace: gateWs,
+          sessionDir,
+          expectHome: true,
+          expectSeat: true,
+          expectGate: true,
+          expectSession: true,
+        },
+        {
+          role: "brain",
+          sessionDir,
+          expectHome: true,
+          expectSeat: false,
+          expectGate: false,
+          expectSession: true,
+        },
+        {
+          role: "planner",
+          sessionDir,
+          expectHome: false,
+          expectSeat: false,
+          expectGate: false,
+          expectSession: true,
+        },
+        {
+          role: "scout",
+          expectHome: false,
+          expectSeat: false,
+          expectGate: false,
+          expectSession: false,
+        },
+      ];
+
+      for (const seat of seats) {
+        const spec = buildPiSpawnSpec({
+          agentosHome: home,
+          detection,
+          args: ["--mode", "json"],
+          cwd: seat.seatWorkspace ?? home,
+          sessionId: `01JPATHCANARY0000000000${seat.role.slice(0, 2).toUpperCase()}`,
+          role: seat.role,
+          socketPath: join(home, `${seat.role}.sock`),
+          extensionPath: join(home, "ext.js"),
+          grantProviderKey: null,
+          // exactOptionalPropertyTypes: omit optional keys rather than pass undefined
+          ...(seat.gateWorkspace !== undefined ? { gateWorkspace: seat.gateWorkspace } : {}),
+          ...(seat.seatWorkspace !== undefined ? { seatWorkspace: seat.seatWorkspace } : {}),
+          ...(seat.sessionDir !== undefined ? { sessionDir: seat.sessionDir } : {}),
+        });
+        const joined = Object.values(spec.env).join("\0");
+        expect(joined).not.toContain(sentinel);
+        for (const key of pathVars) {
+          expect(spec.env[key]).not.toBe(sentinel);
+        }
+        if (seat.expectHome) {
+          expect(spec.env.AGENTOS_HOME).toBe(home);
+        } else {
+          expect(spec.env.AGENTOS_HOME).toBeUndefined();
+        }
+        if (seat.expectSeat) {
+          expect(spec.env.AGENTOS_SEAT_WORKSPACE).toBe(seat.seatWorkspace);
+        } else {
+          expect(spec.env.AGENTOS_SEAT_WORKSPACE).toBeUndefined();
+        }
+        if (seat.expectGate) {
+          expect(spec.env.AGENTOS_GATE_WORKSPACE).toBe(seat.gateWorkspace);
+        } else {
+          expect(spec.env.AGENTOS_GATE_WORKSPACE).toBeUndefined();
+        }
+        if (seat.expectSession) {
+          expect(spec.env.AGENTOS_SESSION_DIR).toBe(seat.sessionDir);
+          expect(spec.env.PI_CODING_AGENT_SESSION_DIR).toBe(seat.sessionDir);
+        } else {
+          expect(spec.env.AGENTOS_SESSION_DIR).toBeUndefined();
+          expect(spec.env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
+        }
+      }
+    } finally {
+      for (const key of pathVars) {
+        const was = prev[key];
+        if (was === undefined) delete process.env[key];
+        else process.env[key] = was;
+      }
+    }
   });
 });
 
@@ -543,6 +726,7 @@ describe("worktree lease reclaim on stop/respawn", () => {
     mkdirSync(join(home, "config"), { recursive: true });
     const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
     config.installDefaults();
+    config.writeGlobal("policies", "{ redBaselineGateRequired: false }\n");
     const service = new FleetService({
       home,
       config,
@@ -1482,6 +1666,7 @@ describe("terminal task lifecycle choke points", () => {
     mkdirSync(join(home, "config"), { recursive: true });
     const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
     config.installDefaults();
+    config.writeGlobal("policies", "{ redBaselineGateRequired: false }\n");
     const service = new FleetService({
       home,
       config,
@@ -1701,6 +1886,130 @@ console.log("PASS");
       else process.env[canaryKey] = prevCanary;
       if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
       else process.env.AGENTOS_FAKE_GATE = prevFake;
+    }
+  });
+});
+
+describe("gate runtime infrastructure is never a verdict", () => {
+  it("ts gate timeout discards partial EXPECTED_RED and does not mint RED proof or FAIL ledger", async () => {
+    const { GateRunner } = await import("../src/fleet/gate-runner.js");
+    const home = temp("agentos-ts-gate-timeout-");
+    const runner = new GateRunner(home, {
+      maxValidations: 6,
+      triageAt: 3,
+      gateLanguage: "ts",
+      gateTimeoutSeconds: 1,
+    });
+    const taskId = "01JTSTIMEOUT00000000000001";
+    const prevFake = process.env.AGENTOS_FAKE_GATE;
+    delete process.env.AGENTOS_FAKE_GATE;
+    try {
+      runner.writeGateSource(
+        taskId,
+        `console.log("EXPECTED_RED");
+console.log("FAIL partial output before hang");
+// busy-wait so the gate prints a verdict-shaped line then exceeds timeout
+const end = Date.now() + 60_000;
+while (Date.now() < end) { /* hang */ }
+`,
+        "ts",
+      );
+      const result = runner.run({
+        taskId,
+        target: "baseline",
+        cwd: runner.gateWorkspace(taskId),
+        language: "ts",
+      });
+      expect(result.infrastructureError).toBe(true);
+      expect(result.outcome).toBe("GATE_ERROR");
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(/infrastructure error/i);
+      expect(result.failLines).toEqual([]);
+      expect(runner.getRedProof(taskId)).toBeNull();
+      expect(runner.hasRedProofForCurrentSource(taskId, "ts")).toBe(false);
+      expect(runner.getFailLedger(taskId)).toBeNull();
+      expect(runner.lastFailHash(taskId)).toBeNull();
+    } finally {
+      if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
+      else process.env.AGENTOS_FAKE_GATE = prevFake;
+    }
+  });
+});
+
+describe("daemon-owned RED proof (not seat-writable disk)", () => {
+  it("ignores forged validation/red-proof.json; only memory+HMAC authorises", async () => {
+    const { GateRunner } = await import("../src/fleet/gate-runner.js");
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const home = temp("agentos-red-proof-authz-");
+    const runner = new GateRunner(home, {
+      maxValidations: 6,
+      triageAt: 3,
+      gateLanguage: "py",
+      gateTimeoutSeconds: 30,
+    });
+    const taskId = "01JREDPROOF000000000000001";
+    const prevFake = process.env.AGENTOS_FAKE_GATE;
+    process.env.AGENTOS_FAKE_GATE = "1";
+    try {
+      runner.writeGateSource(
+        taskId,
+        `#!/usr/bin/env python3\nprint("EXPECTED_RED")\nprint("FAIL baseline")\n`,
+      );
+      const baseline = runner.run({
+        taskId,
+        target: "baseline",
+        cwd: runner.gateWorkspace(taskId),
+      });
+      expect(baseline.outcome).toBe("EXPECTED_RED");
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(true);
+
+      // Edit gate source → proof must drop for the new revision.
+      const revised = `${baseline.gateSourceHash}\n# rev2\nprint("PASS")\n`;
+      runner.writeGateSource(taskId, revised);
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(false);
+
+      // Forge disk where the daemon used to read (sibling validation/) — ignored.
+      const newHash = runner.gateSourceHash(taskId)!;
+      const valDir = runner.validationDir(taskId);
+      mkdirSync(valDir, { recursive: true });
+      writeFileSync(
+        join(valDir, "red-proof.json"),
+        JSON.stringify({
+          gateSourceHash: newHash,
+          outcome: "EXPECTED_RED",
+          provenAt: new Date().toISOString(),
+          hmac: "forged",
+        }),
+      );
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(false);
+
+      // Forged install without valid HMAC is rejected.
+      expect(
+        runner.installRedProof(taskId, {
+          gateSourceHash: newHash,
+          outcome: "EXPECTED_RED",
+          provenAt: new Date().toISOString(),
+          hmac: "forged",
+        }),
+      ).toBe(false);
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(false);
+
+      // Re-prove records a signed proof in memory.
+      process.env.AGENTOS_FAKE_GATE_OUTCOME = "EXPECTED_RED";
+      runner.run({
+        taskId,
+        target: "baseline",
+        cwd: runner.gateWorkspace(taskId),
+      });
+      delete process.env.AGENTOS_FAKE_GATE_OUTCOME;
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(true);
+      const proof = runner.getRedProof(taskId);
+      expect(proof?.hmac).toMatch(/^[a-f0-9]{64}$/);
+    } finally {
+      if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
+      else process.env.AGENTOS_FAKE_GATE = prevFake;
+      delete process.env.AGENTOS_FAKE_GATE_OUTCOME;
     }
   });
 });

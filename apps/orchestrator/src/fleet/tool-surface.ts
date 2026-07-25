@@ -64,7 +64,7 @@ import type { ProjectRegistry } from "./projects.js";
 import type { WorktreePool } from "./worktree-pool.js";
 import type { TmuxController } from "./tmux.js";
 import type { WakeWatcher } from "./watcher.js";
-import type { GateRunner } from "./gate-runner.js";
+import { GateRunner } from "./gate-runner.js";
 import type { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
@@ -166,7 +166,6 @@ export class ToolSurface {
   private sink: ToolEventSink = () => undefined;
   private brain: BrainSnapshot;
   private brainDown = false;
-  private readonly failLines = new Map<string, string[]>();
   private readonly questions = new Map<string, PendingQuestion>();
   private brainSessionId: string | null = null;
   /**
@@ -225,6 +224,19 @@ export class ToolSurface {
       usage,
       ref.sideIndex,
     );
+  }
+
+  /**
+   * True when the Captain stamped a cross-family override onto this task.
+   * Overrides are evidence-stamped in `policyOverrides` — never implicit.
+   */
+  private hasFamilyOverride(task: TaskSnapshot): boolean {
+    return task.policyOverrides.some((o) => o.policyId === "crossFamilyBuilderValidator");
+  }
+
+  /** True when the Captain stamped a red-baseline override onto this task. */
+  private hasRedBaselineOverride(task: TaskSnapshot): boolean {
+    return task.policyOverrides.some((o) => o.policyId === "redBaselineGateRequired");
   }
 
   /** Fusion runs recorded for a task, newest first. */
@@ -331,10 +343,19 @@ export class ToolSurface {
     const normalized: TaskSnapshot = {
       ...task,
       deliveryBlocked: task.deliveryBlocked ?? null,
+      redProof: task.redProof ?? null,
+      lastFailLedger: task.lastFailLedger ?? null,
     };
     this.tasks.set(normalized.id, normalized);
     if (normalized.idempotencyKey !== null) {
       this.idempotency.set(normalized.idempotencyKey, normalized);
+    }
+    // Restore daemon-authoritative proof/ledger into process memory (HMAC-checked).
+    if (normalized.redProof !== null) {
+      this.deps.gates.installRedProof(normalized.id, normalized.redProof);
+    }
+    if (normalized.lastFailLedger !== null) {
+      this.deps.gates.installFailLedger(normalized.id, normalized.lastFailLedger);
     }
     task = normalized;
     for (const s of task.sessions) {
@@ -352,6 +373,29 @@ export class ToolSurface {
       };
       this.sessions.set(s.sessionId, fleetSession);
     }
+  }
+
+  /**
+   * Rebuild RED proofs from the append-only event log (kill -9 path).
+   * HMAC is verified against the daemon key — forged or re-signed-without-key
+   * entries are rejected. Later valid events win.
+   */
+  hydrateRedProofFromEvent(payload: {
+    taskId: string;
+    gateSourceHash: string;
+    outcome: "EXPECTED_RED" | "FAIL";
+    provenAt: string;
+    hmac: string;
+  }): void {
+    const proof = this.deps.gates.installRedProofFromEvent(payload.taskId, payload);
+    if (proof === null) return;
+    const task = this.tasks.get(payload.taskId);
+    if (task === undefined) return;
+    this.tasks.set(payload.taskId, {
+      ...task,
+      redProof: proof,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   /**
@@ -708,6 +752,8 @@ export class ToolSurface {
       worktreePath: null,
       needsCaptainSummary: null,
       deliveryBlocked: null,
+      redProof: null,
+      lastFailLedger: null,
       idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
       updatedAt: now,
@@ -1046,14 +1092,70 @@ export class ToolSurface {
         `cannot spawn scout in phase ${task.phase}`,
       );
     }
-    if (input.role === "builder" && !canSpawnBuilder(task.phase)) {
-      throw new ToolSurfaceError(
-        "ILLEGAL_TRANSITION",
-        `cannot spawn builder in phase ${task.phase}`,
-      );
+
+    const redBaselineConfigured = this.cfg().policies.redBaselineGateRequired;
+    if (input.role === "builder" && input.redBaselineOverride) {
+      task = {
+        ...task,
+        policyOverrides: [
+          ...task.policyOverrides,
+          {
+            policyId: "redBaselineGateRequired",
+            configuredValue: "overridden",
+            layer: "task",
+            stampedAt: new Date().toISOString(),
+          },
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      this.saveTask(task);
+    }
+    const enforceRedBaseline =
+      redBaselineConfigured && !this.hasRedBaselineOverride(task);
+
+    if (input.role === "builder") {
+      if (enforceRedBaseline && !this.deps.gates.hasRedProofForCurrentSource(task.id)) {
+        throw new ToolSurfaceError(
+          "POLICY_VIOLATION",
+          `cannot spawn builder: missing RED baseline proof for current gate source (EXPECTED_RED must be established before the builder starts)`,
+          { taskId: task.id, phase: task.phase },
+        );
+      }
+      if (!canSpawnBuilder(task.phase, { redBaselineRequired: enforceRedBaseline })) {
+        throw new ToolSurfaceError(
+          "ILLEGAL_TRANSITION",
+          `cannot spawn builder in phase ${task.phase}`,
+        );
+      }
     }
 
     const family = familyFromModel(input.model);
+
+    // Cross-family is a scheduler invariant, not a cast-time courtesy. Enforce
+    // it again at spawn — server-derived from the model string — so a caller
+    // that skips or reshapes resolve_cast cannot slip a same-family
+    // builder/validator pair past the check (master plan §11 Phase 5:
+    // "same-family builder/validator impossible via API, CLI, profile import,
+    // recovery, AND Brain tool calls").
+    if (this.cfg().policies.crossFamilyBuilderValidator && !this.hasFamilyOverride(task)) {
+      const counterpartRole = input.role === "validator" ? "builder" : "validator";
+      if (input.role === "validator" || input.role === "builder") {
+        const counterpartFamilies = new Set<string>();
+        for (const cast of task.cast.filter((c) => c.role === counterpartRole)) {
+          counterpartFamilies.add(familyFromModel(cast.model));
+        }
+        for (const session of task.sessions.filter((s) => s.role === counterpartRole)) {
+          counterpartFamilies.add(familyFromModel(session.model));
+        }
+        if (counterpartFamilies.has(family)) {
+          throw new ToolSurfaceError(
+            "POLICY_VIOLATION",
+            `cannot spawn ${input.role} on family ${family}: the task's ${counterpartRole} is the same family`,
+            { role: input.role, family, counterpartRole },
+          );
+        }
+      }
+    }
     const sessionId = nextUlid();
     const windowName = `${input.role}-${sessionId.slice(0, 8).toLowerCase()}`;
 
@@ -1065,6 +1167,8 @@ export class ToolSurface {
 
     const poolRoles = new Set(["builder", "scout", "planner", "fusion", "healthcheck"]);
     if (input.role === "validator") {
+      // Write-jail: a validator only ever sees the gate workspace, never the
+      // product tree it is judging.
       cwd = this.deps.gates.gateWorkspace(task.id);
       worktreePath = cwd;
     } else if (input.role === "brain") {
@@ -1202,6 +1306,13 @@ export class ToolSurface {
             "Pi detection or extension path missing after preflight",
           );
         }
+        const gateWorkspace =
+          input.role === "builder" || input.role === "validator"
+            ? this.deps.gates.gateWorkspace(task.id)
+            : undefined;
+        // Seat allowlist root: builder = leased worktree; validator = gate workspace.
+        const seatWorkspace =
+          input.role === "builder" || input.role === "validator" ? cwd : undefined;
         const spec = buildPiSpawnSpec({
           agentosHome: this.deps.home,
           detection: piDetection,
@@ -1215,6 +1326,8 @@ export class ToolSurface {
           thinking: input.thinking,
           cleanRoom: input.cleanRoom,
           grantProviderKey: grant,
+          ...(gateWorkspace !== undefined ? { gateWorkspace } : {}),
+          ...(seatWorkspace !== undefined ? { seatWorkspace } : {}),
         });
         const win = this.deps.tmux.newWindow({
           windowName,
@@ -1268,7 +1381,9 @@ export class ToolSurface {
       this.saveTask(task);
 
       if (input.role === "builder" && task.phase !== "BUILDING") {
-        task = this.transition(task, "BUILDING", "builder spawned");
+        task = this.transition(task, "BUILDING", "builder spawned", {
+          redBaselineRequired: enforceRedBaseline ? true : false,
+        });
       } else if (input.role === "planner" && task.phase === "DISPATCH_RESOLVED") {
         task = this.transition(task, "PLANNING", "planner spawned");
       } else if (input.role === "validator" && task.phase === "DISPATCH_RESOLVED") {
@@ -1976,16 +2091,35 @@ export class ToolSurface {
         );
       }
       cwd = builderPath;
+
+      // A candidate verdict only means something if THIS revision of the gate
+      // was proven red at baseline. Editing the gate drops the proof, so a
+      // validator cannot weaken the gate after the fact and call the build
+      // green (master plan §11 Phase 5: "gate revisions re-prove RED").
+      // Captain-stamped redBaselineOverride disables the policy holistically
+      // (spawn + candidate), not only the spawn half.
+      const enforceRedBaseline =
+        this.cfg().policies.redBaselineGateRequired &&
+        !this.hasRedBaselineOverride(task);
+      if (enforceRedBaseline && !this.deps.gates.hasRedProofForCurrentSource(task.id)) {
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          `gate revision has no RED baseline proof for task ${task.id} — re-run run_gate(baseline) before judging a candidate`,
+          { gateSourceHash: this.deps.gates.gateSourceHash(task.id) },
+        );
+      }
     }
 
+    const enforceRedBaselineForRun =
+      this.cfg().policies.redBaselineGateRequired &&
+      !this.hasRedBaselineOverride(task);
     const result = this.deps.gates.run({
       taskId: task.id,
       target: input.target,
       cwd,
-      expectedRed: this.cfg().policies.redBaselineGateRequired,
+      expectedRed: enforceRedBaselineForRun,
     });
 
-    this.failLines.set(task.id, result.failLines);
     this.sink({
       type: "gate.result",
       payload: {
@@ -1997,9 +2131,45 @@ export class ToolSurface {
       },
     });
 
+    // Stamp daemon-owned proof/ledger onto the durable task record.
+    // Emit gate.red_proven before task.json so kill -9 can rebuild from the log.
+    const proof = this.deps.gates.getRedProof(task.id);
+    const ledger = this.deps.gates.getFailLedger(task.id);
+    if (
+      input.target === "baseline" &&
+      (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") &&
+      proof !== null
+    ) {
+      // HMAC travels with the event so hydrate can verify — never re-sign.
+      this.sink({
+        type: "gate.red_proven",
+        payload: {
+          taskId: task.id,
+          gateSourceHash: proof.gateSourceHash,
+          outcome: proof.outcome,
+          provenAt: proof.provenAt,
+          hmac: proof.hmac,
+        },
+      });
+    }
+    if (proof !== null || ledger !== null) {
+      task = {
+        ...task,
+        redProof: proof ?? task.redProof,
+        lastFailLedger: ledger ?? task.lastFailLedger,
+        updatedAt: new Date().toISOString(),
+      };
+      this.saveTask(task);
+    }
+
     if (input.target === "baseline") {
       if (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") {
-        task = this.transition(task, "GATE_RED_VERIFIED", "baseline red proven");
+        // Mid-build re-prove stays in BUILDING/VALIDATING so the rebuild loop
+        // can continue after the daemon records a fresh RED proof. First-time
+        // proof advances into GATE_RED_VERIFIED.
+        if (task.phase !== "BUILDING" && task.phase !== "VALIDATING") {
+          task = this.transition(task, "GATE_RED_VERIFIED", "baseline red proven");
+        }
       } else if (result.outcome === "PASS") {
         throw new ToolSurfaceError(
           "GATE_ERROR",
@@ -2020,6 +2190,7 @@ export class ToolSurface {
         task = {
           ...task,
           validationAttempt: attempt,
+          lastFailLedger: ledger ?? task.lastFailLedger,
           updatedAt: new Date().toISOString(),
         };
         this.saveTask(task);
@@ -2029,7 +2200,13 @@ export class ToolSurface {
           task = this.transition(task, "BUILDING", "gate fail — rebuild");
         }
       } else {
-        throw new ToolSurfaceError("GATE_ERROR", `candidate gate error: ${result.stderr}`);
+        // GATE_ERROR is not RED: an infrastructure failure must not burn a
+        // validation attempt or advance the task toward exhaustion.
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          `candidate gate error (infrastructure, not a RED verdict): ${result.stderr}`,
+          { infrastructureError: result.infrastructureError },
+        );
       }
     }
 
@@ -2040,24 +2217,45 @@ export class ToolSurface {
     };
   }
 
-  private sendToCrew(raw: Record<string, unknown>): { sent: boolean } {
+  private sendToCrew(raw: Record<string, unknown>): { sent: boolean; failHash?: string } {
     const input = sendToCrewInputSchema.parse(raw);
     const session = this.sessions.get(input.sessionId);
     if (session === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
     }
     let message = input.message ?? "";
+    let failHash: string | undefined;
     if (input.gateFailRef !== undefined) {
-      // Verbatim FAIL injection — Brain cannot paraphrase.
+      // Verbatim FAIL injection. Substrate injects the ledger's exact bytes and
+      // compares to the stored hash — no split/trim/filter reconstruction.
       const taskId = session.taskId;
-      const lines =
-        taskId !== null
-          ? (this.failLines.get(taskId) ?? this.deps.gates.readLastFailLines(taskId))
-          : [];
-      message = lines.join("\n");
-      if (message.length === 0) {
+      if (taskId === null) {
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          "verbatim FAIL hash unavailable — refusing to inject unverifiable gate output",
+        );
+      }
+      const ledger = this.deps.gates.getFailLedger(taskId);
+      if (ledger === null || ledger.text.length === 0) {
         throw new ToolSurfaceError("NOT_FOUND", "no gate fail lines held for verbatim inject");
       }
+      if (ledger.hash.length === 0) {
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          "verbatim FAIL hash missing — refusing to inject unverifiable gate output",
+          { taskId },
+        );
+      }
+      message = ledger.text;
+      const actual = GateRunner.hashText(message);
+      if (ledger.hash !== actual) {
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          "verbatim FAIL hash mismatch — refusing to inject altered gate output",
+          { expected: ledger.hash, actual },
+        );
+      }
+      failHash = ledger.hash;
     }
     if (message.length === 0) {
       throw new ToolSurfaceError("VALIDATION_ERROR", "message or gateFailRef required");
@@ -2085,7 +2283,7 @@ export class ToolSurface {
         `no live channel to session ${input.sessionId} — message not delivered`,
       );
     }
-    return { sent };
+    return failHash === undefined ? { sent } : { sent, failHash };
   }
 
   /** Record a blocking question a crewmate asked over its extension socket. */
@@ -2888,7 +3086,7 @@ export class ToolSurface {
     task: TaskSnapshot,
     to: TaskPhase,
     reason: string | null,
-    options: { allowDone?: boolean } = {},
+    options: { allowDone?: boolean; redBaselineRequired?: boolean } = {},
   ): TaskSnapshot {
     const current = this.tasks.get(task.id) ?? task;
     const from = current.phase;
@@ -2902,7 +3100,12 @@ export class ToolSurface {
     if (to === "DONE") {
       this.assertDoneInvariant(current);
     }
-    assertTransition(task.id, from, to);
+    // Derive red-baseline policy from config + task overrides when the caller
+    // omits it, so every path (including advance_phase) honours the same edges.
+    const redBaselineRequired =
+      options.redBaselineRequired ??
+      (this.cfg().policies.redBaselineGateRequired && !this.hasRedBaselineOverride(current));
+    assertTransition(task.id, from, to, { redBaselineRequired });
     // Terminal exit choke point: halt every live session, then release leases
     // (stamp deliveryBlocked on dirty quarantine). No-op when deliver_task
     // already halted/released for DONE.

@@ -221,6 +221,7 @@ try {
       model: "openai/gpt-4.1",
       thinking: "medium",
       vars: {},
+      redBaselineOverride: true,
     });
     const worktreePath = spawned.data?.session?.worktreePath ?? null;
     const sessionId = spawned.data?.session?.sessionId ?? null;
@@ -388,6 +389,7 @@ try {
       model: "openai/gpt-4.1",
       thinking: "medium",
       vars: {},
+      redBaselineOverride: true,
     });
     const sessionId = spawned.data?.session?.sessionId;
     const tmuxWindow = spawned.data?.session?.tmuxWindow;

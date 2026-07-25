@@ -124,6 +124,17 @@ export interface BuildSpawnOptions {
   grantProviderKey?: { name: ProviderKeyEnvName; value: string } | null;
   /** Clean-room: add --no-skills --no-extensions --no-context-files, then re-add -e. */
   cleanRoom?: boolean;
+  /**
+   * Absolute path to the task gate workspace (validators author/run gates here).
+   * Passed as AGENTOS_GATE_WORKSPACE; validators also use it as the seat workspace.
+   */
+  gateWorkspace?: string;
+  /**
+   * Absolute path the seat is allowed to touch under AGENTOS_HOME.
+   * Builders: leased worktree. Validators: gate workspace.
+   * Default-deny fence: anything else under AGENTOS_HOME is refused.
+   */
+  seatWorkspace?: string;
 }
 
 /**
@@ -137,11 +148,31 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
   }
 
   const extraAllow: Record<string, string> = {
-    AGENTOS_HOME: options.agentosHome,
     AGENTOS_SESSION_ID: options.sessionId,
     AGENTOS_SOCKET: options.socketPath,
     AGENTOS_ROLE: options.role,
   };
+  // AGENTOS_HOME: Brain (layout) + every non-Brain seat (default-deny fence root).
+  // The signing key is never placed in env — only the home path for path compare.
+  if (
+    options.role === "brain" ||
+    options.role === "validator" ||
+    options.role === "builder"
+  ) {
+    extraAllow.AGENTOS_HOME = options.agentosHome;
+  }
+  if (
+    (options.role === "builder" || options.role === "validator") &&
+    options.gateWorkspace !== undefined
+  ) {
+    extraAllow.AGENTOS_GATE_WORKSPACE = options.gateWorkspace;
+  }
+  if (
+    (options.role === "builder" || options.role === "validator") &&
+    options.seatWorkspace !== undefined
+  ) {
+    extraAllow.AGENTOS_SEAT_WORKSPACE = options.seatWorkspace;
+  }
   if (options.sessionDir !== undefined) {
     // Extension captures side output under AGENTOS_SESSION_DIR/outputs/.
     extraAllow.AGENTOS_SESSION_DIR = options.sessionDir;

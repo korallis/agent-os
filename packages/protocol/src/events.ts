@@ -367,6 +367,24 @@ export const gateResultEventSchema = z.strictObject({
   }),
 });
 
+/**
+ * Daemon recorded a RED baseline proof for a gate source hash.
+ * Survives kill -9 via append-only log replay into process memory.
+ * HMAC is daemon-signed material carried with the event so hydrate verifies
+ * and never re-signs log contents.
+ */
+export const gateRedProvenEventSchema = z.strictObject({
+  type: z.literal("gate.red_proven"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    gateSourceHash: z.string().min(1),
+    outcome: z.enum(["EXPECTED_RED", "FAIL"]),
+    provenAt: isoTimestampSchema,
+    /** HMAC-SHA256(gateSourceHash) with daemon-only key — verified on hydrate. */
+    hmac: z.string().min(1),
+  }),
+});
+
 export const fusionDispatchedEventSchema = z.strictObject({
   type: z.literal("fusion.dispatched"),
   payload: z.strictObject({
@@ -519,6 +537,7 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   brainDownEventSchema,
   toolInvokedEventSchema,
   gateResultEventSchema,
+  gateRedProvenEventSchema,
   fusionDispatchedEventSchema,
   promptInstalledEventSchema,
   fusionSideCompletedEventSchema,

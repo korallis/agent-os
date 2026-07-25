@@ -55,6 +55,7 @@ function fleet(): { service: FleetService; events: OrchestratorEvent[] } {
   mkdirSync(join(home, "config"), { recursive: true });
   const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
   config.installDefaults();
+  config.writeGlobal("policies", "{ redBaselineGateRequired: false }\n");
   const promptService = new PromptService(SHIPPED_PROMPTS_DIR, join(home, "prompts"));
   promptService.installDefaults();
   const events: OrchestratorEvent[] = [];

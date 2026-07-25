@@ -1,11 +1,24 @@
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import agentOsPiExtension, {
   AgentOsExtensionHost,
+  collectToolPathCandidates,
   extractAssistantText,
+  gateWorkspaceBlockReason,
+  seatFenceBlockReason,
+  validatorJailBlockReason,
+  pathIsInsideGate,
   usageFromAssistantMessage,
   type PiExtensionApi,
 } from "../src/extension.js";
@@ -26,6 +39,9 @@ afterEach(() => {
   delete process.env.AGENTOS_SESSION_ID;
   delete process.env.AGENTOS_ROLE;
   delete process.env.AGENTOS_SESSION_DIR;
+  delete process.env.AGENTOS_GATE_WORKSPACE;
+  delete process.env.AGENTOS_SEAT_WORKSPACE;
+  delete process.env.AGENTOS_HOME;
 });
 
 describe("agent-os extension socket frames", () => {
@@ -284,5 +300,600 @@ describe("clean-room model-visible tool surface", () => {
     expect(registered).toContain("read_run_artifacts");
     expect(registered).toContain("agent_os_ask");
     expect(registered.length).toBeGreaterThan(10);
+  });
+});
+
+describe("builder gate-workspace tool fence", () => {
+  it("pathIsInsideGate resolves and rejects ../ escape", () => {
+    const gate = "/tmp/agentos-gate-ws";
+    const cwd = "/tmp/builder-tree";
+    expect(pathIsInsideGate(`${gate}/gate.py`, gate, cwd)).toBe(true);
+    expect(pathIsInsideGate("/tmp/builder-tree/src/a.ts", gate, cwd)).toBe(false);
+    expect(pathIsInsideGate("../agentos-gate-ws/secret", gate, cwd)).toBe(true);
+    expect(pathIsInsideGate("../../etc/passwd", gate, cwd)).toBe(false);
+  });
+
+  it("gateWorkspaceBlockReason blocks read/write into the gate dir", () => {
+    const gate = "/tmp/agentos-gate-ws";
+    const cwd = "/tmp/builder-tree";
+    const blocked = gateWorkspaceBlockReason(
+      "read",
+      { path: `${gate}/gate.py` },
+      gate,
+      cwd,
+    );
+    expect(blocked).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason("write", { path: `${cwd}/ok.ts` }, gate, cwd),
+    ).toBeNull();
+  });
+
+  it("blocks bash relative, ~, and $HOME paths that resolve into the gate tree", () => {
+    const home = "/Users/captain";
+    const gate = `${home}/.agentos/runs/task1/gate-workspace`;
+    const cwd = `${home}/.agentos/worktrees/builder-1`;
+    const env = { HOME: home } as NodeJS.ProcessEnv;
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: `cat ${gate}/gate.py` },
+        gate,
+        cwd,
+        env,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "cat ~/.agentos/runs/task1/gate-workspace/gate.py" },
+        gate,
+        cwd,
+        env,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "cat $HOME/.agentos/runs/task1/gate-workspace/gate.py" },
+        gate,
+        cwd,
+        env,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "cat ../../runs/task1/gate-workspace/secret" },
+        gate,
+        cwd,
+        env,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "echo hello > ./src/ok.ts" },
+        gate,
+        cwd,
+        env,
+      ),
+    ).toBeNull();
+  });
+
+  it("seatFenceBlockReason default-denies secrets and $AGENTOS_HOME tokens", () => {
+    const agentHome = "/Users/captain/.agentos";
+    const seat = `${agentHome}/worktrees/builder-1`;
+    const gate = `${agentHome}/runs/task1/gate-workspace`;
+    const env = {
+      HOME: "/Users/captain",
+      AGENTOS_HOME: agentHome,
+      AGENTOS_SEAT_WORKSPACE: seat,
+      AGENTOS_GATE_WORKSPACE: gate,
+    } as NodeJS.ProcessEnv;
+    expect(
+      seatFenceBlockReason(
+        "read",
+        { path: `${gate}/gate.py` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      seatFenceBlockReason(
+        "bash",
+        { command: "cat $AGENTOS_HOME/secrets/gate-proof.key" },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked|unresolvable|refused/);
+    expect(
+      seatFenceBlockReason(
+        "write",
+        { path: `${agentHome}/events/events.ndjson` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      seatFenceBlockReason(
+        "write",
+        { path: `${seat}/src/ok.ts` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toBeNull();
+    // Unknown env token fails closed.
+    expect(
+      seatFenceBlockReason(
+        "bash",
+        { command: "cat $NOT_A_REAL_ENV_VAR/secret" },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/unresolvable|fail closed/);
+  });
+
+  it("blocks builder tool_call into gate workspace and emits ext.tool_blocked", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-gate-fence-"));
+    dirs.push(dir);
+    const gateDir = join(dir, "gate-workspace");
+    const seatDir = join(dir, "worktree");
+    const socketPath = join(dir, "hub.sock");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE0";
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "builder";
+    process.env.AGENTOS_HOME = dir;
+    process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+    process.env.AGENTOS_SEAT_WORKSPACE = seatDir;
+
+    const frames: unknown[] = [];
+    let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
+
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString("utf8");
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line.length === 0) continue;
+            frames.push(JSON.parse(line));
+            if (frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              server.close();
+              resolve();
+            }
+          }
+        });
+      });
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const pi: PiExtensionApi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        expect(toolCallHandler).toBeTypeOf("function");
+        void host!.connect().then(() => {
+          const result = toolCallHandler?.({
+            toolName: "read",
+            toolCallId: "tc1",
+            input: { path: join(gateDir, "gate.py") },
+          }) as { block?: boolean; reason?: string } | undefined;
+          expect(result?.block).toBe(true);
+          expect(result?.reason ?? "").toMatch(/tool\/fs-blocked/);
+          setTimeout(() => {
+            if (!frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              host?.close();
+              server.close();
+              reject(new Error("ext.tool_blocked not received"));
+            }
+          }, 2000);
+        });
+      });
+    });
+
+    const blocked = frames.find(
+      (f) => (f as { type?: string }).type === "ext.tool_blocked",
+    );
+    const parsed = extensionToDaemonFrameSchema.parse(blocked);
+    expect(parsed.type).toBe("ext.tool_blocked");
+    if (parsed.type === "ext.tool_blocked") {
+      expect(parsed.toolName).toBe("read");
+      expect(parsed.reason).toMatch(/tool\/fs-blocked|seat workspace/);
+    }
+  });
+
+  it("fails closed on fence errors (block: true, never undefined)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-fence-fail-"));
+    dirs.push(dir);
+    const gateDir = join(dir, "gate-workspace");
+    const seatDir = join(dir, "worktree");
+    const socketPath = join(dir, "hub.sock");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE1";
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "builder";
+    process.env.AGENTOS_HOME = dir;
+    process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+    process.env.AGENTOS_SEAT_WORKSPACE = seatDir;
+
+    let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer(() => {
+        // accept connection; no need to parse frames for this assertion
+      });
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const pi: PiExtensionApi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        void host!.connect().then(() => {
+          // Proxy input that throws when enumerated paths are read — forces catch.
+          const hostile = new Proxy(
+            {},
+            {
+              get() {
+                throw new Error("boom");
+              },
+              ownKeys() {
+                throw new Error("boom");
+              },
+              getOwnPropertyDescriptor() {
+                throw new Error("boom");
+              },
+            },
+          );
+          const result = toolCallHandler?.({
+            toolName: "bash",
+            toolCallId: "tc-fail",
+            input: hostile,
+          }) as { block?: boolean; reason?: string } | undefined;
+          expect(result).toBeDefined();
+          expect(result?.block).toBe(true);
+          expect(result?.reason ?? "").toMatch(/fence/i);
+          host?.close();
+          server.close();
+          resolve();
+        });
+      });
+    });
+  });
+
+  it("blocks builder read via in-seat symlink into the gate workspace", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-symlink-fence-"));
+    dirs.push(dir);
+    const seat = join(dir, "worktrees", "builder-1");
+    const gate = join(dir, "runs", "task1", "gate-workspace");
+    mkdirSync(seat, { recursive: true });
+    mkdirSync(gate, { recursive: true });
+    writeFileSync(join(gate, "gate.py"), "assert False\n", { mode: 0o600 });
+    const linkInSeat = join(seat, "escape-gate");
+    symlinkSync(gate, linkInSeat);
+
+    const env = {
+      HOME: dir,
+      AGENTOS_HOME: dir,
+      AGENTOS_SEAT_WORKSPACE: seat,
+      AGENTOS_GATE_WORKSPACE: gate,
+    } as NodeJS.ProcessEnv;
+
+    // resolve() alone would treat the symlink path as inside the seat; realpath must not.
+    expect(
+      seatFenceBlockReason(
+        "read",
+        { path: join(linkInSeat, "gate.py") },
+        seat,
+        dir,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked|refused/);
+    expect(
+      seatFenceBlockReason(
+        "bash",
+        { command: `cat ${linkInSeat}/gate.py` },
+        seat,
+        dir,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked|refused/);
+    expect(
+      seatFenceBlockReason(
+        "write",
+        { path: join(seat, "src", "ok.ts") },
+        seat,
+        dir,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toBeNull();
+  });
+
+  it("blocks redirection-form shell paths with no whitespace before the path", () => {
+    const agentHome = "/Users/captain/.agentos";
+    const seat = `${agentHome}/worktrees/builder-1`;
+    const gate = `${agentHome}/runs/task1/gate-workspace`;
+    const env = {
+      HOME: "/Users/captain",
+      AGENTOS_HOME: agentHome,
+      AGENTOS_SEAT_WORKSPACE: seat,
+      AGENTOS_GATE_WORKSPACE: gate,
+    } as NodeJS.ProcessEnv;
+
+    expect(
+      collectToolPathCandidates("bash", {
+        command: `cat<${gate}/gate.py`,
+      }),
+    ).toContain(`${gate}/gate.py`);
+    expect(
+      collectToolPathCandidates("bash", {
+        command: `cat>${gate}/out.txt`,
+      }),
+    ).toContain(`${gate}/out.txt`);
+
+    expect(
+      seatFenceBlockReason(
+        "bash",
+        { command: `cat<${gate}/gate.py` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked|refused|unparseable/);
+    expect(
+      seatFenceBlockReason(
+        "bash",
+        { command: `cat>${agentHome}/runs/task1/task.json` },
+        seat,
+        agentHome,
+        seat,
+        env,
+        "builder",
+      ),
+    ).toMatch(/tool\/fs-blocked|refused|unparseable/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: `cat<${gate}/secret` },
+        gate,
+        seat,
+        env,
+      ),
+    ).toMatch(/tool\/fs-blocked|unparseable/);
+  });
+
+  it("blocks every tool_call when builder seat lacks fence roots", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-nofence-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "hub.sock");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE3";
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "builder";
+    delete process.env.AGENTOS_HOME;
+    delete process.env.AGENTOS_SEAT_WORKSPACE;
+    delete process.env.AGENTOS_GATE_WORKSPACE;
+
+    const frames: unknown[] = [];
+    let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
+
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString("utf8");
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line.length === 0) continue;
+            frames.push(JSON.parse(line));
+            if (frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              server.close();
+              resolve();
+            }
+          }
+        });
+      });
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const pi: PiExtensionApi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        expect(toolCallHandler).toBeTypeOf("function");
+        void host!.connect().then(() => {
+          const result = toolCallHandler?.({
+            toolName: "bash",
+            toolCallId: "tc-nofence",
+            input: { command: "echo hello" },
+          }) as { block?: boolean; reason?: string } | undefined;
+          expect(result?.block).toBe(true);
+          expect(result?.reason ?? "").toMatch(/missing fence roots/i);
+          setTimeout(() => {
+            if (!frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              host?.close();
+              server.close();
+              reject(new Error("ext.tool_blocked not received for missing fence roots"));
+            }
+          }, 2000);
+        });
+      });
+    });
+
+    const blocked = frames.find(
+      (f) => (f as { type?: string }).type === "ext.tool_blocked",
+    );
+    const parsed = extensionToDaemonFrameSchema.parse(blocked);
+    expect(parsed.type).toBe("ext.tool_blocked");
+    if (parsed.type === "ext.tool_blocked") {
+      expect(parsed.reason).toMatch(/missing fence roots/i);
+    }
+  });
+});
+
+describe("validator write-jail tool fence", () => {
+  it("validatorJailBlockReason allows gate workspace and denies sibling validation/", () => {
+    const agentHome = "/Users/captain/.agentos";
+    const gate = `${agentHome}/runs/task1/gate-workspace`;
+    const cwd = gate;
+    const env = { HOME: "/Users/captain", AGENTOS_HOME: agentHome } as NodeJS.ProcessEnv;
+    expect(
+      validatorJailBlockReason(
+        "write",
+        { path: `${gate}/gate.py` },
+        gate,
+        agentHome,
+        cwd,
+        env,
+      ),
+    ).toBeNull();
+    expect(
+      validatorJailBlockReason(
+        "write",
+        { path: `${agentHome}/runs/task1/validation/red-proof.json` },
+        gate,
+        agentHome,
+        cwd,
+        env,
+      ),
+    ).toMatch(/write-jailed/);
+    expect(
+      validatorJailBlockReason(
+        "bash",
+        { command: "cat ../validation/red-proof.json" },
+        gate,
+        agentHome,
+        cwd,
+        env,
+      ),
+    ).toMatch(/write-jailed/);
+    expect(
+      validatorJailBlockReason(
+        "read",
+        { path: "/tmp/outside.txt" },
+        gate,
+        agentHome,
+        cwd,
+        env,
+      ),
+    ).toBeNull();
+    expect(
+      validatorJailBlockReason(
+        "bash",
+        { command: "cat $AGENTOS_HOME/secrets/gate-proof.key" },
+        gate,
+        agentHome,
+        cwd,
+        env,
+      ),
+    ).toMatch(/write-jailed|unresolvable|fail closed/);
+  });
+
+  it("blocks validator tool_call into validation/ and emits ext.tool_blocked", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-val-jail-"));
+    dirs.push(dir);
+    const gateDir = join(dir, "runs", "task", "gate-workspace");
+    const socketPath = join(dir, "hub.sock");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE2";
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "validator";
+    process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+    process.env.AGENTOS_SEAT_WORKSPACE = gateDir;
+    process.env.AGENTOS_HOME = dir;
+
+    const frames: unknown[] = [];
+    let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
+
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString("utf8");
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line.length === 0) continue;
+            frames.push(JSON.parse(line));
+            if (frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              server.close();
+              resolve();
+            }
+          }
+        });
+      });
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const pi: PiExtensionApi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        expect(toolCallHandler).toBeTypeOf("function");
+        void host!.connect().then(() => {
+          const result = toolCallHandler?.({
+            toolName: "write",
+            toolCallId: "tc-val",
+            input: { path: join(dir, "runs", "task", "validation", "red-proof.json") },
+          }) as { block?: boolean; reason?: string } | undefined;
+          expect(result?.block).toBe(true);
+          expect(result?.reason ?? "").toMatch(/write-jailed/);
+          setTimeout(() => {
+            if (!frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              host?.close();
+              server.close();
+              reject(new Error("ext.tool_blocked not received"));
+            }
+          }, 2000);
+        });
+      });
+    });
+
+    const blocked = frames.find(
+      (f) => (f as { type?: string }).type === "ext.tool_blocked",
+    );
+    const parsed = extensionToDaemonFrameSchema.parse(blocked);
+    expect(parsed.type).toBe("ext.tool_blocked");
   });
 });

@@ -123,6 +123,26 @@ export const deliveryBlockedSchema = z.strictObject({
 });
 export type DeliveryBlocked = z.infer<typeof deliveryBlockedSchema>;
 
+/**
+ * Daemon-owned RED baseline proof. Authorised only when HMAC verifies under the
+ * daemon-only gate-proof secret — never from a seat-writable file alone.
+ */
+export const taskRedProofSchema = z.strictObject({
+  gateSourceHash: z.string().min(1),
+  outcome: z.enum(["EXPECTED_RED", "FAIL"]),
+  provenAt: isoTimestampSchema,
+  /** HMAC-SHA256(gateSourceHash) with daemon-only key. */
+  hmac: z.string().min(1),
+});
+export type TaskRedProof = z.infer<typeof taskRedProofSchema>;
+
+/** Daemon-owned verbatim FAIL ledger (text + hash); disk is cache only. */
+export const taskFailLedgerSchema = z.strictObject({
+  text: z.string(),
+  hash: z.string().min(1),
+});
+export type TaskFailLedger = z.infer<typeof taskFailLedgerSchema>;
+
 export const taskSnapshotSchema = z.strictObject({
   id: ulidSchema,
   shape: taskShapeSchema,
@@ -142,6 +162,13 @@ export const taskSnapshotSchema = z.strictObject({
   needsCaptainSummary: z.string().nullable(),
   /** Set when a task-linked worktree quarantines dirty; sticky until Captain resolves. */
   deliveryBlocked: deliveryBlockedSchema.nullable(),
+  /**
+   * Daemon-authoritative RED proof for the current gate revision.
+   * Rebuilt into process memory on boot; never authorised from seat disk alone.
+   */
+  redProof: taskRedProofSchema.nullable().default(null),
+  /** Daemon-authoritative last FAIL lines for verbatim inject. */
+  lastFailLedger: taskFailLedgerSchema.nullable().default(null),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
@@ -166,7 +193,6 @@ export const LEGAL_TASK_TRANSITIONS: Readonly<Record<TaskPhase, readonly TaskPha
   DISPATCH_RESOLVED: [
     "PLANNING",
     "GATE_AUTHORING",
-    "BUILDING",
     "WAITING_WORKTREE",
     "CANCELLED",
     "FAILED",
@@ -174,7 +200,7 @@ export const LEGAL_TASK_TRANSITIONS: Readonly<Record<TaskPhase, readonly TaskPha
   ],
   BLOCKED_DISPATCH: ["QUEUED", "DISPATCH_RESOLVED", "CANCELLED", "FAILED", "NEEDS_CAPTAIN"],
   PLANNING: ["PLAN_FUSED", "BUILDING", "CANCELLED", "FAILED", "NEEDS_CAPTAIN", "SESSION_LOST"],
-  PLAN_FUSED: ["GATE_AUTHORING", "BUILDING", "CANCELLED", "FAILED", "NEEDS_CAPTAIN"],
+  PLAN_FUSED: ["GATE_AUTHORING", "CANCELLED", "FAILED", "NEEDS_CAPTAIN"],
   GATE_AUTHORING: [
     "GATE_RED_VERIFIED",
     "FAILED",
@@ -186,6 +212,10 @@ export const LEGAL_TASK_TRANSITIONS: Readonly<Record<TaskPhase, readonly TaskPha
   BUILDING: [
     "VALIDATING",
     "DELIVERING",
+    // A candidate gate can FAIL straight from BUILDING (rebuild loop), so the
+    // validation cap must be reachable from here too — otherwise the halt
+    // throws ILLEGAL_TRANSITION and the attempt counter climbs past its cap.
+    "VALIDATION_EXHAUSTED",
     "CANCELLED",
     "FAILED",
     "NEEDS_CAPTAIN",

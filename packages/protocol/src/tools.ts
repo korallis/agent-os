@@ -106,6 +106,11 @@ export const spawnCrewmateInputSchema = z.strictObject({
   prompt: z.string().min(1).max(100_000).optional(),
   cleanRoom: z.boolean().default(true),
   idempotencyKey: z.string().min(1).max(200).optional(),
+  /**
+   * Captain override of red-baseline-before-builder. Evidence-stamped into
+   * policyOverrides when true; never implicit.
+   */
+  redBaselineOverride: z.boolean().default(false),
 });
 export type SpawnCrewmateInput = z.infer<typeof spawnCrewmateInputSchema>;
 
