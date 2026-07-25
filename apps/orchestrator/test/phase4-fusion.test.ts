@@ -608,6 +608,73 @@ describe("/opinion live path", () => {
     expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 
+  it("refuses same-family /opinion even when cast.family labels disagree", () => {
+    const { service } = fleet();
+    const { taskId } = seedShipTask(service);
+
+    // Two anthropic models mislabelled as different families — policy must
+    // derive family from model, not trust the client label.
+    const result = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      spawnSides: false,
+      casts: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          thinking: "high",
+          family: "openai",
+          cleanRoom: true,
+        },
+        {
+          role: "planner",
+          model: "anthropic/claude-opus-4",
+          thinking: "high",
+          family: "xai",
+          cleanRoom: true,
+        },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("POLICY_VIOLATION");
+    expect(result.error?.message).toMatch(/distinct model families/i);
+  });
+
+  it("derives durable FusionSide.family from model, overwriting client labels", () => {
+    const { service } = fleet();
+    const { taskId } = seedShipTask(service);
+
+    const result = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      spawnSides: false,
+      casts: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          thinking: "high",
+          family: "openai",
+          cleanRoom: true,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          thinking: "low",
+          family: "anthropic",
+          cleanRoom: true,
+        },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    const data = result.data as { runId: string; aggregatorFamily: string | null };
+    expect(data.aggregatorFamily).toBe("anthropic");
+
+    const run = service.fusionRuns.get(taskId, data.runId);
+    expect(run).not.toBeNull();
+    expect(run!.sides.map((s) => s.family)).toEqual(["anthropic", "openai"]);
+    expect(run!.aggregatorFamily).toBe("anthropic");
+  });
+
   it("rebuilds fusion ownership, keeps late usage, finalizes stop without placeholders", () => {
     const { service, events } = fleet();
     const { taskId, projectId } = seedShipTask(service);

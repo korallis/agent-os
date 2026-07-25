@@ -1348,13 +1348,21 @@ export class ToolSurface {
     const task = this.requireTask(input.taskId);
     const policies = this.cfg().policies;
 
+    // Family is always derived from model server-side. Client-supplied
+    // cast.family is ignored for policy and durable records so mislabels
+    // cannot bypass cross-family invariants.
+    const casts = input.casts.map((cast) => ({
+      ...cast,
+      family: familyFromModel(cast.model),
+    }));
+
     // Cross-family invariants: an opinion or a plan-fusion whose sides all
     // share a family is not a second opinion, it is an echo.
-    const families = new Set(input.casts.map((c) => c.family));
+    const families = new Set(casts.map((c) => c.family));
     if (input.kind === "plan-fusion" && policies.distinctPlannerFamilies && families.size < 2) {
       throw new ToolSurfaceError("POLICY_VIOLATION", "plan-fusion requires ≥2 distinct families");
     }
-    if (input.kind === "opinion" && input.casts.length >= 2 && families.size < 2) {
+    if (input.kind === "opinion" && casts.length >= 2 && families.size < 2) {
       throw new ToolSurfaceError(
         "POLICY_VIOLATION",
         "/opinion requires ≥2 distinct model families — a same-family panel is not an independent opinion",
@@ -1411,7 +1419,7 @@ export class ToolSurface {
     const instructionHash = sha256(instruction);
 
     // Every side receives the SAME rendered bytes.
-    const sides: FusionSide[] = input.casts.map((cast) => ({
+    const sides: FusionSide[] = casts.map((cast) => ({
       role: cast.role,
       model: cast.model,
       family: cast.family,
@@ -1427,7 +1435,7 @@ export class ToolSurface {
     // Aggregator family retention: the fusion agent runs on the ARCHITECT
     // side's family — the first planner in the cast — and that choice is
     // recorded on the run rather than silently made.
-    const architect = input.casts.find((c) => c.role === "planner") ?? input.casts[0];
+    const architect = casts.find((c) => c.role === "planner") ?? casts[0];
     const aggregatorFamily = architect?.family ?? null;
 
     let contractOk: boolean | null = null;
@@ -1474,7 +1482,7 @@ export class ToolSurface {
       const spawnedSessionIds: Array<string | null> = sides.map(() => null);
       for (let i = 0; i < sides.length; i++) {
         const side = sides[i]!;
-        const cast = input.casts[i]!;
+        const cast = casts[i]!;
         try {
           const result = this.spawnCrewmate({
             taskId: task.id,
@@ -1615,9 +1623,7 @@ export class ToolSurface {
     });
     this.deps.fusionRuns.save({ ...latest, sides });
 
-    for (const [sid, ref] of this.fusionBySessionId) {
-      if (ref.runId === runId) this.fusionBySessionId.delete(sid);
-    }
+    this.clearFusionRunSessionState(runId, sides.map((s) => s.sessionId));
     const finalRun = this.deps.fusionRuns.get(taskId, runId);
     if (finalRun !== null) {
       this.emitFusionCompleted(finalRun, errorMessage);
@@ -1701,8 +1707,15 @@ export class ToolSurface {
    */
   private releaseSettledFusionCrewmate(sessionId: string): void {
     const session = this.sessions.get(sessionId);
-    if (session === undefined) return;
-    if (session.status === "stopped" || session.status === "lost") return;
+    if (session === undefined) {
+      // Artifact already captured; free the dir map even if the session row is gone.
+      this.sessionDirs.delete(sessionId);
+      return;
+    }
+    if (session.status === "stopped" || session.status === "lost") {
+      this.sessionDirs.delete(sessionId);
+      return;
+    }
 
     try {
       this.deps.tmux.killWindow(session.tmuxWindow);
@@ -1714,6 +1727,9 @@ export class ToolSurface {
     const now = new Date().toISOString();
     const released = this.sessions.get(sessionId) ?? session;
     this.sessions.set(sessionId, { ...released, status: "stopped" });
+    // Artifact already read; drop the session-dir mapping so happy-path settle
+    // does not retain unbounded sessionId→dir entries (fake-Pi has no session_end).
+    this.sessionDirs.delete(sessionId);
     if (session.taskId !== null) {
       const task = this.tasks.get(session.taskId);
       if (task !== undefined) {
@@ -1767,10 +1783,12 @@ export class ToolSurface {
       return;
     }
 
-    // Drop session → run mappings for this run once every side is done.
-    for (const [sid, ref] of this.fusionBySessionId) {
-      if (ref.runId === runId) this.fusionBySessionId.delete(sid);
-    }
+    // Drop ownership + session-dir maps for this run once every side is done
+    // (fake-Pi never emits session_end, so clearFusionSession alone is not enough).
+    this.clearFusionRunSessionState(
+      runId,
+      run.sides.map((s) => s.sessionId),
+    );
 
     this.emitFusionCompleted(run);
 
@@ -1795,6 +1813,24 @@ export class ToolSurface {
         ...(error != null && error.length > 0 ? { error } : {}),
       },
     });
+  }
+
+  /** Drop fusion ownership and session-dir entries for a finished/failed run. */
+  private clearFusionRunSessionState(
+    runId: string,
+    sessionIds: Array<string | null | undefined>,
+  ): void {
+    for (const [sid, ref] of this.fusionBySessionId) {
+      if (ref.runId === runId) {
+        this.fusionBySessionId.delete(sid);
+        this.sessionDirs.delete(sid);
+      }
+    }
+    for (const sessionId of sessionIds) {
+      if (sessionId == null) continue;
+      this.fusionBySessionId.delete(sessionId);
+      this.sessionDirs.delete(sessionId);
+    }
   }
 
   private clearFusionSession(sessionId: string): void {
