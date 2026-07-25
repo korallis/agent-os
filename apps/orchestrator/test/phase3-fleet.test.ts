@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { startDaemon } from "../src/daemon.js";
 import { familyFromModel } from "../src/substrate/family.js";
-import { canTransition, assertTransition, IllegalTransitionError } from "../src/substrate/task-machine.js";
+import {
+  canTransition,
+  assertTransition,
+  canSpawnScout,
+  IllegalTransitionError,
+} from "../src/substrate/task-machine.js";
 
 const homes: string[] = [];
 
@@ -39,6 +44,12 @@ describe("task state machine", () => {
 
   it("rejects run_gate-style illegal BUILDING ← GATE_AUTHORING skip when asserted wrong", () => {
     expect(() => assertTransition("t1", "QUEUED", "VALIDATING")).toThrow(IllegalTransitionError);
+  });
+
+  it("refuses scout spawn while task is still QUEUED", () => {
+    expect(canSpawnScout("QUEUED")).toBe(false);
+    expect(canSpawnScout("DISPATCH_RESOLVED")).toBe(true);
+    expect(canSpawnScout("BUILDING")).toBe(true);
   });
 });
 

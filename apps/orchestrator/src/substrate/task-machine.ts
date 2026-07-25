@@ -61,7 +61,7 @@ export function canSpawnBuilder(phase: TaskPhase): boolean {
   );
 }
 
-/** Phases where a scout may be spawned. */
+/** Phases where a scout may be spawned (requires a resolved cast). */
 export function canSpawnScout(phase: TaskPhase): boolean {
-  return phase === "QUEUED" || phase === "DISPATCH_RESOLVED" || phase === "BUILDING";
+  return phase === "DISPATCH_RESOLVED" || phase === "BUILDING";
 }

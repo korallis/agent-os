@@ -956,8 +956,6 @@ export class ToolSurface {
 
       if (input.role === "builder" && task.phase !== "BUILDING") {
         task = this.transition(task, "BUILDING", "builder spawned");
-      } else if (input.role === "scout" && task.phase === "QUEUED") {
-        task = this.transition(task, "BUILDING", "scout spawned");
       } else if (input.role === "planner" && task.phase === "DISPATCH_RESOLVED") {
         task = this.transition(task, "PLANNING", "planner spawned");
       } else if (input.role === "validator" && task.phase === "DISPATCH_RESOLVED") {
@@ -1013,7 +1011,22 @@ export class ToolSurface {
     this.deps.tmux.killWindow(session.tmuxWindow);
     void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId: input.sessionId });
+    const now = new Date().toISOString();
     this.sessions.set(input.sessionId, { ...session, status: "stopped" });
+    if (session.taskId !== null) {
+      const task = this.tasks.get(session.taskId);
+      if (task !== undefined) {
+        this.saveTask({
+          ...task,
+          sessions: task.sessions.map((s) =>
+            s.sessionId === input.sessionId
+              ? { ...s, status: "stopped", lastEventAt: now }
+              : s,
+          ),
+          updatedAt: now,
+        });
+      }
+    }
     this.sink({
       type: "session.stopped",
       payload: {

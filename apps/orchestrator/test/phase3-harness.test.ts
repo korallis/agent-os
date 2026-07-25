@@ -528,6 +528,99 @@ describe("worktree lease reclaim on stop/respawn", () => {
       "uncommitted builder work",
     );
   });
+
+  it("persists stopped status across restart and does not emit SESSION_LOST", () => {
+    const home = temp("agentos-stop-persist-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    service.start();
+
+    const { taskId, model } = seedTask(service, {
+      name: "stop-persist",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+
+    const stopped = service.tools.invoke("stop_crewmate", {
+      sessionId,
+      reason: "intentional stop",
+    });
+    expect(stopped.ok).toBe(true);
+
+    const durable = JSON.parse(
+      readFileSync(join(home, "runs", taskId, "task.json"), "utf8"),
+    ) as { sessions: Array<{ sessionId: string; status: string }> };
+    expect(durable.sessions.find((s) => s.sessionId === sessionId)?.status).toBe("stopped");
+
+    const config2 = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    const restarted = new FleetService({
+      home,
+      config: config2,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    const after = restarted.tools.listSessions().find((s) => s.sessionId === sessionId);
+    expect(after?.status).toBe("stopped");
+    expect(restarted.tools.getTask(taskId)?.sessions.find((s) => s.sessionId === sessionId)?.status).toBe(
+      "stopped",
+    );
+    expect(restarted.tools.getTask(taskId)?.phase).not.toBe("SESSION_LOST");
+  });
+});
+
+describe("scout spawn requires cast", () => {
+  it("refuses scout spawn in QUEUED before leasing a worktree", () => {
+    const service = fleet({ fakePi: true });
+    const project = service.projects.register({
+      name: "scout-queued",
+      path: gitRepo(),
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SCOUT",
+        title: "look",
+        intent: "read only",
+        projectId: project.id,
+        mode: "local-only",
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    expect(service.tools.getTask(taskId)?.phase).toBe("QUEUED");
+
+    const leasesBefore = service.worktrees.list().length;
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "scout",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(false);
+    expect(spawned.error?.code).toBe("ILLEGAL_TRANSITION");
+    expect(spawned.error?.message).toMatch(/cannot spawn scout in phase QUEUED/i);
+    expect(service.worktrees.list().length).toBe(leasesBefore);
+  });
 });
 
 describe("deliver_task dirty worktree fail-closed", () => {

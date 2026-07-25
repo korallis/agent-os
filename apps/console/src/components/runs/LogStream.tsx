@@ -42,6 +42,7 @@ function levelOf(envelope: EventEnvelope): Level {
     case "task.phase_changed":
     case "task.updated":
     case "task.cast_resolved":
+    case "task.delivery_block_resolved":
     case "session.spawned":
     case "session.stopped":
     case "worktree.leased":
@@ -55,8 +56,9 @@ function levelOf(envelope: EventEnvelope): Level {
     case "bridge.tool_call":
       return "INFO";
     default: {
-      const exhaustive: never = envelope.event;
-      return exhaustive;
+      const _exhaustive: never = envelope.event;
+      void _exhaustive;
+      return "INFO";
     }
   }
 }
@@ -93,6 +95,7 @@ function sourceOf(envelope: EventEnvelope): string {
     case "task.phase_changed":
     case "task.updated":
     case "task.cast_resolved":
+    case "task.delivery_block_resolved":
       return "tasks";
     case "session.spawned":
     case "session.stopped":
@@ -123,8 +126,9 @@ function sourceOf(envelope: EventEnvelope): string {
     case "captain.escalation":
       return "captain";
     default: {
-      const exhaustive: never = envelope.event;
-      return exhaustive;
+      const _exhaustive: never = envelope.event;
+      void _exhaustive;
+      return "events";
     }
   }
 }
@@ -180,6 +184,8 @@ function messageOf(envelope: EventEnvelope): string {
       return `Task updated — ${event.payload.taskId.slice(0, 8)}…`;
     case "task.cast_resolved":
       return `Cast resolved — ${event.payload.roles.map((r) => r.role).join(", ")}`;
+    case "task.delivery_block_resolved":
+      return `Delivery block resolved — task ${event.payload.taskId.slice(0, 8)}… by ${event.payload.clearedBy}: ${event.payload.reason}`;
     case "session.spawned":
       return `Session spawned — ${event.payload.role} ${event.payload.model}`;
     case "session.stopped":
@@ -219,8 +225,9 @@ function messageOf(envelope: EventEnvelope): string {
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {
-      const exhaustive: never = event;
-      return exhaustive;
+      const _exhaustive: never = event;
+      void _exhaustive;
+      return "Unhandled event";
     }
   }
 }
