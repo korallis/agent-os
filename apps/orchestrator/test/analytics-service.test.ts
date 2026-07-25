@@ -48,6 +48,8 @@ describe("AnalyticsService window + cost honesty", () => {
           title: "in-window",
           projectId: "01ARZ3NDEKTSV4RRFFQ69G5FC1",
           mode: "local-only",
+          phase: "QUEUED",
+          idempotencyKey: null,
         },
       }),
       envelope(5, dayOffset(1), {
@@ -164,7 +166,7 @@ describe("AnalyticsService window + cost honesty", () => {
         type: "session.spawned",
         payload: {
           sessionId,
-          taskId: null,
+          taskId: "01ARZ3NDEKTSV4RRFFQ69G5FB3",
           role: "builder",
           model: "anthropic/claude-opus",
           family: "anthropic",
@@ -220,7 +222,7 @@ describe("AnalyticsService window + cost honesty", () => {
         type: "session.spawned",
         payload: {
           sessionId,
-          taskId: null,
+          taskId: "01ARZ3NDEKTSV4RRFFQ69G5FB4",
           role: "validator",
           model: "anthropic/claude-max",
           family: "anthropic",
