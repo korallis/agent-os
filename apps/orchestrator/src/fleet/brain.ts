@@ -419,7 +419,15 @@ export class BrainManager {
               x.provider === "vercel-ai-gateway") &&
             x.kind === "pi-api-key",
         );
-        if (c !== undefined) return "anthropic/claude-sonnet-4-5";
+        if (c !== undefined) {
+          // Provider-qualified refs so grant lookup and handoff pickTarget can
+          // distinguish a gateway-routed Sonnet from a direct Anthropic cast.
+          if (c.provider === "openrouter") return "openrouter/anthropic/claude-sonnet-4-5";
+          if (c.provider === "vercel-ai-gateway") {
+            return "vercel-ai-gateway/anthropic/claude-sonnet-4-5";
+          }
+          return "anthropic/claude-sonnet-4-5";
+        }
       }
       if (pref.includes("openai") || pref.includes("chatgpt")) {
         const c = healthy.find((x) => x.provider === "openai");

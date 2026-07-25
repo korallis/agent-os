@@ -1,6 +1,6 @@
 import { createHash, createPublicKey, verify as verifySignature } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 /**
  * Signed self-update with rollback (master plan §11 Phase 8).
@@ -16,13 +16,21 @@ import { join } from "node:path";
  *      recoverable without network access.
  *   3. Verification failure is terminal for that release, not a warning that
  *      proceeds anyway.
+ *
+ * The signature covers the version label together with the payload digest so a
+ * CDN/MITM cannot swap `version` independently of a legitimate payload. The
+ * version is also validated as a path token and re-checked under versionsDir
+ * before any write — defence in depth against path traversal.
  */
 
 export interface ReleaseManifest {
   version: string;
   /** sha256 of the release archive, hex. */
   sha256: string;
-  /** Base64 detached signature over the sha256 hex string. */
+  /**
+   * Base64 detached signature over the canonical signed message
+   * (`version + "\\n" + sha256`), not the digest alone.
+   */
   signature: string;
 }
 
@@ -34,7 +42,11 @@ export type UpdateFailureCode =
   | "DIGEST_MISMATCH"
   | "SIGNATURE_INVALID"
   | "NO_PUBLIC_KEY"
+  | "VERSION_UNSAFE"
   | "APPLY_FAILED";
+
+/** Single path segment only: letters, digits, dot, underscore, hyphen. */
+const SAFE_VERSION_TOKEN = /^[0-9A-Za-z][0-9A-Za-z._-]*$/;
 
 export class SelfUpdater {
   constructor(
@@ -57,9 +69,57 @@ export class SelfUpdater {
     return join(this.root, "previous");
   }
 
-  /** sha256 of the payload, hex — the value the signature actually covers. */
+  /** sha256 of the payload, hex. */
   static digest(payload: Buffer): string {
     return createHash("sha256").update(payload).digest("hex");
+  }
+
+  /**
+   * Canonical bytes the release signature covers: version label + digest.
+   * Swapping either field invalidates the signature.
+   */
+  static signedMessage(version: string, sha256: string): Buffer {
+    return Buffer.from(`${version}\n${sha256}`, "utf8");
+  }
+
+  /**
+   * True when `version` is a single safe filesystem token (no separators,
+   * no `..`, no absolute paths). Independent of signature verification.
+   */
+  static isSafeVersionToken(version: string): boolean {
+    if (version.length === 0 || version.length > 128) return false;
+    if (version === "." || version === "..") return false;
+    if (version.includes("/") || version.includes("\\") || version.includes("\0")) return false;
+    if (version.includes("..")) return false;
+    return SAFE_VERSION_TOKEN.test(version);
+  }
+
+  /**
+   * Resolve `${versionsDir}/${version}.tar` and assert it stays under versionsDir.
+   * Callers must use the returned path for writes — never re-join unchecked.
+   */
+  static resolveVersionArchive(
+    versionsDir: string,
+    version: string,
+  ): { ok: true; path: string } | { ok: false; code: "VERSION_UNSAFE"; reason: string } {
+    if (!SelfUpdater.isSafeVersionToken(version)) {
+      return {
+        ok: false,
+        code: "VERSION_UNSAFE",
+        reason: `version ${JSON.stringify(version)} is not a safe path token`,
+      };
+    }
+    const versionsRoot = resolve(versionsDir);
+    const target = resolve(versionsRoot, `${version}.tar`);
+    const prefix = versionsRoot.endsWith(sep) ? versionsRoot : `${versionsRoot}${sep}`;
+    if (!target.startsWith(prefix)) {
+      return {
+        ok: false,
+        code: "VERSION_UNSAFE",
+        reason: `version path escapes versions directory`,
+      };
+    }
+    return { ok: true, path: target };
   }
 
   /**
@@ -72,6 +132,15 @@ export class SelfUpdater {
         ok: false,
         code: "NO_PUBLIC_KEY",
         reason: "no update public key is compiled into this install — refusing to self-update",
+      };
+    }
+    // Path safety is independent of crypto: refuse traversal tokens before we
+    // even look at the signature, so a bypassed verify cannot write them later.
+    if (!SelfUpdater.isSafeVersionToken(manifest.version)) {
+      return {
+        ok: false,
+        code: "VERSION_UNSAFE",
+        reason: `version ${JSON.stringify(manifest.version)} is not a safe path token`,
       };
     }
     const actual = SelfUpdater.digest(payload);
@@ -88,7 +157,7 @@ export class SelfUpdater {
       const key = createPublicKey(this.publicKeyPem);
       const valid = verifySignature(
         null,
-        Buffer.from(manifest.sha256, "utf8"),
+        SelfUpdater.signedMessage(manifest.version, manifest.sha256),
         key,
         Buffer.from(manifest.signature, "base64"),
       );
@@ -118,9 +187,14 @@ export class SelfUpdater {
     if (!verified.ok) {
       return { ok: false, reason: verified.reason, code: verified.code };
     }
+    // Defence in depth: re-resolve and assert containment even after verify,
+    // so a future ordering mistake cannot write outside the update root.
+    const archive = SelfUpdater.resolveVersionArchive(this.versionsDir(), manifest.version);
+    if (!archive.ok) {
+      return { ok: false, reason: archive.reason, code: archive.code };
+    }
     try {
-      const versionPath = join(this.versionsDir(), `${manifest.version}.tar`);
-      writeFileSync(versionPath, payload, { mode: 0o600 });
+      writeFileSync(archive.path, payload, { mode: 0o600 });
 
       // Retain the outgoing version BEFORE swapping, so rollback never depends
       // on the network or on the release we are about to trust.
@@ -158,8 +232,8 @@ export class SelfUpdater {
     if (previous === null) {
       return { ok: false, version: null, reason: "no retained previous version to roll back to" };
     }
-    const archive = join(this.versionsDir(), `${previous}.tar`);
-    if (!existsSync(archive)) {
+    const archive = SelfUpdater.resolveVersionArchive(this.versionsDir(), previous);
+    if (!archive.ok || !existsSync(archive.path)) {
       return {
         ok: false,
         version: previous,
@@ -180,7 +254,11 @@ export class SelfUpdater {
 
   /** Test/packaging helper: stage an initial version without a signature. */
   seedCurrent(version: string, payload: Buffer): void {
-    writeFileSync(join(this.versionsDir(), `${version}.tar`), payload, { mode: 0o600 });
+    const archive = SelfUpdater.resolveVersionArchive(this.versionsDir(), version);
+    if (!archive.ok) {
+      throw new Error(archive.reason);
+    }
+    writeFileSync(archive.path, payload, { mode: 0o600 });
     writeFileSync(this.currentPath(), `${version}\n`, { mode: 0o600 });
   }
 }

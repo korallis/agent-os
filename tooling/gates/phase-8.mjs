@@ -335,70 +335,102 @@ try {
   // ── G6 — Brain handoff past the threshold, into a NEW session ──────────
   {
     const brainBefore = (await get("/v1/fleet")).summary.brain;
+    const brainProvider = (brainBefore.model ?? "").split("/")[0] ?? "";
 
-    // Two connections so a handoff target exists, then drive the Brain's own
-    // connection past the configured share of its window.
-    await post("/v1/connections/api-key", {
-      provider: "xai",
-      apiKey: "p8-handoff-target-not-a-secret",
-      label: "handoff target",
-    });
-    const connections = (await get("/v1/connections")).connections ?? [];
-    const brainProvider = (brainBefore.model ?? "").split("/")[0];
-    const brainConnection = connections.find((c) => c.provider === brainProvider) ?? connections[0];
+    // Fixture the Brain's OWN routing provider — evaluateBrainHandoff only
+    // loads samples for that connection and returns shouldHandoff=false when
+    // it is missing. Never fall back to connections[0].
+    let connections = (await get("/v1/connections")).connections ?? [];
+    let brainConnection = connections.find((c) => c.provider === brainProvider);
+    if (brainConnection === undefined && brainProvider.length > 0) {
+      await post("/v1/connections/api-key", {
+        provider: brainProvider,
+        apiKey: "p8-brain-own-provider-not-a-secret",
+        label: "brain own provider for handoff fixture",
+      });
+      connections = (await get("/v1/connections")).connections ?? [];
+      brainConnection = connections.find((c) => c.provider === brainProvider);
+    }
 
-    // Drive the Brain's own window past the threshold through the explicit
-    // quota fixture seam, then refresh so the daemon holds the real sample.
-    mkdirSync(join(home, "fake-quota"), { recursive: true });
-    writeFileSync(
-      join(home, "fake-quota", `${brainConnection.provider}.json`),
-      JSON.stringify([
-        {
-          kind: "weekly-window-pct",
-          value: 93,
-          unit: "percent",
-          tier: "live",
-          source: "OAUTH",
-          syncedAt: new Date().toISOString(),
-          reason: null,
-          resetsAt: null,
-          limitReached: false,
-        },
-      ]),
-    );
-    await post(`/v1/connections/${brainConnection.id}/quota/refresh`, {});
+    // A second healthy connection so pickTarget has a refuge.
+    if (!connections.some((c) => c.provider === "xai")) {
+      await post("/v1/connections/api-key", {
+        provider: "xai",
+        apiKey: "p8-handoff-target-not-a-secret",
+        label: "handoff target",
+      });
+      connections = (await get("/v1/connections")).connections ?? [];
+      brainConnection = connections.find((c) => c.provider === brainProvider);
+    }
 
-    const decision = (await post("/v1/brain/handoff/evaluate", {})).decision;
-    await sleep(800);
-    const brainAfter = (await get("/v1/fleet")).summary.brain;
+    const fixtureMatchesBrain =
+      brainConnection !== undefined &&
+      brainProvider.length > 0 &&
+      brainConnection.provider === brainProvider;
 
-    const handedOff = decision?.shouldHandoff === true;
-    const modelChanged = brainAfter.model !== brainBefore.model;
-    // The core rule: a new session, so no cross-model transcript replay.
-    const newSession =
-      brainAfter.sessionId !== null && brainAfter.sessionId !== brainBefore.sessionId;
+    if (!fixtureMatchesBrain) {
+      gate(
+        "G6",
+        "Brain hands off past the budget threshold into a NEW session",
+        false,
+        `fixture connection does not match Brain provider: brainProvider=${brainProvider} fixture=${brainConnection?.provider ?? "none"} model=${brainBefore.model}`,
+      );
+    } else {
+      // Drive the Brain's own window past the threshold through the explicit
+      // quota fixture seam, then refresh so the daemon holds the real sample.
+      mkdirSync(join(home, "fake-quota"), { recursive: true });
+      writeFileSync(
+        join(home, "fake-quota", `${brainConnection.provider}.json`),
+        JSON.stringify([
+          {
+            kind: "weekly-window-pct",
+            value: 93,
+            unit: "percent",
+            tier: "live",
+            source: "OAUTH",
+            syncedAt: new Date().toISOString(),
+            reason: null,
+            resetsAt: null,
+            limitReached: false,
+          },
+        ]),
+      );
+      await post(`/v1/connections/${brainConnection.id}/quota/refresh`, {});
 
-    const replay = await get(
-      "/v1/events/replay?types=brain.handoff_triggered,brain.handoff_completed&limit=1000",
-    );
-    const frames = (replay.events ?? []).map((e) => e.event ?? e);
-    const triggered = frames.find((e) => e.type === "brain.handoff_triggered");
-    const completed = frames.find((e) => e.type === "brain.handoff_completed");
-    const sessionsDiffer =
-      completed !== undefined && completed.payload.fromSessionId !== completed.payload.toSessionId;
+      const decision = (await post("/v1/brain/handoff/evaluate", {})).decision;
+      await sleep(800);
+      const brainAfter = (await get("/v1/fleet")).summary.brain;
 
-    gate(
-      "G6",
-      "Brain hands off past the budget threshold into a NEW session",
-      handedOff &&
-        modelChanged &&
-        newSession &&
-        triggered !== undefined &&
+      const handedOff = decision?.shouldHandoff === true;
+      const modelChanged = brainAfter.model !== brainBefore.model;
+      // The core rule: a new session, so no cross-model transcript replay.
+      const newSession =
+        brainAfter.sessionId !== null && brainAfter.sessionId !== brainBefore.sessionId;
+
+      const replay = await get(
+        "/v1/events/replay?types=brain.handoff_triggered,brain.handoff_completed&limit=1000",
+      );
+      const frames = (replay.events ?? []).map((e) => e.event ?? e);
+      const triggered = frames.find((e) => e.type === "brain.handoff_triggered");
+      const completed = frames.find((e) => e.type === "brain.handoff_completed");
+      const sessionsDiffer =
         completed !== undefined &&
-        sessionsDiffer &&
-        brainAfter.status === "running",
-      `${brainBefore.model} → ${brainAfter.model} observed=${decision?.observedPct}% threshold=${decision?.thresholdPct}% newSession=${newSession} events=${triggered !== undefined}/${completed !== undefined}`,
-    );
+        completed.payload.fromSessionId !== completed.payload.toSessionId;
+
+      gate(
+        "G6",
+        "Brain hands off past the budget threshold into a NEW session",
+        fixtureMatchesBrain &&
+          handedOff &&
+          modelChanged &&
+          newSession &&
+          triggered !== undefined &&
+          completed !== undefined &&
+          sessionsDiffer &&
+          brainAfter.status === "running",
+        `brainConn=${brainConnection.id}/${brainConnection.provider} ${brainBefore.model} → ${brainAfter.model} observed=${decision?.observedPct}% threshold=${decision?.thresholdPct}% newSession=${newSession} events=${triggered !== undefined}/${completed !== undefined} reason=${decision?.reason ?? ""}`,
+      );
+    }
   }
 
   // ── G7 — config doctor lists drift; upgrade never overwrites ───────────
@@ -456,12 +488,17 @@ try {
       updater.seedCurrent('1.0.0', Buffer.from('v1'));
       const payload = Buffer.from(${JSON.stringify(payload.toString())});
       const sha256 = SelfUpdater.digest(payload);
-      const good = sign(null, Buffer.from(sha256, 'utf8'), ${JSON.stringify(
+      const privatePem = ${JSON.stringify(
         privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-      )}).toString('base64');
+      )};
+      const signMsg = (version, digest) =>
+        sign(null, SelfUpdater.signedMessage(version, digest), privatePem).toString('base64');
+      const good = signMsg('2.0.0', sha256);
 
       const forged = updater.apply({ version: '9.9.9', sha256, signature: Buffer.from('forged').toString('base64') }, payload);
       const swapped = updater.apply({ version: '9.9.9', sha256, signature: good }, Buffer.from('a different payload'));
+      const versionSwap = updater.apply({ version: '9.9.9', sha256, signature: good }, payload);
+      const traversal = updater.apply({ version: '../../evil', sha256, signature: signMsg('../../evil', sha256) }, payload);
       const applied = updater.apply({ version: '2.0.0', sha256, signature: good }, payload);
       const afterApply = updater.currentVersion();
       const rolled = updater.rollback();
@@ -469,6 +506,8 @@ try {
       process.stdout.write(JSON.stringify({
         forged: forged.ok === false ? forged.code : 'APPLIED',
         swapped: swapped.ok === false ? swapped.code : 'APPLIED',
+        versionSwap: versionSwap.ok === false ? versionSwap.code : 'APPLIED',
+        traversal: traversal.ok === false ? traversal.code : 'APPLIED',
         applied: applied.ok,
         afterApply,
         rolled: rolled.ok,
@@ -490,11 +529,13 @@ try {
       "self-update refuses forged and swapped releases, applies a signed one, rolls back",
       outcome.forged === "SIGNATURE_INVALID" &&
         outcome.swapped === "DIGEST_MISMATCH" &&
+        outcome.versionSwap === "SIGNATURE_INVALID" &&
+        outcome.traversal === "VERSION_UNSAFE" &&
         outcome.applied === true &&
         outcome.afterApply === "2.0.0" &&
         outcome.rolled === true &&
         outcome.afterRollback === "1.0.0",
-      `forged=${outcome.forged} swapped=${outcome.swapped} applied=${outcome.afterApply} rolledBackTo=${outcome.afterRollback}`,
+      `forged=${outcome.forged} swapped=${outcome.swapped} versionSwap=${outcome.versionSwap} traversal=${outcome.traversal} applied=${outcome.afterApply} rolledBackTo=${outcome.afterRollback}`,
     );
   }
 

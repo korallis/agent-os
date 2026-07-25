@@ -47,15 +47,29 @@ export interface FleetServiceOptions {
  * Brain-capable default model per provider. Deliberately conservative: a
  * handoff target must be a model we already spawn Brains on, not whatever the
  * provider happens to offer.
+ *
+ * Gateway providers emit provider-qualified refs so a routed Sonnet
+ * (`openrouter/anthropic/…`) is a distinct string from an OAuth Sonnet
+ * (`anthropic/…`). Without that prefix, pickTarget's `c !== currentModel`
+ * filter drops the default same-family refuge and handoff never moves.
  */
 const DEFAULT_BRAIN_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = {
   anthropic: "anthropic/claude-sonnet-4-5",
   "claude-agent-sdk": "claude-agent-sdk/claude-sonnet-4-5",
   openai: "openai/gpt-4.1",
   xai: "xai/grok-3",
-  openrouter: "anthropic/claude-sonnet-4-5",
-  "vercel-ai-gateway": "anthropic/claude-sonnet-4-5",
+  openrouter: "openrouter/anthropic/claude-sonnet-4-5",
+  "vercel-ai-gateway": "vercel-ai-gateway/anthropic/claude-sonnet-4-5",
 };
+
+/** Min interval between Brain handoffs — stops thrashing every heartbeat. */
+const BRAIN_HANDOFF_COOLDOWN_MS = 5 * 60 * 1000;
+
+/** Routing provider id = first segment of a `provider/…` model ref. */
+function modelRoutingProvider(model: string): string {
+  const slash = model.indexOf("/");
+  return (slash === -1 ? model : model.slice(0, slash)).toLowerCase();
+}
 
 type PendingToolResult = {
   frame: Extract<DaemonControlFrame, { type: "ctl.tool_result" }>;
@@ -82,6 +96,8 @@ export class FleetService {
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   /** ctl.tool_result frames that failed sendControl; retried on session re-hello. */
   private readonly pendingToolResults = new Map<string, PendingToolResult[]>();
+  /** Last budget handoff — used to suppress thrash between over-threshold providers. */
+  private lastHandoff: { atMs: number; toModel: string } | null = null;
 
   constructor(private readonly options: FleetServiceOptions) {
     const cfg = options.config.effective().config;
@@ -492,10 +508,11 @@ export class FleetService {
     const samples = this.options.quotaSamples?.() ?? [];
     const connections = this.options.connections?.list() ?? [];
 
-    // The Brain's connection is the one whose provider serves its model ref.
-    const brainProvider = brainSnapshot.model.split("/")[0] ?? "";
+    // Match the connection that actually routes this model ref (first segment),
+    // not a bare origin family — openrouter/anthropic/… is an openrouter cast.
+    const brainProvider = modelRoutingProvider(brainSnapshot.model);
     const brainConnection =
-      connections.find((c) => c.provider === brainProvider) ?? null;
+      connections.find((c) => c.provider.toLowerCase() === brainProvider) ?? null;
 
     const decision = decideHandoff({
       brainModel: brainSnapshot.model,
@@ -505,7 +522,33 @@ export class FleetService {
       samples,
       candidates: this.handoffCandidates(brainSnapshot.model),
     });
-    if (!decision.shouldHandoff || decision.toModel === null) return decision;
+
+    // Below threshold: clear the post-handoff latch so a later breach can move
+    // the Brain again without waiting out an old cooldown.
+    if (!decision.shouldHandoff || decision.toModel === null) {
+      if (
+        decision.basis !== "none" &&
+        decision.observedPct < decision.thresholdPct
+      ) {
+        this.lastHandoff = null;
+      }
+      return decision;
+    }
+
+    // Suppress thrash: two over-threshold providers must not bounce the Brain
+    // into a new session on every reconcile tick.
+    if (this.lastHandoff !== null) {
+      const elapsed = Date.now() - this.lastHandoff.atMs;
+      if (elapsed < BRAIN_HANDOFF_COOLDOWN_MS) {
+        const remainingSec = Math.ceil((BRAIN_HANDOFF_COOLDOWN_MS - elapsed) / 1000);
+        return {
+          ...decision,
+          shouldHandoff: false,
+          toModel: null,
+          reason: `${decision.metric} at ${decision.observedPct}% crossed ${decision.thresholdPct}% but handoff cooldown has ${remainingSec}s remaining after move to ${this.lastHandoff.toModel}`,
+        };
+      }
+    }
 
     this.sink({
       type: "brain.handoff_triggered",
@@ -518,7 +561,13 @@ export class FleetService {
       },
     });
     this.brain.handoff(decision.toModel, decision.reason);
+    this.lastHandoff = { atMs: Date.now(), toModel: decision.toModel };
     return decision;
+  }
+
+  /** Last budget handoff time/target, for inspectability and tests. */
+  lastBrainHandoff(): { atMs: number; toModel: string } | null {
+    return this.lastHandoff;
   }
 
   /**
@@ -528,12 +577,12 @@ export class FleetService {
    */
   private handoffCandidates(currentModel: string): string[] {
     const connections = this.options.connections?.list() ?? [];
-    const currentProvider = currentModel.split("/")[0] ?? "";
+    const currentProvider = modelRoutingProvider(currentModel);
     const candidates: string[] = [];
     for (const connection of connections) {
       if (connection.limitReached) continue;
       if (connection.health === "unhealthy") continue;
-      if (connection.provider === currentProvider) continue;
+      if (connection.provider.toLowerCase() === currentProvider) continue;
       const model = DEFAULT_BRAIN_MODEL_BY_PROVIDER[connection.provider];
       if (model === undefined) continue;
       candidates.push(model);

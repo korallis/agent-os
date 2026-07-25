@@ -1,12 +1,22 @@
 import { generateKeyPairSync, sign as signPayload } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type {
+  BrainConfig,
+  BudgetsConfig,
+  ProviderConnection,
+  QuotaSample,
+} from "@agent-os/protocol";
+import { ConfigService } from "../src/config/service.js";
+import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
 import { AfkService } from "../src/fleet/afk.js";
 import { decideHandoff } from "../src/fleet/brain-handoff.js";
+import { FleetService } from "../src/fleet/service.js";
+import type { ConnectionRegistry } from "../src/pi/connections.js";
+import { familyFromModel } from "../src/substrate/family.js";
 import { SelfUpdater, type ReleaseManifest } from "../src/update/self-update.js";
-import type { BrainConfig, BudgetsConfig, QuotaSample } from "@agent-os/protocol";
 
 const temps: string[] = [];
 function temp(prefix: string): string {
@@ -132,6 +142,117 @@ describe("Brain budget handoff", () => {
     expect(decision.thresholdPct).toBe(80);
   });
 
+  it("hands Anthropic OAuth Brain off to OpenRouter-qualified Sonnet", () => {
+    // Default same-family refuge: openrouter/anthropic/… must not collapse to
+    // the bare anthropic/… string the OAuth Brain already uses.
+    expect(familyFromModel("openrouter/anthropic/claude-sonnet-4-5")).toBe("anthropic");
+    expect(familyFromModel("vercel-ai-gateway/anthropic/claude-sonnet-4-5")).toBe("anthropic");
+    const decision = decideHandoff({
+      brainModel: "anthropic/claude-sonnet-4-5",
+      brainConnectionId: "01JCONN00000000000000000AA",
+      config,
+      budgets,
+      samples: [sample(93)],
+      candidates: ["openrouter/anthropic/claude-sonnet-4-5"],
+    });
+    expect(decision.shouldHandoff).toBe(true);
+    expect(decision.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+  });
+
+  it("suppresses a second handoff while cooldown is active", () => {
+    const home = temp("agentos-p8-handoff-cd-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    configService.installDefaults();
+
+    const now = new Date().toISOString();
+    const conn = (
+      id: string,
+      provider: ProviderConnection["provider"],
+      family: ProviderConnection["family"],
+    ): ProviderConnection => ({
+      id,
+      kind: "pi-api-key",
+      provider,
+      label: provider,
+      family,
+      billingSurface: "api-metered",
+      billingMode: null,
+      health: "healthy",
+      healthReason: null,
+      authStorePresence: null,
+      effectiveCredentialPath: "env-keychain",
+      personalUseOnly: true,
+      supportedRoles: ["brain"],
+      limitReached: false,
+      limitReachedReason: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const anthropicId = "01JCONN0000000000000000ANT";
+    const openrouterId = "01JCONN0000000000000000ORR";
+    const xaiId = "01JCONN0000000000000000XAI";
+    const connections = [
+      conn(anthropicId, "anthropic", "anthropic"),
+      conn(openrouterId, "openrouter", "other"),
+      conn(xaiId, "xai", "xai"),
+    ];
+    const registry = { list: () => connections } as ConnectionRegistry;
+
+    const windowSample = (connectionId: string, provider: string, pct: number): QuotaSample => ({
+      id: `01JQUOTA${connectionId.slice(-8)}0000000000`,
+      connectionId,
+      provider,
+      metrics: [
+        {
+          kind: "weekly-window-pct",
+          value: pct,
+          unit: "percent",
+          tier: "live",
+          source: "OAUTH",
+          syncedAt: now,
+          reason: null,
+          resetsAt: null,
+          limitReached: false,
+        },
+      ],
+      sampledAt: now,
+    });
+
+    // Both Anthropic and OpenRouter report over threshold so a thrash loop
+    // would otherwise bounce the Brain every reconcile tick.
+    const samples = [
+      windowSample(anthropicId, "anthropic", 93),
+      windowSample(openrouterId, "openrouter", 91),
+      windowSample(xaiId, "xai", 10),
+    ];
+
+    const service = new FleetService({
+      home,
+      config: configService,
+      connections: registry,
+      quotaSamples: () => samples,
+      fakeTmux: true,
+      fakeBrain: true,
+    });
+    service.start();
+    // Force the Brain onto Anthropic OAuth model string.
+    service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+
+    const first = service.evaluateBrainHandoff();
+    expect(first?.shouldHandoff).toBe(true);
+    expect(first?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+    expect(service.lastBrainHandoff()?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+
+    const second = service.evaluateBrainHandoff();
+    expect(second?.shouldHandoff).toBe(false);
+    expect(second?.reason).toContain("cooldown");
+    expect(service.brain.getSnapshot().model).toBe("openrouter/anthropic/claude-sonnet-4-5");
+
+    service.stop();
+  });
+
   it("says so plainly when the threshold is crossed but nothing is available", () => {
     const decision = decideHandoff({
       brainModel: "anthropic/claude-fable-5",
@@ -164,14 +285,18 @@ describe("signed self-update", () => {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const publicPem = publicKey.export({ type: "spki", format: "pem" }).toString();
 
-  function sign(digestHex: string): string {
+  function sign(version: string, digestHex: string): string {
     // Ed25519 is a one-shot algorithm: null digest, sign the bytes directly.
-    return signPayload(null, Buffer.from(digestHex, "utf8"), privateKey).toString("base64");
+    return signPayload(
+      null,
+      SelfUpdater.signedMessage(version, digestHex),
+      privateKey,
+    ).toString("base64");
   }
 
   function manifestFor(version: string, payload: Buffer): ReleaseManifest {
     const sha256 = SelfUpdater.digest(payload);
-    return { version, sha256, signature: sign(sha256) };
+    return { version, sha256, signature: sign(version, sha256) };
   }
 
   it("refuses a release whose digest does not match its manifest", () => {
@@ -203,6 +328,36 @@ describe("signed self-update", () => {
     const outcome = updater.apply(manifestFor("1.3.0", payload), payload);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.code).toBe("NO_PUBLIC_KEY");
+  });
+
+  it("refuses a traversal version token even when the signature covers it", () => {
+    const root = temp("agentos-p8-up-trav-");
+    const updater = new SelfUpdater(root, publicPem);
+    const payload = Buffer.from("evil payload");
+    const version = "../../evil";
+    const sha256 = SelfUpdater.digest(payload);
+    // Sign as an attacker who also controls the signing step for this vector —
+    // the path check must still refuse before any write escapes versions/.
+    const outcome = updater.apply(
+      { version, sha256, signature: sign(version, sha256) },
+      payload,
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("VERSION_UNSAFE");
+    expect(updater.currentVersion()).toBeNull();
+  });
+
+  it("refuses a version-swapped manifest that keeps a valid payload digest", () => {
+    const updater = new SelfUpdater(temp("agentos-p8-up-vswap-"), publicPem);
+    const payload = Buffer.from("legit release");
+    const sha256 = SelfUpdater.digest(payload);
+    // Signature was made for version 1.0.0; attacker rewrites the label only.
+    const outcome = updater.apply(
+      { version: "9.9.9", sha256, signature: sign("1.0.0", sha256) },
+      payload,
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("SIGNATURE_INVALID");
   });
 
   it("applies a verified release and can roll back without the network", () => {

@@ -221,7 +221,7 @@ export async function runStow(projectId?: string, notes?: string): Promise<void>
     });
     const body = (await response.json()) as {
       ok?: boolean;
-      result?: { path?: string };
+      data?: { path?: string };
       error?: { code?: string; message?: string };
     };
     if (!response.ok || body.ok !== true) {
@@ -229,7 +229,7 @@ export async function runStow(projectId?: string, notes?: string): Promise<void>
       process.exitCode = 1;
       return;
     }
-    console.log(`stow: written ${body.result?.path ?? "(path unreported)"}`);
+    console.log(`stow: written ${body.data?.path ?? "(path unreported)"}`);
   } catch {
     console.log("stow: daemon not reachable");
     process.exitCode = 1;
