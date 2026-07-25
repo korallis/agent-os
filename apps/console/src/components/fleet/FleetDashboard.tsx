@@ -273,8 +273,8 @@ function TokenConsumptionCard({
 }
 
 /** Real, useful actions for a local single-user fleet — not a SaaS upsell. */
-function QuickActionsCard({ needsCaptain }: { needsCaptain: number }) {
-  const actions = [
+/** Static — hoisted out of the component so it is not rebuilt each render. */
+const QUICK_ACTIONS = [
     { href: "/tasks", label: "Tasks board", hint: "Dispatch and track work" },
     { href: "/projects", label: "Projects", hint: "Register a repository" },
     { href: "/providers", label: "Providers & quota", hint: "Connections and limits" },
@@ -283,9 +283,13 @@ function QuickActionsCard({ needsCaptain }: { needsCaptain: number }) {
     { href: "/runs", label: "Live log stream", hint: "Everything the fleet emits" },
     { href: "/runs/history", label: "Run history", hint: "Gate and fusion journeys" },
     { href: "/network", label: "Network I/O", hint: "Outbound calls Agent OS made" },
+    { href: "/pipeline", label: "Pipeline", hint: "Live no-mistakes gate state" },
     { href: "/policies", label: "Policies", hint: "Layered config and safety" },
     { href: "/onboarding", label: "Setup wizard", hint: "Guided first-run and re-setup" },
-  ];
+] as const;
+
+function QuickActionsCard({ needsCaptain }: { needsCaptain: number }) {
+  const actions = QUICK_ACTIONS;;
   return (
     <Card className="p-5 flex flex-col gap-4">
       <div className="flex items-center justify-between">

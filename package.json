@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "axe-core": "^4.12.1",
+    "better-sqlite3": "13.0.1",
     "eslint": "9.39.4",
     "playwright": "1.62.0",
     "turbo": "2.10.6",

@@ -1324,7 +1324,7 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] `agentos config doctor` lists drifted templates; a daemon restart (which reinstalls shipped defaults) never overwrites a customized template (G7) [R3].
 - [x] Signed self-update with rollback: a forged signature and a swapped payload are both refused with distinct typed codes, a correctly signed release applies, and rollback restores the retained version without the network (G8). The public key is baked into the install, never fetched with the release. [B]
 
-**Phase 9 — Live pipeline visibility & configurable observability (v1.1, 2 wk)** **[R7 — Captain-requested]**
+**Phase 9 — Live pipeline visibility & configurable observability (v1.1, 2 wk)** **[R7 — Captain-requested]** — shipped (`tooling/gates/phase-9.mjs` G1–G8 + G5b; 9/9)
 
 The Captain's framing: *"the purpose of this app is not just extremely good Agentic Engineering, it's visibility that's configurable and gives the user control over what they want to see, whilst letting agents fully build everything they plan out."* Today, when work enters the `no-mistakes` gate, Agent OS goes blind — the only way to know what is happening is to poll `axi status`. That is the one place the product stops being live.
 
@@ -1342,14 +1342,14 @@ The Captain's framing: *"the purpose of this app is not just extremely good Agen
 - **Configurable visibility is the point, not a setting.** A new `observability.json5` config surface (**#15** — #11 remains secondmate charters in §2.6) defines *visibility profiles*: which event classes reach the Console, at what density, and which raise a wake. The default profile is quiet; the Captain opts into depth. This is the config-layered, hot-reloadable house pattern — not a per-page toggle.
 
 Gates:
-- [ ] Live-vs-polled honesty: with the socket stream available, the surface reports `live`; with it unavailable, it reports `polled` **and the observed lag** — a fixture forcing fallback must flip the label within one cycle.
-- [ ] A pipeline run started outside Agent OS appears in the Console within 1 s of its first step transition, with step, round (`auto-fix 1/3`), and findings count.
-- [ ] Step log output streams incrementally — a line appended to `review.log` is visible without a page action.
-- [ ] Gate-awaiting state is unmistakable: a run parked on a review gate renders as needing a decision, with the findings table and each finding's `action` (`auto-fix` / `no-op` / `ask-user`).
-- [ ] Schema-drift fixture (renamed column / unknown `event_kind`) → visible degradation, never silent staleness; the daemon logs the incompatibility once, not per tick.
-- [ ] Read-only proof: an fs-audit over a full run shows zero writes by Agent OS anywhere under `~/.no-mistakes/`.
-- [ ] Visibility profiles: three shipped profiles (quiet / working / firehose) demonstrably change what reaches the Console and the wake queue, hot-reloaded without a restart.
-- [ ] No unbounded growth: a long run's step log is windowed in the Console with truncation stated, not silently dropped.
+- [x] Live-vs-polled honesty: with the socket stream available, the surface reports `live`; with it unavailable, it reports `polled` **and the observed lag** — a fixture forcing fallback must flip the label within one cycle.
+- [x] A pipeline run started outside Agent OS appears in the Console within 1 s of its first step transition, with step, round (`auto-fix 1/3`), and findings count.
+- [x] Step log output streams incrementally — a line appended to `review.log` is visible without a page action.
+- [x] Gate-awaiting state is unmistakable: a run parked on a review gate renders as needing a decision, with the findings table and each finding's `action` (`auto-fix` / `no-op` / `ask-user`).
+- [x] Schema-drift fixture (renamed column / unknown `event_kind`) → visible degradation, never silent staleness; the daemon logs the incompatibility once, not per tick.
+- [x] Read-only proof: an fs-audit over a full run shows zero writes by Agent OS anywhere under `~/.no-mistakes/`.
+- [x] Visibility profiles: three shipped profiles (quiet / working / firehose) demonstrably change what reaches the Console and the wake queue, hot-reloaded without a restart.
+- [x] No unbounded growth: a long run's step log is windowed in the Console with truncation stated, not silently dropped.
 
 **Phase 10 — Auto-balancer (v1.1, 2 wk)** **[R7 — Captain-requested]**
 

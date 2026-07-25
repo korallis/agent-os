@@ -73,6 +73,11 @@ function levelOf(envelope: EventEnvelope): Level {
         (envelope.event.payload.status ?? 200) >= 400
         ? "WARN"
         : "INFO";
+    case "pipeline.run_updated":
+    case "pipeline.log_appended":
+      return "INFO";
+    case "pipeline.unavailable":
+      return "WARN";
     case "fusion.completed":
       return envelope.event.payload.error != null && envelope.event.payload.error.length > 0
         ? "ERROR"
@@ -142,6 +147,10 @@ function sourceOf(envelope: EventEnvelope): string {
     case "secondmate.charter_changed":
     case "secondmate.routed":
       return "secondmates";
+    case "pipeline.run_updated":
+    case "pipeline.log_appended":
+    case "pipeline.unavailable":
+      return "pipeline";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -291,7 +300,18 @@ function messageOf(envelope: EventEnvelope): string {
         : `Routing to ${event.payload.name} REFUSED — ${event.payload.reason ?? "unknown"}`;
     case "session.wedged":
       return `Seat ${event.payload.role} WEDGED — silent ${Math.round(event.payload.idleMinutes)}m (threshold ${event.payload.thresholdMinutes}m) → ${event.payload.action} (${event.payload.respawnsUsed}/${event.payload.respawnCap} respawns used)`;
-
+    case "pipeline.run_updated": {
+      const active = event.payload.steps.find(
+        (s) => s.status === "running" || s.status === "fixing",
+      );
+      return `Pipeline ${event.payload.branch} ${event.payload.status}${
+        active !== undefined ? ` — ${active.step} ${active.status}` : ""
+      }`;
+    }
+    case "pipeline.log_appended":
+      return `Pipeline ${event.payload.step}: ${event.payload.chunk.trim().split("\n").at(-1) ?? ""}`;
+    case "pipeline.unavailable":
+      return `Pipeline view unavailable — ${event.payload.reason}`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {
