@@ -187,26 +187,39 @@ try {
   const contiguous = (seqs) =>
     seqs.length > 1 && seqs.every((value, index) => value === seqs[0] + index);
 
-  const streamOk = (seqs, sawContent) =>
-    seqs.length >= 1 &&
-    seqs[0] === 1 &&
-    sawContent &&
-    (paneChanges ? contiguous(seqs) : seqs.length === 1 || contiguous(seqs));
+  const POLL_MS = 500;
+  const minFramesFor = (windowMs) =>
+    paneChanges ? Math.max(2, Math.floor(windowMs / POLL_MS / 3)) : 1;
+
+  const streamOk = (seqs, sawContent, windowMs) => {
+    const floor = minFramesFor(windowMs);
+    return (
+      seqs.length >= 1 &&
+      seqs[0] === 1 &&
+      sawContent &&
+      (paneChanges
+        ? contiguous(seqs) && seqs.length >= floor
+        : seqs.length === 1 || contiguous(seqs))
+    );
+  };
 
   const first = await streamFor(SOAK_MS);
+  const firstFloor = minFramesFor(SOAK_MS);
   gate(
     "T1",
     "frames are sequenced from 1 with real pane content, and every frame received is contiguous",
-    streamOk(first.seqs, first.sawContent),
-    `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${paneChanges ? contiguous(first.seqs) : first.seqs.length === 1 ? "n/a (pane did not change)" : contiguous(first.seqs)} content=${first.sawContent} paneTickerStarted=${paneChanges} soakMs=${SOAK_MS}`,
+    streamOk(first.seqs, first.sawContent, SOAK_MS),
+    `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${paneChanges ? contiguous(first.seqs) : first.seqs.length === 1 ? "n/a (pane did not change)" : contiguous(first.seqs)} content=${first.sawContent} paneTickerStarted=${paneChanges} soakMs=${SOAK_MS} minFrames=${firstFloor} (floor=max(2,floor(soakMs/${POLL_MS}/3)) ≈⅓ of theoretical max at ${POLL_MS}ms poll)`,
   );
 
-  const second = await streamFor(Math.min(4_000, SOAK_MS));
+  const reconnectMs = Math.min(4_000, SOAK_MS);
+  const second = await streamFor(reconnectMs);
+  const secondFloor = minFramesFor(reconnectMs);
   gate(
     "T2",
     "a reconnect resumes the same pane and restarts its own numbering at 1",
-    streamOk(second.seqs, second.sawContent),
-    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs)} samePane=${second.sawContent}`,
+    streamOk(second.seqs, second.sawContent, reconnectMs),
+    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs)} samePane=${second.sawContent} minFrames=${secondFloor}`,
   );
 
   if (!paneChanges) {

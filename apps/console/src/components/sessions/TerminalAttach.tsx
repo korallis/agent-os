@@ -169,7 +169,7 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold text-fg-1">Terminal (read-only)</h3>
         <div className="flex items-center gap-2">
-          {frames > 0 && (
+          {(frames > 0 || dropped > 0) && (
             /* Frame continuity, stated. A quiet pane sends nothing, so silence
                is normal — a seq GAP is a real loss and must not be hidden. */
             <span
@@ -179,11 +179,15 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
               )}
               title={
                 dropped > 0
-                  ? `${dropped} frame(s) lost — sequence gap detected`
+                  ? frames === 0
+                    ? `all ${dropped} frame(s) lost — no pane frames received`
+                    : `${dropped} frame(s) lost — sequence gap detected`
                   : "no sequence gaps observed"
               }
             >
-              {frames} frames{dropped > 0 ? ` · ${dropped} dropped` : " · no gaps"}
+              {frames === 0
+                ? `0 frames · ${dropped} dropped`
+                : `${frames} frames${dropped > 0 ? ` · ${dropped} dropped` : " · no gaps"}`}
             </span>
           )}
           <span
