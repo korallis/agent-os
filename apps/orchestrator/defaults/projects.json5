@@ -1,0 +1,5 @@
+// projects.json5 — project mode defaults (master plan §5.2, surface #8).
+{
+  defaultMode: "pipeline",
+  yoloAllowed: false,
+}

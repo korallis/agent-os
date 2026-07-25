@@ -1,0 +1,18 @@
+// brain.json5 — Orchestrator Brain cast + handoff (master plan §5.11, surface #1).
+{
+  cast: "auto",
+  thinking: "high",
+  preferenceOrder: [
+    "anthropic via claude-oauth",
+    "anthropic via api-key",
+    "openai via chatgpt-oauth",
+    "best-available via copilot-oauth",
+    "xai via xai-oauth",
+    "best-available via any api-key",
+  ],
+  handoff: {
+    thresholdPct: 80,
+    target: "same-family-api-key",
+  },
+  respawnBlocked: false,
+}

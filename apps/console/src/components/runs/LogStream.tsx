@@ -14,9 +14,15 @@ function levelOf(envelope: EventEnvelope): Level {
   switch (envelope.event.type) {
     case "config.rejected":
     case "provider.billing_mismatch":
+    case "session.lost":
+    case "brain.down":
+    case "scout.write_violation":
       return "ERROR";
     case "daemon.stopping":
     case "quota.threshold":
+    case "captain.escalation":
+    case "wake.classified":
+    case "crew.question":
       return "WARN";
     case "policy.changed":
       return envelope.event.payload.safetyOverride ? "WARN" : "INFO";
@@ -30,10 +36,29 @@ function levelOf(envelope: EventEnvelope): Level {
     case "ext.usage":
     case "onboarding.step":
     case "onboarding.completed":
+    case "project.registered":
+    case "project.updated":
+    case "task.created":
+    case "task.phase_changed":
+    case "task.updated":
+    case "task.cast_resolved":
+    case "task.delivery_block_resolved":
+    case "session.spawned":
+    case "session.stopped":
+    case "worktree.leased":
+    case "worktree.released":
+    case "brain.status":
+    case "brain.handoff":
+    case "tool.invoked":
+    case "gate.result":
+    case "fusion.dispatched":
+    case "crew.answered":
+    case "bridge.tool_call":
       return "INFO";
     default: {
-      const exhaustive: never = envelope.event;
-      return exhaustive;
+      const _exhaustive: never = envelope.event;
+      void _exhaustive;
+      return "INFO";
     }
   }
 }
@@ -63,9 +88,47 @@ function sourceOf(envelope: EventEnvelope): string {
     case "onboarding.step":
     case "onboarding.completed":
       return "onboarding";
+    case "project.registered":
+    case "project.updated":
+      return "projects";
+    case "task.created":
+    case "task.phase_changed":
+    case "task.updated":
+    case "task.cast_resolved":
+    case "task.delivery_block_resolved":
+      return "tasks";
+    case "session.spawned":
+    case "session.stopped":
+    case "session.lost":
+      return "sessions";
+    case "crew.question":
+    case "crew.answered":
+      return "crew";
+    case "scout.write_violation":
+      return "scout";
+    case "bridge.tool_call":
+      return "bridge";
+    case "worktree.leased":
+    case "worktree.released":
+      return "worktrees";
+    case "wake.classified":
+      return "watcher";
+    case "brain.status":
+    case "brain.handoff":
+    case "brain.down":
+      return "brain";
+    case "tool.invoked":
+      return "tools";
+    case "gate.result":
+      return "gate";
+    case "fusion.dispatched":
+      return "fusion";
+    case "captain.escalation":
+      return "captain";
     default: {
-      const exhaustive: never = envelope.event;
-      return exhaustive;
+      const _exhaustive: never = envelope.event;
+      void _exhaustive;
+      return "events";
     }
   }
 }
@@ -109,9 +172,62 @@ function messageOf(envelope: EventEnvelope): string {
       return `Onboarding step → ${event.payload.step}`;
     case "onboarding.completed":
       return `Onboarding completed at ${event.payload.at}`;
+    case "project.registered":
+      return `Project registered — ${event.payload.name} (${event.payload.mode})`;
+    case "project.updated":
+      return `Project updated — ${event.payload.projectId.slice(0, 8)}…`;
+    case "task.created":
+      return `Task created — ${event.payload.title} [${event.payload.shape}]`;
+    case "task.phase_changed":
+      return `Task phase ${event.payload.from} → ${event.payload.to}`;
+    case "task.updated":
+      return `Task updated — ${event.payload.taskId.slice(0, 8)}…`;
+    case "task.cast_resolved":
+      return `Cast resolved — ${event.payload.roles.map((r) => r.role).join(", ")}`;
+    case "task.delivery_block_resolved":
+      return `Delivery block resolved — task ${event.payload.taskId.slice(0, 8)}… by ${event.payload.clearedBy}: ${event.payload.reason}`;
+    case "session.spawned":
+      return `Session spawned — ${event.payload.role} ${event.payload.model}`;
+    case "session.stopped":
+      return `Session stopped — ${event.payload.reason}`;
+    case "session.lost":
+      return `Session lost — ${event.payload.reason}`;
+    case "worktree.leased":
+      return `Worktree leased — ${event.payload.path}`;
+    case "worktree.released":
+      return `Worktree released${event.payload.quarantined ? " (quarantined)" : ""}`;
+    case "wake.classified":
+      return `Wake ${event.payload.class}${event.payload.absorbed ? " absorbed" : " → brain"}: ${event.payload.summary}`;
+    case "brain.status":
+      return `Brain ${event.payload.status}${event.payload.model !== null ? ` · ${event.payload.model}` : ""}`;
+    case "brain.handoff":
+      return `Brain handoff ${event.payload.fromModel} → ${event.payload.toModel}`;
+    case "brain.down":
+      return `BRAIN DOWN — ${event.payload.wakeQueueDepth} wakes queued — ${event.payload.reason}`;
+    case "tool.invoked":
+      return `Tool ${event.payload.tool} ${event.payload.ok ? "ok" : event.payload.errorCode ?? "err"} (${event.payload.durationMs}ms)`;
+    case "gate.result":
+      return `Gate ${event.payload.target} → ${event.payload.outcome}`;
+    case "fusion.dispatched":
+      return `Fusion ${event.payload.kind} dispatched`;
+    case "crew.question":
+      return `Crewmate asked — ${event.payload.question}`;
+    case "crew.answered":
+      return event.payload.delivered
+        ? `Answer delivered to session ${event.payload.sessionId.slice(0, 8)}`
+        : `Answer UNDELIVERED — session ${event.payload.sessionId.slice(0, 8)} has no live channel`;
+    case "scout.write_violation":
+      return `SCOUT WRITE VIOLATION — ${event.payload.changedPaths.length} path(s) in ${event.payload.worktreePath}${event.payload.quarantined ? " (worktree quarantined)" : ""}`;
+    case "bridge.tool_call":
+      return event.payload.accepted
+        ? `Bridge ${event.payload.tool} accepted from ${event.payload.sessionId.slice(0, 8)}`
+        : `Bridge ${event.payload.tool} refused — ${event.payload.reason ?? "unknown"}`;
+    case "captain.escalation":
+      return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {
-      const exhaustive: never = event;
-      return exhaustive;
+      const _exhaustive: never = event;
+      void _exhaustive;
+      return "Unhandled event";
     }
   }
 }

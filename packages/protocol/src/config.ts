@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { quotaConfigSchema } from "./quota.js";
+import { projectModeSchema, thinkingLevelSchema } from "./tasks.js";
 
 /**
  * Config schemas — the Policy Packs foundation (master plan §2.6, §9).
  *
  * Phase 1: supervision, policies, console.
  * Phase 2: + quota (surface #14).
+ * Phase 3: + brain, worktrees, projects, dispatch, validation, budgets.
  */
 
 /** Layer precedence, lowest → highest (§2.6). */
@@ -71,15 +73,90 @@ export const consoleConfigSchema = z.strictObject({
 });
 export type ConsoleConfig = z.infer<typeof consoleConfigSchema>;
 
+/** `brain.json5` — config surface #1 (§2.6, §5.11). */
+export const brainConfigSchema = z.strictObject({
+  cast: z.union([z.literal("auto"), z.string().min(3)]),
+  thinking: thinkingLevelSchema,
+  preferenceOrder: z.array(z.string().min(1)).min(1),
+  handoff: z.strictObject({
+    thresholdPct: z.number().int().min(1).max(100),
+    target: z.enum(["same-family-api-key", "best-available-other-family"]),
+  }),
+  /** When true, brain pane respawn is blocked (fixture / degraded-mode tests). */
+  respawnBlocked: z.boolean(),
+});
+export type BrainConfig = z.infer<typeof brainConfigSchema>;
+
+/** `worktrees.json5` — config surface #7. */
+export const worktreesConfigSchema = z.strictObject({
+  poolSize: z.number().int().min(1).max(64),
+  reclaimPolicy: z.enum(["verified-reset", "quarantine-always"]),
+  networkPolicy: z.enum(["fetch-allowed", "offline"]),
+});
+export type WorktreesConfig = z.infer<typeof worktreesConfigSchema>;
+
+/** `projects.json5` — config surface #8 defaults. */
+export const projectsConfigSchema = z.strictObject({
+  defaultMode: projectModeSchema,
+  yoloAllowed: z.boolean(),
+});
+export type ProjectsConfig = z.infer<typeof projectsConfigSchema>;
+
+/** `dispatch.json5` — config surface #4. */
+export const dispatchConfigSchema = z.strictObject({
+  rules: z.array(
+    z.strictObject({
+      when: z.string().min(1),
+      hint: z.record(z.string(), z.unknown()),
+    }),
+  ),
+});
+export type DispatchConfig = z.infer<typeof dispatchConfigSchema>;
+
+/** `validation.json5` — config surface #6. */
+export const validationConfigSchema = z.strictObject({
+  maxValidations: z.number().int().min(1).max(20),
+  triageAt: z.number().int().min(1).max(20),
+  gateLanguage: z.enum(["py", "ts"]),
+  gateTimeoutSeconds: z.number().int().min(5).max(3600),
+});
+export type ValidationConfig = z.infer<typeof validationConfigSchema>;
+
+/** `budgets.json5` — config surface #9. */
+export const budgetsConfigSchema = z.strictObject({
+  perTaskUsd: z.number().min(0),
+  claudeExtraUsageDailyUsd: z.number().min(0),
+  brainTokensPerDay: z.number().int().min(0),
+  gatewayHardUsd: z.number().min(0),
+});
+export type BudgetsConfig = z.infer<typeof budgetsConfigSchema>;
+
 /** Domain registry — one schema per on-disk config file. */
 export const configDomainSchemas = {
   supervision: supervisionConfigSchema,
   policies: safetyPoliciesConfigSchema,
   console: consoleConfigSchema,
   quota: quotaConfigSchema,
+  brain: brainConfigSchema,
+  worktrees: worktreesConfigSchema,
+  projects: projectsConfigSchema,
+  dispatch: dispatchConfigSchema,
+  validation: validationConfigSchema,
+  budgets: budgetsConfigSchema,
 } as const;
 
-export const configDomainSchema = z.enum(["supervision", "policies", "console", "quota"]);
+export const configDomainSchema = z.enum([
+  "supervision",
+  "policies",
+  "console",
+  "quota",
+  "brain",
+  "worktrees",
+  "projects",
+  "dispatch",
+  "validation",
+  "budgets",
+]);
 export type ConfigDomain = z.infer<typeof configDomainSchema>;
 
 export const CONFIG_DOMAINS: readonly ConfigDomain[] = [
@@ -87,6 +164,12 @@ export const CONFIG_DOMAINS: readonly ConfigDomain[] = [
   "policies",
   "console",
   "quota",
+  "brain",
+  "worktrees",
+  "projects",
+  "dispatch",
+  "validation",
+  "budgets",
 ];
 
 /** The fully-resolved effective config across all domains. */
@@ -95,6 +178,12 @@ export const agentOsConfigSchema = z.strictObject({
   policies: safetyPoliciesConfigSchema,
   console: consoleConfigSchema,
   quota: quotaConfigSchema,
+  brain: brainConfigSchema,
+  worktrees: worktreesConfigSchema,
+  projects: projectsConfigSchema,
+  dispatch: dispatchConfigSchema,
+  validation: validationConfigSchema,
+  budgets: budgetsConfigSchema,
 });
 export type AgentOsConfig = z.infer<typeof agentOsConfigSchema>;
 

@@ -4,8 +4,8 @@ import { agentRoleSchema } from "./providers.js";
 
 /**
  * Daemon ⇄ Pi extension Unix-socket frames (master plan §2.1, §5).
- * NDJSON lines, zod-validated both ways. Phase 2 carries telemetry + control;
- * Brain tool bridge expands in Phase 3.
+ * NDJSON lines, zod-validated both ways. Telemetry + control (Phase 2) plus
+ * the Brain tool bridge (`ext.tool_call` / `ctl.tool_result`, Phase 3).
  */
 
 export const extensionHelloFrameSchema = z.strictObject({
@@ -58,12 +58,39 @@ export const extensionToolBlockedFrameSchema = z.strictObject({
 });
 export type ExtensionToolBlockedFrame = z.infer<typeof extensionToolBlockedFrameSchema>;
 
+/** Brain tool-call frame (Phase 3 tool bridge). */
+export const extensionToolCallFrameSchema = z.strictObject({
+  type: z.literal("ext.tool_call"),
+  sessionId: ulidSchema,
+  invocationId: ulidSchema,
+  tool: z.string(),
+  input: z.record(z.string(), z.unknown()),
+  ts: isoTimestampSchema,
+});
+export type ExtensionToolCallFrame = z.infer<typeof extensionToolCallFrameSchema>;
+
+/**
+ * A crewmate asking the Captain/Brain a blocking question. The daemon keys the
+ * question by id so `answer_crewmate` can route the answer back to the exact
+ * session that asked it.
+ */
+export const extensionQuestionFrameSchema = z.strictObject({
+  type: z.literal("ext.question"),
+  sessionId: ulidSchema,
+  questionId: ulidSchema,
+  question: z.string().min(1).max(20_000),
+  ts: isoTimestampSchema,
+});
+export type ExtensionQuestionFrame = z.infer<typeof extensionQuestionFrameSchema>;
+
 /** Frames the extension may send to the daemon. */
 export const extensionToDaemonFrameSchema = z.discriminatedUnion("type", [
   extensionHelloFrameSchema,
   extensionLifecycleFrameSchema,
   extensionUsageFrameSchema,
   extensionToolBlockedFrameSchema,
+  extensionToolCallFrameSchema,
+  extensionQuestionFrameSchema,
 ]);
 export type ExtensionToDaemonFrame = z.infer<typeof extensionToDaemonFrameSchema>;
 
@@ -83,6 +110,20 @@ export const daemonControlFrameSchema = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("ctl.shutdown"),
     reason: z.string(),
+    ts: isoTimestampSchema,
+  }),
+  z.strictObject({
+    type: z.literal("ctl.tool_result"),
+    sessionId: ulidSchema,
+    invocationId: ulidSchema,
+    ok: z.boolean(),
+    data: z.unknown().optional(),
+    error: z
+      .strictObject({
+        code: z.string(),
+        message: z.string(),
+      })
+      .optional(),
     ts: isoTimestampSchema,
   }),
 ]);

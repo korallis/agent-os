@@ -1,26 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { eventEnvelopeSchema, type EventEnvelope } from "@agent-os/protocol";
+import {
+  ORCHESTRATOR_EVENT_TYPES,
+  eventEnvelopeSchema,
+  type EventEnvelope,
+} from "@agent-os/protocol";
 
-/** Named SSE event types (Phase 1 + Phase 2). Named events do not fire onmessage. */
-const EVENT_TYPES = [
-  "daemon.started",
-  "daemon.stopping",
-  "config.installed",
-  "config.changed",
-  "config.rejected",
-  "policy.changed",
-  "provider.connection_updated",
-  "provider.credential_refreshed",
-  "provider.billing_mismatch",
-  "quota.updated",
-  "quota.threshold",
-  "ext.hello",
-  "ext.usage",
-  "onboarding.step",
-  "onboarding.completed",
-] as const;
+/** Named SSE event types derived from the protocol schema so they cannot drift. */
+const EVENT_TYPES = ORCHESTRATOR_EVENT_TYPES;
 
 export type StreamState = "connecting" | "live" | "down";
 
@@ -28,6 +16,8 @@ export interface EventStream {
   state: StreamState;
   /** Newest first, capped. */
   events: EventEnvelope[];
+  /** Newest single envelope (or null before first). */
+  lastEvent: EventEnvelope | null;
   /** Total envelopes received this session (incl. replay). */
   received: number;
 }
@@ -73,5 +63,5 @@ export function useEventStream(cap = 100): EventStream {
     };
   }, [cap]);
 
-  return { state, events, received };
+  return { state, events, lastEvent: events[0] ?? null, received };
 }

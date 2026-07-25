@@ -1,0 +1,7 @@
+// budgets.json5 — cost ceilings (master plan §2.6 surface #9).
+{
+  perTaskUsd: 5,
+  claudeExtraUsageDailyUsd: 10,
+  brainTokensPerDay: 200000,
+  gatewayHardUsd: 25,
+}

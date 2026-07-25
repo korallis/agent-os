@@ -137,15 +137,26 @@ try {
 
   // ---------- G4 (part 1): defaults installed + effective sources ----------
   {
-    const domains = readdirSync(join(home, "config")).filter((f) => f.endsWith(".json5"));
+    // Every shipped default domain must be materialised into the home — the
+    // set grows per phase, so compare against the shipped directory itself
+    // rather than a hard-coded count.
+    const shipped = readdirSync(join(ROOT, "apps", "orchestrator", "defaults"))
+      .filter((f) => f.endsWith(".json5"))
+      .sort();
+    const domains = readdirSync(join(home, "config"))
+      .filter((f) => f.endsWith(".json5"))
+      .sort();
     const effective = await (await api("/v1/config/effective", token)).json();
+    const missing = shipped.filter((f) => !domains.includes(f));
     gate(
       "G4a",
       "shipped defaults install; /v1/config/effective per-key source layer",
-      domains.length === 3 &&
+      shipped.length > 0 &&
+        missing.length === 0 &&
+        domains.length === shipped.length &&
         effective.sources["supervision.heartbeatSeconds"] === "shipped" &&
         effective.config.policies.scoutReadOnly === true,
-      `installed=[${domains.join(",")}]`,
+      `installed=${domains.length}/${shipped.length}${missing.length ? ` missing=[${missing.join(",")}]` : ""}`,
     );
   }
 
@@ -304,8 +315,27 @@ try {
     const quarantined = readdirSync(join(home, "events")).filter((f) =>
       f.startsWith("quarantine-"),
     );
-    // SSE resume from the pre-kill cursor: must deliver the post-restart
-    // daemon.started with a strictly increasing seq and no duplicates.
+
+    // Exactly-once: the projection holds every durable log line once — no
+    // replay duplicates, no dropped survivors. Boot itself appends events
+    // (daemon.started plus subsystem readiness), so the invariant is
+    // "projection == log, ids unique", not a fixed delta.
+    const logLines = readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l));
+    const ids = logLines.map((e) => e.id);
+    const uniqueIds = new Set(ids);
+    const seqsInLog = logLines.map((e) => e.seq);
+    const logMonotonic = seqsInLog.every((s, i) => i === 0 || s > seqsInLog[i - 1]);
+    const exactlyOnce =
+      after.events.count === logLines.length &&
+      uniqueIds.size === ids.length &&
+      after.events.count > before.events.count &&
+      logMonotonic;
+
+    // SSE resume from the pre-kill cursor: must deliver only post-kill events,
+    // starting at the next seq, strictly increasing, including daemon.started.
     const resumed = await readSse(
       token,
       { "last-event-id": lastIdBeforeKill },
@@ -317,12 +347,12 @@ try {
     gate(
       "G2",
       "kill -9 after 100+ events → exactly-once projection + SSE resume; corrupt tail quarantined",
-      after.events.count === before.events.count + 1 && // exactly the new daemon.started
+      exactlyOnce &&
         quarantined.length === 1 &&
         resumed.length >= 1 &&
         seqs[0] === before.events.lastSeq + 1 &&
         strictlyIncreasing,
-      `before=${before.events.count} after=${after.events.count} quarantined=${quarantined.length} resumedFrom=#${seqs[0]}`,
+      `before=${before.events.count} after=${after.events.count} log=${logLines.length} dupes=${ids.length - uniqueIds.size} quarantined=${quarantined.length} resumedFrom=#${seqs[0]}`,
     );
   }
 

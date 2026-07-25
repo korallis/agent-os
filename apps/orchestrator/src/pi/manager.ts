@@ -103,6 +103,8 @@ export interface BuildSpawnOptions {
   args: string[];
   cwd: string;
   sessionId: string;
+  /** Role the extension reports in `ext.hello`; gates the tool bridge. */
+  role: string;
   socketPath: string;
   /** Extension path (agent-os) always passed with -e. */
   extensionPath: string;
@@ -126,6 +128,7 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
     AGENTOS_HOME: options.agentosHome,
     AGENTOS_SESSION_ID: options.sessionId,
     AGENTOS_SOCKET: options.socketPath,
+    AGENTOS_ROLE: options.role,
   };
   if (options.detection.configDirEnv !== null) {
     extraAllow[options.detection.configDirEnv] = options.detection.managedHome;

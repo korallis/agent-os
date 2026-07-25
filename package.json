@@ -13,10 +13,13 @@
     "lint": "turbo run lint",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck",
-    "verify:no-deprecated": "node scripts/verify-no-deprecated.mjs"
+    "verify:no-deprecated": "node scripts/verify-no-deprecated.mjs",
+    "gates": "node tooling/gates/phase-1.mjs && node tooling/gates/phase-2.mjs && node tooling/gates/phase-3.mjs",
+    "screenshots": "pnpm run build && node tooling/screenshots/capture-console.mjs"
   },
   "devDependencies": {
     "eslint": "9.39.4",
+    "playwright": "1.62.0",
     "turbo": "2.10.6",
     "typescript": "5.9.3",
     "typescript-eslint": "8.65.0"
