@@ -792,12 +792,18 @@ describe("/opinion live path", () => {
     const { taskId } = seedShipTask(service);
     events.length = 0;
 
-    // Only one worktree slot: first side spawns, second fails mid-cast.
-    service.worktrees.updateConfig({
-      poolSize: 1,
-      reclaimPolicy: "verified-reset",
-      networkPolicy: "fetch-allowed",
-    });
+    // Inject a mid-cast lease failure on the second side. poolSize: 1 is no
+    // longer enough: the first side settles and releases its lease before the
+    // second spawn runs, so a real pool of one would succeed for both sides.
+    const originalLease = service.worktrees.lease.bind(service.worktrees);
+    let leaseCalls = 0;
+    service.worktrees.lease = ((input: Parameters<typeof originalLease>[0]) => {
+      leaseCalls += 1;
+      if (leaseCalls >= 2) {
+        throw new Error("worktree pool exhausted");
+      }
+      return originalLease(input);
+    }) as typeof service.worktrees.lease;
 
     const result = service.tools.invoke("dispatch_fusion", {
       taskId,

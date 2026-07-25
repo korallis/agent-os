@@ -1538,7 +1538,7 @@ export class ToolSurface {
   ): void {
     for (let i = 0; i < failedAtIndex; i++) {
       const sessionId = spawnedSessionIds[i];
-      if (sessionId === null) continue;
+      if (sessionId == null) continue;
       const live = this.sessions.get(sessionId);
       if (
         live === undefined ||
@@ -1612,8 +1612,9 @@ export class ToolSurface {
   /**
    * Capture a fusion side's output when its session settles, emit
    * fusion.side_completed, and finish the run when every side is done.
-   * Ownership stays until the run completes or the session stops so late
-   * usage frames after agent_settled are still attributed.
+   * The settled side's pane is killed and its worktree lease released so it
+   * does not hold a pool slot. fusionBySessionId stays until the run
+   * completes so late usage frames after agent_settled still attribute.
    */
   private completeFusionSide(sessionId: string): void {
     const ref = this.fusionBySessionId.get(sessionId);
@@ -1633,6 +1634,7 @@ export class ToolSurface {
     if (side.settledAt != null || side.artifactPath !== null) {
       // Already recorded (e.g. double settle from agent_settled + session_end).
       this.tryCompleteFusionRun(ref.taskId, ref.runId);
+      this.releaseSettledFusionCrewmate(sessionId);
       return;
     }
 
@@ -1675,6 +1677,50 @@ export class ToolSurface {
     });
 
     this.tryCompleteFusionRun(ref.taskId, ref.runId);
+    this.releaseSettledFusionCrewmate(sessionId);
+  }
+
+  /**
+   * Stop a settled fusion side's pane and free its worktree lease without
+   * dropping fusion ownership (that stays until the whole run completes).
+   */
+  private releaseSettledFusionCrewmate(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) return;
+    if (session.status === "stopped" || session.status === "lost") return;
+
+    try {
+      this.deps.tmux.killWindow(session.tmuxWindow);
+    } catch {
+      // Pane may already be gone (real session_end / prior halt).
+    }
+    void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
+    this.releaseWorktreeLeases({ sessionId });
+    const now = new Date().toISOString();
+    const released = this.sessions.get(sessionId) ?? session;
+    this.sessions.set(sessionId, { ...released, status: "stopped" });
+    if (session.taskId !== null) {
+      const task = this.tasks.get(session.taskId);
+      if (task !== undefined) {
+        this.saveTask({
+          ...task,
+          sessions: task.sessions.map((s) =>
+            s.sessionId === sessionId
+              ? { ...s, status: "stopped", lastEventAt: now }
+              : s,
+          ),
+          updatedAt: now,
+        });
+      }
+    }
+    this.sink({
+      type: "session.stopped",
+      payload: {
+        sessionId,
+        taskId: session.taskId,
+        reason: "fusion side settled",
+      },
+    });
   }
 
   /**
@@ -2642,6 +2688,16 @@ export class ToolSurface {
     // Finalize any in-flight fusion side before dropping ownership so a
     // pane-lost side cannot leave the run stranded on fusion.dispatched.
     this.completeFusionSide(sessionId);
+    // Kill a still-live pane so reconcile/respawn cannot share
+    // AGENTOS_SESSION_DIR/outputs with an orphan process.
+    const afterFusion = this.sessions.get(sessionId) ?? session;
+    if (afterFusion.status !== "stopped" && afterFusion.status !== "lost") {
+      try {
+        this.deps.tmux.killWindow(afterFusion.tmuxWindow);
+      } catch {
+        // Pane may already be gone.
+      }
+    }
     void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId });
     const released = this.sessions.get(sessionId) ?? session;

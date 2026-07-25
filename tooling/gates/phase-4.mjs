@@ -107,7 +107,7 @@ try {
   const home = mkdtempSync(join(tmpdir(), "agentos-p4-home-"));
   cleanups.push(home);
   child = startDaemon(home, PORT);
-  const token = await waitForHealth(home, PORT);
+  let token = await waitForHealth(home, PORT);
 
   const repo = fixtureRepo();
   cleanups.push(repo);
