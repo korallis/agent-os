@@ -1,7 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import {
   agentRoleSchema,
@@ -53,7 +53,10 @@ interface PendingToolCall {
 
 /** Minimal Pi extension API surface we depend on (real Pi 0.82+ plus contract hosts). */
 export interface PiExtensionApi {
-  on?: (event: string, handler: (...args: unknown[]) => void) => void;
+  on?: (
+    event: string,
+    handler: (...args: unknown[]) => unknown,
+  ) => void;
   version?: string;
   registerTool?: (definition: {
     name: string;
@@ -428,6 +431,85 @@ function messageFromEvent(event: unknown): unknown {
   return event;
 }
 
+/** True when `candidate` resolves inside `gateRoot` (../ cannot walk in). */
+export function pathIsInsideGate(candidate: string, gateRoot: string, cwd: string): boolean {
+  if (candidate.length === 0) return false;
+  const resolved = resolve(cwd, candidate);
+  const gate = resolve(gateRoot);
+  const rel = relative(gate, resolved);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+/** Collect path-like arguments from a Pi tool call for gate-workspace denial. */
+export function collectToolPathCandidates(
+  toolName: string,
+  input: Record<string, unknown>,
+): string[] {
+  const paths: string[] = [];
+  const push = (value: unknown): void => {
+    if (typeof value === "string" && value.length > 0) paths.push(value);
+  };
+
+  push(input.path);
+  push(input.file);
+  push(input.filepath);
+  push(input.file_path);
+  push(input.filePath);
+  push(input.target);
+  push(input.target_path);
+  push(input.targetPath);
+
+  if (Array.isArray(input.paths)) {
+    for (const p of input.paths) push(p);
+  }
+  if (Array.isArray(input.edits)) {
+    for (const edit of input.edits) {
+      if (edit !== null && typeof edit === "object") {
+        push((edit as { path?: unknown }).path);
+      }
+    }
+  }
+
+  if (toolName === "bash" || toolName === "shell") {
+    const command = typeof input.command === "string" ? input.command : "";
+    if (command.length > 0) {
+      // Absolute path tokens in the command line (../ already resolved by resolve()).
+      for (const match of command.matchAll(/(?:^|[\s"'=])(\/[^\s"'\\;|&]+)/g)) {
+        const token = match[1];
+        if (token !== undefined) push(token);
+      }
+    }
+  }
+
+  return paths;
+}
+
+/**
+ * If any resolved path falls inside the gate workspace, return a block reason.
+ * Otherwise null.
+ */
+export function gateWorkspaceBlockReason(
+  toolName: string,
+  input: Record<string, unknown>,
+  gateWorkspace: string,
+  cwd: string = process.cwd(),
+): string | null {
+  const gate = resolve(gateWorkspace);
+  for (const candidate of collectToolPathCandidates(toolName, input)) {
+    if (pathIsInsideGate(candidate, gate, cwd)) {
+      return `builder is tool/fs-blocked from the gate workspace (${gate}): refused path ${resolve(cwd, candidate)}`;
+    }
+  }
+  // Bash may reference the gate dir by absolute path substring without a clean token.
+  if (toolName === "bash" || toolName === "shell") {
+    const command = typeof input.command === "string" ? input.command : "";
+    if (command.includes(gate)) {
+      return `builder is tool/fs-blocked from the gate workspace (${gate}): refused command reference`;
+    }
+  }
+  return null;
+}
+
 /**
  * Pi extension entry — Pi loads this when passed with `-e`.
  * Uses AGENTOS_SOCKET / AGENTOS_SESSION_ID / AGENTOS_ROLE / AGENTOS_SESSION_DIR
@@ -487,6 +569,32 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
   // orchestration tools in the model-visible catalogue. Brain only.
   if (role === "brain") {
     registerAgentOsTools(pi, host);
+  }
+
+  // Builder gate-dir fence: deny tool calls whose resolved paths fall inside
+  // the task gate workspace. Report via ext.tool_blocked for audit.
+  const gateWorkspace = process.env.AGENTOS_GATE_WORKSPACE;
+  if (role === "builder" && gateWorkspace !== undefined && gateWorkspace.length > 0) {
+    pi.on?.("tool_call", (event: unknown) => {
+      try {
+        if (event === null || typeof event !== "object") return undefined;
+        const toolName =
+          typeof (event as { toolName?: unknown }).toolName === "string"
+            ? (event as { toolName: string }).toolName
+            : "";
+        const rawInput = (event as { input?: unknown }).input;
+        const input =
+          rawInput !== null && typeof rawInput === "object"
+            ? (rawInput as Record<string, unknown>)
+            : {};
+        const reason = gateWorkspaceBlockReason(toolName, input, gateWorkspace);
+        if (reason === null) return undefined;
+        host.toolBlocked(toolName.length > 0 ? toolName : "unknown", reason);
+        return { block: true, reason };
+      } catch {
+        return undefined;
+      }
+    });
   }
 
   pi.on?.("agent_start", () => host.lifecycle("session_start"));

@@ -40,10 +40,12 @@ const BASE_ALLOWLIST = new Set([
   "COLORTERM",
   "SHELL",
   "SSH_AUTH_SOCK",
-  "AGENTOS_HOME",
+  // AGENTOS_HOME is granted only via extraAllow (Brain seat). Non-Brain seats
+  // must not inherit a path into ~/.agentos/runs/*/gate-workspace.
   "AGENTOS_SESSION_ID",
   "AGENTOS_SOCKET",
   "AGENTOS_ROLE",
+  "AGENTOS_GATE_WORKSPACE",
   "PI_CONFIG_DIR",
   "PI_HOME",
   "XDG_CONFIG_HOME",

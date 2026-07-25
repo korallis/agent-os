@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import agentOsPiExtension, {
   AgentOsExtensionHost,
   extractAssistantText,
+  gateWorkspaceBlockReason,
+  pathIsInsideGate,
   usageFromAssistantMessage,
   type PiExtensionApi,
 } from "../src/extension.js";
@@ -26,6 +28,7 @@ afterEach(() => {
   delete process.env.AGENTOS_SESSION_ID;
   delete process.env.AGENTOS_ROLE;
   delete process.env.AGENTOS_SESSION_DIR;
+  delete process.env.AGENTOS_GATE_WORKSPACE;
 });
 
 describe("agent-os extension socket frames", () => {
@@ -284,5 +287,104 @@ describe("clean-room model-visible tool surface", () => {
     expect(registered).toContain("read_run_artifacts");
     expect(registered).toContain("agent_os_ask");
     expect(registered.length).toBeGreaterThan(10);
+  });
+});
+
+describe("builder gate-workspace tool fence", () => {
+  it("pathIsInsideGate resolves and rejects ../ escape", () => {
+    const gate = "/tmp/agentos-gate-ws";
+    const cwd = "/tmp/builder-tree";
+    expect(pathIsInsideGate(`${gate}/gate.py`, gate, cwd)).toBe(true);
+    expect(pathIsInsideGate("/tmp/builder-tree/src/a.ts", gate, cwd)).toBe(false);
+    expect(pathIsInsideGate("../agentos-gate-ws/secret", gate, cwd)).toBe(true);
+    expect(pathIsInsideGate("../../etc/passwd", gate, cwd)).toBe(false);
+  });
+
+  it("gateWorkspaceBlockReason blocks read/write into the gate dir", () => {
+    const gate = "/tmp/agentos-gate-ws";
+    const cwd = "/tmp/builder-tree";
+    const blocked = gateWorkspaceBlockReason(
+      "read",
+      { path: `${gate}/gate.py` },
+      gate,
+      cwd,
+    );
+    expect(blocked).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason("write", { path: `${cwd}/ok.ts` }, gate, cwd),
+    ).toBeNull();
+  });
+
+  it("blocks builder tool_call into gate workspace and emits ext.tool_blocked", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-gate-fence-"));
+    dirs.push(dir);
+    const gateDir = join(dir, "gate-workspace");
+    const socketPath = join(dir, "hub.sock");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE0";
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "builder";
+    process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+
+    const frames: unknown[] = [];
+    let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
+
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString("utf8");
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line.length === 0) continue;
+            frames.push(JSON.parse(line));
+            if (frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              server.close();
+              resolve();
+            }
+          }
+        });
+      });
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const pi: PiExtensionApi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        expect(toolCallHandler).toBeTypeOf("function");
+        void host!.connect().then(() => {
+          const result = toolCallHandler?.({
+            toolName: "read",
+            toolCallId: "tc1",
+            input: { path: join(gateDir, "gate.py") },
+          }) as { block?: boolean; reason?: string } | undefined;
+          expect(result?.block).toBe(true);
+          expect(result?.reason ?? "").toMatch(/tool\/fs-blocked/);
+          setTimeout(() => {
+            if (!frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              host?.close();
+              server.close();
+              reject(new Error("ext.tool_blocked not received"));
+            }
+          }, 2000);
+        });
+      });
+    });
+
+    const blocked = frames.find(
+      (f) => (f as { type?: string }).type === "ext.tool_blocked",
+    );
+    const parsed = extensionToDaemonFrameSchema.parse(blocked);
+    expect(parsed.type).toBe("ext.tool_blocked");
+    if (parsed.type === "ext.tool_blocked") {
+      expect(parsed.toolName).toBe("read");
+      expect(parsed.reason).toMatch(/gate workspace/);
+    }
   });
 });

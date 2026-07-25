@@ -1,7 +1,10 @@
 export {
   AgentOsExtensionHost,
   EXTENSION_VERSION,
+  collectToolPathCandidates,
   extractAssistantText,
+  gateWorkspaceBlockReason,
+  pathIsInsideGate,
   usageFromAssistantMessage,
   type ExtensionHostOptions,
   type PiExtensionApi,

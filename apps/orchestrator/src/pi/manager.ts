@@ -124,6 +124,11 @@ export interface BuildSpawnOptions {
   grantProviderKey?: { name: ProviderKeyEnvName; value: string } | null;
   /** Clean-room: add --no-skills --no-extensions --no-context-files, then re-add -e. */
   cleanRoom?: boolean;
+  /**
+   * Absolute path to the task gate workspace. Passed to builders as
+   * AGENTOS_GATE_WORKSPACE so the extension can deny tool paths inside it.
+   */
+  gateWorkspace?: string;
 }
 
 /**
@@ -137,11 +142,18 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
   }
 
   const extraAllow: Record<string, string> = {
-    AGENTOS_HOME: options.agentosHome,
     AGENTOS_SESSION_ID: options.sessionId,
     AGENTOS_SOCKET: options.socketPath,
     AGENTOS_ROLE: options.role,
   };
+  // AGENTOS_HOME is only for the Brain seat (extension socket + secrets layout
+  // awareness). Crewmates must not receive a path into runs/*/gate-workspace.
+  if (options.role === "brain") {
+    extraAllow.AGENTOS_HOME = options.agentosHome;
+  }
+  if (options.role === "builder" && options.gateWorkspace !== undefined) {
+    extraAllow.AGENTOS_GATE_WORKSPACE = options.gateWorkspace;
+  }
   if (options.sessionDir !== undefined) {
     // Extension captures side output under AGENTOS_SESSION_DIR/outputs/.
     extraAllow.AGENTOS_SESSION_DIR = options.sessionDir;

@@ -215,8 +215,25 @@ print("PASS")
     );
   }
 
-  // G2 — baseline that PASSES is a gate defect; no builder may spawn
+  // G2 — EXPECTED_RED before builder: refuse spawn with no baseline at all,
+  // and refuse after a baseline that PASSES (gate defect).
   {
+    const beforeBaselineId = await readyTask(token, projectId, "No baseline yet", {
+      gateSource: RED_THEN_GREEN_GATE,
+    });
+    const earlySpawn = await callTool(token, "spawn_crewmate", {
+      taskId: beforeBaselineId,
+      role: "builder",
+      model: "openai/gpt-5.6-sol",
+      thinking: "medium",
+      vars: {},
+    });
+    const earlyMsg = String(earlySpawn.error?.message ?? "");
+    const earlyRefused =
+      earlySpawn.ok === false &&
+      earlySpawn.error?.code === "POLICY_VIOLATION" &&
+      /missing RED baseline proof|EXPECTED_RED/i.test(earlyMsg);
+
     const taskId = await readyTask(token, projectId, "Baseline defect", {
       gateSource: `#!/usr/bin/env python3
 # /// script
@@ -236,11 +253,12 @@ print("PASS")
     });
     gate(
       "G2",
-      "baseline PASS → GATE DEFECT and the builder is refused",
-      body.ok === false &&
+      "builder refused before any baseline (names missing RED proof); baseline PASS → GATE DEFECT",
+      earlyRefused &&
+        body.ok === false &&
         String(body.error?.message ?? "").includes("GATE DEFECT") &&
         spawned.ok === false,
-      `gate=${body.error?.code} spawn=${spawned.error?.code}`,
+      `early=${earlySpawn.error?.code} earlyMsg=${earlyMsg.slice(0, 80)} gate=${body.error?.code} spawn=${spawned.error?.code}`,
     );
   }
 
@@ -266,7 +284,8 @@ print("PASS")
     );
   }
 
-  // G4 — validator write-jailed to the gate workspace; builder elsewhere
+  // G4 — validator write-jailed; builder tree separate; builder tool path into
+  // the gate workspace is BLOCKED and an ext.tool_blocked frame is emitted.
   let jailTaskId;
   {
     jailTaskId = await readyTask(token, projectId, "Write jail", {
@@ -290,16 +309,106 @@ print("PASS")
     const gateWorkspace = join(home, "runs", jailTaskId, "gate-workspace");
     const validatorPath = validator.data?.session?.worktreePath ?? "";
     const builderPath = builder.data?.session?.worktreePath ?? "";
+    const blockedAbs = join(gateWorkspace, "gate.py");
+
+    // Drive the real extension entry: builder role + AGENTOS_GATE_WORKSPACE must
+    // block a read of an absolute path inside the gate dir and emit ext.tool_blocked.
+    const { createServer } = await import("node:net");
+    const { agentOsPiExtension } = await import(
+      join(ROOT, "packages", "pi-extension", "dist", "index.js")
+    );
+    const sockDir = mkdtempSync(join(tmpdir(), "agentos-p5-g4-"));
+    cleanups.push(sockDir);
+    const sockPath = join(sockDir, "ext.sock");
+    const frames = [];
+    let toolCallHandler = null;
+    const blockResult = await new Promise((resolve, reject) => {
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString("utf8");
+          let nl;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line.length === 0) continue;
+            try {
+              frames.push(JSON.parse(line));
+            } catch {
+              // ignore
+            }
+          }
+        });
+      });
+      server.on("error", reject);
+      server.listen(sockPath, () => {
+        const prev = {
+          socket: process.env.AGENTOS_SOCKET,
+          session: process.env.AGENTOS_SESSION_ID,
+          role: process.env.AGENTOS_ROLE,
+          gate: process.env.AGENTOS_GATE_WORKSPACE,
+        };
+        process.env.AGENTOS_SOCKET = sockPath;
+        process.env.AGENTOS_SESSION_ID = builder.data?.session?.sessionId ?? "01ARZ3NDEKTSV4RRFFQ69G5FG4";
+        process.env.AGENTOS_ROLE = "builder";
+        process.env.AGENTOS_GATE_WORKSPACE = gateWorkspace;
+        const pi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        if (host === undefined || toolCallHandler === null) {
+          server.close();
+          reject(new Error("extension did not register tool_call fence"));
+          return;
+        }
+        void host.connect().then(() => {
+          const result = toolCallHandler({
+            toolName: "read",
+            toolCallId: "t1",
+            input: { path: blockedAbs },
+          });
+          setTimeout(() => {
+            host.close();
+            server.close();
+            if (prev.socket === undefined) delete process.env.AGENTOS_SOCKET;
+            else process.env.AGENTOS_SOCKET = prev.socket;
+            if (prev.session === undefined) delete process.env.AGENTOS_SESSION_ID;
+            else process.env.AGENTOS_SESSION_ID = prev.session;
+            if (prev.role === undefined) delete process.env.AGENTOS_ROLE;
+            else process.env.AGENTOS_ROLE = prev.role;
+            if (prev.gate === undefined) delete process.env.AGENTOS_GATE_WORKSPACE;
+            else process.env.AGENTOS_GATE_WORKSPACE = prev.gate;
+            resolve(result);
+          }, 80);
+        });
+      });
+    });
+
+    const blockedOk =
+      blockResult &&
+      blockResult.block === true &&
+      String(blockResult.reason ?? "").includes("tool/fs-blocked");
+    const toolBlockedFrame = frames.find((f) => f.type === "ext.tool_blocked");
+    const toolBlockedRecorded =
+      toolBlockedFrame !== undefined &&
+      toolBlockedFrame.toolName === "read" &&
+      String(toolBlockedFrame.reason ?? "").includes("gate workspace");
+
     gate(
       "G4",
-      "validator write-jailed to the gate workspace; builder tree is separate",
+      "validator write-jailed; builder blocked from gate-dir paths; ext.tool_blocked recorded",
       validator.ok === true &&
         builder.ok === true &&
         validatorPath === gateWorkspace &&
         builderPath !== gateWorkspace &&
         !builderPath.startsWith(gateWorkspace) &&
-        builderPath !== repo,
-      `validator=${validatorPath === gateWorkspace} builderSeparate=${builderPath !== gateWorkspace}`,
+        builderPath !== repo &&
+        blockedOk &&
+        toolBlockedRecorded,
+      `validator=${validatorPath === gateWorkspace} blocked=${blockedOk} tool_blocked=${toolBlockedRecorded}`,
     );
     await releaseTask(token, jailTaskId);
   }

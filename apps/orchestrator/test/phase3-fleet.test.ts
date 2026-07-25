@@ -197,6 +197,7 @@ describe("phase 3 fleet integration", () => {
             thinking: "medium",
             cleanRoom: true,
             vars: {},
+            redBaselineOverride: true,
           },
         }),
       });

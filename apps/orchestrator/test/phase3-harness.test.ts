@@ -50,6 +50,9 @@ function fleet(options: { fakePi?: boolean } = {}): FleetService {
   mkdirSync(join(home, "config"), { recursive: true });
   const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
   config.installDefaults();
+  // Phase-3 harness is not about red-baseline ordering; keep the looser spawn
+  // path so these cases stay focused on worktrees/env/session isolation.
+  config.writeGlobal("policies", "{ redBaselineGateRequired: false }\n");
   const service = new FleetService({
     home,
     config,
@@ -179,15 +182,35 @@ describe("spawn env delivery", () => {
       socketPath: join(home, "s.sock"),
       extensionPath: join(home, "ext.js"),
       grantProviderKey: apiGrant,
+      gateWorkspace: join(home, "runs", "task", "gate-workspace"),
     });
     expect(apiSpec.env.OPENAI_API_KEY).toBe("sk-openai-cast-secret");
     expect(apiSpec.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(apiSpec.env.AGENTOS_HOME).toBeUndefined();
+    expect(apiSpec.env.AGENTOS_GATE_WORKSPACE).toBe(
+      join(home, "runs", "task", "gate-workspace"),
+    );
     expect(
       Object.keys(apiSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
     ).toEqual(["OPENAI_API_KEY"]);
     // Durable spawn manifest records key names only (values stay in runtime env).
     expect(apiSpec.envKeys).toContain("OPENAI_API_KEY");
     expect(apiSpec.envKeys).not.toContain("sk-openai-cast-secret");
+    expect(apiSpec.envKeys).not.toContain("AGENTOS_HOME");
+
+    const brainSpec = buildPiSpawnSpec({
+      agentosHome: home,
+      detection,
+      args: ["--mode", "json"],
+      cwd: home,
+      sessionId: "01JSESSGRANT0000000000000BR",
+      role: "brain",
+      socketPath: join(home, "brain.sock"),
+      extensionPath: join(home, "ext.js"),
+      grantProviderKey: null,
+    });
+    expect(brainSpec.env.AGENTOS_HOME).toBe(home);
+    expect(brainSpec.env.AGENTOS_GATE_WORKSPACE).toBeUndefined();
 
     const oauthHome = temp("agentos-oauth-grant-");
     const oauthRegistry = new ConnectionRegistry(oauthHome);
