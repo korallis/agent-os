@@ -1,16 +1,16 @@
 {
   "capturedAgainst": {
-    "daemonPort": 5332,
-    "consolePort": 3601
+    "daemonPort": 5348,
+    "consolePort": 3618
   },
   "seeded": {
-    "projectId": "01KYDBH88JG0RC8WHSFJXKAVKS",
-    "taskA": "01KYDBH88TFKVEDDMG93NCPX3Y",
-    "taskB": "01KYDBH8CXG2YK5P47R5KDQ6GF",
-    "taskC": "01KYDBH8HFKCZK7FYWDDDHCCCM",
-    "sessionId": "01KYDBH8AQ4YAZARFHK2Y4VJW0",
-    "fusionRunId": "01KYDBH8DND134TZ739M9CM1CV",
-    "connectionId": "01KYDBH8MNXNNXWGQX1AFK95ZN"
+    "projectId": "01KYDC0Q5V4FVEGCVEMKBB17J7",
+    "taskA": "01KYDC0Q64QYF995BF6CMTK8CK",
+    "taskB": "01KYDC0QA3KHQKZ3G9Q2TZE90G",
+    "taskC": "01KYDC0QEJV8025ZQFDX8NYYRR",
+    "sessionId": "01KYDC0Q7Z5DTGWF94095FZ476",
+    "fusionRunId": "01KYDC0QAW4JFD56EK811A1XCQ",
+    "connectionId": "01KYDC0QHQQ4Y9W5X59KPHJG7Z"
   },
   "shots": [
     {
@@ -27,13 +27,13 @@
     },
     {
       "name": "task-detail-validation",
-      "path": "/tasks/01KYDBH88TFKVEDDMG93NCPX3Y",
+      "path": "/tasks/01KYDC0Q64QYF995BF6CMTK8CK",
       "note": "Brain decision lane + FAIL vs GATE_ERROR evidence",
       "status": 200
     },
     {
       "name": "task-detail-fusion",
-      "path": "/tasks/01KYDBH8CXG2YK5P47R5KDQ6GF",
+      "path": "/tasks/01KYDC0QA3KHQKZ3G9Q2TZE90G",
       "note": "Clean-room /fusion columns with byte-identical prompt proof",
       "status": 200
     },
@@ -111,15 +111,15 @@
     },
     {
       "name": "session-detail",
-      "path": "/sessions/01KYDBH8AQ4YAZARFHK2Y4VJW0",
+      "path": "/sessions/01KYDC0Q7Z5DTGWF94095FZ476",
       "note": "Seat model, tmux pane, attach command, agent log",
       "status": 200
     },
     {
-      "name": "fusion-run",
-      "path": "/runs/01KYDBH8DND134TZ739M9CM1CV",
-      "note": "Fusion run record with per-side prompt hashes",
-      "status": 404
+      "name": "terminal-attach",
+      "path": "/sessions/01KYDC1J4DEHX524CDDP75PBS9",
+      "note": "Read-only ticketed terminal streaming a live tmux pane",
+      "status": 200
     },
     {
       "name": "fleet-mobile",

@@ -26,6 +26,7 @@ show that the Console distinguishes it from a RED verdict.
 | "Add retry budget to the fetch client" | Cross-family cast, RED baseline proved, then a real `FAIL` and a real `GATE_ERROR` |
 | "Choose the cache eviction strategy" | Clean-room `/opinion` fusion across two families |
 | "Document the daemon event contract" | Delivered to `DONE`, so throughput and success rate are real |
+| "Stream a live crewmate pane" | Spawned immediately before the terminal capture, so the pane is still live when the socket attaches |
 
 Plus a registered project on a real git repo, a provider connection with a live quota probe,
 and a Captain escalation so the wake queue and alerts have real rows.
@@ -41,6 +42,7 @@ and a Captain escalation so the wake queue and alerts have real rows.
 | `task-detail-validation.png` | **`EXPECTED_RED` → `FAIL` → `GATE_ERROR`**, with `GATE_ERROR` labelled "no attempt consumed"; Brain decision lane showing 7 tool calls, 1 refused by the substrate |
 | `task-detail-fusion.png` | **`CLEAN-ROOM ✓ identical prompts`** with the *same* prompt hash (`7daeb64b764c`) on both sides, separate sessions, cross-family |
 | `session-detail.png` | Seat model, tmux pane, display-only attach command, agent log |
+| `terminal-attach.png` | **Read-only terminal streaming a live tmux pane** — button reads `Streaming`, pane content is real |
 | `projects.png` | Registered project and trust state |
 
 ### Usage, cost, and honesty
@@ -73,5 +75,9 @@ Several panels render empty states in this capture (for example "No agent teleme
 before crewmates report usage). Those are the **real** empty states of a young fleet, kept in
 the pack deliberately — a screenshot that only ever shows a full dashboard would hide how the
 product behaves on day one.
+
+A fake-Pi seat settles within seconds and its pane exits, so the terminal capture spawns its
+own fresh seat rather than attaching to one that has already finished. Under a real Pi the pane
+persists for the life of the seat.
 
 `manifest.json` records the seeded ids and the HTTP status of every captured page.

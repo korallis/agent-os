@@ -323,6 +323,63 @@ try {
   // Fusion evidence renders inside Task Detail (the fusion columns above);
   // there is deliberately no standalone /runs/:id screen to capture.
 
+  // Terminal attach. A fake-Pi seat settles within seconds and its pane exits,
+  // so a seat spawned at the start of the capture is already gone by now —
+  // attaching to it would screenshot an honest but uninteresting "pane is gone".
+  // Spawn a fresh seat here and attach while its pane is still live.
+  {
+    const taskD = (
+      await post("/v1/tasks", {
+        spec: {
+          shape: "SHIP",
+          title: "Stream a live crewmate pane",
+          intent: "Hold a pane open so the read-only terminal has something to show",
+          projectId,
+          mode: "local-only",
+          yolo: true,
+        },
+      })
+    ).task.id;
+    await tool("resolve_cast", {
+      taskId: taskD,
+      roles: [{ role: "builder", model: "openai/gpt-5.6-sol", thinking: "medium", cleanRoom: true }],
+      familyCheckOverride: false,
+    });
+    const spawned = await tool("spawn_crewmate", {
+      taskId: taskD,
+      role: "builder",
+      model: "openai/gpt-5.6-sol",
+      thinking: "medium",
+      vars: {},
+      redBaselineOverride: true,
+    });
+    const liveSessionId = spawned.data?.session?.sessionId ?? null;
+    if (liveSessionId !== null) {
+      await page.goto(`${CONSOLE}/sessions/${liveSessionId}`, { waitUntil: "networkidle" });
+      await sleep(500);
+      const attach = page.getByRole("button", { name: /attach|reconnect/i }).first();
+      if ((await attach.count()) > 0) {
+        await attach.click();
+        // "Streaming" is only reachable once the ticketed WebSocket upgrade
+        // succeeded and pane frames actually arrived.
+        try {
+          await page.getByRole("button", { name: /streaming/i }).waitFor({ timeout: 15_000 });
+        } catch {
+          console.warn("terminal did not reach Streaming within 15s — capturing as-is");
+        }
+        await sleep(1500);
+        await page.screenshot({ path: join(OUT, "terminal-attach.png"), fullPage: true });
+        shots.push({
+          name: "terminal-attach",
+          path: `/sessions/${liveSessionId}`,
+          note: "Read-only ticketed terminal streaming a live tmux pane",
+          status: 200,
+        });
+        console.log("captured terminal-attach (live PTY)");
+      }
+    }
+  }
+
   // Mobile pass on the two screens the Captain reads away from the desk.
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } });
   for (const [name, path] of [
