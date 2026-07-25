@@ -816,14 +816,38 @@ describe("/opinion live path", () => {
     const afterStop = service.fusionRuns.get(taskId, runId);
     expect(afterStop?.sides[1]?.settledAt).toBeTruthy();
     expect(afterStop?.sides[1]?.artifactPath).toBeNull();
+    expect(afterStop?.completedAt).toBeTruthy();
     expect(events.map((e) => e.type)).toContain("fusion.side_completed");
     expect(events.map((e) => e.type)).toContain("fusion.completed");
+    const completedStop = events.find((e) => e.type === "fusion.completed");
+    if (completedStop?.type === "fusion.completed") {
+      expect(completedStop.payload.error).toBe("test stop");
+    }
 
     const sideBEvent = events.find((e) => e.type === "fusion.side_completed");
     if (sideBEvent?.type === "fusion.side_completed") {
       expect(sideBEvent.payload.artifactPath).toBeNull();
       expect(sideBEvent.payload.model).toBe("openai/gpt-5.6-sol");
     }
+
+    // Terminal sessions must not resurrect on late settled/running frames.
+    events.length = 0;
+    service.tools.markSessionStatus(sessionB, "settled");
+    service.tools.markSessionStatus(sessionB, "running");
+    const afterResurrect = service.tools
+      .listSessions()
+      .find((s) => s.sessionId === sessionB);
+    expect(afterResurrect?.status).toBe("stopped");
+    expect(events.map((e) => e.type)).not.toContain("fusion.completed");
+    expect(events.map((e) => e.type)).not.toContain("fusion.side_completed");
+
+    // Durable completedAt: hydrate must not re-arm a finished run.
+    service.tools.hydrateFusionOwnership();
+    events.length = 0;
+    service.tools.markSessionStatus(sessionA, "settled");
+    service.tools.markSessionStatus(sessionB, "settled");
+    expect(events.map((e) => e.type)).not.toContain("fusion.completed");
+    expect(service.fusionRuns.get(taskId, runId)?.completedAt).toBeTruthy();
   });
 
   it("does not re-attribute a prior /opinion run's bytes to a sequential same-cast run", () => {
@@ -925,6 +949,8 @@ describe("/opinion live path", () => {
 
     const types = events.map((e) => e.type);
     expect(types).toContain("fusion.dispatched");
+    // Every side — including never-spawned — must emit side_completed before completed.
+    expect(types.filter((t) => t === "fusion.side_completed")).toHaveLength(2);
     expect(types).toContain("fusion.completed");
     const completed = events.find((e) => e.type === "fusion.completed");
     if (completed?.type === "fusion.completed") {
@@ -937,6 +963,7 @@ describe("/opinion live path", () => {
     expect(run.sides.every((s) => s.settledAt != null || s.artifactPath !== null)).toBe(
       true,
     );
+    expect(run.completedAt).toBeTruthy();
     // First side got a session + artifact; the failed side has no session.
     expect(run.sides[0]?.sessionId).not.toBeNull();
     expect(run.sides[0]?.artifactPath).not.toBeNull();

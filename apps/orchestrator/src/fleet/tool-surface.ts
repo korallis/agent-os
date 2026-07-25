@@ -360,6 +360,7 @@ export class ToolSurface {
   hydrateFusionOwnership(): void {
     for (const task of this.tasks.values()) {
       for (const run of this.deps.fusionRuns.listForTask(task.id)) {
+        if (run.completedAt != null) continue;
         run.sides.forEach((side, sideIndex) => {
           if (side.sessionId === null) return;
           if (side.settledAt != null || side.artifactPath !== null) return;
@@ -1278,8 +1279,9 @@ export class ToolSurface {
       this.auditScoutSession(input.sessionId);
     }
     // Finalize any in-flight fusion side before dropping ownership so a stop
-    // cannot leave the run stranded on fusion.dispatched.
-    this.completeFusionSide(input.sessionId);
+    // cannot leave the run stranded on fusion.dispatched. Pass reason so the
+    // last side's stop is not reported as a clean fusion.completed success.
+    this.completeFusionSide(input.sessionId, input.reason);
     this.deps.tmux.killWindow(session.tmuxWindow);
     void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId: input.sessionId });
@@ -1465,6 +1467,7 @@ export class ToolSurface {
       aggregatorFamily,
       contractOk,
       createdAt: new Date().toISOString(),
+      completedAt: null,
     };
     this.deps.fusionRuns.create(run);
     this.deps.fusionRuns.writeInstruction(task.id, runId, instruction);
@@ -1616,10 +1619,27 @@ export class ToolSurface {
         });
         return { ...s, sessionId, artifactPath, settledAt: now };
       }
+      // Never-spawned sides: still emit side_completed (null artifact) so a
+      // failed dispatch never jumps dispatched → completed with zero side events.
+      if (s.settledAt != null || s.artifactPath !== null) {
+        return { ...s, sessionId };
+      }
+      this.sink({
+        type: "fusion.side_completed",
+        payload: {
+          taskId,
+          runId,
+          role: s.role,
+          model: s.model,
+          family: s.family,
+          promptHash: s.promptHash,
+          artifactPath: null,
+        },
+      });
       return {
         ...s,
         sessionId,
-        settledAt: s.settledAt ?? now,
+        settledAt: now,
       };
     });
     this.deps.fusionRuns.save({ ...latest, sides });
@@ -1782,6 +1802,7 @@ export class ToolSurface {
   ): void {
     const run = this.deps.fusionRuns.get(taskId, runId);
     if (run === null) return;
+    if (run.completedAt != null) return;
     // A side is done when it has settled (possibly without an artifact) or,
     // for older records, when an artifact path was already written.
     if (!run.sides.every((s) => s.settledAt != null || s.artifactPath !== null)) {
@@ -1809,15 +1830,19 @@ export class ToolSurface {
   }
 
   private emitFusionCompleted(run: FusionRun, error?: string | null): void {
+    const latest = this.deps.fusionRuns.get(run.taskId, run.runId) ?? run;
+    if (latest.completedAt != null) return;
+    const completedAt = new Date().toISOString();
+    this.deps.fusionRuns.save({ ...latest, completedAt });
     this.sink({
       type: "fusion.completed",
       payload: {
-        taskId: run.taskId,
-        runId: run.runId,
-        kind: run.kind,
-        promptsIdentical: run.promptsIdentical,
-        aggregatorFamily: run.aggregatorFamily,
-        contractOk: run.contractOk,
+        taskId: latest.taskId,
+        runId: latest.runId,
+        kind: latest.kind,
+        promptsIdentical: latest.promptsIdentical,
+        aggregatorFamily: latest.aggregatorFamily,
+        contractOk: latest.contractOk,
         ...(error != null && error.length > 0 ? { error } : {}),
       },
     });
@@ -2304,10 +2329,12 @@ export class ToolSurface {
     // (e.g. a prior halt path). Re-arm and settle so hydrate cannot re-arm
     // a run with no live settle path on the next boot.
     for (const run of this.deps.fusionRuns.listForTask(taskId)) {
+      if (run.completedAt != null) continue;
       const sideCount = run.sides.length;
       for (let sideIndex = 0; sideIndex < sideCount; sideIndex++) {
         const latest = this.deps.fusionRuns.get(taskId, run.runId);
         if (latest === null) break;
+        if (latest.completedAt != null) break;
         const side = latest.sides[sideIndex];
         if (side === undefined) continue;
         if (side.settledAt != null || side.artifactPath !== null) continue;
@@ -2785,6 +2812,9 @@ export class ToolSurface {
   markSessionStatus(sessionId: string, status: FleetSession["status"]): void {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
+    // Terminal is terminal: late agent_settled / running frames after stop or
+    // lost must not resurrect the session (and must not inflate healthyLeft).
+    if (session.status === "stopped" || session.status === "lost") return;
     this.sessions.set(sessionId, { ...session, status });
     const task = session.taskId !== null ? this.tasks.get(session.taskId) : undefined;
     if (task !== undefined) {
@@ -2813,7 +2843,8 @@ export class ToolSurface {
     if (session.status === "lost" || session.status === "stopped") return;
     // Finalize any in-flight fusion side before dropping ownership so a
     // pane-lost side cannot leave the run stranded on fusion.dispatched.
-    this.completeFusionSide(sessionId);
+    // Pass reason so a lost last side is not reported as a clean success.
+    this.completeFusionSide(sessionId, reason);
     // Kill a still-live pane so reconcile/respawn cannot share
     // AGENTOS_SESSION_DIR/outputs with an orphan process.
     const afterFusion = this.sessions.get(sessionId) ?? session;

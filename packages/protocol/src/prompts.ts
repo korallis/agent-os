@@ -81,6 +81,12 @@ export const fusionRunSchema = z.strictObject({
   aggregatorFamily: modelFamilySchema.nullable(),
   contractOk: z.boolean().nullable(),
   createdAt: isoTimestampSchema,
+  /**
+   * When fusion.completed was emitted. Durable idempotency guard so re-entry
+   * or re-armed ownership after a restart cannot duplicate the completion event.
+   * Optional for records written before this field existed.
+   */
+  completedAt: isoTimestampSchema.nullable().optional(),
 });
 export type FusionRun = z.infer<typeof fusionRunSchema>;
 
