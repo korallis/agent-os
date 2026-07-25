@@ -42,9 +42,9 @@ function payloadTaskId(event: EventEnvelope): string | null {
  * replaces events. A failed refresh never wipes last-good history.
  */
 export function useTaskEvents(taskId: string): TaskEventsState {
-  const { lastEvent } = useEventStream();
+  const { events: streamEvents } = useEventStream();
   const refreshKey = useStickyRefreshKey(
-    lastEvent,
+    streamEvents,
     (event) => payloadTaskId(event) === taskId,
     taskId,
   );

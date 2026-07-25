@@ -471,8 +471,8 @@ interface FleetSummaryView {
 }
 
 export function FleetDashboard() {
-  const { events, lastEvent } = useEventStream();
-  const refreshKey = useDebouncedRefreshKey(lastEvent, isFleetAnalyticsEvent);
+  const { events } = useEventStream();
+  const refreshKey = useDebouncedRefreshKey(events, isFleetAnalyticsEvent);
   const [summary, setSummary] = useState<FleetSummaryView | null>(null);
   const [summaryStatus, setSummaryStatus] = useState<LoadStatus>("loading");
   const [analytics, setAnalytics] = useState<AnalyticsSnapshot | null>(null);

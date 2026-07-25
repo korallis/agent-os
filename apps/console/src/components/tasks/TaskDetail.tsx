@@ -56,10 +56,10 @@ export function TaskDetail({ taskId }: { taskId: string }) {
   const [task, setTask] = useState<TaskSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
-  const { lastEvent } = useEventStream();
+  const { events: streamEvents } = useEventStream();
   const taskEvents = useTaskEvents(taskId);
   const refreshKey = useStickyRefreshKey(
-    lastEvent,
+    streamEvents,
     (event) =>
       isTaskDetailRefreshEvent(event.event.type) && payloadTaskId(event) === taskId,
     taskId,

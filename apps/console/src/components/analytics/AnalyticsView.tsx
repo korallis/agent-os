@@ -62,8 +62,8 @@ function Card({ className, children }: { className?: string; children: React.Rea
 type LoadStatus = "loading" | "ready" | "unavailable";
 
 export function AnalyticsView() {
-  const { lastEvent } = useEventStream();
-  const refreshKey = useDebouncedRefreshKey(lastEvent, isFleetAnalyticsEvent);
+  const { events } = useEventStream();
+  const refreshKey = useDebouncedRefreshKey(events, isFleetAnalyticsEvent);
   const [snapshot, setSnapshot] = useState<AnalyticsSnapshot | null>(null);
   const [snapshotStatus, setSnapshotStatus] = useState<LoadStatus>("loading");
   const [budgets, setBudgets] = useState<BudgetsConfig | null>(null);

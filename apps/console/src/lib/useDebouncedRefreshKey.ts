@@ -4,15 +4,34 @@ import { useEffect, useRef, useState } from "react";
 import type { EventEnvelope } from "@agent-os/protocol";
 
 /**
+ * Newest-first scan for the first envelope that matches `isRelevant`.
+ * Looking only at `events[0]` drops relevant frames when React batches a
+ * relevant SSE message with a later irrelevant one into a single render
+ * (e.g. `task.created` immediately followed by `tool.invoked`).
+ */
+function newestRelevant(
+  events: EventEnvelope[],
+  isRelevant: (event: EventEnvelope) => boolean,
+): EventEnvelope | null {
+  for (const envelope of events) {
+    if (isRelevant(envelope)) return envelope;
+  }
+  return null;
+}
+
+/**
  * Sticky refresh key from the newest relevant SSE frame. Unrelated frames leave
  * the prior key in place so load effects do not thrash back to `"init"`.
  *
  * When `scopeKey` changes (e.g. taskId), the key resets to `"init"` so the
  * consumer reloads for the new scope. Uses React's render-time state
  * adjustment (store previous props) rather than an effect.
+ *
+ * Scans the full newest-first `events` list so a relevant frame buried under
+ * a later non-matching tip still advances the key.
  */
 export function useStickyRefreshKey(
-  lastEvent: EventEnvelope | null,
+  events: EventEnvelope[],
   isRelevant: (event: EventEnvelope) => boolean,
   scopeKey?: string,
 ): string {
@@ -27,9 +46,10 @@ export function useStickyRefreshKey(
     nextScope = scopeKey;
     nextKey = "init";
   }
-  if (lastEvent !== null && isRelevant(lastEvent)) {
+  const relevant = newestRelevant(events, isRelevant);
+  if (relevant !== null) {
     nextScope = scopeKey;
-    nextKey = lastEvent.id;
+    nextKey = relevant.id;
   }
   if (nextScope !== stored.scope || nextKey !== stored.key) {
     setStored({ scope: nextScope, key: nextKey });
@@ -47,11 +67,15 @@ export function useStickyRefreshKey(
  * forces a flush at least that often from the first pending frame, so live
  * dashboards still update while the fleet is busy.
  *
+ * Scans newest-first `events` for the newest relevant envelope — not only the
+ * stream tip — so React-batched non-relevant frames cannot hide a `task.created`
+ * (or similar) that must refresh the dashboard within the 1 s gate budget.
+ *
  * Returns "init" until the first relevant frame is flushed, so the consumer's
  * load effect still runs once on mount.
  */
 export function useDebouncedRefreshKey(
-  lastEvent: EventEnvelope | null,
+  events: EventEnvelope[],
   isRelevant: (eventType: string) => boolean,
   debounceMs = 300,
   maxWaitMs = 1000,
@@ -63,10 +87,12 @@ export function useDebouncedRefreshKey(
   const maxWaitTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (lastEvent === null) return;
-    if (!isRelevant(lastEvent.event.type)) return;
+    const relevant = newestRelevant(events, (envelope) => isRelevant(envelope.event.type));
+    if (relevant === null) return;
+    // Already applied or already scheduled for this exact frame — nothing new.
+    if (relevant.id === refreshKey || relevant.id === pendingIdRef.current) return;
 
-    pendingIdRef.current = lastEvent.id;
+    pendingIdRef.current = relevant.id;
     const now = Date.now();
     if (firstPendingAtRef.current === null) {
       firstPendingAtRef.current = now;
@@ -101,11 +127,11 @@ export function useDebouncedRefreshKey(
     }
 
     return () => {
-      // Keep pending timers across lastEvent identity changes so maxWait spans
+      // Keep pending timers across events identity changes so maxWait spans
       // a burst of frames; only clear when the effect is torn down for real
-      // (deps other than lastEvent) via the unmount path below.
+      // (deps other than events) via the unmount path below.
     };
-  }, [lastEvent, isRelevant, debounceMs, maxWaitMs]);
+  }, [events, isRelevant, debounceMs, maxWaitMs, refreshKey]);
 
   useEffect(() => {
     return () => {

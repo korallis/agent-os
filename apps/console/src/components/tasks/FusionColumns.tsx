@@ -32,9 +32,9 @@ function shortHash(hash: string | null): string {
 }
 
 export function FusionColumns({ taskId }: { taskId: string }) {
-  const { lastEvent } = useEventStream();
+  const { events: streamEvents } = useEventStream();
   const refreshKey = useStickyRefreshKey(
-    lastEvent,
+    streamEvents,
     (event) => event.event.type.startsWith("fusion."),
     taskId,
   );

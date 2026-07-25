@@ -55,8 +55,8 @@ function chipValue(status: LoadStatus, value: number): string {
 }
 
 export function NotificationsView() {
-  const { lastEvent } = useEventStream();
-  const refreshKey = useDebouncedRefreshKey(lastEvent, isNotificationsEvent);
+  const { events } = useEventStream();
+  const refreshKey = useDebouncedRefreshKey(events, isNotificationsEvent);
   const [wakes, setWakes] = useState<WakeDigest[]>([]);
   const [queue, setQueue] = useState<WakeDigest[]>([]);
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
