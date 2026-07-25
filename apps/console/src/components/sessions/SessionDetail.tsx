@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type {
@@ -89,6 +89,17 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
   const [logState, setLogState] = useState<LoadState>("loading");
   const [logTruncated, setLogTruncated] = useState(false);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const boundSessionId = useRef(sessionId);
+
+  if (boundSessionId.current !== sessionId) {
+    boundSessionId.current = sessionId;
+    setDetail(null);
+    setDetailState("loading");
+    setLog([]);
+    setLogState("loading");
+    setLogTruncated(false);
+    setCopyState("idle");
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -97,11 +108,11 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
         const res = await fetch(`/api/agentos/sessions/${sessionId}`, { cache: "no-store" });
         if (cancelled) return;
         if (res.status === 404) {
+          setDetail(null);
           setDetailState("missing");
           return;
         }
         if (!res.ok) {
-          // Keep any previously loaded detail rather than blanking the page.
           setDetailState((prev) => (prev === "ready" ? "ready" : "unavailable"));
           return;
         }
@@ -291,7 +302,7 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
               logState !== "ready"
                 ? "—"
                 : usageTotals.cost === null
-                  ? "not reported"
+                  ? formatUsageValue("not reported", usagePartial)
                   : formatUsageValue(`$${usageTotals.cost.toFixed(4)}`, usagePartial),
           },
         ].map((chip) => (

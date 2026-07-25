@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { FusionRun, FusionRunDetailResponse } from "@agent-os/protocol";
 import { useEventStream } from "@/lib/useEventStream";
@@ -46,6 +46,17 @@ export function FusionColumns({ taskId }: { taskId: string }) {
   const [detailFailedRunId, setDetailFailedRunId] = useState<string | null>(null);
   /** RunId currently being fetched (null when idle). */
   const [detailLoadingRunId, setDetailLoadingRunId] = useState<string | null>(null);
+  const boundTaskId = useRef(taskId);
+
+  if (boundTaskId.current !== taskId) {
+    boundTaskId.current = taskId;
+    setRuns([]);
+    setDetail(null);
+    setSelected(null);
+    setListStatus("loading");
+    setDetailFailedRunId(null);
+    setDetailLoadingRunId(null);
+  }
 
   useEffect(() => {
     let cancelled = false;
