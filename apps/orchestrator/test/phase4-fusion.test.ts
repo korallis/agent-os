@@ -315,6 +315,39 @@ describe("session keys (G6)", () => {
       specB.env.PI_CODING_AGENT_SESSION_DIR,
     );
 
+    // Cast thinking must reach Pi argv — not metadata-only.
+    const withThinking = buildPiSpawnSpec({
+      agentosHome: temp("agentos-p4-spec-home-t-"),
+      detection,
+      args: ["-p", "hi", "--model", "anthropic/claude-fable-5"],
+      cwd: temp("agentos-p4-spec-cwd-t-"),
+      sessionId: "01JSESSION000000000000000T",
+      role: "planner",
+      socketPath: "/tmp/agentos-test-t.sock",
+      extensionPath: join(temp("agentos-p4-ext-t-"), "ext.js"),
+      sessionDir: dirA,
+      thinking: "high",
+      cleanRoom: true,
+    });
+    expect(withThinking.args).toContain("--thinking");
+    expect(withThinking.args[withThinking.args.indexOf("--thinking") + 1]).toBe(
+      "high",
+    );
+    const withLow = buildPiSpawnSpec({
+      agentosHome: temp("agentos-p4-spec-home-tl-"),
+      detection,
+      args: ["-p", "hi", "--model", "openai/gpt-4.1"],
+      cwd: temp("agentos-p4-spec-cwd-tl-"),
+      sessionId: "01JSESSION00000000000000TL",
+      role: "planner",
+      socketPath: "/tmp/agentos-test-tl.sock",
+      extensionPath: join(temp("agentos-p4-ext-tl-"), "ext.js"),
+      sessionDir: dirB,
+      thinking: "low",
+      cleanRoom: true,
+    });
+    expect(withLow.args[withLow.args.indexOf("--thinking") + 1]).toBe("low");
+
     // Wipe exactly the openai session dir; anthropic survives.
     rmSync(dirB, { recursive: true, force: true });
     expect(
@@ -361,6 +394,76 @@ describe("session keys (G6)", () => {
     ).toBe(true);
     expect(service.tools.getTask(taskId)?.phase).not.toBe("SESSION_LOST");
     expect(service.tools.getTask(taskId)?.phase).toBe(phaseBefore);
+    expect(
+      service.sessionKeys.missingRoles(projectId, [
+        { role: "planner", model: "anthropic/claude-fable-5" },
+        { role: "planner", model: "openai/gpt-5.6-sol" },
+      ]),
+    ).toEqual([]);
+  });
+
+  it("removes a newly created session key when spawn fails so resume still sees the role missing", () => {
+    const { service } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+    let windowCalls = 0;
+    service.tmux.newWindow = ((input: Parameters<typeof originalNewWindow>[0]) => {
+      windowCalls += 1;
+      if (windowCalls === 1) {
+        throw new Error("tmux refused spawn");
+      }
+      return originalNewWindow(input);
+    }) as typeof service.tmux.newWindow;
+
+    const failed = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      vars: {},
+    });
+    expect(failed.ok).toBe(false);
+
+    // Orphan empty key dir must not exist — missingRoles must still list the role.
+    expect(
+      service.sessionKeys.missingRoles(projectId, [
+        { role: "planner", model: "anthropic/claude-fable-5" },
+      ]),
+    ).toEqual([{ role: "planner", model: "anthropic/claude-fable-5" }]);
+    expect(service.sessionKeys.has({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    })).toBe(false);
+
+    // Restart half: after a failed spawn the role is still missing and respawns.
+    service.tmux.newWindow = originalNewWindow;
+    // Seed a surviving sibling session so reconcileMissingCastRoles engages
+    // (it requires at least one prior session row on the task).
+    const sibling = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      vars: {},
+    });
+    expect(sibling.ok).toBe(true);
+    const siblingDir = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+    }).dir;
+    expect(existsSync(siblingDir)).toBe(true);
+
+    const respawned = service.tools.reconcileMissingCastRoles();
+    expect(respawned).toEqual([
+      {
+        taskId,
+        role: "planner",
+        model: "anthropic/claude-fable-5",
+      },
+    ]);
     expect(
       service.sessionKeys.missingRoles(projectId, [
         { role: "planner", model: "anthropic/claude-fable-5" },
@@ -1004,6 +1107,101 @@ describe("/opinion live path", () => {
     service.tools.hydrateFusionOwnership();
     const settledRun = service.fusionRuns.get(taskId, settledRunId);
     expect(settledRun?.completedAt).toBeTruthy();
+    expect(events.map((e) => e.type)).toContain("fusion.completed");
+  });
+
+  it("boot hydrate finalizes sides whose durable sessions are already stopped", () => {
+    const { service, events } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    // kill-9-during-deliver-halt: panes stopped without completeFusionSide.
+    const spawnA = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
+    const spawnB = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      cleanRoom: true,
+    });
+    expect(spawnA.ok).toBe(true);
+    expect(spawnB.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session
+      .sessionId;
+    const sessionB = (spawnB.data as { session: { sessionId: string } }).session
+      .sessionId;
+
+    const runId = "01JHALTEDFUSIONSTOPPED0000001";
+    service.fusionRuns.create({
+      runId,
+      taskId,
+      kind: "opinion",
+      templateRef: null,
+      templateLayer: null,
+      templateHash: null,
+      renderedHash: "halted-hash",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          family: "anthropic",
+          sessionId: sessionA,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: sessionB,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: new Date().toISOString(),
+    });
+
+    const dirA = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    }).dir;
+    mkdirSync(join(dirA, "outputs"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dirA, "outputs", `${sessionA}.md`), "halted side a\n", {
+      mode: 0o600,
+    });
+
+    // Simulate haltTaskSessions without completeFusionSide (kill-9 window).
+    service.tools.markSessionStatus(sessionA, "stopped");
+    service.tools.markSessionStatus(sessionB, "stopped");
+    expect(service.fusionRuns.get(taskId, runId)?.completedAt == null).toBe(true);
+    expect(
+      service.fusionRuns.get(taskId, runId)?.sides.every((s) => s.settledAt == null),
+    ).toBe(true);
+
+    events.length = 0;
+    service.tools.hydrateFusionOwnership();
+
+    const run = service.fusionRuns.get(taskId, runId);
+    expect(run).not.toBeNull();
+    expect(run!.completedAt).toBeTruthy();
+    expect(run!.sides.every((s) => s.settledAt != null)).toBe(true);
+    expect(run!.sides[0]?.artifactPath).not.toBeNull();
+    expect(events.map((e) => e.type)).toContain("fusion.side_completed");
     expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 

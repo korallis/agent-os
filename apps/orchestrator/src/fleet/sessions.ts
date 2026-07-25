@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { SessionKey } from "@agent-os/protocol";
 
@@ -53,6 +60,25 @@ export class SessionKeyStore {
     };
     writeFileSync(metaPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
     return record;
+  }
+
+  /**
+   * True when the durable key directory already exists. missingRoles treats dir
+   * presence as "role present", so callers that create a key before a successful
+   * spawn must remove a newly created dir on failure.
+   */
+  has(input: { projectId: string; role: string; model: string }): boolean {
+    return existsSync(join(this.root, SessionKeyStore.computeKey(input)));
+  }
+
+  /**
+   * Delete a session key directory. Used when spawn fails after ensure so an
+   * empty orphan cannot make missingRoles believe the role is present.
+   */
+  remove(input: { projectId: string; role: string; model: string }): void {
+    const dir = join(this.root, SessionKeyStore.computeKey(input));
+    if (!existsSync(dir)) return;
+    rmSync(dir, { recursive: true, force: true });
   }
 
   get(key: string): SessionKey | null {

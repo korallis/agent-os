@@ -181,6 +181,7 @@ export class BrainManager {
           role: "brain",
           socketPath,
           extensionPath: this.deps.extensionPath,
+          thinking,
           cleanRoom: false,
           grantProviderKey: grant,
         });

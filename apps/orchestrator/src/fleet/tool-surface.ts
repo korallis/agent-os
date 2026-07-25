@@ -358,8 +358,9 @@ export class ToolSurface {
    * Sides with a sessionId that have not yet settled remain in-flight so
    * settle/session_end can still write artifacts and emit fusion.completed.
    * Open runs are then reconciled via the shared finalize path so a kill-9
-   * mid-dispatch (null sessionId) or a crash after the last settle cannot
-   * leave a run permanently on fusion.dispatched.
+   * mid-dispatch (null sessionId), halt-without-settle (stopped session), or a
+   * crash after the last settle cannot leave a run permanently on
+   * fusion.dispatched.
    */
   hydrateFusionOwnership(): void {
     for (const task of this.tasks.values()) {
@@ -386,8 +387,9 @@ export class ToolSurface {
       }
     }
 
-    // Boot counterpart of halt finalize: settle never-spawned sides and
-    // complete runs whose sides are all done but completedAt is still null.
+    // Boot counterpart of halt finalize: never-spawned sides, terminal/lost
+    // sessions that never got completeFusionSide, and all-settled-missing-
+    // completedAt. One shared helper so boot cannot diverge from runtime.
     for (const task of this.tasks.values()) {
       for (const run of this.deps.fusionRuns.listForTask(task.id)) {
         if (run.completedAt != null) continue;
@@ -397,21 +399,13 @@ export class ToolSurface {
             s.settledAt == null &&
             s.artifactPath === null,
         );
-        if (hasNeverSpawned) {
-          this.finalizeOpenFusionRun(
-            task.id,
-            run.runId,
-            "fusion side never spawned (daemon interrupted mid-dispatch)",
-          );
-          continue;
-        }
-        if (
-          run.sides.every(
-            (s) => s.settledAt != null || s.artifactPath !== null,
-          )
-        ) {
-          this.tryCompleteFusionRun(task.id, run.runId);
-        }
+        this.finalizeOpenFusionRun(
+          task.id,
+          run.runId,
+          hasNeverSpawned
+            ? "fusion side never spawned (daemon interrupted mid-dispatch)"
+            : undefined,
+        );
       }
     }
   }
@@ -1118,15 +1112,38 @@ export class ToolSurface {
     // Per-model session key: a model change yields a new directory so transcripts
     // never cross families. buildPiSpawnSpec hands it to Pi via --session-dir +
     // PI_CODING_AGENT_SESSION_DIR; AGENTOS_SESSION_DIR is extension output only.
-    const sessionDir = this.deps.sessionKeys.ensure({
+    // Preflight before ensure; remove a newly created key dir on launch failure
+    // so missingRoles does not treat an orphan as "role present".
+    const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
+    const piDetection = this.deps.pi;
+    const extensionPath = this.deps.extensionPath;
+    const sessionKeyInput = {
       projectId: task.projectId,
       role: input.role,
       model: input.model,
-    }).dir;
-    this.sessionDirs.set(sessionId, sessionDir);
+    };
+    let sessionKeyCreated = false;
 
     try {
-      const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
+      if (!fake) {
+        if (piDetection?.binary == null) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
+          );
+        }
+        if (extensionPath === undefined || !existsSync(extensionPath)) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
+          );
+        }
+      }
+
+      const sessionKeyExisted = this.deps.sessionKeys.has(sessionKeyInput);
+      const sessionDir = this.deps.sessionKeys.ensure(sessionKeyInput).dir;
+      sessionKeyCreated = !sessionKeyExisted;
+      this.sessionDirs.set(sessionId, sessionDir);
 
       let tmuxWindow = `agentos:${windowName}`;
       if (fake) {
@@ -1151,21 +1168,6 @@ export class ToolSurface {
           cwd,
         });
       } else {
-        if (this.deps.pi?.binary == null) {
-          throw new ToolSurfaceError(
-            "PI_UNAVAILABLE",
-            "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
-          );
-        }
-        if (
-          this.deps.extensionPath === undefined ||
-          !existsSync(this.deps.extensionPath)
-        ) {
-          throw new ToolSurfaceError(
-            "PI_UNAVAILABLE",
-            "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
-          );
-        }
         // Control channel is a hard precondition of spawn — never launch Pi with a dead socket.
         let socketPath: string;
         try {
@@ -1191,16 +1193,24 @@ export class ToolSurface {
           input.model,
           this.deps.connections,
         );
+        // Narrowed by preflight above; TypeScript cannot see the throw path.
+        if (piDetection == null || extensionPath === undefined) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "Pi detection or extension path missing after preflight",
+          );
+        }
         const spec = buildPiSpawnSpec({
           agentosHome: this.deps.home,
-          detection: this.deps.pi,
+          detection: piDetection,
           args: ["--mode", "json", "-p", prompt, "--model", input.model],
           cwd,
           sessionId,
           role: input.role,
           socketPath,
-          extensionPath: this.deps.extensionPath,
+          extensionPath,
           sessionDir,
+          thinking: input.thinking,
           cleanRoom: input.cleanRoom,
           grantProviderKey: grant,
         });
@@ -1292,6 +1302,9 @@ export class ToolSurface {
       return { session: fleetSession, task: this.requireTask(task.id) };
     } catch (error) {
       this.sessionDirs.delete(sessionId);
+      if (sessionKeyCreated) {
+        this.deps.sessionKeys.remove(sessionKeyInput);
+      }
       if (sessionSocketOpened) {
         void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
       }
@@ -1594,9 +1607,8 @@ export class ToolSurface {
 
   /**
    * After a mid-cast spawn failure: stop already-spawned crewmates (pane,
-   * socket, lease), capture any unfinished spawned sides, mark the rest
-   * settled (no artifact), and emit fusion.completed with the failure so
-   * Console never sits on "dispatched" while an orphan holds a pool slot.
+   * socket, lease), then settle remaining sides and complete the run through
+   * the shared finalize helper so Console never sits on "dispatched".
    */
   private failRemainingFusionSides(
     taskId: string,
@@ -1605,6 +1617,7 @@ export class ToolSurface {
     failedAtIndex: number,
     errorMessage: string,
   ): void {
+    const stopReason = `fusion spawn failed at side ${failedAtIndex}: ${errorMessage}`;
     for (let i = 0; i < failedAtIndex; i++) {
       const sessionId = spawnedSessionIds[i];
       if (sessionId == null) continue;
@@ -1619,78 +1632,16 @@ export class ToolSurface {
       try {
         this.stopCrewmate({
           sessionId,
-          reason: `fusion spawn failed at side ${failedAtIndex}: ${errorMessage}`,
+          reason: stopReason,
         });
       } catch {
         // Best-effort teardown; finalize below even if stop races.
       }
     }
 
-    const latest = this.deps.fusionRuns.get(taskId, runId);
-    if (latest === null) return;
-    const now = new Date().toISOString();
-
-    const sides = latest.sides.map((s, i) => {
-      const sessionId = s.sessionId ?? spawnedSessionIds[i] ?? null;
-      if (i < failedAtIndex) {
-        if (s.settledAt != null || s.artifactPath !== null) {
-          return { ...s, sessionId };
-        }
-        const content = sessionId !== null ? this.readSideOutput(sessionId) : null;
-        const artifactPath =
-          content === null
-            ? null
-            : this.deps.fusionRuns.writeSideArtifact(
-                taskId,
-                runId,
-                i,
-                s.model,
-                content,
-              );
-        this.sink({
-          type: "fusion.side_completed",
-          payload: {
-            taskId,
-            runId,
-            role: s.role,
-            model: s.model,
-            family: s.family,
-            promptHash: s.promptHash,
-            artifactPath,
-          },
-        });
-        return { ...s, sessionId, artifactPath, settledAt: now };
-      }
-      // Never-spawned sides: still emit side_completed (null artifact) so a
-      // failed dispatch never jumps dispatched → completed with zero side events.
-      if (s.settledAt != null || s.artifactPath !== null) {
-        return { ...s, sessionId };
-      }
-      this.sink({
-        type: "fusion.side_completed",
-        payload: {
-          taskId,
-          runId,
-          role: s.role,
-          model: s.model,
-          family: s.family,
-          promptHash: s.promptHash,
-          artifactPath: null,
-        },
-      });
-      return {
-        ...s,
-        sessionId,
-        settledAt: now,
-      };
-    });
-    this.deps.fusionRuns.save({ ...latest, sides });
-
-    this.clearFusionRunSessionState(runId, sides.map((s) => s.sessionId));
-    const finalRun = this.latchFusionError(taskId, runId, errorMessage);
-    if (finalRun !== null) {
-      this.emitFusionCompleted(finalRun);
-    }
+    // Same lifecycle as halt/boot: never-spawned sides, remaining session
+    // sides, tryComplete with the failure latched.
+    this.finalizeOpenFusionRun(taskId, runId, errorMessage);
   }
 
   /**
@@ -2440,9 +2391,11 @@ export class ToolSurface {
 
   /**
    * Single durable-run finalize: settle never-spawned (null sessionId) sides,
-   * complete remaining session-owned sides, and tryComplete when every side
-   * is done (including all-settled runs that still lack completedAt).
-   * Used by halt/cancel and boot hydrate so the rule is not forked.
+   * complete session-owned sides that are force-finalized (error path) or
+   * already terminal/missing (boot hydrate after halt-without-settle), leave
+   * live sides for settle/session_end, and tryComplete when every side is done
+   * (including all-settled runs that still lack completedAt).
+   * Used by halt/cancel, mid-spawn failure, and boot hydrate so the rule is not forked.
    */
   private finalizeOpenFusionRun(
     taskId: string,
@@ -2453,6 +2406,7 @@ export class ToolSurface {
       this.latchFusionError(taskId, runId, error);
     }
 
+    const force = error != null && error.length > 0;
     const initial = this.deps.fusionRuns.get(taskId, runId);
     if (initial === null || initial.completedAt != null) return;
 
@@ -2490,7 +2444,16 @@ export class ToolSurface {
         runId: latest.runId,
         sideIndex,
       });
-      this.completeFusionSide(side.sessionId, error);
+      const session = this.sessions.get(side.sessionId);
+      const terminal =
+        session === undefined ||
+        session.status === "stopped" ||
+        session.status === "lost";
+      // Force (halt / mid-spawn fail / never-spawned sibling) completes live
+      // sides; boot hydrate only settles sides whose session is already dead.
+      if (force || terminal) {
+        this.completeFusionSide(side.sessionId, error);
+      }
     }
 
     // Crash window: all sides already settled but completedAt still null.
@@ -3118,7 +3081,9 @@ function sha256(text: string): string {
 
 /**
  * Accumulate distinct fusion failure reasons. A later clean settle must not
- * erase an earlier stop/lost/abort; duplicate strings are not repeated.
+ * erase an earlier stop/lost/abort; duplicate segments (exact equality after
+ * splitting on "; ") are not repeated. Substring matches are not de-duped —
+ * "stop" after "test stop" is a distinct reason.
  */
 function mergeFusionErrors(
   existing: string | null | undefined,
@@ -3127,7 +3092,12 @@ function mergeFusionErrors(
   const trimmed = next.trim();
   if (trimmed.length === 0) return existing ?? "";
   if (existing == null || existing.length === 0) return trimmed;
-  if (existing === trimmed || existing.includes(trimmed)) return existing;
+  if (existing === trimmed) return existing;
+  const segments = existing
+    .split("; ")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (segments.includes(trimmed)) return existing;
   return `${existing}; ${trimmed}`;
 }
 
