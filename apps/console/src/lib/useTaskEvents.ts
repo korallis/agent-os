@@ -20,8 +20,13 @@ function payloadTaskId(event: EventEnvelope): string | null {
 
 /**
  * Shared task-scoped event history for Brain decisions + validation evidence.
- * One fetch, refresh only when a frame for this task arrives, and prior data
- * stays on screen while reloading.
+ * One fetch, refresh only when a frame for this task arrives.
+ *
+ * On a failed refresh after a successful load, the last good events and
+ * truncated flag are kept and `unavailable` is set only when there is prior
+ * data to protect — panels can show real data plus a staleness note instead of
+ * wiping to an empty "nothing happened" state. A failed first load still
+ * surfaces as unavailable with no events.
  */
 export function useTaskEvents(taskId: string): TaskEventsState {
   const { lastEvent } = useEventStream();
@@ -35,11 +40,15 @@ export function useTaskEvents(taskId: string): TaskEventsState {
   const [unavailable, setUnavailable] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const boundTaskId = useRef(taskId);
+  const everSucceeded = useRef(false);
+  const lastGoodCount = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
     if (boundTaskId.current !== taskId) {
       boundTaskId.current = taskId;
+      everSucceeded.current = false;
+      lastGoodCount.current = 0;
       setEvents([]);
       setTruncated(false);
       setUnavailable(false);
@@ -48,14 +57,31 @@ export function useTaskEvents(taskId: string): TaskEventsState {
     void fetchTaskEvents(taskId)
       .then((result) => {
         if (cancelled) return;
+        if (result.unavailable) {
+          if (!everSucceeded.current) {
+            setUnavailable(true);
+          } else if (lastGoodCount.current > 0) {
+            // Keep last good events + truncated; only mark unavailable when
+            // there is prior data on screen to protect.
+            setUnavailable(true);
+          }
+          setLoaded(true);
+          return;
+        }
+        everSucceeded.current = true;
+        lastGoodCount.current = result.events.length;
         setEvents(result.events);
         setTruncated(result.truncated);
-        setUnavailable(result.unavailable);
+        setUnavailable(false);
         setLoaded(true);
       })
       .catch(() => {
         if (cancelled) return;
-        setUnavailable(true);
+        if (!everSucceeded.current) {
+          setUnavailable(true);
+        } else if (lastGoodCount.current > 0) {
+          setUnavailable(true);
+        }
         setLoaded(true);
       });
     return () => {

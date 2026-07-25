@@ -13,6 +13,9 @@ import { useEventStream } from "@/lib/useEventStream";
  * hash — because "these answers are independent" is a claim the UI should
  * evidence rather than assert. A run whose sides saw different bytes is shown
  * in red: that is a broken experiment, not a nicer-looking one.
+ *
+ * Detail is bound strictly to the selected runId: switching tabs never shows
+ * another run's artifacts, fused spans, or clean-room header under the new tab.
  */
 
 const FAMILY_ACCENT: Record<string, string> = {
@@ -35,6 +38,10 @@ export function FusionColumns({ taskId }: { taskId: string }) {
   const [detail, setDetail] = useState<FusionRunDetailResponse | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [listStatus, setListStatus] = useState<"loading" | "ready" | "unavailable">("loading");
+  /** RunId whose latest detail fetch failed with no matching detail retained. */
+  const [detailFailedRunId, setDetailFailedRunId] = useState<string | null>(null);
+  /** RunId currently being fetched (null when idle). */
+  const [detailLoadingRunId, setDetailLoadingRunId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,12 +73,40 @@ export function FusionColumns({ taskId }: { taskId: string }) {
   useEffect(() => {
     if (selected === null) return;
     let cancelled = false;
-    fetch(`/api/agentos/tasks/${taskId}/fusion/${selected}`, { cache: "no-store" })
-      .then(async (res) => {
-        if (cancelled || !res.ok) return;
-        setDetail((await res.json()) as FusionRunDetailResponse);
-      })
-      .catch(() => undefined);
+    const requested = selected;
+
+    void (async () => {
+      setDetailLoadingRunId(requested);
+      try {
+        const res = await fetch(`/api/agentos/tasks/${taskId}/fusion/${requested}`, {
+          cache: "no-store",
+        });
+        if (cancelled) return;
+        if (!res.ok) {
+          // Keep same-run detail on refresh failure; drop any other run's body.
+          setDetail((prev) =>
+            prev !== null && prev.run.runId === requested ? prev : null,
+          );
+          setDetailFailedRunId(requested);
+          return;
+        }
+        const body = (await res.json()) as FusionRunDetailResponse;
+        if (cancelled || body.run.runId !== requested) return;
+        setDetail(body);
+        setDetailFailedRunId(null);
+      } catch {
+        if (cancelled) return;
+        setDetail((prev) =>
+          prev !== null && prev.run.runId === requested ? prev : null,
+        );
+        setDetailFailedRunId(requested);
+      } finally {
+        if (!cancelled) {
+          setDetailLoadingRunId((prev) => (prev === requested ? null : prev));
+        }
+      }
+    })();
+
     return () => {
       cancelled = true;
     };
@@ -95,7 +130,14 @@ export function FusionColumns({ taskId }: { taskId: string }) {
 
   if (runs.length === 0) return null;
 
-  const run = detail?.run ?? runs.find((r) => r.runId === selected) ?? null;
+  // Never use detail for a different run under the current selection.
+  const selectedDetail = detail !== null && detail.run.runId === selected ? detail : null;
+  const listRun = runs.find((r) => r.runId === selected) ?? null;
+  const run = selectedDetail?.run ?? listRun;
+  const detailUnavailable =
+    selected !== null && detailFailedRunId === selected && selectedDetail === null;
+  const detailLoading =
+    selected !== null && selectedDetail === null && detailLoadingRunId === selected;
 
   return (
     <section>
@@ -165,6 +207,11 @@ export function FusionColumns({ taskId }: { taskId: string }) {
               {run.error}
             </span>
           )}
+          {detailUnavailable && (
+            <span className="rounded-md border border-warn/30 bg-warn/10 px-2 py-0.5 text-warn">
+              detail unavailable
+            </span>
+          )}
         </div>
       )}
 
@@ -175,7 +222,7 @@ export function FusionColumns({ taskId }: { taskId: string }) {
         }}
       >
         {(run?.sides ?? []).map((side, i) => {
-          const artifact = detail?.sideArtifacts.find(
+          const artifact = selectedDetail?.sideArtifacts.find(
             (a) => a.role === side.role && a.model === side.model,
           );
           return (
@@ -207,7 +254,13 @@ export function FusionColumns({ taskId }: { taskId: string }) {
               <div className="h-px bg-line-1" />
               {artifact === undefined ? (
                 <p className="text-[12px] text-fg-3 py-4">
-                  {side.settledAt == null ? "In flight…" : "No artifact captured."}
+                  {detailLoading
+                    ? "Loading detail…"
+                    : detailUnavailable
+                      ? "Detail unavailable for this run."
+                      : side.settledAt == null
+                        ? "In flight…"
+                        : "No artifact captured."}
                 </p>
               ) : (
                 <pre className="text-[11px] leading-[17px] text-fg-2 whitespace-pre-wrap break-words max-h-[320px] overflow-y-auto font-mono">
@@ -219,10 +272,10 @@ export function FusionColumns({ taskId }: { taskId: string }) {
         })}
       </div>
 
-      {detail?.fused != null && detail.spans.length > 0 && (
+      {selectedDetail?.fused != null && selectedDetail.spans.length > 0 && (
         <div className="mt-3 rounded-2xl border border-line-2 bg-panel p-4 flex flex-col gap-3">
           <h4 className="text-[13px] font-semibold text-fg-1">Fused artifact</h4>
-          {detail.spans.map((span, i) => (
+          {selectedDetail.spans.map((span, i) => (
             <div key={`${span.tag}-${i}`} className="flex flex-col gap-1">
               <span className="text-[10px] font-semibold uppercase tracking-wide text-teal-brand">
                 [{span.tag}]

@@ -13,8 +13,9 @@ import type { TaskEventsState } from "@/lib/useTaskEvents";
  * correcting the Brain, and that record is the evidence the substrate — not the
  * model — is what enforces the rules.
  *
- * Empty, truncated, and unavailable history are rendered as distinct states —
- * a failed fetch never looks like "nothing happened".
+ * Empty, truncated, and unavailable history are rendered as distinct states.
+ * When a refresh fails but prior events exist, those events stay on screen with
+ * a staleness note — a failed fetch never looks like "nothing happened".
  */
 
 interface Invocation {
@@ -60,19 +61,23 @@ export function BrainDecisionLane({
       </section>
     );
   }
-  if (!unavailable && calls.length === 0 && !truncated) return null;
+
+  const hasData = calls.length > 0;
+  if (!hasData && !unavailable && !truncated) return null;
 
   const refused = calls.filter((c) => !c.ok).length;
 
   let statusLabel: string;
-  if (unavailable) {
-    statusLabel = "history unavailable";
-  } else if (calls.length === 0) {
-    statusLabel = "history truncated";
-  } else {
+  if (hasData) {
     statusLabel = `${calls.length} tool call${calls.length === 1 ? "" : "s"}${
       refused > 0 ? ` · ${refused} refused by the substrate` : ""
-    }${truncated ? " · history truncated" : ""}`;
+    }${truncated ? " · history truncated" : ""}${
+      unavailable ? " · refresh unavailable (showing last loaded)" : ""
+    }`;
+  } else if (unavailable) {
+    statusLabel = "history unavailable";
+  } else {
+    statusLabel = "history truncated";
   }
 
   return (
@@ -81,20 +86,13 @@ export function BrainDecisionLane({
         <h3 className="text-sm font-semibold text-fg-1">Brain decisions</h3>
         <span className="text-[11px] text-fg-3">{statusLabel}</span>
       </div>
-      {unavailable ? (
-        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
-          <p className="text-[12px] text-fg-3">
-            History unavailable — the event log could not be loaded for this task.
-          </p>
-        </div>
-      ) : calls.length === 0 ? (
-        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
-          <p className="text-[12px] text-fg-3">
-            Event history was truncated before this task&apos;s tool calls were reached.
-          </p>
-        </div>
-      ) : (
+      {hasData ? (
         <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">
+          {unavailable && (
+            <p className="px-4 py-2 text-[11px] text-warn border-b border-line-1/60">
+              Latest refresh failed — showing last loaded history.
+            </p>
+          )}
           <ul className="divide-y divide-line-1/60">
             {calls.map((call, i) => (
               <li key={`${call.ts}-${i}`} className="flex items-center gap-3 px-4 py-2.5">
@@ -124,6 +122,18 @@ export function BrainDecisionLane({
               </li>
             ))}
           </ul>
+        </div>
+      ) : unavailable ? (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            History unavailable — the event log could not be loaded for this task.
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            Event history was truncated before this task&apos;s tool calls were reached.
+          </p>
         </div>
       )}
     </section>

@@ -7,6 +7,10 @@ import type { AnalyticsSnapshot, TaskListItem } from "@agent-os/protocol";
 import { Icon } from "@/components/shell/Icon";
 import { EmptyState } from "@/components/shell/EmptyState";
 import { useEventStream } from "@/lib/useEventStream";
+import {
+  isFleetAnalyticsEvent,
+  useDebouncedRefreshKey,
+} from "@/lib/useDebouncedRefreshKey";
 
 /**
  * Fleet (§7.1) — the Figma "Home Dashboard" frame (node 10:11978).
@@ -468,7 +472,7 @@ interface FleetSummaryView {
 
 export function FleetDashboard() {
   const { events, lastEvent } = useEventStream();
-  const refreshKey = lastEvent?.id ?? "init";
+  const refreshKey = useDebouncedRefreshKey(lastEvent, isFleetAnalyticsEvent);
   const [summary, setSummary] = useState<FleetSummaryView | null>(null);
   const [summaryStatus, setSummaryStatus] = useState<LoadStatus>("loading");
   const [analytics, setAnalytics] = useState<AnalyticsSnapshot | null>(null);

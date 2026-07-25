@@ -7,6 +7,10 @@ import { Icon } from "@/components/shell/Icon";
 import { EmptyState } from "@/components/shell/EmptyState";
 import { QuotaUsageStrip } from "@/components/analytics/QuotaUsageStrip";
 import { useEventStream } from "@/lib/useEventStream";
+import {
+  isFleetAnalyticsEvent,
+  useDebouncedRefreshKey,
+} from "@/lib/useDebouncedRefreshKey";
 
 /**
  * Analytics — the Figma "Token Usage" frame (node 37:2265), bound to the real
@@ -59,7 +63,7 @@ type LoadStatus = "loading" | "ready" | "unavailable";
 
 export function AnalyticsView() {
   const { lastEvent } = useEventStream();
-  const refreshKey = lastEvent?.id ?? "init";
+  const refreshKey = useDebouncedRefreshKey(lastEvent, isFleetAnalyticsEvent);
   const [snapshot, setSnapshot] = useState<AnalyticsSnapshot | null>(null);
   const [snapshotStatus, setSnapshotStatus] = useState<LoadStatus>("loading");
   const [budgets, setBudgets] = useState<BudgetsConfig | null>(null);

@@ -13,8 +13,9 @@ import type { TaskEventsState } from "@/lib/useTaskEvents";
  * states identically would hide the difference between "the code is wrong" and
  * "the gate never ran".
  *
- * Empty, truncated, and unavailable history are distinct — a failed fetch
- * never looks like "nothing happened".
+ * Empty, truncated, and unavailable history are distinct. When a refresh fails
+ * but prior gate results exist, those results stay on screen with a staleness
+ * note — a failed fetch never looks like "nothing happened".
  */
 
 interface GateResult {
@@ -78,7 +79,9 @@ export function ValidationEvidence({
       </section>
     );
   }
-  if (!unavailable && results.length === 0 && !truncated) return null;
+
+  const hasData = results.length > 0;
+  if (!hasData && !unavailable && !truncated) return null;
 
   const exhausted = validationAttempt >= maxValidations;
 
@@ -94,24 +97,18 @@ export function ValidationEvidence({
         >
           attempt {validationAttempt} / {maxValidations}
           {exhausted && " — halted at cap"}
-          {unavailable && " · history unavailable"}
+          {unavailable && hasData && " · refresh unavailable (showing last loaded)"}
+          {unavailable && !hasData && " · history unavailable"}
           {!unavailable && truncated && " · history truncated"}
         </span>
       </div>
-      {unavailable ? (
-        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
-          <p className="text-[12px] text-fg-3">
-            History unavailable — the event log could not be loaded for this task.
-          </p>
-        </div>
-      ) : results.length === 0 ? (
-        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
-          <p className="text-[12px] text-fg-3">
-            Event history was truncated before this task&apos;s gate results were reached.
-          </p>
-        </div>
-      ) : (
+      {hasData ? (
         <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">
+          {unavailable && (
+            <p className="px-4 py-2 text-[11px] text-warn border-b border-line-1/60">
+              Latest refresh failed — showing last loaded history.
+            </p>
+          )}
           <ul className="divide-y divide-line-1/60">
             {results.map((r, i) => (
               <li key={`${r.ts}-${i}`} className="flex items-start gap-3 px-4 py-3">
@@ -143,6 +140,18 @@ export function ValidationEvidence({
               </li>
             ))}
           </ul>
+        </div>
+      ) : unavailable ? (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            History unavailable — the event log could not be loaded for this task.
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            Event history was truncated before this task&apos;s gate results were reached.
+          </p>
         </div>
       )}
     </section>
