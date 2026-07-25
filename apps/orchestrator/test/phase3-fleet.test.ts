@@ -200,7 +200,27 @@ describe("phase 3 fleet integration", () => {
           },
         }),
       });
-      expect(((await spawn.json()) as { ok: boolean }).ok).toBe(true);
+      const spawnBody = (await spawn.json()) as {
+        ok: boolean;
+        data?: { session?: { sessionId?: string } };
+      };
+      expect(spawnBody.ok).toBe(true);
+      const sessionId = spawnBody.data?.session?.sessionId;
+      expect(typeof sessionId).toBe("string");
+
+      // Stop before deliver so the lease is never reclaimed under a live session.
+      const stop = await fetch(`${base}/v1/tools/call`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          tool: "stop_crewmate",
+          input: { sessionId, reason: "scripted ship complete" },
+        }),
+      });
+      expect(((await stop.json()) as { ok: boolean }).ok).toBe(true);
 
       const deliver = await fetch(`${base}/v1/tools/call`, {
         method: "POST",

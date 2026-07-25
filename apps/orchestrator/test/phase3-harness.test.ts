@@ -1351,3 +1351,117 @@ describe("extension lifecycle drives session state", () => {
     );
   });
 });
+
+describe("crewmate cwd isolation", () => {
+  it("never spawns a crewmate cwd equal to the project primary checkout", () => {
+    const service = fleet({ fakePi: true });
+    const repo = gitRepo();
+    const project = service.projects.register({
+      name: "cwd-isolation",
+      path: repo,
+      mode: "local-only",
+      trusted: true,
+    });
+
+    const roles: Array<{
+      role: "builder" | "scout" | "planner" | "fusion" | "healthcheck" | "validator";
+      shape: "SHIP" | "SCOUT";
+      model: string;
+    }> = [
+      { role: "builder", shape: "SHIP", model: "openai/gpt-4.1" },
+      { role: "scout", shape: "SCOUT", model: "openai/gpt-4.1" },
+      { role: "planner", shape: "SHIP", model: "openai/gpt-4.1" },
+      { role: "fusion", shape: "SHIP", model: "openai/gpt-4.1" },
+      { role: "healthcheck", shape: "SHIP", model: "openai/gpt-4.1" },
+      { role: "validator", shape: "SHIP", model: "anthropic/claude-sonnet-4" },
+    ];
+
+    for (const entry of roles) {
+      const created = service.tools.invoke("create_task", {
+        spec: {
+          shape: entry.shape,
+          title: `cwd-${entry.role}`,
+          intent: "isolate",
+          projectId: project.id,
+          mode: "local-only" as const,
+          ...(entry.shape === "SHIP" ? { yolo: true } : {}),
+        },
+      });
+      expect(created.ok).toBe(true);
+      const taskId = (created.data as { id: string }).id;
+      const cast = service.tools.invoke("resolve_cast", {
+        taskId,
+        roles: [
+          {
+            role: entry.role,
+            model: entry.model,
+            thinking: "low",
+            cleanRoom: true,
+          },
+        ],
+        familyCheckOverride: false,
+      });
+      expect(cast.ok).toBe(true);
+
+      const spawned = service.tools.invoke("spawn_crewmate", {
+        taskId,
+        role: entry.role,
+        model: entry.model,
+        thinking: "low",
+        vars: {},
+      });
+      expect(spawned.ok).toBe(true);
+      const session = (
+        spawned.data as { session: { sessionId: string; worktreePath: string | null } }
+      ).session;
+      expect(session.worktreePath).not.toBeNull();
+      expect(session.worktreePath).not.toBe(project.path);
+      expect(session.worktreePath).not.toBe(repo);
+
+      if (entry.role === "validator") {
+        const artifacts = service.tools.invoke("read_run_artifacts", { taskId });
+        expect(artifacts.ok).toBe(true);
+        const runsDir = (artifacts.data as { path: string }).path;
+        expect(session.worktreePath).toBe(join(runsDir, "gate-workspace"));
+      } else {
+        // Pool leases live under AGENTOS_HOME/worktrees, never the project tree.
+        expect(session.worktreePath?.includes(`${sep}worktrees${sep}`)).toBe(true);
+      }
+
+      void service.tools.invoke("stop_crewmate", {
+        sessionId: session.sessionId,
+        reason: "cwd isolation test",
+      });
+    }
+  });
+
+  it("deliver_task stops a live session before releasing its worktree lease", () => {
+    const service = fleet({ fakePi: true });
+    const { taskId, model } = seedTask(service, {
+      name: "deliver-halt",
+      shape: "SHIP",
+      role: "builder",
+    });
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model,
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "running",
+    );
+
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(true);
+    expect((deliver.data as { phase: string }).phase).toBe("DONE");
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "stopped",
+    );
+    const leased = service.worktrees.list().filter((l) => l.taskId === taskId);
+    expect(leased).toHaveLength(0);
+  });
+});

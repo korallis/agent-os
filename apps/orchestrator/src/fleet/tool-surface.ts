@@ -811,8 +811,16 @@ export class ToolSurface {
     let branch: string | null = task.branch;
     let leaseId: string | null = null;
     let sessionSocketOpened = false;
+    let cwd: string;
 
-    if (input.role === "builder" || input.role === "scout" || input.role === "planner") {
+    const poolRoles = new Set(["builder", "scout", "planner", "fusion", "healthcheck"]);
+    if (input.role === "validator") {
+      cwd = this.deps.gates.gateWorkspace(task.id);
+      worktreePath = cwd;
+    } else if (input.role === "brain") {
+      cwd = this.deps.home;
+      worktreePath = null;
+    } else if (poolRoles.has(input.role)) {
       try {
         const lease = this.deps.worktrees.lease({
           projectId: task.projectId,
@@ -824,6 +832,7 @@ export class ToolSurface {
         worktreePath = lease.path;
         branch = lease.branch;
         leaseId = lease.id;
+        cwd = lease.path;
       } catch (error) {
         if (error instanceof Error && error.message.includes("exhausted")) {
           task = this.transition(task, "WAITING_WORKTREE", error.message);
@@ -838,10 +847,21 @@ export class ToolSurface {
         }
         throw error;
       }
+    } else {
+      throw new ToolSurfaceError(
+        "SPAWN_FAILED",
+        `role ${input.role} has no isolated cwd; refusing to spawn in the primary checkout`,
+      );
+    }
+
+    if (cwd === project.path) {
+      throw new ToolSurfaceError(
+        "SPAWN_FAILED",
+        `refusing to spawn ${input.role} in the Captain's primary checkout`,
+      );
     }
 
     try {
-      const cwd = worktreePath ?? project.path;
       const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
 
       let tmuxWindow = `agentos:${windowName}`;
@@ -949,7 +969,8 @@ export class ToolSurface {
       task = {
         ...task,
         sessions: [...task.sessions.filter((s) => s.sessionId !== sessionId), taskSession],
-        worktreePath: worktreePath ?? task.worktreePath,
+        worktreePath:
+          leaseId !== null ? (worktreePath ?? task.worktreePath) : task.worktreePath,
         branch: branch ?? task.branch,
         updatedAt: now,
       };
@@ -1443,6 +1464,56 @@ export class ToolSurface {
     return { clean: false, changedPaths };
   }
 
+  private haltSessionsForDelivery(taskId: string): void {
+    const live = [...this.sessions.values()].filter(
+      (s) =>
+        s.taskId === taskId && s.status !== "stopped" && s.status !== "lost",
+    );
+    for (const session of live) {
+      try {
+        if (session.role === "scout") {
+          this.auditScoutSession(session.sessionId);
+        }
+        this.deps.tmux.killWindow(session.tmuxWindow);
+        void this.deps.sockets?.closeSession(session.sessionId).catch(() => undefined);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot deliver task ${taskId}: session ${session.sessionId} is still live and could not be stopped (${message})`,
+        );
+      }
+      if (this.deps.tmux.hasWindow(session.tmuxWindow)) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `cannot deliver task ${taskId}: session ${session.sessionId} is still live (tmux window ${session.tmuxWindow} remains)`,
+        );
+      }
+      const now = new Date().toISOString();
+      this.sessions.set(session.sessionId, { ...session, status: "stopped" });
+      const task = this.tasks.get(taskId);
+      if (task !== undefined) {
+        this.saveTask({
+          ...task,
+          sessions: task.sessions.map((s) =>
+            s.sessionId === session.sessionId
+              ? { ...s, status: "stopped", lastEventAt: now }
+              : s,
+          ),
+          updatedAt: now,
+        });
+      }
+      this.sink({
+        type: "session.stopped",
+        payload: {
+          sessionId: session.sessionId,
+          taskId,
+          reason: "deliver_task halt",
+        },
+      });
+    }
+  }
+
   private deliverTask(raw: Record<string, unknown>): TaskSnapshot {
     const input = deliverTaskInputSchema.parse(raw);
     let task = this.requireTask(input.taskId);
@@ -1466,6 +1537,10 @@ export class ToolSurface {
     if (task.phase !== "DELIVERING") {
       task = this.transition(task, "DELIVERING", "deliver_task");
     }
+
+    this.haltSessionsForDelivery(task.id);
+    task = this.requireTask(task.id);
+    this.assertNotDeliveryBlocked(task);
 
     const branch = task.branch ?? `ao/${task.id.slice(0, 10).toLowerCase()}`;
 
@@ -1674,7 +1749,9 @@ export class ToolSurface {
 
   private assertAssociatedWorktreesClean(task: TaskSnapshot): void {
     if (process.env.AGENTOS_FAKE_GIT === "1") return;
+    const gateWorkspace = join(this.deps.home, "runs", task.id, "gate-workspace");
     for (const path of this.associatedWorktreePaths(task)) {
+      if (resolve(path) === resolve(gateWorkspace)) continue;
       if (!existsSync(path)) {
         throw new ToolSurfaceError(
           "CONFLICT",

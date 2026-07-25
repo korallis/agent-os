@@ -223,11 +223,20 @@ try {
       vars: {},
     });
     const worktreePath = spawned.data?.session?.worktreePath ?? null;
+    const sessionId = spawned.data?.session?.sessionId ?? null;
     const isRealWorktree =
       worktreePath !== null &&
       spawnSync("git", ["-C", worktreePath, "rev-parse", "--is-inside-work-tree"], {
         encoding: "utf8",
       }).stdout.trim() === "true";
+
+    // Stop the crewmate before deliver so the lease is not reclaimed under a live pane.
+    if (sessionId !== null) {
+      await callTool(BASE, token, "stop_crewmate", {
+        sessionId,
+        reason: "G5 ship complete",
+      });
+    }
 
     const body = await callTool(BASE, token, "deliver_task", { taskId });
     gate(

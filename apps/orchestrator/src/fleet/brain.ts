@@ -260,7 +260,7 @@ export class BrainManager {
 
   /**
    * Scripted local-only SHIP path for gates (fake brain decides deterministically).
-   * sequence: resolve_cast → spawn builder → deliver
+   * sequence: resolve_cast → spawn builder → stop crewmate → deliver
    */
   runScriptedLocalShip(taskId: string, model = "openai/gpt-4.1"): void {
     this.deps.tools.invoke("resolve_cast", {
@@ -268,7 +268,7 @@ export class BrainManager {
       roles: [{ role: "builder", model, thinking: "medium", cleanRoom: true }],
       familyCheckOverride: false,
     });
-    this.deps.tools.invoke("spawn_crewmate", {
+    const spawned = this.deps.tools.invoke("spawn_crewmate", {
       taskId,
       role: "builder",
       model,
@@ -277,6 +277,16 @@ export class BrainManager {
       vars: {},
       prompt: "local-only ship — implement and stop",
     });
+    if (spawned.ok === true && spawned.data !== undefined) {
+      const sessionId = (spawned.data as { session?: { sessionId?: string } }).session
+        ?.sessionId;
+      if (typeof sessionId === "string") {
+        this.deps.tools.invoke("stop_crewmate", {
+          sessionId,
+          reason: "scripted local-only ship complete",
+        });
+      }
+    }
     this.deps.tools.invoke("deliver_task", { taskId });
   }
 
