@@ -5,12 +5,16 @@ import { cn } from "@agent-os/ui";
 import type { AttachTicketResponse } from "@agent-os/protocol";
 
 /**
- * Read-only terminal attach (master plan §7.2).
+ * Read-only terminal attach (master plan §7.2, §8.2).
  *
  * Mints a single-use ticket over authenticated REST, then opens the PTY
  * WebSocket with it. The stream is deliberately read-only — the Console never
  * types into a crewmate's pane. Taking over is the Captain running the attach
  * command in their own terminal, which the session page shows alongside this.
+ *
+ * Pane frames carry a per-stream `seq`; gaps are counted and shown (never
+ * silently tolerated). A reconnect is a new stream, so the gap counter resets
+ * with it — carrying the old sequence would false-positive every reconnect.
  *
  * The ticket is one-shot, so reconnecting mints a fresh one; a ticket captured
  * from a log or history is already spent.

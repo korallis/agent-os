@@ -3,11 +3,15 @@ import { WebSocketServer, WebSocket } from "ws";
  * Read-only terminal attach over WebSocket (master plan §7.2, §8).
  *
  * This streams what the pane actually shows, by polling `tmux capture-pane` and
- * sending only when the content changed. It is deliberately READ-ONLY: the
- * Console never writes keystrokes into a crewmate's pane. Taking over is done
- * by the Captain running the attach command in their own terminal, which is
- * what "human-attachable" means in the plan — the daemon is not a proxy for the
- * Captain's hands.
+ * sending only when the content changed. Each pane frame carries a monotonic
+ * per-stream `seq` (from 1); a quiet pane sends nothing, so a gap is a real
+ * drop rather than silence. Reconnect is a new stream that renumbers from 1;
+ * `closed` includes `lastSeq` so the client knows how far the stream got.
+ *
+ * Deliberately READ-ONLY: the Console never writes keystrokes into a crewmate's
+ * pane. Taking over is done by the Captain running the attach command in their
+ * own terminal, which is what "human-attachable" means in the plan — the daemon
+ * is not a proxy for the Captain's hands.
  *
  * Polling rather than a real PTY is a deliberate trade: `tmux pipe-pane` would
  * stream raw output but requires a writable FIFO per session, and a true PTY
