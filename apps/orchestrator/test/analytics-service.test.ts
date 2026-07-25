@@ -73,7 +73,7 @@ describe("AnalyticsService window + cost honesty", () => {
     const service = new AnalyticsService(
       () => ({ events: windowEvents, truncated: false }),
       () => [],
-      () => sessionSpawns,
+      () => ({ facts: sessionSpawns, truncated: false }),
     );
     const snap = service.snapshot({ days: 7 });
 
@@ -112,23 +112,49 @@ describe("AnalyticsService window + cost honesty", () => {
     const withoutLookup = new AnalyticsService(
       () => ({ events: windowEvents, truncated: false }),
       () => [],
-      () => [],
+      () => ({ facts: [], truncated: false }),
     );
     expect(withoutLookup.snapshot({ days: 7 }).agents[0]?.role).toBe("unattributed");
 
     const withLookup = new AnalyticsService(
       () => ({ events: windowEvents, truncated: false }),
       () => [],
-      () => [
-        {
-          sessionId,
-          role: "validator",
-          model: "openai/gpt-4.1",
-          taskId: null,
-        },
-      ],
+      () => ({
+        facts: [
+          {
+            sessionId,
+            role: "validator",
+            model: "openai/gpt-4.1",
+            taskId: null,
+          },
+        ],
+        truncated: false,
+      }),
     );
     expect(withLookup.snapshot({ days: 7 }).agents[0]?.role).toBe("validator");
+  });
+
+  it("surfaces spawn-lookup truncation on the snapshot truncated flag", () => {
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FAA";
+    const windowEvents: EventEnvelope[] = [
+      envelope(1, dayOffset(0), {
+        type: "ext.usage",
+        payload: {
+          sessionId,
+          provider: "openai",
+          model: "gpt-4.1",
+          inputTokens: 1,
+          outputTokens: 1,
+          costUsd: 0.01,
+        },
+      }),
+    ];
+    const service = new AnalyticsService(
+      () => ({ events: windowEvents, truncated: false }),
+      () => [],
+      () => ({ facts: [], truncated: true }),
+    );
+    expect(service.snapshot({ days: 7 }).truncated).toBe(true);
   });
 
   it("tracks partial cost coverage without treating null as zero bill", () => {

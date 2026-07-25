@@ -71,6 +71,7 @@ export class SqliteProjection {
         id: envelope.id,
         ts: envelope.ts,
         type: envelope.event.type,
+        taskId: taskIdFromEnvelope(envelope),
         envelope: JSON.stringify(envelope),
       })
       .onConflictDoNothing();
@@ -206,8 +207,9 @@ export class SqliteProjection {
   }
 
   /**
-   * Events whose payload.taskId matches, optionally filtered by type.
+   * Events whose projected task_id matches, optionally filtered by type.
    * Newest-first page so truncation drops the oldest frames for this task.
+   * Uses the apply-time task_id column + index (not json_extract per scan).
    */
   eventsForTask(taskId: string, types: readonly string[] | null, limit: number): EventEnvelope[] {
     if (types !== null && types.length === 0) return [];
@@ -220,7 +222,7 @@ export class SqliteProjection {
     const rows = this.sqlite
       .prepare(
         `SELECT envelope FROM events
-         WHERE json_extract(envelope, '$.event.payload.taskId') = ?${typeFilter}
+         WHERE task_id = ?${typeFilter}
          ORDER BY seq DESC
          LIMIT ?`,
       )
@@ -228,7 +230,7 @@ export class SqliteProjection {
     return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
   }
 
-  /** Count of events whose payload.taskId matches (optional type filter). */
+  /** Count of events whose projected task_id matches (optional type filter). */
   countForTask(taskId: string, types: readonly string[] | null): number {
     if (types !== null && types.length === 0) return 0;
     const typeFilter =
@@ -239,7 +241,7 @@ export class SqliteProjection {
     const row = this.sqlite
       .prepare(
         `SELECT COUNT(*) AS n FROM events
-         WHERE json_extract(envelope, '$.event.payload.taskId') = ?${typeFilter}`,
+         WHERE task_id = ?${typeFilter}`,
       )
       .get(...params) as { n: number };
     return row.n;
@@ -295,6 +297,11 @@ export class SqliteProjection {
   close(): void {
     this.sqlite.close();
   }
+}
+
+function taskIdFromEnvelope(envelope: EventEnvelope): string | null {
+  const payload = envelope.event.payload as { taskId?: unknown };
+  return typeof payload.taskId === "string" ? payload.taskId : null;
 }
 
 // Silence unused-export noise if drizzle tables are only used for types elsewhere.

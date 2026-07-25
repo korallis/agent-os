@@ -10,6 +10,8 @@ export const events = sqliteTable("events", {
   id: text("id").notNull().unique(),
   ts: text("ts").notNull(),
   type: text("type").notNull(),
+  /** Projected payload.taskId when present; indexed for task-scoped evidence scans. */
+  taskId: text("task_id"),
   /** Full JSON-serialized envelope (exact bytes reproducible). */
   envelope: text("envelope").notNull(),
 });
@@ -92,6 +94,15 @@ CREATE TABLE IF NOT EXISTS quota_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_quota_samples_connection ON quota_samples(connection_id);
 CREATE INDEX IF NOT EXISTS idx_connections_provider ON connections(provider);
+`,
+  },
+  {
+    version: 3,
+    sql: `
+ALTER TABLE events ADD COLUMN task_id TEXT;
+UPDATE events SET task_id = json_extract(envelope, '$.event.payload.taskId');
+CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
+CREATE INDEX IF NOT EXISTS idx_events_task_id_type ON events(task_id, type);
 `,
   },
 ];

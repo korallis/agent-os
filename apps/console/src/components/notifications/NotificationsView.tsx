@@ -7,6 +7,10 @@ import type { FleetStateSnapshot, TaskListItem, WakeDigest } from "@agent-os/pro
 import { Icon } from "@/components/shell/Icon";
 import { EmptyState } from "@/components/shell/EmptyState";
 import { useEventStream } from "@/lib/useEventStream";
+import {
+  isNotificationsEvent,
+  useDebouncedRefreshKey,
+} from "@/lib/useDebouncedRefreshKey";
 
 /**
  * Notifications — the Figma "Notifications" frame (node 17:940), rendered as
@@ -52,7 +56,7 @@ function chipValue(status: LoadStatus, value: number): string {
 
 export function NotificationsView() {
   const { lastEvent } = useEventStream();
-  const refreshKey = lastEvent?.id ?? "init";
+  const refreshKey = useDebouncedRefreshKey(lastEvent, isNotificationsEvent);
   const [wakes, setWakes] = useState<WakeDigest[]>([]);
   const [queue, setQueue] = useState<WakeDigest[]>([]);
   const [tasks, setTasks] = useState<TaskListItem[]>([]);

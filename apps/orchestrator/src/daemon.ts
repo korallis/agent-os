@@ -245,7 +245,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       },
       () => [...quotaSamples.values()],
       () => {
-        const { events: spawns } = eventStore.eventsByType("session.spawned", 100_000);
+        const { events: spawns, truncated: spawnTruncated } = eventStore.eventsByType(
+          "session.spawned",
+          100_000,
+        );
         const facts: Array<{
           sessionId: string;
           role: string;
@@ -261,7 +264,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
             taskId: envelope.event.payload.taskId,
           });
         }
-        return facts;
+        return { facts, truncated: spawnTruncated };
       },
     );
 

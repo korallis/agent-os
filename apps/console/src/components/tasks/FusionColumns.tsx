@@ -32,8 +32,12 @@ function shortHash(hash: string | null): string {
 
 export function FusionColumns({ taskId }: { taskId: string }) {
   const { lastEvent } = useEventStream();
-  const refreshKey =
-    lastEvent !== null && lastEvent.event.type.startsWith("fusion.") ? lastEvent.id : "init";
+  const [refreshKey, setRefreshKey] = useState("init");
+  useEffect(() => {
+    if (lastEvent === null) return;
+    if (!lastEvent.event.type.startsWith("fusion.")) return;
+    setRefreshKey(lastEvent.id);
+  }, [lastEvent]);
   const [runs, setRuns] = useState<FusionRun[]>([]);
   const [detail, setDetail] = useState<FusionRunDetailResponse | null>(null);
   const [selected, setSelected] = useState<string | null>(null);

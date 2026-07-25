@@ -21,6 +21,12 @@ export type SessionSpawnFact = {
   taskId: string | null;
 };
 
+export type SessionSpawnPage = {
+  facts: SessionSpawnFact[];
+  /** True when the spawn lookup hit its bound — older sessions may be unattributed. */
+  truncated: boolean;
+};
+
 /**
  * Usage & cost analytics (master plan §7.6 "Analytics").
  *
@@ -44,6 +50,8 @@ export class AnalyticsService {
    * @param readQuota live quota samples (not windowed — current fleet state).
    * @param readSessionSpawns session.spawned facts outside the day filter, so
    *   in-window usage from pre-window sessions is attributed to the real role.
+   *   Must surface truncation when the lookup bound is hit — silent caps would
+   *   bucket older sessions as unattributed while the role table looks complete.
    */
   constructor(
     private readonly readEvents: (options: {
@@ -51,7 +59,10 @@ export class AnalyticsService {
       limit: number;
     }) => AnalyticsEventPage,
     private readonly readQuota: () => QuotaSample[],
-    private readonly readSessionSpawns: () => SessionSpawnFact[] = () => [],
+    private readonly readSessionSpawns: () => SessionSpawnPage = () => ({
+      facts: [],
+      truncated: false,
+    }),
   ) {}
 
   snapshot(options: { days?: number; limit?: number } = {}): AnalyticsSnapshot {
@@ -64,7 +75,8 @@ export class AnalyticsService {
     /** sessionId → its spawn facts, so usage frames can be attributed. */
     const sessions = new Map<string, SessionSpawnFact>();
     // Side lookup first: covers sessions spawned before the analytics window.
-    for (const spawn of this.readSessionSpawns()) {
+    const spawnPage = this.readSessionSpawns();
+    for (const spawn of spawnPage.facts) {
       sessions.set(spawn.sessionId, spawn);
     }
     // Overlay any in-window spawns (same shape as production dual-read).
@@ -223,7 +235,7 @@ export class AnalyticsService {
     return {
       generatedAt: new Date().toISOString(),
       windowDays: days,
-      truncated,
+      truncated: truncated || spawnPage.truncated,
       totals: {
         inputTokens: totalInput,
         outputTokens: totalOutput,

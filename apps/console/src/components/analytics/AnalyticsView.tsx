@@ -182,9 +182,9 @@ export function AnalyticsView() {
 
       {snapshot?.truncated === true && (
         <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
-          Event history for this window was truncated at the analytics read bound —
-          figures keep the newest frames and may omit older ones inside the{" "}
-          {windowDays}-day range.
+          Analytics history was truncated at a read bound — figures keep the newest
+          frames and may omit older in-window usage or pre-window session attribution
+          inside the {windowDays}-day range.
         </div>
       )}
 

@@ -20,20 +20,35 @@ function payloadTaskId(event: EventEnvelope): string | null {
 
 /**
  * Shared task-scoped event history for Brain decisions + validation evidence.
- * One fetch, refresh only when a frame for this task arrives.
+ * One fetch; refresh only when a frame for this task arrives.
  *
- * On a failed refresh after a successful load, the last good events and
- * truncated flag are kept and `unavailable` is set only when there is prior
- * data to protect — panels can show real data plus a staleness note instead of
- * wiping to an empty "nothing happened" state. A failed first load still
- * surfaces as unavailable with no events.
+ * Refresh key is sticky: it holds the last relevant event id and only advances
+ * when a newly relevant frame arrives. Unrelated SSE frames must not collapse
+ * the key back to "init" (that oscillates and re-fetches thrash).
+ *
+ * Load-state table after the first attempt settles
+ * (everSucceeded, lastGoodCount, lastLoadFailed):
+ *
+ * | everSucceeded | lastGoodCount | lastLoadFailed | panel |
+ * |---------------|---------------|----------------|--------|
+ * | false         | 0             | true           | unavailable, empty |
+ * | true          | 0             | false          | genuine empty (null) |
+ * | true          | 0             | true           | unavailable (never “nothing happened”) |
+ * | true          | >0            | false          | show data |
+ * | true          | >0            | true           | show last-good data + staleness |
+ *
+ * Rule: lastLoadFailed ⇒ unavailable=true always; success clears it and
+ * replaces events. A failed refresh never wipes last-good history.
  */
 export function useTaskEvents(taskId: string): TaskEventsState {
   const { lastEvent } = useEventStream();
-  const refreshKey =
-    lastEvent !== null && payloadTaskId(lastEvent) === taskId
-      ? lastEvent.id
-      : "init";
+  const [refreshKey, setRefreshKey] = useState("init");
+
+  useEffect(() => {
+    if (lastEvent === null) return;
+    if (payloadTaskId(lastEvent) !== taskId) return;
+    setRefreshKey(lastEvent.id);
+  }, [lastEvent, taskId]);
 
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [truncated, setTruncated] = useState(false);
@@ -58,13 +73,8 @@ export function useTaskEvents(taskId: string): TaskEventsState {
       .then((result) => {
         if (cancelled) return;
         if (result.unavailable) {
-          if (!everSucceeded.current) {
-            setUnavailable(true);
-          } else if (lastGoodCount.current > 0) {
-            // Keep last good events + truncated; only mark unavailable when
-            // there is prior data on screen to protect.
-            setUnavailable(true);
-          }
+          // lastLoadFailed → unavailable for every settled path above.
+          setUnavailable(true);
           setLoaded(true);
           return;
         }
@@ -77,11 +87,7 @@ export function useTaskEvents(taskId: string): TaskEventsState {
       })
       .catch(() => {
         if (cancelled) return;
-        if (!everSucceeded.current) {
-          setUnavailable(true);
-        } else if (lastGoodCount.current > 0) {
-          setUnavailable(true);
-        }
+        setUnavailable(true);
         setLoaded(true);
       });
     return () => {

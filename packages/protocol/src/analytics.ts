@@ -87,8 +87,10 @@ export const analyticsSnapshotSchema = z.strictObject({
   generatedAt: isoTimestampSchema,
   windowDays: z.number().int().min(1).max(365),
   /**
-   * True when the event-store read hit its bound. Pages are newest-first, so
-   * truncation omits older frames inside the window — never the newest tail.
+   * True when a read bound was hit: the day-window event page and/or the
+   * session.spawned attribution lookup. Pages are newest-first, so truncation
+   * omits older frames — never the newest tail. Spawn-lookup truncation can
+   * leave older sessions unattributed.
    */
   truncated: z.boolean(),
   totals: analyticsTotalsSchema,
