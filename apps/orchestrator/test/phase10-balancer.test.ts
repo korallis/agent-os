@@ -204,7 +204,7 @@ describe("candidate construction from live fleet state", () => {
           label: "Claude",
           family: "anthropic",
           billingSurface: "plan-quota",
-          billingMode: "subscription-oauth",
+          billingMode: "extra-usage-oauth",
           health: "healthy",
           healthReason: null,
           authStorePresence: null,
