@@ -251,14 +251,18 @@ try {
     const started = await post("/v1/connections/oauth/start", { provider: "anthropic" });
     const connectionsRes = await get("/v1/connections");
     const connections = connectionsRes.body.connections ?? [];
-    const oauth = connections.find((c) => c.kind === "pi-oauth");
+    // Host auth-store sync may already have other pi-oauth cards (e.g. xai).
+    // W2 must assert the fixture we just created, not the first oauth row.
+    const oauth = connections.find(
+      (c) => c.kind === "pi-oauth" && c.provider === "anthropic",
+    );
     gate(
       "W2",
       "a fixture pi-oauth connection is created through the attach-command path",
       started.body.attachCommand !== undefined &&
         oauth !== undefined &&
         oauth.billingSurface === "extra-usage-per-token",
-      `attachCommand=${started.body.attachCommand !== undefined} oauthConnection=${oauth !== undefined} kind=${oauth?.kind ?? "none"} billingSurface=${oauth?.billingSurface ?? "none"}`,
+      `attachCommand=${started.body.attachCommand !== undefined} oauthConnection=${oauth !== undefined} provider=${oauth?.provider ?? "none"} kind=${oauth?.kind ?? "none"} billingSurface=${oauth?.billingSurface ?? "none"}`,
     );
   }
 
