@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "agent-os Pi extension — lifecycle telemetry + control over Unix sockets (master plan §1.1, §4)",
+  "description": "agent-os Pi extension — lifecycle telemetry, control, and Brain tool bridge over per-session Unix sockets (master plan §1.1, §4, §5)",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

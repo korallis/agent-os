@@ -4,8 +4,8 @@ import { agentRoleSchema } from "./providers.js";
 
 /**
  * Daemon ⇄ Pi extension Unix-socket frames (master plan §2.1, §5).
- * NDJSON lines, zod-validated both ways. Phase 2 carries telemetry + control;
- * Brain tool bridge expands in Phase 3.
+ * NDJSON lines, zod-validated both ways. Telemetry + control (Phase 2) plus
+ * the Brain tool bridge (`ext.tool_call` / `ctl.tool_result`, Phase 3).
  */
 
 export const extensionHelloFrameSchema = z.strictObject({

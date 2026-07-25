@@ -5,8 +5,8 @@ import { cn } from "@agent-os/ui";
 import { Icon } from "@/components/shell/Icon";
 import { useEventStream } from "@/lib/useEventStream";
 
-/* Static roster/table data — pixel-faithful renderings of the Figma design.
-   The task engine that feeds these lands in Phase 3 (master plan §11). */
+/* Static roster/table fixtures — pixel-faithful Figma renderings until Phase 6
+   wires Swarm Activity, Token Consumption, Top Agents, and Recent Tasks to the daemon. */
 
 const TOP_AGENTS = [
   {
@@ -360,8 +360,8 @@ function RecentTasksTable() {
 
 /**
  * Fleet (§7.1) — the Figma "Home Dashboard" screen.
- * Live: swarm "last updated", fleet summary chips (active/queued/needs-you/brain).
- * Roster cards remain design placeholders where analytics still use fixtures.
+ * Live: "last updated", fleet summary chips (active/queued/needs-you/brain).
+ * Swarm Activity, Token Consumption, Top Agents, and Recent Tasks remain fixtures (Phase 6).
  */
 export function FleetDashboard() {
   const { events, lastEvent } = useEventStream();

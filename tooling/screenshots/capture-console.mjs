@@ -197,8 +197,10 @@ async function main() {
     }
     // Let SSE-driven panels take their first frame and reveals settle.
     await sleep(1200);
-    const file = join(OUT_DIR, `${target.name}.png`);
-    await page.screenshot({ path: file, fullPage: true });
+    const absFile = join(OUT_DIR, `${target.name}.png`);
+    await page.screenshot({ path: absFile, fullPage: true });
+    // Repo-relative paths only — absolute machine paths go stale outside the capturer's host.
+    const file = `docs/screenshots/${target.name}.png`;
     captured.push({ path: target.path, status, file });
     console.log(`captured ${target.path} → ${file} (HTTP ${status})`);
   }

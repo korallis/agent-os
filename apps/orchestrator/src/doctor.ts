@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
  * "doctor verifies tmux/git/gh/node/pi/uv"; §4.10 wizard reuses the same
  * probes). Missing tools remain non-fatal warnings here; the onboarding
  * wizard (§4.10) drives guided installs and hard blocks for Pi / Claude SDK
- * paths. Fleet-hard deps (tmux) still land with Phase 3.
+ * paths. tmux is a hard fleet dependency from Phase 3 onward.
  */
 
 export interface DoctorCheck {
@@ -23,7 +23,7 @@ interface ToolSpec {
 
 const TOOLS: readonly ToolSpec[] = [
   { tool: "node", args: ["--version"], note: "runtime (require >=24)" },
-  { tool: "tmux", args: ["-V"], note: "session backend — hard dependency from Phase 3" },
+  { tool: "tmux", args: ["-V"], note: "session backend — hard fleet dependency (Phase 3+)" },
   { tool: "git", args: ["--version"], note: "worktrees + delivery" },
   { tool: "gh", args: ["--version"], note: "PR delivery modes" },
   { tool: "pi", args: ["--version"], note: "the one worker harness (pinned @earendil-works/pi-coding-agent)" },
