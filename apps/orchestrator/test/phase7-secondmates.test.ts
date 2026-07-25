@@ -430,6 +430,119 @@ describe("secondmate stopAll reaps runtime orphans", () => {
     }
     expect(alive).toBe(false);
   });
+
+  it("stop waits until the target pid is reaped before clearing runtime", async () => {
+    const home = temp("agentos-p7-stop-reap-");
+    const registry = new SecondmateRegistry(home);
+    const record = registry.provision({ name: "infra", domain: "infra" });
+    const sleeper = await import("node:child_process").then((cp) =>
+      cp.spawn("sleep", ["30"], { stdio: "ignore" }),
+    );
+    expect(sleeper.pid).toBeTypeOf("number");
+    const runtimeDir = join(home, "runtime", "secondmates", record.name);
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(
+      join(runtimeDir, "runtime.json"),
+      JSON.stringify({
+        name: record.name,
+        pid: sleeper.pid,
+        port: record.port,
+        tokenPath: join(runtimeDir, "daemon.token"),
+        startedAt: new Date().toISOString(),
+      }),
+      { mode: 0o600 },
+    );
+
+    const result = await registry.stop("infra");
+    expect(result.stopped).toBe(true);
+    expect(registry.readRuntime("infra")).toBeNull();
+    let alive = true;
+    try {
+      process.kill(sleeper.pid!, 0);
+    } catch {
+      alive = false;
+    }
+    expect(alive).toBe(false);
+  });
+
+  it("stop leaves a live process alone when runtime names a dead pid", async () => {
+    const home = temp("agentos-p7-stop-identity-");
+    const registry = new SecondmateRegistry(home);
+    const record = registry.provision({ name: "infra", domain: "infra" });
+    const live = await import("node:child_process").then((cp) =>
+      cp.spawn("sleep", ["30"], { stdio: "ignore" }),
+    );
+    expect(live.pid).toBeTypeOf("number");
+    const runtimeDir = join(home, "runtime", "secondmates", record.name);
+    mkdirSync(runtimeDir, { recursive: true });
+    // Stale bookkeeping: dead pid in runtime.json while an unrelated process lives.
+    writeFileSync(
+      join(runtimeDir, "runtime.json"),
+      JSON.stringify({
+        name: record.name,
+        pid: 1_000_000 + (process.pid % 100_000),
+        port: record.port,
+        tokenPath: join(runtimeDir, "daemon.token"),
+        startedAt: new Date().toISOString(),
+      }),
+      { mode: 0o600 },
+    );
+
+    const result = await registry.stop("infra");
+    expect(result.stopped).toBe(false);
+    expect(registry.readRuntime("infra")).toBeNull();
+    let liveAlive = true;
+    try {
+      process.kill(live.pid!, 0);
+    } catch {
+      liveAlive = false;
+    }
+    expect(liveAlive).toBe(true);
+    try {
+      process.kill(live.pid!, "SIGKILL");
+    } catch {
+      // ignore
+    }
+  });
+
+  it("concurrent stop calls serialize without orphaning a live pid", async () => {
+    const home = temp("agentos-p7-stop-start-race-");
+    const registry = new SecondmateRegistry(home);
+    const record = registry.provision({ name: "infra", domain: "infra" });
+    const sleeper = await import("node:child_process").then((cp) =>
+      cp.spawn("sleep", ["60"], { stdio: "ignore" }),
+    );
+    expect(sleeper.pid).toBeTypeOf("number");
+    const runtimeDir = join(home, "runtime", "secondmates", record.name);
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(
+      join(runtimeDir, "runtime.json"),
+      JSON.stringify({
+        name: record.name,
+        pid: sleeper.pid,
+        port: record.port,
+        tokenPath: join(runtimeDir, "daemon.token"),
+        startedAt: new Date().toISOString(),
+      }),
+      { mode: 0o600 },
+    );
+
+    // Concurrent stop (runtime orphan) + stop again: both share the lifecycle
+    // chain; after they settle, runtime matches reality (no live untracked pid).
+    const [a, b] = await Promise.all([
+      registry.stop("infra"),
+      registry.stop("infra"),
+    ]);
+    expect(a.stopped || b.stopped).toBe(true);
+    expect(registry.readRuntime("infra")).toBeNull();
+    let alive = true;
+    try {
+      process.kill(sleeper.pid!, 0);
+    } catch {
+      alive = false;
+    }
+    expect(alive).toBe(false);
+  });
 });
 
 describe("secondmate admission capacity", () => {

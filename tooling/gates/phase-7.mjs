@@ -15,6 +15,7 @@
  *   G10 secondmate api-key grants resolve from primary secrets without copying
  *   G11 primary bound port blocks secondmate provision without AGENTOS_PORT
  *   G12 secondmate own tmux server; primary Brain survives secondmate start
+ *   G13 concurrent stop+start leaves exactly one live process matching registry
  *
  * Real daemons on real homes; only the model is simulated.
  * Usage: node tooling/gates/phase-7.mjs
@@ -645,6 +646,80 @@ try {
         audit.ok === true &&
         smToken !== null,
       `primaryKey=${primaryKeyRes.status} smKey=${smKeyOk} grant=${grantRun.stdout.trim() || grantRun.stderr.trim()} banned=${banned.length} audit=${audit.ok} primarySecret=${primarySecretExists}`,
+    );
+  }
+
+  // G13 — concurrent stop+start: registry tracks exactly one live process
+  {
+    const runtimePath = join(home, "runtime", "secondmates", "infra", "runtime.json");
+    const beforePid = existsSync(runtimePath)
+      ? JSON.parse(readFileSync(runtimePath, "utf8")).pid
+      : null;
+    const stopP = api("/v1/secondmates/infra/stop", { method: "POST", body: "{}" });
+    const startP = api("/v1/secondmates/infra/start", { method: "POST", body: "{}" });
+    const [stopRes, startRes2] = await Promise.all([stopP, startP]);
+    let startBody2 = startRes2.ok ? await startRes2.json().catch(() => ({})) : {};
+    // Either order is valid on the serial chain: stop→start ends running;
+    // start→stop may end stopped. Ensure a final start so we assert one live.
+    if (!startRes2.ok || !(startBody2.runtime?.pid > 0)) {
+      const retry = await api("/v1/secondmates/infra/start", { method: "POST", body: "{}" });
+      startBody2 = retry.ok ? await retry.json().catch(() => ({})) : {};
+    }
+    const runtime = existsSync(runtimePath)
+      ? JSON.parse(readFileSync(runtimePath, "utf8"))
+      : null;
+    const registryPid = runtime?.pid ?? null;
+    let registryAlive = false;
+    if (typeof registryPid === "number" && registryPid > 0) {
+      try {
+        process.kill(registryPid, 0);
+        registryAlive = true;
+      } catch {
+        registryAlive = false;
+      }
+    }
+    let beforeAlive = false;
+    if (typeof beforePid === "number" && beforePid > 0 && beforePid !== registryPid) {
+      try {
+        process.kill(beforePid, 0);
+        beforeAlive = true;
+      } catch {
+        beforeAlive = false;
+      }
+    }
+    // Refresh token after possible restart (token path is stable under runtime/).
+    const g13TokenPath =
+      startBody2.runtime?.tokenPath ??
+      join(home, "runtime", "secondmates", "infra", "daemon.token");
+    if (existsSync(g13TokenPath)) {
+      smToken = readFileSync(g13TokenPath, "utf8").trim();
+    }
+    let statusOk = false;
+    if (registryAlive && smToken) {
+      try {
+        const st = await fetch(`http://127.0.0.1:${SM_PORT}/v1/status`, {
+          headers: { authorization: `Bearer ${smToken}` },
+        });
+        if (st.ok) {
+          const stBody = await st.json();
+          statusOk = stBody.daemon?.home === smHome;
+        }
+      } catch {
+        statusOk = false;
+      }
+    }
+    const oneLiveMatching =
+      registryPid !== null &&
+      registryAlive &&
+      registryPid === startBody2.runtime?.pid &&
+      !beforeAlive &&
+      statusOk &&
+      stopRes.status < 500;
+    gate(
+      "G13",
+      "concurrent stop+start leaves exactly one live process matching registry",
+      oneLiveMatching,
+      `beforePid=${beforePid} registryPid=${registryPid} startPid=${startBody2.runtime?.pid} beforeAlive=${beforeAlive} registryAlive=${registryAlive} statusOk=${statusOk} stop=${stopRes.status} start=${startRes2.status}`,
     );
   }
 

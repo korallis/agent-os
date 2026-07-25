@@ -20,6 +20,11 @@ import type { OrchestratorEvent } from "@agent-os/protocol";
  *
  * A provisioned directory is not a secondmate; start() launches a real
  * agentosd against the isolated home and waits until it is healthy.
+ *
+ * Lifecycle invariant: runtime.json and the children map describe exactly the
+ * process that is actually running, at every instant, and only the owner of a
+ * pid may clear that pid's record. start/stop for one name share one serial
+ * chain so they never interleave bookkeeping.
  */
 
 export interface SecondmateRecord {
@@ -64,6 +69,15 @@ export class SecondmateStartError extends Error {
   }
 }
 
+export class SecondmateStopError extends Error {
+  readonly code = "SECONDMATE_STOP_FAILED" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "SecondmateStopError";
+  }
+}
+
 export class SecondmateRegistry {
   private readonly root: string;
   private readonly runtimeRoot: string;
@@ -71,8 +85,11 @@ export class SecondmateRegistry {
   private primaryPort: number | null;
   private sink: SecondmateEventSink = () => undefined;
   private readonly children = new Map<string, ChildProcess>();
-  /** Per-name start chain — concurrent start() must not double-spawn. */
-  private readonly startChains = new Map<string, Promise<void>>();
+  /**
+   * Per-name lifecycle chain — concurrent start()/stop() for one secondmate
+   * must not interleave spawn, kill, or runtime bookkeeping.
+   */
+  private readonly lifecycleChains = new Map<string, Promise<void>>();
 
   constructor(agentosHome: string, options?: { primaryPort?: number }) {
     this.primaryHome = agentosHome;
@@ -293,7 +310,7 @@ export class SecondmateRegistry {
    * Start a secondmate agentosd with AGENTOS_HOME set to its isolated home.
    * Waits until the runtime token exists and /v1/status is healthy before
    * returning. Daemon token is written under primary runtime/ (outside audit).
-   * Serialized per name so concurrent starts cannot both spawn.
+   * Serialized per name with stop() so concurrent lifecycle ops cannot race.
    */
   async start(
     name: string,
@@ -305,13 +322,18 @@ export class SecondmateRegistry {
     },
   ): Promise<SecondmateRuntimeState> {
     const safe = name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
-    const prev = this.startChains.get(safe) ?? Promise.resolve();
-    const run = prev.then(
-      () => this.startExclusive(safe, options),
-      () => this.startExclusive(safe, options),
-    );
-    this.startChains.set(
-      safe,
+    return this.enqueueLifecycle(safe, () => this.startExclusive(safe, options));
+  }
+
+  /**
+   * Queue start/stop work for one secondmate name so only one lifecycle op
+   * runs at a time. Failures on prior ops do not block the next.
+   */
+  private enqueueLifecycle<T>(name: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.lifecycleChains.get(name) ?? Promise.resolve();
+    const run = prev.then(op, op);
+    this.lifecycleChains.set(
+      name,
       run.then(
         () => undefined,
         () => undefined,
@@ -478,45 +500,73 @@ export class SecondmateRegistry {
 
   /**
    * Stop a running secondmate process and wait for exit before clearing runtime
-   * state, so a quick restart cannot race the still-held home lock.
+   * state, so a quick restart cannot race the still-held home lock. Serialized
+   * on the same per-name chain as start(); only clears bookkeeping that still
+   * names the pid this stop targeted.
    */
   async stop(name: string): Promise<{ stopped: boolean; name: string }> {
+    const safe = name.replace(/[^a-z0-9_-]/gi, "").toLowerCase();
+    return this.enqueueLifecycle(safe, () => this.stopExclusive(safe));
+  }
+
+  private async stopExclusive(name: string): Promise<{ stopped: boolean; name: string }> {
     const record = this.get(name);
     if (record === null) {
       throw new Error(`no secondmate named ${name}`);
     }
     const runtime = this.readRuntime(record.name);
     const child = this.children.get(record.name);
-    let pid: number | null = null;
+    let targetPid: number | null = null;
+    let targetChild: ChildProcess | undefined;
     if (child !== undefined && child.pid !== undefined) {
-      pid = child.pid;
+      targetPid = child.pid;
+      targetChild = child;
       try {
         child.kill("SIGTERM");
       } catch {
         // ignore
       }
     } else if (runtime !== null && isProcessAlive(runtime.pid)) {
-      pid = runtime.pid;
+      targetPid = runtime.pid;
       try {
         process.kill(runtime.pid, "SIGTERM");
       } catch {
         // ignore
       }
     } else {
+      // Stale bookkeeping with no live process — drop only records for a dead
+      // runtime pid (or missing runtime), never a newer tracked child.
+      if (child !== undefined && (child.pid === undefined || !isProcessAlive(child.pid))) {
+        this.children.delete(record.name);
+      }
+      if (runtime !== null && !isProcessAlive(runtime.pid)) {
+        try {
+          rmSync(this.runtimeStatePath(record.name), { force: true });
+        } catch {
+          // ignore
+        }
+      }
+      return { stopped: false, name: record.name };
+    }
+
+    await waitForExit(targetPid, targetChild, STOP_EXIT_TIMEOUT_MS);
+
+    // Only the owner of a pid may clear that pid's record.
+    const tracked = this.children.get(record.name);
+    if (
+      tracked !== undefined &&
+      (tracked === targetChild ||
+        (tracked.pid !== undefined && tracked.pid === targetPid))
+    ) {
+      this.children.delete(record.name);
+    }
+    const currentRuntime = this.readRuntime(record.name);
+    if (currentRuntime !== null && currentRuntime.pid === targetPid) {
       try {
         rmSync(this.runtimeStatePath(record.name), { force: true });
       } catch {
         // ignore
       }
-      return { stopped: false, name: record.name };
-    }
-
-    await waitForExit(pid, child, STOP_EXIT_TIMEOUT_MS);
-    this.children.delete(record.name);
-    try {
-      rmSync(this.runtimeStatePath(record.name), { force: true });
-    } catch {
-      // ignore
     }
     return { stopped: true, name: record.name };
   }
@@ -565,11 +615,19 @@ export class SecondmateRegistry {
     } catch {
       // ignore
     }
-    await waitForExit(runtime.pid, undefined, STOP_EXIT_TIMEOUT_MS);
     try {
-      rmSync(this.runtimeStatePath(name), { force: true });
+      await waitForExit(runtime.pid, undefined, STOP_EXIT_TIMEOUT_MS);
     } catch {
-      // ignore
+      // Orphan reaping is best-effort; leave runtime.json if the pid survived.
+      return;
+    }
+    const still = this.readRuntime(name);
+    if (still !== null && still.pid === runtime.pid) {
+      try {
+        rmSync(this.runtimeStatePath(name), { force: true });
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -631,50 +689,83 @@ async function fetchWithTimeout(
   }
 }
 
+/**
+ * Wait for a soft exit; if the bound expires, SIGKILL and wait (bounded) until
+ * the pid is genuinely reaped. Throws SecondmateStopError if still alive.
+ */
 async function waitForExit(
   pid: number | null,
   child: ChildProcess | undefined,
   timeoutMs: number,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const softDeadline = Date.now() + timeoutMs;
+
   if (child !== undefined) {
-    const exited = await new Promise<boolean>((resolve) => {
-      if (child.exitCode !== null) {
-        resolve(true);
-        return;
-      }
-      const onExit = (): void => {
-        cleanup();
-        resolve(true);
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        resolve(false);
-      }, timeoutMs);
-      const cleanup = (): void => {
-        clearTimeout(timer);
-        child.removeListener("exit", onExit);
-      };
-      child.once("exit", onExit);
-    });
+    const exited = await waitChildExit(child, timeoutMs);
     if (exited) return;
     try {
       child.kill("SIGKILL");
     } catch {
       // ignore
     }
-    await sleep(100);
+  } else if (pid !== null) {
+    while (Date.now() < softDeadline) {
+      if (!isProcessAlive(pid)) return;
+      await sleep(READY_POLL_MS);
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ignore
+    }
+  } else {
     return;
   }
-  if (pid === null) return;
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return;
-    await sleep(READY_POLL_MS);
+
+  // Post-SIGKILL: must confirm reaping before callers clear runtime/port state.
+  const hardDeadline = Date.now() + timeoutMs;
+  if (child !== undefined) {
+    const reaped = await waitChildExit(child, timeoutMs);
+    if (reaped) return;
   }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // ignore
+  if (pid !== null) {
+    while (Date.now() < hardDeadline) {
+      if (!isProcessAlive(pid)) return;
+      if (child !== undefined && child.exitCode !== null) return;
+      await sleep(READY_POLL_MS);
+    }
+    if (isProcessAlive(pid) || (child !== undefined && child.exitCode === null)) {
+      throw new SecondmateStopError(
+        `secondmate pid ${pid} still alive after SIGKILL within ${timeoutMs}ms`,
+      );
+    }
+    return;
   }
-  await sleep(100);
+  if (child !== undefined && child.exitCode === null) {
+    throw new SecondmateStopError(
+      `secondmate child still running after SIGKILL within ${timeoutMs}ms`,
+    );
+  }
+}
+
+function waitChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null) {
+      resolve(true);
+      return;
+    }
+    const onExit = (): void => {
+      cleanup();
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, Math.max(1, timeoutMs));
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+    };
+    child.once("exit", onExit);
+  });
 }
