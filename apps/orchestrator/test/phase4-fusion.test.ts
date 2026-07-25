@@ -974,12 +974,16 @@ describe("/opinion live path", () => {
     expect(service.fusionRuns.get(taskId, runId)?.completedAt).toBeTruthy();
   });
 
+  // Boot-recovery kill-9 windows (property: side cannot still make progress).
+  // 1) mid-dispatch never-spawned (null sessionId)
+  // 2) halt-without-settle (status stopped)
+  // 3) markSessionStatus(settled) before completeFusionSide (status settled, settledAt null)
   it("boot hydrate finalizes mid-dispatch runs left with a never-spawned side", () => {
     const { service, events } = fleet();
     const { taskId, projectId } = seedShipTask(service);
 
-    // Simulate kill-9 mid dispatchFusion loop: first side persisted with a
-    // sessionId, second side still sessionId null.
+    // kill-9 mid-dispatch: first side persisted with a sessionId, second side
+    // still sessionId null.
     const spawnA = service.tools.invoke("spawn_crewmate", {
       taskId,
       role: "planner",
@@ -1188,6 +1192,119 @@ describe("/opinion live path", () => {
     // Simulate haltTaskSessions without completeFusionSide (kill-9 window).
     service.tools.markSessionStatus(sessionA, "stopped");
     service.tools.markSessionStatus(sessionB, "stopped");
+    expect(service.fusionRuns.get(taskId, runId)?.completedAt == null).toBe(true);
+    expect(
+      service.fusionRuns.get(taskId, runId)?.sides.every((s) => s.settledAt == null),
+    ).toBe(true);
+
+    events.length = 0;
+    service.tools.hydrateFusionOwnership();
+
+    const run = service.fusionRuns.get(taskId, runId);
+    expect(run).not.toBeNull();
+    expect(run!.completedAt).toBeTruthy();
+    expect(run!.sides.every((s) => s.settledAt != null)).toBe(true);
+    expect(run!.sides[0]?.artifactPath).not.toBeNull();
+    expect(events.map((e) => e.type)).toContain("fusion.side_completed");
+    expect(events.map((e) => e.type)).toContain("fusion.completed");
+  });
+
+  it("boot hydrate finalizes sides left settled without settledAt", () => {
+    const { service, events } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    // kill-9 between markSessionStatus(settled) and completeFusionSide:
+    // durable session status is settled, fusion side still has null settledAt.
+    const spawnA = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
+    const spawnB = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      cleanRoom: true,
+    });
+    expect(spawnA.ok).toBe(true);
+    expect(spawnB.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session
+      .sessionId;
+    const sessionB = (spawnB.data as { session: { sessionId: string } }).session
+      .sessionId;
+
+    const runId = "01JSETTLEDNULLATFUSION00000001";
+    service.fusionRuns.create({
+      runId,
+      taskId,
+      kind: "opinion",
+      templateRef: null,
+      templateLayer: null,
+      templateHash: null,
+      renderedHash: "settled-null-hash",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          family: "anthropic",
+          sessionId: sessionA,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: sessionB,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: new Date().toISOString(),
+    });
+
+    const dirA = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    }).dir;
+    mkdirSync(join(dirA, "outputs"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dirA, "outputs", `${sessionA}.md`), "settled side a\n", {
+      mode: 0o600,
+    });
+
+    // Persist status=settled without invoking completeFusionSide (the kill-9
+    // window after task.json write, before fusion side settledAt is written).
+    const task = service.tools.getTask(taskId);
+    expect(task).not.toBeNull();
+    const now = new Date().toISOString();
+    service.tools.hydrateTask({
+      ...task!,
+      sessions: task!.sessions.map((s) =>
+        s.sessionId === sessionA || s.sessionId === sessionB
+          ? { ...s, status: "settled", lastEventAt: now }
+          : s,
+      ),
+      updatedAt: now,
+    });
+    expect(
+      service.tools
+        .listSessions()
+        .filter((s) => s.sessionId === sessionA || s.sessionId === sessionB)
+        .every((s) => s.status === "settled"),
+    ).toBe(true);
     expect(service.fusionRuns.get(taskId, runId)?.completedAt == null).toBe(true);
     expect(
       service.fusionRuns.get(taskId, runId)?.sides.every((s) => s.settledAt == null),

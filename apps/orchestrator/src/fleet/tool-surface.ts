@@ -358,9 +358,9 @@ export class ToolSurface {
    * Sides with a sessionId that have not yet settled remain in-flight so
    * settle/session_end can still write artifacts and emit fusion.completed.
    * Open runs are then reconciled via the shared finalize path so a kill-9
-   * mid-dispatch (null sessionId), halt-without-settle (stopped session), or a
-   * crash after the last settle cannot leave a run permanently on
-   * fusion.dispatched.
+   * mid-dispatch (null sessionId), halt-without-settle (stopped/settled
+   * without settledAt), missing pane, or all-settled-missing-completedAt
+   * cannot leave a run permanently on fusion.dispatched.
    */
   hydrateFusionOwnership(): void {
     for (const task of this.tasks.values()) {
@@ -387,9 +387,10 @@ export class ToolSurface {
       }
     }
 
-    // Boot counterpart of halt finalize: never-spawned sides, terminal/lost
-    // sessions that never got completeFusionSide, and all-settled-missing-
-    // completedAt. One shared helper so boot cannot diverge from runtime.
+    // Boot counterpart of halt finalize: any side that can no longer make
+    // progress on its own (never spawned, non-live status, missing pane),
+    // plus all-settled-missing-completedAt. One shared helper so boot cannot
+    // diverge from runtime.
     for (const task of this.tasks.values()) {
       for (const run of this.deps.fusionRuns.listForTask(task.id)) {
         if (run.completedAt != null) continue;
@@ -2391,10 +2392,10 @@ export class ToolSurface {
 
   /**
    * Single durable-run finalize: settle never-spawned (null sessionId) sides,
-   * complete session-owned sides that are force-finalized (error path) or
-   * already terminal/missing (boot hydrate after halt-without-settle), leave
-   * live sides for settle/session_end, and tryComplete when every side is done
-   * (including all-settled runs that still lack completedAt).
+   * complete session-owned sides that cannot still make progress (or are
+   * force-finalized on error paths), leave live sides for settle/session_end,
+   * and tryComplete when every side is done (including all-settled runs that
+   * still lack completedAt).
    * Used by halt/cancel, mid-spawn failure, and boot hydrate so the rule is not forked.
    */
   private finalizeOpenFusionRun(
@@ -2444,20 +2445,43 @@ export class ToolSurface {
         runId: latest.runId,
         sideIndex,
       });
-      const session = this.sessions.get(side.sessionId);
-      const terminal =
-        session === undefined ||
-        session.status === "stopped" ||
-        session.status === "lost";
+      // Property, not a status enum: can this side still receive lifecycle
+      // events? Only starting/running rows with a live pane can. Anything else
+      // (settled/stopped/lost/wedged/missing row/gone pane/unknown) must be
+      // finalized here — default to finalize when progress is no or unknown.
+      const canStillMakeProgress = this.fusionSideCanStillMakeProgress(
+        side.sessionId,
+      );
       // Force (halt / mid-spawn fail / never-spawned sibling) completes live
-      // sides; boot hydrate only settles sides whose session is already dead.
-      if (force || terminal) {
+      // sides; boot hydrate only settles sides that can no longer settle alone.
+      if (force || !canStillMakeProgress) {
         this.completeFusionSide(side.sessionId, error);
       }
     }
 
     // Crash window: all sides already settled but completedAt still null.
     this.tryCompleteFusionRun(taskId, runId, error);
+  }
+
+  /**
+   * Whether a fusion side can still emit agent_settled / session_end on its own.
+   * True only for a known session in a live status whose tmux window still
+   * exists. Missing sessions, non-live statuses (including settled-without-
+   * settledAt), gone panes, and unknown rows all return false so boot recovery
+   * finalizes them through completeFusionSide rather than waiting forever.
+   */
+  private fusionSideCanStillMakeProgress(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) return false;
+    if (session.status !== "starting" && session.status !== "running") {
+      return false;
+    }
+    try {
+      return this.deps.tmux.hasWindow(session.tmuxWindow);
+    } catch {
+      // Unknown liveness → cannot assume progress; finalize on boot/halt.
+      return false;
+    }
   }
 
   private deliverTask(raw: Record<string, unknown>): TaskSnapshot {
