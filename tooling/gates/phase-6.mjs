@@ -79,6 +79,45 @@ const PAGES = [
   "/onboarding",
 ];
 
+/** Open a WS and resolve true only when the upgrade actually succeeded. */
+async function tryWebSocket(url) {
+  const { WebSocket } = await import("ws");
+  return await new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const ws = new WebSocket(url, { origin: "http://127.0.0.1" });
+    const timer = setTimeout(() => {
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      done(false);
+    }, 3000);
+    ws.on("open", () => {
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      done(true);
+    });
+    ws.on("error", () => {
+      clearTimeout(timer);
+      done(false);
+    });
+    ws.on("unexpected-response", () => {
+      clearTimeout(timer);
+      done(false);
+    });
+  });
+}
+
 const cleanups = [];
 let daemon;
 let consoleServer;
@@ -500,6 +539,24 @@ try {
       detail = `model=${hasModel} window=${hasWindow} attach=${hasAttach} log=${hasLogHeading}`;
     }
     gate("G9", "session detail renders the seat's model, pane, attach command and log", ok, detail);
+  }
+
+  // G11 — attach ticket is single-use and the WS refuses a spent one
+  {
+    const state = await (await fetch(`${BASE}/v1/fleet/state`, { headers: auth })).json();
+    const session = (state.state?.sessions ?? [])[0];
+    let ok = false;
+    let detail = "no session seeded";
+    if (session !== undefined) {
+      const minted = await post(`/v1/sessions/${session.sessionId}/attach-ticket`, {});
+      const hasUrl = typeof minted.wsUrl === "string" && minted.wsUrl.startsWith("ws://127.0.0.1:");
+      // Redeem once over a real WS upgrade, then prove the same ticket is dead.
+      const openOnce = await tryWebSocket(minted.wsUrl);
+      const openTwice = await tryWebSocket(minted.wsUrl);
+      ok = hasUrl && openOnce && !openTwice;
+      detail = `wsUrl=${hasUrl} first=${openOnce} replay=${openTwice}`;
+    }
+    gate("G11", "attach ticket is single-use — a replayed ticket is refused", ok, detail);
   }
 
   // G8 — unknown route renders the shared empty treatment

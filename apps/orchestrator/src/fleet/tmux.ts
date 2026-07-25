@@ -50,7 +50,8 @@ export function envPrefixedCommand(argv: string[], env?: Record<string, string>)
 }
 
 export class TmuxController {
-  private readonly socketName: string;
+  /** Exposed so the PTY reader targets the same tmux server the fleet uses. */
+  readonly socketName: string;
   private readonly fake: boolean;
   private readonly fakeWindows = new Map<string, { session: string; window: string; cmd: string }>();
 
