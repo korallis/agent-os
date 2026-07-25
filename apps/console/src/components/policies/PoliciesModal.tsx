@@ -10,6 +10,7 @@ import {
 import { SettingsModal, Divider, type SettingsTab } from "@/components/settings/SettingsModal";
 import { SafetyToggles } from "./SafetyToggles";
 import { PromptDiff } from "./PromptDiff";
+import { BalancerPanel } from "./BalancerPanel";
 
 function leafEntries(
   value: Record<string, unknown>,
@@ -159,6 +160,22 @@ export function PoliciesModal() {
         footer={footer}
       >
         <p className="text-[13px] text-fg-3">loading effective config…</p>
+      </SettingsModal>
+    );
+  }
+
+  if (domain === "balancer") {
+    return (
+      <SettingsModal
+        heading="Policies"
+        tabs={tabs}
+        activeTab={domain}
+        title="Auto-balancer"
+        subtitle="Spread work across your roster by remaining quota window."
+        footer={footer}
+        onTabSelect={setActiveDomain}
+      >
+        <BalancerPanel />
       </SettingsModal>
     );
   }
