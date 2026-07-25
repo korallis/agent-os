@@ -697,15 +697,15 @@ describe("structural WEDGED ladder", () => {
     // Force escalate to throw once after the durable pending is recorded.
     let failOnce = true;
     const tools = service.tools as unknown as {
-      escalate: (raw: Record<string, unknown>) => unknown;
+      escalate: (raw: Record<string, unknown>, options?: { bypassAfk?: boolean }) => unknown;
     };
     const originalEscalate = tools.escalate.bind(service.tools);
-    tools.escalate = (raw: Record<string, unknown>) => {
+    tools.escalate = (raw: Record<string, unknown>, options?: { bypassAfk?: boolean }) => {
       if (failOnce) {
         failOnce = false;
         throw new Error("simulated escalate sink failure");
       }
-      return originalEscalate(raw);
+      return originalEscalate(raw, options);
     };
 
     events.length = 0;
@@ -719,14 +719,146 @@ describe("structural WEDGED ladder", () => {
       expect(pending[0]?.sessionId).toBe(sessionId);
       expect(pending[0]?.role).toBe(role);
 
-      // Next tick discharges the durable obligation without needing a live seat.
+      // Next tick discharges via top-of-loop only — no second session.wedged.
       events.length = 0;
       service.tools.reconcileWedgedSessions(Date.now());
       expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+      expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
       expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
       expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+      expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
     } finally {
       tools.escalate = originalEscalate;
     }
+  });
+
+  it("does not re-arm Captain notify after successful discharge survives restart", () => {
+    const { service, events, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+    const { taskId, sessionId } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    events.length = 0;
+    expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("escalated");
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
+
+    // Persist is already on disk via saveTask; bounce with empty process state.
+    const restarted = fleet({ home, start: false });
+    const reEvents: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => reEvents.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(
+      sessionId,
+    );
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      0,
+    );
+  });
+
+  it("still escalates after restart when discharge never succeeded", () => {
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const tools = service.tools as unknown as {
+      escalate: (raw: Record<string, unknown>, options?: { bypassAfk?: boolean }) => unknown;
+    };
+    const originalEscalate = tools.escalate.bind(service.tools);
+    tools.escalate = () => {
+      throw new Error("simulated durable sink failure");
+    };
+
+    try {
+      service.tools.reconcileWedgedSessions(Date.now());
+    } finally {
+      tools.escalate = originalEscalate;
+    }
+
+    const pending = service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? [];
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.sessionId).toBe(sessionId);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds ?? []).not.toContain(
+      sessionId,
+    );
+
+    // Ensure the failed-discharge task state is what a bounce would load.
+    writeFileSync(
+      join(home, "runs", taskId, "task.json"),
+      `${JSON.stringify(service.tools.getTask(taskId), null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const restarted = fleet({ home, start: false });
+    const reEvents: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => reEvents.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies).toHaveLength(1);
+    expect(
+      restarted.service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds ?? [],
+    ).not.toContain(sessionId);
+
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    const esc = reEvents.find((e) => e.type === "captain.escalation");
+    if (esc?.type === "captain.escalation") {
+      expect(esc.payload.summary).toContain(role);
+    }
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      0,
+    );
+    expect(restarted.service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    expect(restarted.service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(
+      sessionId,
+    );
+  });
+
+  it("does not clear wedge pending when AFK FAQ would match the summary", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+    const { taskId, sessionId } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    // Broad FAQ needles that substring-match a typical wedge summary ("Seat … wedged").
+    service.afk.arm({
+      faq: [
+        {
+          match: ["seat", "wedged"],
+          answer: "Ignore structural wedge — keep going.",
+          rationale: "would incorrectly auto-answer a structural wedge",
+        },
+      ],
+    });
+    expect(service.afk.isActive()).toBe(true);
+
+    events.length = 0;
+    const acted = service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted[0]?.action).toBe("escalated");
+    // AFK must not swallow the structural wedge: Captain still gets the sink.
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(events.some((e) => e.type === "afk.auto_answered")).toBe(false);
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
+
+    // Crewmate-style escalate still honours AFK when not a wedge discharge.
+    events.length = 0;
+    const crewmate = service.tools.invoke("escalate_to_captain", {
+      taskId,
+      summary: "Seat builder wedged — OK to ignore?",
+      severity: "info",
+    });
+    expect(crewmate.ok).toBe(true);
+    expect((crewmate.data as { autoAnswered?: boolean; sank?: boolean }).autoAnswered).toBe(true);
+    expect((crewmate.data as { sank?: boolean }).sank).toBe(false);
+    expect(events.some((e) => e.type === "captain.escalation")).toBe(false);
+    expect(events.some((e) => e.type === "afk.auto_answered")).toBe(true);
   });
 });

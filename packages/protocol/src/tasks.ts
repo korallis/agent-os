@@ -191,6 +191,12 @@ export const taskSnapshotSchema = z.strictObject({
       }),
     )
     .default([]),
+  /**
+   * Session ids whose WEDGED ladder fully finished (respawn done, or captain
+   * escalation sunk). Durable so a daemon restart cannot re-open a completed
+   * escalate seat and re-arm a cleared Captain-notify obligation.
+   */
+  wedgeLadderCompletedSessionIds: z.array(z.string().min(1)).default([]),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,

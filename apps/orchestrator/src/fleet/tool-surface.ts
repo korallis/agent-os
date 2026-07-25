@@ -258,9 +258,9 @@ export class ToolSurface {
   /** `${taskId}:${role}` → wedge respawns already consumed (ladder ledger). */
   private readonly wedgeRespawns = new Map<string, number>();
   /**
-   * sessionIds whose wedge ladder has completed in this process (emit + outcome).
-   * Durable-wedged seats rehydrated after a crash are reconsidered once until
-   * they land here — prevents stranding and per-tick re-escalate spam.
+   * sessionIds whose wedge ladder has completed (emit + outcome, or Captain
+   * notify sunk). Backed by task.wedgeLadderCompletedSessionIds so a restart
+   * cannot re-open a finished escalate seat and re-arm a cleared obligation.
    */
   private readonly wedgeLadderCompleted = new Set<string>();
   /**
@@ -463,6 +463,7 @@ export class ToolSurface {
   hydrateTask(task: TaskSnapshot): void {
     const wedgeRespawnsByRole = task.wedgeRespawnsByRole ?? {};
     const wedgePendingCaptainNotifies = task.wedgePendingCaptainNotifies ?? [];
+    const wedgeLadderCompletedSessionIds = task.wedgeLadderCompletedSessionIds ?? [];
     const normalized: TaskSnapshot = {
       ...task,
       deliveryBlocked: task.deliveryBlocked ?? null,
@@ -470,6 +471,7 @@ export class ToolSurface {
       lastFailLedger: task.lastFailLedger ?? null,
       wedgeRespawnsByRole,
       wedgePendingCaptainNotifies,
+      wedgeLadderCompletedSessionIds,
     };
     this.tasks.set(normalized.id, normalized);
     if (normalized.idempotencyKey !== null) {
@@ -486,6 +488,9 @@ export class ToolSurface {
       if (typeof count === "number" && Number.isFinite(count) && count >= 0) {
         this.wedgeRespawns.set(`${normalized.id}:${role}`, count);
       }
+    }
+    for (const sessionId of wedgeLadderCompletedSessionIds) {
+      this.wedgeLadderCompleted.add(sessionId);
     }
     task = normalized;
     for (const s of task.sessions) {
@@ -672,10 +677,13 @@ export class ToolSurface {
     const acted: Array<{ sessionId: string; action: string }> = [];
 
     for (const session of [...this.sessions.values()]) {
-      // Re-admit durable-wedged seats that never finished the ladder in this
-      // process (crash between classify and outcome, or pre-fix stranded rows).
+      // Re-admit durable-wedged seats that never finished the ladder (crash
+      // between classify and outcome, or a notify that never sunk). Completion
+      // is durable on the task so a successful discharge does not re-open after
+      // restart; absence of completion + empty pending still re-enters so a
+      // never-notified wedge escalates on the next boot (exactly-once).
       const reopened =
-        session.status === "wedged" && !this.wedgeLadderCompleted.has(session.sessionId);
+        session.status === "wedged" && !this.isWedgeLadderCompleted(session.sessionId);
       if (session.status !== "running" && session.status !== "starting" && !reopened) {
         continue;
       }
@@ -700,6 +708,17 @@ export class ToolSurface {
       const spawnLegal =
         task !== null && this.canLegallySpawnForWedgeRespawn(task, session.role);
 
+      // Pending notify already records the obligation; top-of-loop discharge
+      // owns retries. Do not re-emit session.wedged or re-enter escalate.
+      if (reopened) {
+        const hasPending = (task?.wedgePendingCaptainNotifies ?? []).some(
+          (n) => n.sessionId === session.sessionId,
+        );
+        if (hasPending) {
+          continue;
+        }
+      }
+
       // In-memory only until the outcome is known — durable wedged before
       // respawn/escalate strands the seat if we crash mid-ladder (rehydrate
       // would skip running|starting-only candidates with an unspent ledger).
@@ -715,12 +734,7 @@ export class ToolSurface {
       // never re-attempt respawn or re-wedge a terminal row.
       if (reopened) {
         action = "escalated";
-        const existingPending = task?.wedgePendingCaptainNotifies?.find(
-          (n) => n.sessionId === session.sessionId,
-        );
-        escalateSummary =
-          existingPending?.summary ??
-          `Seat ${session.role} wedged — completing deferred Captain notify (no activity for ${Math.round(idleMinutes)}m)`;
+        escalateSummary = `Seat ${session.role} wedged — completing deferred Captain notify (no activity for ${Math.round(idleMinutes)}m)`;
       } else if (canRespawn && spawnLegal) {
         try {
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
@@ -796,17 +810,23 @@ export class ToolSurface {
             continue;
           }
         } else {
-          this.escalate({
-            taskId: undefined,
-            summary: escalateSummary,
-            severity: "critical",
-          });
+          const result = this.escalate(
+            {
+              taskId: undefined,
+              summary: escalateSummary,
+              severity: "critical",
+            },
+            { bypassAfk: true },
+          );
+          if (!result.sank) {
+            acted.push({ sessionId: session.sessionId, action });
+            continue;
+          }
         }
       }
       // Only after a successful escalate (or a finished no-escalate respawn).
-      // The reconcile tick swallows errors — marking complete first would leave
-      // a durable-wedged seat that never re-attempts captain.escalation.
-      this.wedgeLadderCompleted.add(session.sessionId);
+      // Mark durable so a restart cannot re-arm a cleared Captain-notify.
+      this.markWedgeLadderCompleted(session.sessionId, session.taskId);
       acted.push({ sessionId: session.sessionId, action });
     }
     return acted;
@@ -911,9 +931,32 @@ export class ToolSurface {
     });
   }
 
+  private isWedgeLadderCompleted(sessionId: string): boolean {
+    return this.wedgeLadderCompleted.has(sessionId);
+  }
+
   /**
-   * Sink captain.escalation for one pending entry and clear it only on success.
-   * Returns false when there was nothing to discharge, or the attempt threw
+   * Record ladder completion in memory and on the task snapshot so a restart
+   * cannot re-open a finished seat and re-arm a cleared Captain-notify.
+   */
+  private markWedgeLadderCompleted(sessionId: string, taskId: string | null): void {
+    this.wedgeLadderCompleted.add(sessionId);
+    if (taskId === null) return;
+    const task = this.tasks.get(taskId);
+    if (task === undefined) return;
+    const existing = task.wedgeLadderCompletedSessionIds ?? [];
+    if (existing.includes(sessionId)) return;
+    this.saveTask({
+      ...task,
+      wedgeLadderCompletedSessionIds: [...existing, sessionId],
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Sink captain.escalation for one pending entry and clear it only when the
+   * escalation event was actually sunk (not AFK-auto-answered, not thrown).
+   * Returns false when there was nothing to discharge, or the sink did not land
    * (entry left in place for a later tick).
    */
   private dischargePendingWedgeCaptainNotify(taskId: string, sessionId: string): boolean {
@@ -922,25 +965,43 @@ export class ToolSurface {
     const pending = task.wedgePendingCaptainNotifies ?? [];
     const entry = pending.find((n) => n.sessionId === sessionId);
     if (entry === undefined) return false;
+    let sank = false;
     try {
-      this.escalate({
-        taskId,
-        summary: entry.summary,
-        severity: entry.severity,
-      });
+      // Structural wedges must reach the Captain — never FAQ-auto-answer them.
+      const result = this.escalate(
+        {
+          taskId,
+          summary: entry.summary,
+          severity: entry.severity,
+        },
+        { bypassAfk: true },
+      );
+      sank = result.sank;
     } catch {
       return false;
     }
+    if (!sank) return false;
     // Re-read after escalate (may have rewritten the task) and clear this entry.
     const after = this.tasks.get(taskId);
-    if (after === undefined) return true;
+    if (after === undefined) {
+      this.wedgeLadderCompleted.add(sessionId);
+      return true;
+    }
     const remaining = (after.wedgePendingCaptainNotifies ?? []).filter(
       (n) => n.sessionId !== sessionId,
     );
-    if (remaining.length !== (after.wedgePendingCaptainNotifies ?? []).length) {
+    const completed = after.wedgeLadderCompletedSessionIds ?? [];
+    const needsCompleted = !completed.includes(sessionId);
+    if (
+      remaining.length !== (after.wedgePendingCaptainNotifies ?? []).length ||
+      needsCompleted
+    ) {
       this.saveTask({
         ...after,
         wedgePendingCaptainNotifies: remaining,
+        wedgeLadderCompletedSessionIds: needsCompleted
+          ? [...completed, sessionId]
+          : completed,
         updatedAt: new Date().toISOString(),
       });
     }
@@ -1569,6 +1630,7 @@ export class ToolSurface {
       lastFailLedger: null,
       wedgeRespawnsByRole: {},
       wedgePendingCaptainNotifies: [],
+      wedgeLadderCompletedSessionIds: [],
       idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
       updatedAt: now,
@@ -3954,10 +4016,15 @@ export class ToolSurface {
     }
   }
 
-  private escalate(raw: Record<string, unknown>): {
+  private escalate(
+    raw: Record<string, unknown>,
+    options?: { bypassAfk?: boolean },
+  ): {
     ok: true;
     autoAnswered: boolean;
     answer: string | null;
+    /** True when captain.escalation was actually sunk (not FAQ-auto-answered). */
+    sank: boolean;
   } {
     const input = escalateToCaptainInputSchema.parse(raw);
 
@@ -3965,10 +4032,16 @@ export class ToolSurface {
     // matching FAQ entry falls through to the normal escalation below and
     // waits — inventing an answer would be worse than the delay, because the
     // Brain would act on an instruction the Captain never gave.
-    if (this.deps.afk !== undefined && this.deps.afk.isActive()) {
+    // Structural wedge discharges pass bypassAfk so FAQ needles cannot swallow
+    // a seat-failure that must reach the Captain.
+    if (
+      options?.bypassAfk !== true &&
+      this.deps.afk !== undefined &&
+      this.deps.afk.isActive()
+    ) {
       const answered = this.deps.afk.tryAnswer(input.summary);
       if (answered !== null) {
-        return { ok: true, autoAnswered: true, answer: answered.answer };
+        return { ok: true, autoAnswered: true, answer: answered.answer, sank: false };
       }
     }
 
@@ -3994,7 +4067,7 @@ export class ToolSurface {
         severity: input.severity,
       },
     });
-    return { ok: true, autoAnswered: false, answer: null };
+    return { ok: true, autoAnswered: false, answer: null, sank: true };
   }
 
   private notify(raw: Record<string, unknown>): { ok: true } {
