@@ -420,6 +420,8 @@ export const bridgeToolCallEventSchema = z.strictObject({
     tool: z.string(),
     accepted: z.boolean(),
     reason: z.string().nullable(),
+    /** False when ctl.tool_result could not be written to the session socket. */
+    delivered: z.boolean().optional(),
   }),
 });
 

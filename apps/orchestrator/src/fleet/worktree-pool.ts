@@ -92,9 +92,20 @@ export class WorktreePool {
     branch?: string;
   }): WorktreeLease {
     const branch = input.branch ?? `ao/${input.taskId.slice(0, 10).toLowerCase()}`;
-    const idle = this.listForProject(input.projectId).find((l) => l.state === "idle");
-    if (idle !== undefined) {
-      this.checkoutBranchForReuse(idle.path, input.repoPath, branch);
+    // Prefer idle reuse, but never re-issue a missing/broken tree — drop and allocate fresh.
+    for (;;) {
+      const idle = this.listForProject(input.projectId).find((l) => l.state === "idle");
+      if (idle === undefined) break;
+      if (!this.isUsableWorktreePath(idle.path)) {
+        this.dropIdleLease(idle, "idle worktree path missing or not a usable git worktree");
+        continue;
+      }
+      try {
+        this.checkoutBranchForReuse(idle.path, input.repoPath, branch);
+      } catch {
+        this.dropIdleLease(idle, "idle worktree checkout failed");
+        continue;
+      }
       const leased: WorktreeLease = {
         ...idle,
         state: "leased",
@@ -171,6 +182,42 @@ export class WorktreePool {
       },
     });
     return lease;
+  }
+
+  /** True when the path can host a crewmate cwd (real git worktree or FAKE_GIT marker). */
+  private isUsableWorktreePath(worktreePath: string): boolean {
+    if (!existsSync(worktreePath)) return false;
+    if (process.env.AGENTOS_FAKE_GIT === "1") return true;
+    if (!existsSync(join(worktreePath, ".git"))) {
+      // Marker-only fixture trees from non-git repos are usable as metadata paths.
+      return existsSync(join(worktreePath, ".agentos-worktree"));
+    }
+    const probe = spawnSync("git", ["-C", worktreePath, "rev-parse", "--is-inside-work-tree"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    return probe.status === 0 && probe.stdout.trim() === "true";
+  }
+
+  /** Drop a broken idle lease so the pool can allocate a replacement. */
+  private dropIdleLease(lease: WorktreeLease, reason: string): void {
+    try {
+      rmSync(lease.path, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+    this.leases.delete(lease.id);
+    this.persistProject(lease.projectId);
+    this.sink({
+      type: "worktree.released",
+      payload: {
+        leaseId: lease.id,
+        projectId: lease.projectId,
+        path: lease.path,
+        quarantined: true,
+        reason,
+      },
+    });
   }
 
   /**
@@ -361,5 +408,24 @@ export class WorktreePool {
     }
     this.leases.delete(leaseId);
     this.persistProject(lease.projectId);
+  }
+
+  /**
+   * Boot reclaim: release leases still marked leased/reclaiming whose session is
+   * gone or has no live tmux pane. Returns the number of leases released.
+   */
+  reclaimOrphanedLeases(isLiveSession: (sessionId: string | null) => boolean): number {
+    let reclaimed = 0;
+    for (const lease of [...this.leases.values()]) {
+      if (lease.state !== "leased" && lease.state !== "reclaiming") continue;
+      if (isLiveSession(lease.sessionId)) continue;
+      try {
+        this.release(lease.id, {});
+        reclaimed += 1;
+      } catch {
+        // best-effort
+      }
+    }
+    return reclaimed;
   }
 }

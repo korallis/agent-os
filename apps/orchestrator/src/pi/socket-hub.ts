@@ -209,7 +209,11 @@ export class SocketHub {
     });
 
     socket.on("close", () => {
-      if (sessionId !== null) this.sockets.delete(sessionId);
+      // Only drop the map entry when it still points at this socket. A reconnect
+      // that hellos on a new socket before the old close fires must not wipe the live peer.
+      if (sessionId !== null && this.sockets.get(sessionId) === socket) {
+        this.sockets.delete(sessionId);
+      }
     });
   }
 

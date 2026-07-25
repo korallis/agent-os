@@ -96,12 +96,17 @@ export class BrainManager {
 
   /**
    * Start or respawn the Brain. Blocked when config.respawnBlocked (BRAIN_DOWN fixture).
+   * Always tears down any prior Brain pane/socket before spawning so respawn and
+   * daemon-restart reclaim cannot leave an unauthorized live pane in BRAIN_DOWN.
    */
   start(reason = "boot"): BrainSnapshot {
     if (this.config.respawnBlocked) {
+      this.teardownPriorBrain();
       this.enterDown(`respawn blocked (${reason})`);
       return this.getSnapshot();
     }
+
+    this.teardownPriorBrain();
 
     const model = this.resolveModel();
     const thinking = this.config.thinking;
@@ -125,10 +130,13 @@ export class BrainManager {
     this.emitStatus("starting", reason);
 
     if (this.fake) {
+      // Long-lived pane so daemon restart / reconcile does not treat the Brain as dead
+      // after a short-lived `echo` exits under real tmux.
       this.deps.tmux.newWindow({
         windowName,
-        argv: ["echo", "fake-brain", sessionId],
+        argv: ["sh", "-c", `echo fake-brain ${sessionId}; exec sleep 86400`],
       });
+      this.deps.tools.setBrainSessionId(sessionId);
     } else {
       if (this.deps.pi?.binary == null || this.deps.extensionPath === undefined) {
         this.enterDown(
@@ -211,6 +219,31 @@ export class BrainManager {
       },
     });
     this.emitStatus("down", reason);
+  }
+
+  /**
+   * Kill any surviving brain tmux window, close its control socket, and clear
+   * the authorized brain session id so a respawn cannot collide or leave a
+   * live pane unauthorized while the fleet is in BRAIN_DOWN.
+   */
+  private teardownPriorBrain(): void {
+    const priorSessionId = this.snapshot.sessionId;
+    const priorWindow = this.snapshot.tmuxWindow;
+    const targets = new Set<string>(["agentos:brain"]);
+    if (priorWindow !== null) targets.add(priorWindow);
+    for (const target of targets) {
+      if (this.deps.tmux.hasWindow(target)) {
+        try {
+          this.deps.tmux.killWindow(target);
+        } catch {
+          // best-effort reclaim
+        }
+      }
+    }
+    if (priorSessionId !== null) {
+      void this.deps.sockets?.closeSession(priorSessionId).catch(() => undefined);
+    }
+    this.deps.tools.setBrainSessionId(null);
   }
 
   /**

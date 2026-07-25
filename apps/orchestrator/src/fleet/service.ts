@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
+  DaemonControlFrame,
   ExtensionToDaemonFrame,
   FleetSummary,
   OrchestratorEvent,
@@ -32,6 +33,13 @@ export interface FleetServiceOptions {
   fakeBrain?: boolean;
 }
 
+type PendingToolResult = {
+  frame: Extract<DaemonControlFrame, { type: "ctl.tool_result" }>;
+  tool: string;
+  accepted: boolean;
+  reason: string | null;
+};
+
 /**
  * Fleet service facade — owns projects, worktrees, tools, watcher, brain.
  */
@@ -44,6 +52,9 @@ export class FleetService {
   readonly tools: ToolSurface;
   readonly brain: BrainManager;
   private sink: FleetEventSink = () => undefined;
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
+  /** ctl.tool_result frames that failed sendControl; retried on session re-hello. */
+  private readonly pendingToolResults = new Map<string, PendingToolResult[]>();
 
   constructor(private readonly options: FleetServiceOptions) {
     const cfg = options.config.effective().config;
@@ -82,6 +93,7 @@ export class FleetService {
     });
 
     this.hydrateTasks();
+    this.rehydrateRuntime();
   }
 
   onEvent(sink: FleetEventSink): void {
@@ -96,9 +108,10 @@ export class FleetService {
     this.brain.onEvent(fanout);
   }
 
-  /** Boot: start brain (or enter BRAIN_DOWN if blocked). */
+  /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */
   start(): void {
     this.brain.start("daemon-boot");
+    this.startReconcileTick();
   }
 
   /**
@@ -109,6 +122,7 @@ export class FleetService {
   handleExtensionFrame(frame: ExtensionToDaemonFrame): void {
     switch (frame.type) {
       case "ext.hello":
+        this.flushPendingToolResults(frame.sessionId);
         break;
       case "ext.lifecycle":
         this.onLifecycle(frame);
@@ -176,6 +190,8 @@ export class FleetService {
         });
         break;
       case "session_end":
+        // Fast path for extension-driven end: settle cleanly when still live.
+        // SIGKILL / pane death without session_end is handled by reconcileDeadPanes.
         this.tools.markSessionStatus(frame.sessionId, "settled");
         void this.options.sockets?.closeSession(frame.sessionId).catch(() => undefined);
         break;
@@ -193,17 +209,8 @@ export class FleetService {
     frame: Extract<ExtensionToDaemonFrame, { type: "ext.tool_call" }>,
   ): void {
     const result = this.tools.invokeFromSession(frame.sessionId, frame.tool, frame.input);
-    this.sink({
-      type: "bridge.tool_call",
-      payload: {
-        sessionId: frame.sessionId,
-        invocationId: frame.invocationId,
-        tool: frame.tool,
-        accepted: result.ok,
-        reason: result.ok ? null : (result.error?.message ?? null),
-      },
-    });
-    this.options.sockets?.sendControl(frame.sessionId, {
+    const reason = result.ok ? null : (result.error?.message ?? null);
+    const controlFrame: Extract<DaemonControlFrame, { type: "ctl.tool_result" }> = {
       type: "ctl.tool_result",
       sessionId: frame.sessionId,
       invocationId: frame.invocationId,
@@ -213,11 +220,65 @@ export class FleetService {
         ? { error: { code: result.error.code, message: result.error.message } }
         : {}),
       ts: new Date().toISOString(),
+    };
+    const delivered = this.options.sockets?.sendControl(frame.sessionId, controlFrame) ?? false;
+    this.sink({
+      type: "bridge.tool_call",
+      payload: {
+        sessionId: frame.sessionId,
+        invocationId: frame.invocationId,
+        tool: frame.tool,
+        accepted: result.ok,
+        reason: delivered
+          ? reason
+          : (reason ?? "tool_result undelivered — will retry on re-hello"),
+        delivered,
+      },
     });
+    if (!delivered) {
+      const queue = this.pendingToolResults.get(frame.sessionId) ?? [];
+      queue.push({
+        frame: controlFrame,
+        tool: frame.tool,
+        accepted: result.ok,
+        reason,
+      });
+      this.pendingToolResults.set(frame.sessionId, queue);
+    }
+  }
+
+  private flushPendingToolResults(sessionId: string): void {
+    const queue = this.pendingToolResults.get(sessionId);
+    if (queue === undefined || queue.length === 0) return;
+    const remaining: PendingToolResult[] = [];
+    for (const pending of queue) {
+      const delivered = this.options.sockets?.sendControl(sessionId, pending.frame) ?? false;
+      if (!delivered) {
+        remaining.push(pending);
+        continue;
+      }
+      this.sink({
+        type: "bridge.tool_call",
+        payload: {
+          sessionId,
+          invocationId: pending.frame.invocationId,
+          tool: pending.tool,
+          accepted: pending.accepted,
+          reason: pending.reason,
+          delivered: true,
+        },
+      });
+    }
+    if (remaining.length === 0) {
+      this.pendingToolResults.delete(sessionId);
+    } else {
+      this.pendingToolResults.set(sessionId, remaining);
+    }
   }
 
   stop(): void {
     // leave tmux windows alive — they survive daemon restarts
+    this.stopReconcileTick();
   }
 
   reloadConfig(): void {
@@ -226,6 +287,7 @@ export class FleetService {
     this.watcher.updateConfig(cfg.supervision);
     this.gates.updateConfig(cfg.validation);
     this.brain.updateConfig(cfg.brain);
+    this.startReconcileTick();
   }
 
   summary(): FleetSummary {
@@ -259,6 +321,14 @@ export class FleetService {
     return this.tools.listTasks().map((t) => taskToListItem(t, projects.get(t.projectId)?.name ?? null));
   }
 
+  /**
+   * Fallback liveness sweep (master plan: pane-scraping demotes to fallback).
+   * Public so gates/tests can force one reconcile cycle without waiting.
+   */
+  reconcile(): string[] {
+    return this.tools.reconcileDeadPanes();
+  }
+
   private hydrateTasks(): void {
     const runsDir = join(this.options.home, "runs");
     if (!existsSync(runsDir)) return;
@@ -272,6 +342,46 @@ export class FleetService {
       } catch {
         // skip corrupt
       }
+    }
+  }
+
+  /**
+   * kill -9 restart-proof path: rebind control sockets for surviving sessions,
+   * mark dead panes lost, reclaim orphaned worktree leases stuck in `leased`.
+   */
+  private rehydrateRuntime(): void {
+    this.tools.rebindSessionListeners();
+    this.tools.reconcileDeadPanes();
+    this.worktrees.reclaimOrphanedLeases((sessionId) => {
+      if (sessionId === null) return false;
+      const session = this.tools.listSessions().find((s) => s.sessionId === sessionId);
+      if (session === undefined) return false;
+      if (session.status === "lost" || session.status === "stopped") return false;
+      return this.tmux.hasWindow(session.tmuxWindow);
+    });
+  }
+
+  private startReconcileTick(): void {
+    this.stopReconcileTick();
+    const seconds = this.options.config.effective().config.supervision.heartbeatSeconds;
+    const ms = Math.max(1, seconds) * 1000;
+    this.reconcileTimer = setInterval(() => {
+      try {
+        this.reconcile();
+      } catch {
+        // never let the tick crash the daemon
+      }
+    }, ms);
+    // Unref so the interval alone cannot keep a test process alive.
+    if (typeof this.reconcileTimer.unref === "function") {
+      this.reconcileTimer.unref();
+    }
+  }
+
+  private stopReconcileTick(): void {
+    if (this.reconcileTimer !== null) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = null;
     }
   }
 }

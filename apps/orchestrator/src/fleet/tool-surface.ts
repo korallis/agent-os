@@ -244,12 +244,60 @@ export class ToolSurface {
     };
   }
 
-  /** Hydrate from durable task store (daemon boot). */
+  /** Hydrate from durable task store (daemon boot). Rebuilds in-memory session rows. */
   hydrateTask(task: TaskSnapshot): void {
     this.tasks.set(task.id, task);
     if (task.idempotencyKey !== null) {
       this.idempotency.set(task.idempotencyKey, task);
     }
+    for (const s of task.sessions) {
+      const fleetSession: FleetSession = {
+        sessionId: s.sessionId,
+        taskId: task.id,
+        role: s.role,
+        model: s.model,
+        thinking: s.thinking,
+        family: s.family,
+        tmuxWindow: s.tmuxWindow,
+        status: s.status,
+        worktreePath: s.worktreePath,
+        startedAt: s.startedAt,
+      };
+      this.sessions.set(s.sessionId, fleetSession);
+    }
+  }
+
+  /**
+   * After boot hydrate: re-open per-session listeners for non-terminal live
+   * sessions so surviving Pi panes can re-hello.
+   */
+  rebindSessionListeners(): void {
+    if (this.deps.sockets === undefined) return;
+    for (const session of this.sessions.values()) {
+      if (session.status !== "starting" && session.status !== "running") continue;
+      try {
+        this.deps.sockets.openSession(session.sessionId);
+      } catch {
+        // Bind failure is non-fatal at boot; reconcile will mark the session lost
+        // if the pane is also gone.
+      }
+    }
+  }
+
+  /**
+   * Fallback liveness: any starting/running session whose tmux window is gone
+   * becomes SESSION_LOST. Prefer the extension session_end path; this is the
+   * pane-scraping fallback.
+   */
+  reconcileDeadPanes(): string[] {
+    const lost: string[] = [];
+    for (const session of [...this.sessions.values()]) {
+      if (session.status !== "starting" && session.status !== "running") continue;
+      if (this.deps.tmux.hasWindow(session.tmuxWindow)) continue;
+      this.markSessionLost(session.sessionId, "tmux pane missing (reconcile)");
+      lost.push(session.sessionId);
+    }
+    return lost;
   }
 
   invoke(
@@ -710,9 +758,15 @@ export class ToolSurface {
 
       let tmuxWindow = `agentos:${windowName}`;
       if (fake) {
+        // Stay alive so pane-liveness reconcile does not spuriously SESSION_LOST
+        // the moment a short-lived `echo` exits under real tmux.
         this.deps.tmux.newWindow({
           windowName,
-          argv: ["echo", "fake-pi", input.role, sessionId],
+          argv: [
+            "sh",
+            "-c",
+            `echo fake-pi ${input.role} ${sessionId}; exec sleep 86400`,
+          ],
           cwd,
         });
       } else {
@@ -777,7 +831,7 @@ export class ToolSurface {
         family,
         tmuxWindow,
         worktreePath,
-        status: fake ? "settled" : "running",
+        status: "running",
         startedAt: now,
         lastEventAt: now,
       };
@@ -789,7 +843,7 @@ export class ToolSurface {
         thinking: input.thinking,
         family,
         tmuxWindow,
-        status: fake ? "settled" : "running",
+        status: "running",
         worktreePath,
         startedAt: now,
       };
@@ -1487,6 +1541,7 @@ export class ToolSurface {
   markSessionLost(sessionId: string, reason: string): void {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
+    if (session.status === "lost" || session.status === "stopped") return;
     this.sessions.set(sessionId, { ...session, status: "lost" });
     void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId });
@@ -1496,8 +1551,25 @@ export class ToolSurface {
     });
     if (session.taskId !== null) {
       const task = this.tasks.get(session.taskId);
-      if (task !== undefined && !isTerminalPhase(task.phase)) {
-        this.transition(task, "SESSION_LOST", reason);
+      if (task !== undefined) {
+        const withSession: TaskSnapshot = {
+          ...task,
+          sessions: task.sessions.map((s) =>
+            s.sessionId === sessionId
+              ? { ...s, status: "lost", lastEventAt: new Date().toISOString() }
+              : s,
+          ),
+          updatedAt: new Date().toISOString(),
+        };
+        if (!isTerminalPhase(withSession.phase) && withSession.phase !== "SESSION_LOST") {
+          try {
+            this.transition(withSession, "SESSION_LOST", reason);
+            return;
+          } catch {
+            // Illegal from this phase — still persist the session status.
+          }
+        }
+        this.saveTask(withSession);
       }
     }
   }

@@ -19,6 +19,7 @@
  *   G9  SCOUT write violation is audited by git and quarantines the worktree
  *   G10 a non-Brain session cannot orchestrate over the extension bridge
  *   G11 the spawn command line starts from `env -i` and carries no stray key
+ *   G12 SIGKILL crewmate window → SESSION_LOST + lease reclaim within one reconcile cycle
  *
  * Usage: node tooling/gates/phase-3.mjs
  * Exit 0 = all gates green.
@@ -153,8 +154,14 @@ try {
 
   home = mkdtempSync(join(tmpdir(), "agentos-p3-gate-"));
   cleanups.push(home);
+  // Fast reconcile cadence so G12 can assert SESSION_LOST within one cycle.
+  mkdirSync(join(home, "config"), { recursive: true });
+  writeFileSync(
+    join(home, "config", "supervision.json5"),
+    "{ heartbeatSeconds: 1, staleMinutes: { api: 5, build: 12 }, escalationLadderSteps: 3, respawnPerStage: 1, absorb: [\"PROGRESS\", \"TURN_SETTLED_MID_STAGE\", \"CONTEXT_PRESSURE_LT_70\"] }\n",
+  );
   child = startDaemon(home, PORT);
-  const token = await waitForHealth(home, PORT);
+  let token = await waitForHealth(home, PORT);
 
   // G1 — fleet + brain endpoints
   {
@@ -315,10 +322,10 @@ try {
     child.kill("SIGKILL");
     await sleep(400);
     child = startDaemon(home, PORT);
-    const token2 = await waitForHealth(home, PORT);
+    token = await waitForHealth(home, PORT);
 
-    const rehydrated = await (await api(BASE, `/v1/tasks/${liveTask}`, token2)).json();
-    const brain = await (await api(BASE, "/v1/brain", token2)).json();
+    const rehydrated = await (await api(BASE, `/v1/tasks/${liveTask}`, token)).json();
+    const brain = await (await api(BASE, "/v1/brain", token)).json();
     gate(
       "G8",
       "kill -9 → tasks rehydrate and the Brain reconciles on restart",
@@ -354,6 +361,56 @@ try {
       "spawn command line starts from `env -i` and carries only scrubbed pairs",
       run.status === 0 && run.stdout.trim() === "ok",
       `exit=${run.status}`,
+    );
+  }
+
+  // G12 — kill crewmate tmux window → SESSION_LOST + lease reclaim within one reconcile cycle
+  {
+    const liveTask = await createTask(BASE, token, projectId, { title: "Session lost gate" });
+    await callTool(BASE, token, "resolve_cast", {
+      taskId: liveTask,
+      roles: [{ role: "builder", model: "openai/gpt-4.1", thinking: "medium", cleanRoom: true }],
+      familyCheckOverride: false,
+    });
+    const spawned = await callTool(BASE, token, "spawn_crewmate", {
+      taskId: liveTask,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "medium",
+      vars: {},
+    });
+    const sessionId = spawned.data?.session?.sessionId;
+    const tmuxWindow = spawned.data?.session?.tmuxWindow;
+    const worktreePath = spawned.data?.session?.worktreePath;
+    let killed = false;
+    if (typeof tmuxWindow === "string") {
+      const kill = spawnSync("tmux", ["-L", TMUX_SOCKET, "kill-window", "-t", tmuxWindow], {
+        encoding: "utf8",
+      });
+      killed = kill.status === 0;
+    }
+    // One reconcile cycle at heartbeatSeconds=1, plus margin for the tick.
+    await sleep(2500);
+    const state = await (await api(BASE, "/v1/fleet/state", token)).json();
+    const session = (state.state?.sessions ?? []).find((s) => s.sessionId === sessionId);
+    const task = await (await api(BASE, `/v1/tasks/${liveTask}`, token)).json();
+    const lease =
+      typeof worktreePath === "string"
+        ? (state.state?.worktrees ?? []).find((l) => l.path === worktreePath)
+        : undefined;
+    const leaseReclaimed =
+      lease === undefined || lease.state === "idle" || lease.state === "quarantined";
+    const lost =
+      session?.status === "lost" ||
+      task.task?.phase === "SESSION_LOST" ||
+      (task.task?.sessions ?? []).some((s) => s.sessionId === sessionId && s.status === "lost");
+    const { events } = await (await api(BASE, "/v1/events/replay", token)).json();
+    const lostEvents = events.filter((e) => e.event.type === "session.lost").length;
+    gate(
+      "G12",
+      "SIGKILL crewmate window → SESSION_LOST + lease reclaim within one reconcile cycle",
+      killed && lost && leaseReclaimed && lostEvents >= 1,
+      `killed=${killed} lost=${lost} lease=${lease?.state ?? "gone"} events=${lostEvents} phase=${task.task?.phase}`,
     );
   }
 
