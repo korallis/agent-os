@@ -266,6 +266,7 @@ function QuickActionsCard({ needsCaptain }: { needsCaptain: number }) {
     { href: "/projects", label: "Projects", hint: "Register a repository" },
     { href: "/providers", label: "Providers & quota", hint: "Connections and limits" },
     { href: "/runs", label: "Live log stream", hint: "Everything the fleet emits" },
+    { href: "/runs/history", label: "Run history", hint: "Gate and fusion journeys" },
     { href: "/policies", label: "Policies", hint: "Layered config and safety" },
   ];
   return (

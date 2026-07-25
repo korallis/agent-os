@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { cn } from "@agent-os/ui";
-import type { EventEnvelope, TaskListItem } from "@agent-os/protocol";
+import type { RunHistoryResponse, RunHistoryRow } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
 import { useEventStream } from "@/lib/useEventStream";
 import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
@@ -13,21 +13,11 @@ import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
  * (`41:7213`).
  *
  * A "run" here is a real task's journey: its phase transitions, gate verdicts
- * and fusion dispatches, reconstructed from the durable event log. Nothing is
- * synthesised — a task with no gate runs simply shows none.
+ * and fusion dispatches. Counts come from GET /v1/runs/history — daemon-side
+ * aggregates over the full relevant event set — never a paged global replay.
  */
 
 type LoadState = "loading" | "ready" | "unavailable";
-
-interface RunRow {
-  task: TaskListItem;
-  gateRuns: number;
-  gateFailures: number;
-  gateErrors: number;
-  fusionRuns: number;
-  firstSeen: string | null;
-  lastSeen: string | null;
-}
 
 const RELEVANT = new Set([
   "task.created",
@@ -53,59 +43,21 @@ export function RunHistory() {
     (event) => RELEVANT.has(event.event.type),
     "runs",
   );
-  const [rows, setRows] = useState<RunRow[]>([]);
+  const [rows, setRows] = useState<RunHistoryRow[]>([]);
   const [state, setState] = useState<LoadState>("loading");
-  const [truncated, setTruncated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     const load = async (): Promise<void> => {
       try {
-        const [tasksRes, eventsRes] = await Promise.all([
-          fetch("/api/agentos/tasks", { cache: "no-store" }),
-          fetch("/api/agentos/events/replay?limit=10000", { cache: "no-store" }),
-        ]);
+        const res = await fetch("/api/agentos/runs/history", { cache: "no-store" });
         if (cancelled) return;
-        if (!tasksRes.ok || !eventsRes.ok) {
+        if (!res.ok) {
           setState((prev) => (prev === "ready" ? "ready" : "unavailable"));
           return;
         }
-        const tasks = ((await tasksRes.json()) as { tasks: TaskListItem[] }).tasks;
-        const body = (await eventsRes.json()) as {
-          events: EventEnvelope[];
-          truncated: boolean;
-        };
-
-        const byTask = new Map<string, RunRow>();
-        for (const task of tasks) {
-          byTask.set(task.id, {
-            task,
-            gateRuns: 0,
-            gateFailures: 0,
-            gateErrors: 0,
-            fusionRuns: 0,
-            firstSeen: null,
-            lastSeen: null,
-          });
-        }
-        for (const envelope of body.events) {
-          const payload = envelope.event.payload as { taskId?: string };
-          const taskId = payload.taskId;
-          if (taskId === undefined) continue;
-          const row = byTask.get(taskId);
-          if (row === undefined) continue;
-          if (row.firstSeen === null) row.firstSeen = envelope.ts;
-          row.lastSeen = envelope.ts;
-          if (envelope.event.type === "gate.result") {
-            row.gateRuns += 1;
-            if (envelope.event.payload.outcome === "FAIL") row.gateFailures += 1;
-            if (envelope.event.payload.outcome === "GATE_ERROR") row.gateErrors += 1;
-          } else if (envelope.event.type === "fusion.dispatched") {
-            row.fusionRuns += 1;
-          }
-        }
-        setRows([...byTask.values()].sort((a, b) => b.task.updatedAt.localeCompare(a.task.updatedAt)));
-        setTruncated(body.truncated);
+        const body = (await res.json()) as RunHistoryResponse;
+        setRows(body.runs);
         setState("ready");
       } catch {
         if (!cancelled) setState((prev) => (prev === "ready" ? "ready" : "unavailable"));
@@ -138,11 +90,6 @@ export function RunHistory() {
 
   return (
     <div className="flex flex-col gap-3">
-      {truncated && (
-        <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-2 text-[11px] text-warn">
-          Event history was truncated — counts reflect the most recent frames only.
-        </div>
-      )}
       <div className="bg-panel border border-line-2 rounded-2xl overflow-hidden">
         <table className="w-full text-left">
           <thead>

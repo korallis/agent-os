@@ -288,6 +288,25 @@ export class SqliteProjection {
     return row.n;
   }
 
+  /**
+   * All envelopes of the given types that carry a projected task_id.
+   * Unbounded by design — run-history aggregates only sparse lifecycle types
+   * (gate/fusion/task), never the chatty usage stream.
+   */
+  eventsOfTypesForTasks(types: readonly string[]): EventEnvelope[] {
+    if (types.length === 0) return [];
+    const placeholders = types.map(() => "?").join(", ");
+    const rows = this.sqlite
+      .prepare(
+        `SELECT envelope FROM events
+         WHERE type IN (${placeholders})
+           AND task_id IS NOT NULL
+         ORDER BY seq ASC`,
+      )
+      .all(...types) as { envelope: string }[];
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
   seqOfEventId(id: string): number | null {
     const rows = this.db.select({ seq: events.seq }).from(events).where(eq(events.id, id)).limit(1).all();
     return rows[0]?.seq ?? null;

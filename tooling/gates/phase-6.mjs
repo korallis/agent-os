@@ -469,13 +469,26 @@ try {
       ).json();
       await page.goto(`${CONSOLE}/sessions/${session.sessionId}`, { waitUntil: "networkidle" });
       await sleep(700);
-      const text = (await page.textContent("body")) ?? "";
-      // Assert on label+value pairs, never a bare value that could occur by chance.
-      const hasModel = text.includes(session.model);
-      const hasWindow = text.includes(session.tmuxWindow);
-      const hasAttach =
-        typeof apiDetail.attachCommand === "string" && text.includes(apiDetail.attachCommand);
-      const hasLogHeading = text.includes("Agent log");
+      // Label+value pairs only — never bare values that could appear anywhere in the DOM.
+      // Model and pane are exposed via aria-label "Model: …" / "Pane: …".
+      // Attach requires the "Attach to this seat" heading in the same card as the command.
+      // Log is the section heading, not a value floating alone.
+      const hasModel =
+        (await page.getByLabel(`Model: ${session.model}`, { exact: true }).count()) > 0;
+      const hasWindow =
+        (await page.getByLabel(`Pane: ${session.tmuxWindow}`, { exact: true }).count()) > 0;
+      const attachCommand =
+        typeof apiDetail.attachCommand === "string" ? apiDetail.attachCommand : null;
+      const attachCard =
+        attachCommand === null
+          ? null
+          : page
+              .locator("div")
+              .filter({ has: page.getByText("Attach to this seat", { exact: true }) })
+              .filter({ has: page.getByText(attachCommand, { exact: true }) });
+      const hasAttach = attachCard !== null && (await attachCard.count()) > 0;
+      const hasLogHeading =
+        (await page.getByRole("heading", { name: "Agent log", exact: true }).count()) > 0;
       ok = hasModel && hasWindow && hasAttach && hasLogHeading;
       detail = `model=${hasModel} window=${hasWindow} attach=${hasAttach} log=${hasLogHeading}`;
     }

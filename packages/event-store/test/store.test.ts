@@ -207,4 +207,94 @@ describe("EventStore", () => {
     expect(empty.truncated).toBe(false);
     store.close();
   });
+
+  it("aggregateRunHistory counts gate/fusion per task and ignores chatty noise", () => {
+    const { store } = EventStore.open(home);
+    const taskA = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const taskB = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+    store.append({
+      type: "task.created",
+      payload: {
+        taskId: taskA,
+        shape: "SHIP",
+        title: "A",
+        projectId: "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+        mode: "local-only",
+        phase: "QUEUED",
+        idempotencyKey: null,
+      },
+    });
+    // Chatty usage frames must not enter run-history aggregates.
+    store.append({
+      type: "ext.usage",
+      payload: {
+        sessionId: "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+        provider: "anthropic",
+        model: "claude",
+        inputTokens: 10,
+        outputTokens: 5,
+        costUsd: 0.01,
+      },
+    });
+    store.append({
+      type: "gate.result",
+      payload: {
+        taskId: taskA,
+        target: "candidate",
+        outcome: "FAIL",
+        attempt: 1,
+        outputHash: null,
+      },
+    });
+    store.append({
+      type: "gate.result",
+      payload: {
+        taskId: taskA,
+        target: "candidate",
+        outcome: "GATE_ERROR",
+        attempt: 2,
+        outputHash: null,
+      },
+    });
+    store.append({
+      type: "fusion.dispatched",
+      payload: {
+        taskId: taskA,
+        kind: "fusion",
+        runId: "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+      },
+    });
+    store.append({
+      type: "gate.result",
+      payload: {
+        taskId: taskB,
+        target: "baseline",
+        outcome: "PASS",
+        attempt: 0,
+        outputHash: "abc",
+      },
+    });
+
+    const rows = store.aggregateRunHistory();
+    const a = rows.find((r) => r.taskId === taskA);
+    const b = rows.find((r) => r.taskId === taskB);
+    expect(a).toMatchObject({
+      gateRuns: 2,
+      gateFailures: 1,
+      gateErrors: 1,
+      fusionRuns: 1,
+    });
+    expect(a?.firstSeen).not.toBeNull();
+    expect(a?.lastSeen).not.toBeNull();
+    expect(a!.firstSeen! <= a!.lastSeen!).toBe(true);
+    expect(b).toMatchObject({
+      gateRuns: 1,
+      gateFailures: 0,
+      gateErrors: 0,
+      fusionRuns: 0,
+    });
+    // Usage frames are not attributed to any task in this aggregate.
+    expect(rows).toHaveLength(2);
+    store.close();
+  });
 });

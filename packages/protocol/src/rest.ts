@@ -100,6 +100,27 @@ export const sessionEventsResponseSchema = z.strictObject({
 });
 export type SessionEventsResponse = z.infer<typeof sessionEventsResponseSchema>;
 
+/**
+ * GET `/v1/runs/history` — per-task gate/fusion aggregates for Pipeline Runs.
+ * Counts are computed daemon-side over the full relevant event set (not a
+ * paged global replay), so the Console never reconstructs them from a window.
+ */
+export const runHistoryRowSchema = z.strictObject({
+  task: taskListItemSchema,
+  gateRuns: z.number().int().min(0),
+  gateFailures: z.number().int().min(0),
+  gateErrors: z.number().int().min(0),
+  fusionRuns: z.number().int().min(0),
+  firstSeen: isoTimestampSchema.nullable(),
+  lastSeen: isoTimestampSchema.nullable(),
+});
+export type RunHistoryRow = z.infer<typeof runHistoryRowSchema>;
+
+export const runHistoryResponseSchema = z.strictObject({
+  runs: z.array(runHistoryRowSchema),
+});
+export type RunHistoryResponse = z.infer<typeof runHistoryResponseSchema>;
+
 export const apiErrorCodeSchema = z.enum([
   "UNAUTHORIZED",
   "FORBIDDEN",

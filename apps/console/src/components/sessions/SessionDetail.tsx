@@ -68,6 +68,10 @@ function summarise(envelope: EventEnvelope): string {
   }
 }
 
+function formatUsageValue(value: string, partial: boolean): string {
+  return partial ? `${value} partial` : value;
+}
+
 export function SessionDetail({ sessionId }: { sessionId: string }) {
   const { events: streamEvents } = useEventStream();
   const refreshKey = useStickyRefreshKey(
@@ -84,7 +88,7 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
   const [log, setLog] = useState<EventEnvelope[]>([]);
   const [logState, setLogState] = useState<LoadState>("loading");
   const [logTruncated, setLogTruncated] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
   useEffect(() => {
     let cancelled = false;
@@ -159,6 +163,27 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
     return { input, output, cost: costReported ? cost : null, requests };
   }, [log]);
 
+  const usagePartial = logState === "ready" && logTruncated;
+
+  const copyAttachCommand = async (): Promise<void> => {
+    const command = detail?.attachCommand;
+    if (command === null || command === undefined) return;
+    const clipboard = navigator.clipboard;
+    if (clipboard === undefined || typeof clipboard.writeText !== "function") {
+      setCopyState("failed");
+      setTimeout(() => setCopyState("idle"), 2000);
+      return;
+    }
+    try {
+      await clipboard.writeText(command);
+      setCopyState("copied");
+      setTimeout(() => setCopyState("idle"), 1500);
+    } catch {
+      setCopyState("failed");
+      setTimeout(() => setCopyState("idle"), 2000);
+    }
+  };
+
   if (detailState === "missing") {
     return (
       <main className="flex-1 p-8">
@@ -201,7 +226,12 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
         <div className="flex items-start justify-between gap-4">
           <div>
             <h2 className="text-[22px] font-bold text-fg-1 capitalize">{session.role}</h2>
-            <p className="text-[13px] font-mono text-fg-2 mt-1">{session.model}</p>
+            <p
+              className="text-[13px] font-mono text-fg-2 mt-1"
+              aria-label={`Model: ${session.model}`}
+            >
+              {session.model}
+            </p>
           </div>
           <span
             className={cn(
@@ -223,7 +253,10 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
           <span className="rounded-md bg-panel border border-line-1 px-2 py-0.5">
             {session.thinking}
           </span>
-          <span className="rounded-md bg-panel border border-line-1 px-2 py-0.5 font-mono">
+          <span
+            className="rounded-md bg-panel border border-line-1 px-2 py-0.5 font-mono"
+            aria-label={`Pane: ${session.tmuxWindow}`}
+          >
             {session.tmuxWindow}
           </span>
         </div>
@@ -231,14 +264,26 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {[
-          { label: "Requests", value: logState === "ready" ? String(usageTotals.requests) : "—" },
+          {
+            label: "Requests",
+            value:
+              logState === "ready"
+                ? formatUsageValue(String(usageTotals.requests), usagePartial)
+                : "—",
+          },
           {
             label: "Input tokens",
-            value: logState === "ready" ? usageTotals.input.toLocaleString() : "—",
+            value:
+              logState === "ready"
+                ? formatUsageValue(usageTotals.input.toLocaleString(), usagePartial)
+                : "—",
           },
           {
             label: "Output tokens",
-            value: logState === "ready" ? usageTotals.output.toLocaleString() : "—",
+            value:
+              logState === "ready"
+                ? formatUsageValue(usageTotals.output.toLocaleString(), usagePartial)
+                : "—",
           },
           {
             label: "Cost",
@@ -247,7 +292,7 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
                 ? "—"
                 : usageTotals.cost === null
                   ? "not reported"
-                  : `$${usageTotals.cost.toFixed(4)}`,
+                  : formatUsageValue(`$${usageTotals.cost.toFixed(4)}`, usagePartial),
           },
         ].map((chip) => (
           <div
@@ -255,7 +300,14 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
             className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1"
           >
             <span className="text-[11px] uppercase tracking-wide text-fg-3">{chip.label}</span>
-            <span className="text-xl font-semibold text-fg-1">{chip.value}</span>
+            <span
+              className={cn(
+                "text-xl font-semibold text-fg-1",
+                usagePartial && logState === "ready" && "text-warn",
+              )}
+            >
+              {chip.value}
+            </span>
           </div>
         ))}
       </div>
@@ -276,18 +328,21 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
             <button
               type="button"
               onClick={() => {
-                void navigator.clipboard?.writeText(detail.attachCommand ?? "");
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
+                void copyAttachCommand();
               }}
               className="rounded-lg bg-panel-2 border border-line-1 px-3 py-1 text-[11px] font-medium text-fg-1"
             >
-              {copied ? "Copied" : "Copy"}
+              {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy"}
             </button>
           </div>
           <code className="text-[12px] font-mono text-teal-brand break-all">
             {detail.attachCommand}
           </code>
+          {copyState === "failed" && (
+            <p className="text-[11px] text-danger" role="status">
+              Could not copy — select the command and copy it manually.
+            </p>
+          )}
           <p className="text-[11px] text-fg-3">
             Run this yourself — Agent OS never attaches on your behalf. The pane survives daemon
             restarts.
@@ -299,11 +354,15 @@ export function SessionDetail({ sessionId }: { sessionId: string }) {
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-semibold text-fg-1">Agent log</h3>
           <span className="text-[11px] text-fg-3">
-            {logState === "ready" ? `${log.length} frames` : logState}
+            {logState === "ready" ? `${log.length} frames` : logState === "loading" ? "loading…" : logState}
             {logTruncated && " · oldest frames truncated"}
           </span>
         </div>
-        {logState === "unavailable" && log.length === 0 ? (
+        {logState === "loading" && log.length === 0 ? (
+          <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+            <p className="text-[12px] text-fg-3">Loading agent log…</p>
+          </div>
+        ) : logState === "unavailable" && log.length === 0 ? (
           <EmptyState
             kind="server-error"
             title="Log unavailable"
