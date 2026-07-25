@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { PipelineFinding, PipelineRunSnapshot } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
@@ -12,6 +12,14 @@ import { useEventStream } from "@/lib/useEventStream";
  * Until now, work entering the gate meant Agent OS went blind. This renders the
  * gate's own state, republished onto Agent OS's event log, so it arrives over
  * the same SSE path as everything else.
+ *
+ * Quiet-by-default vs live pipeline page: the active observability profile
+ * filters the general Console live log (so under `quiet`, pipeline.run_updated
+ * does not flood LogStream). Opening /pipeline is the Captain's intent to watch
+ * the gate, so this page always short-polls REST for run cards rather than
+ * depending on profile-gated SSE frames for its invalidation cursor. SSE still
+ * supplies log_appended chunks when the profile streams them, and config.changed
+ * still refreshes profile knobs without a full reload.
  *
  * The header states the TRANSPORT and the observed lag as fact. Labels match
  * modes that can actually occur today: WAL-assisted (fs.watch + poll floor) or
@@ -92,21 +100,19 @@ export function PipelineView() {
   const [runs, setRuns] = useState<PipelineRunSnapshot[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [logs, setLogs] = useState<Record<string, string>>({});
-  const [recoveryPoll, setRecoveryPoll] = useState(0);
+  const [logTruncated, setLogTruncated] = useState<Record<string, boolean>>({});
+  const [pollTick, setPollTick] = useState(0);
   const { events } = useEventStream();
+  /** Event ids already folded into log state — SSE ring eviction must not erase text. */
+  const appliedLogIds = useRef(new Set<string>());
+  /** Mirror of `logs` for append-only updates without reading stale state. */
+  const logsRef = useRef<Record<string, string>>({});
+  const logTruncatedRef = useRef<Record<string, boolean>>({});
 
   const logChars = status?.profile?.pipelineLogChars ?? 20_000;
 
-  // Newest-first buffer: index 0 is the newest frame (the .at(-1) trap again).
-  const pipelineCursor =
-    events.find(
-      (envelope) =>
-        envelope.event.type === "pipeline.run_updated" ||
-        envelope.event.type === "pipeline.unavailable",
-    )?.id ?? "none";
-
   // Profile / watch knobs land as config.changed and must re-fetch status so
-  // pipelineLogChars and transport updates take effect without a run frame.
+  // pipelineLogChars and transport updates take effect without waiting a poll.
   const observabilityConfigCursor =
     events.find(
       (envelope) =>
@@ -114,19 +120,14 @@ export function PipelineView() {
         envelope.event.payload.domain === "observability",
     )?.id ?? "none";
 
-  const viewUnreadable =
-    status !== null &&
-    (!status.compatibility.ok || status.transport === "unavailable");
-
-  // While unreadable, poll so recovery is observed even when no new run frame
-  // arrives (empty gate after the DB returns, watch re-enabled with no runs).
+  // Always short-poll while mounted: under quiet, pipeline.run_updated never
+  // reaches SSE, so a cursor on that frame would freeze the page after mount.
   useEffect(() => {
-    if (!viewUnreadable) return;
     const id = setInterval(() => {
-      setRecoveryPoll((n) => n + 1);
-    }, 2000);
+      setPollTick((n) => n + 1);
+    }, 1000);
     return () => clearInterval(id);
-  }, [viewUnreadable]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -162,28 +163,61 @@ export function PipelineView() {
     return () => {
       cancelled = true;
     };
-  }, [pipelineCursor, observabilityConfigCursor, recoveryPoll]);
+  }, [pollTick, observabilityConfigCursor]);
 
-  // Rebuild log text purely from the live buffer — never fold the whole buffer
-  // onto prior state (that duplicated every chunk on each stream update).
-  // Retention is driven by the active observability profile's pipelineLogChars;
-  // a smaller retention re-bounds what is already on screen.
+  // Append-only by event id, then window with pipelineLogChars. Rebuilding the
+  // whole string from the capped SSE ring would drop middle text when frames
+  // leave the ring while retention still had room — worse than a trailing window.
   useEffect(() => {
     const retention = Math.max(0, logChars);
     if (retention === 0) {
+      appliedLogIds.current.clear();
+      logsRef.current = {};
+      logTruncatedRef.current = {};
       setLogs({});
+      setLogTruncated({});
       return;
     }
+
     const appended = events.filter((e) => e.event.type === "pipeline.log_appended");
-    const next: Record<string, string> = {};
-    // events is newest-first; accumulate oldest-first so text reads in order.
-    for (const envelope of [...appended].reverse()) {
+    // Newest-first buffer → process oldest-first so chunks concatenate in order.
+    const chronological = [...appended].reverse();
+    const fresh = chronological.filter((e) => !appliedLogIds.current.has(e.id));
+
+    const next = { ...logsRef.current };
+    const nextTrunc = { ...logTruncatedRef.current };
+    let textChanged = false;
+    let truncChanged = false;
+
+    for (const envelope of fresh) {
+      appliedLogIds.current.add(envelope.id);
       if (envelope.event.type !== "pipeline.log_appended") continue;
       const { runId, step, chunk } = envelope.event.payload;
       const key = `${runId}:${step}`;
-      next[key] = `${next[key] ?? ""}${chunk}`.slice(-retention);
+      next[key] = `${next[key] ?? ""}${chunk}`;
+      textChanged = true;
     }
-    setLogs(next);
+
+    // Re-window against current retention (overflow from new chunks or profile shrink).
+    for (const [key, text] of Object.entries(next)) {
+      if (text.length > retention) {
+        next[key] = text.slice(-retention);
+        textChanged = true;
+        if (nextTrunc[key] !== true) {
+          nextTrunc[key] = true;
+          truncChanged = true;
+        }
+      }
+    }
+
+    if (textChanged) {
+      logsRef.current = next;
+      setLogs(next);
+    }
+    if (truncChanged) {
+      logTruncatedRef.current = nextTrunc;
+      setLogTruncated(nextTrunc);
+    }
   }, [events, logChars]);
 
   const unavailableEvent = useMemo(
@@ -342,6 +376,11 @@ export function PipelineView() {
                     </span>
                     {active.lastActivity !== null && (
                       <span className="text-[11px] text-fg-2">{active.lastActivity}</span>
+                    )}
+                    {logKey !== null && logTruncated[logKey] === true && logChars > 0 && (
+                      <span className="text-[11px] text-fg-3">
+                        showing the last {logChars.toLocaleString()} characters
+                      </span>
                     )}
                   </div>
                   {logText !== null && logText.length > 0 ? (

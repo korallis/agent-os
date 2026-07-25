@@ -338,6 +338,28 @@ describe("PipelineWatcher", () => {
     watcher.stop();
   });
 
+  it("does not promote transport on applyConfig while schema is unreadable", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-apply-unreadable-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    db.exec("ALTER TABLE step_results RENAME COLUMN findings_json TO findings_blob");
+    db.close();
+
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: () => undefined,
+    });
+    watcher.start();
+    expect(watcher.status().compatibility.ok).toBe(false);
+    expect(watcher.status().transport).toBe("unavailable");
+
+    watcher.applyConfig({ watchPipeline: true, pollMs: 500 });
+    expect(watcher.status().compatibility.ok).toBe(false);
+    expect(watcher.status().transport).toBe("unavailable");
+    watcher.stop();
+  });
+
   it("re-attaches WAL watch on later ticks when the WAL appears after start", () => {
     const gateHome = mkdtempSync(join(tmpdir(), "p9-wal-late-"));
     homes.push(gateHome);

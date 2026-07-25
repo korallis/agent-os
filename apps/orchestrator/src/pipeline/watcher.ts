@@ -233,7 +233,13 @@ export class PipelineWatcher {
     // Already running — refresh interval cadence and re-attach WAL watch.
     this.restartTimer();
     this.attachWalWatch();
-    this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
+    // Never promote the honesty banner while the schema is unreadable.
+    // Hot-reloading pollMs must not flip UNAVAILABLE → WAL/INTERVAL-ONLY.
+    this.transport = this.compatibility.ok
+      ? this.walWatchAttached
+        ? "wal-assisted"
+        : "interval-only"
+      : "unavailable";
   }
 
   /**
