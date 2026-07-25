@@ -68,6 +68,11 @@ function levelOf(envelope: EventEnvelope): Level {
         (envelope.event.payload.status ?? 200) >= 400
         ? "WARN"
         : "INFO";
+    case "pipeline.run_updated":
+    case "pipeline.log_appended":
+      return "INFO";
+    case "pipeline.unavailable":
+      return "WARN";
     case "fusion.completed":
       return envelope.event.payload.error != null && envelope.event.payload.error.length > 0
         ? "ERROR"
@@ -133,6 +138,10 @@ function sourceOf(envelope: EventEnvelope): string {
       return "brain";
     case "net.request":
       return "net";
+    case "pipeline.run_updated":
+    case "pipeline.log_appended":
+    case "pipeline.unavailable":
+      return "pipeline";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -274,6 +283,18 @@ function messageOf(envelope: EventEnvelope): string {
       return event.payload.error !== null
         ? `${event.payload.method} ${event.payload.url} failed — ${event.payload.error}`
         : `${event.payload.method} ${event.payload.url} → ${event.payload.status ?? "—"} in ${Math.round(event.payload.durationMs)}ms`;
+    case "pipeline.run_updated": {
+      const active = event.payload.steps.find(
+        (s) => s.status === "running" || s.status === "fixing",
+      );
+      return `Pipeline ${event.payload.branch} ${event.payload.status}${
+        active !== undefined ? ` — ${active.step} ${active.status}` : ""
+      }`;
+    }
+    case "pipeline.log_appended":
+      return `Pipeline ${event.payload.step}: ${event.payload.chunk.trim().split("\n").at(-1) ?? ""}`;
+    case "pipeline.unavailable":
+      return `Pipeline view unavailable — ${event.payload.reason}`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {

@@ -4,7 +4,8 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
 import { EmptyState } from "@/components/shell/EmptyState";
-import { formatBytes, statusTone, type NetworkRequestRow } from "./NetworkList";
+import { formatBytes, statusTone, type NetworkRequestRow } from "@/lib/formatNetwork";
+import { LocalTime } from "@/components/shell/LocalTime";
 
 /**
  * Network I/O Detail — Figma frame `41:4815`.
@@ -49,7 +50,7 @@ function MetricCard({
   tone,
 }: {
   label: string;
-  value: string;
+  value: React.ReactNode;
   tone?: string;
 }) {
   return (
@@ -176,7 +177,7 @@ export function NetworkDetail({ requestId }: { requestId: string }) {
         />
         <MetricCard label="Request Size" value={formatBytes(request.requestBytes)} />
         <MetricCard label="Response Size" value={formatBytes(request.responseBytes)} />
-        <MetricCard label="Timestamp" value={new Date(request.ts).toLocaleTimeString()} />
+        <MetricCard label="Timestamp" value={<LocalTime iso={request.ts} />} />
         <MetricCard label="Protocol" value={request.protocol} tone="text-electric" />
       </div>
 

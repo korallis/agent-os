@@ -54,6 +54,7 @@ import type { PromptService } from "../prompts/service.js";
 import type { AnalyticsService } from "../analytics/service.js";
 import type { PtyTicketStore } from "../pty/tickets.js";
 import { runConfigDoctor } from "../prompts/doctor.js";
+import type { PipelineWatcher } from "../pipeline/watcher.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -82,6 +83,8 @@ export interface ServerDeps {
   analytics?: AnalyticsService;
   /** Phase 6 single-use tickets for the read-only PTY WebSocket. */
   ptyTickets?: PtyTicketStore;
+  /** Phase 9 live view of the local no-mistakes gate (read-only). */
+  pipeline?: PipelineWatcher;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -544,6 +547,34 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       );
       return;
     }
+  });
+
+  // ── Phase 9: live pipeline visibility ─────────────────────────────────
+
+  /**
+   * Transport and freshness of the pipeline view. Reported as fact: a Console
+   * showing a "live" view that is actually a 1 s poll is misleading in exactly
+   * the way this product refuses to be elsewhere.
+   */
+  app.get("/v1/pipeline/status", async (_request, reply) => {
+    if (deps.pipeline === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "pipeline watcher unavailable");
+      return;
+    }
+    return { pipeline: deps.pipeline.status() };
+  });
+
+  app.get("/v1/pipeline/runs", async (_request, reply) => {
+    const { events } = deps.store.eventsOfTypes(["pipeline.run_updated"], 500);
+    void reply;
+    // Newest-first: keep only the latest frame per run id.
+    const latest = new Map<string, unknown>();
+    for (const envelope of events) {
+      if (envelope.event.type !== "pipeline.run_updated") continue;
+      const snapshot = envelope.event.payload;
+      if (!latest.has(snapshot.runId)) latest.set(snapshot.runId, snapshot);
+    }
+    return { runs: [...latest.values()] };
   });
 
   // ── Network I/O (§7 Network I/O Detail, Figma 41:4815) ────────────────

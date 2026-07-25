@@ -568,6 +568,65 @@ export const brainHandoffCompletedEventSchema = z.strictObject({
   }),
 });
 
+/**
+ * Live view of the `no-mistakes` gate (§11 Phase 9). Agent OS republishes the
+ * gate's own state onto its append-only log so the Console consumes pipeline
+ * progress through the same SSE + projection path as everything else.
+ */
+export const pipelineStepSnapshotSchema = z.strictObject({
+  step: z.string(),
+  order: z.number().int().min(0),
+  status: z.string(),
+  findingsCount: z.number().int().min(0),
+  lastActivity: z.string().nullable(),
+  lastActivityAt: isoTimestampSchema.nullable(),
+  durationMs: z.number().int().min(0).nullable(),
+  agentPid: z.number().int().nullable(),
+});
+export type PipelineStepSnapshot = z.infer<typeof pipelineStepSnapshotSchema>;
+
+export const pipelineRunSnapshotSchema = z.strictObject({
+  runId: z.string(),
+  branch: z.string(),
+  status: z.string(),
+  headSha: z.string(),
+  prUrl: z.string().nullable(),
+  error: z.string().nullable(),
+  intent: z.string().nullable(),
+  steps: z.array(pipelineStepSnapshotSchema),
+  updatedAt: isoTimestampSchema,
+});
+export type PipelineRunSnapshot = z.infer<typeof pipelineRunSnapshotSchema>;
+
+export const pipelineRunUpdatedEventSchema = z.strictObject({
+  type: z.literal("pipeline.run_updated"),
+  payload: pipelineRunSnapshotSchema,
+});
+
+/** Newly appended bytes from the active step's log — incremental, not a replay. */
+export const pipelineLogAppendedEventSchema = z.strictObject({
+  type: z.literal("pipeline.log_appended"),
+  payload: z.strictObject({
+    runId: z.string(),
+    step: z.string(),
+    chunk: z.string(),
+  }),
+});
+
+/**
+ * The gate's state could not be read — most often a schema change in a newer
+ * no-mistakes. Emitted ONCE per incompatibility so the Console can degrade
+ * visibly instead of rendering stale rows as current.
+ */
+export const pipelineUnavailableEventSchema = z.strictObject({
+  type: z.literal("pipeline.unavailable"),
+  payload: z.strictObject({
+    reason: z.string(),
+    missingColumns: z.array(z.string()),
+    home: z.string(),
+  }),
+});
+
 export const captainEscalationEventSchema = z.strictObject({
   type: z.literal("captain.escalation"),
   payload: z.strictObject({
@@ -636,6 +695,9 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   afkAutoAnsweredEventSchema,
   brainHandoffTriggeredEventSchema,
   brainHandoffCompletedEventSchema,
+  pipelineRunUpdatedEventSchema,
+  pipelineLogAppendedEventSchema,
+  pipelineUnavailableEventSchema,
   captainEscalationEventSchema,
   taskDeliveryBlockResolvedEventSchema,
 ]);

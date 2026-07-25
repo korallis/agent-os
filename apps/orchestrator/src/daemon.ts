@@ -22,6 +22,7 @@ import {
   QuotaProbeScheduler,
 } from "./quota-probes/scheduler.js";
 import { enableQuotaProviders } from "./quota-probes/enable.js";
+import { PipelineWatcher } from "./pipeline/watcher.js";
 import type { QuotaSample } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
 import { PromptService } from "./prompts/service.js";
@@ -281,6 +282,19 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     // REST, redeemed once on the WS upgrade. WS is used for PTY only (§8).
     const ptyTickets = new PtyTicketStore();
 
+    // Phase 9: live view of the no-mistakes gate. Strictly read-only — it
+    // never writes under the no-mistakes home and never drives the pipeline.
+    const observability = config.effective().config.observability;
+    const pipelineWatcher = new PipelineWatcher({
+      pollMs: observability.pipelinePollMs,
+      sink: (event) => {
+        eventStore.append(event);
+      },
+    });
+    if (observability.watchPipeline) {
+      pipelineWatcher.start();
+    }
+
     const deps = {
       store,
       config,
@@ -297,6 +311,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       prompts,
       analytics,
       ptyTickets,
+      pipeline: pipelineWatcher,
     };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });
@@ -370,6 +385,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         closed = true;
         try {
           runningFleet.stop();
+          pipelineWatcher.stop();
           quotaScheduler.stop();
           runningStore.append({
             type: "daemon.stopping",

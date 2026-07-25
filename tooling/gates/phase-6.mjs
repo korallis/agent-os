@@ -71,6 +71,7 @@ const PAGES = [
   "/runs",
   "/runs/history",
   "/network",
+  "/pipeline",
   "/settings/billing",
   "/analytics/models",
   "/alerts",

@@ -131,6 +131,42 @@ export const budgetsConfigSchema = z.strictObject({
 });
 export type BudgetsConfig = z.infer<typeof budgetsConfigSchema>;
 
+/**
+ * `observability.json5` — config surface #11 (§11 Phase 9, [R7]).
+ *
+ * The Captain's framing: visibility is the product, and it must be theirs to
+ * configure. A profile decides which event classes reach the Console, how much
+ * live log to carry, and what is worth waking the Brain for. The shipped
+ * default is deliberately quiet — depth is opted into, not opted out of.
+ */
+export const observabilityConfigSchema = z.strictObject({
+  /** Named profile in `profiles`. */
+  activeProfile: z.string().min(1),
+  profiles: z.record(
+    z.string(),
+    z.strictObject({
+      /**
+       * Event type prefixes surfaced live (e.g. "pipeline.", "task."), or the
+       * single token "*" meaning every event. An empty-string prefix is
+       * deliberately NOT the wildcard — it would match everything by accident
+       * whenever a value was left blank.
+       */
+      surface: z.array(z.string().min(1)),
+      /** Carry incremental step-log output, not just structured state. */
+      streamPipelineLogs: z.boolean(),
+      /** Max log characters retained per step in the Console. */
+      pipelineLogChars: z.number().int().min(0).max(200_000),
+      /** Event prefixes that additionally raise a Captain wake. */
+      wakeOn: z.array(z.string()),
+    }),
+  ),
+  /** Watch the local no-mistakes gate. Read-only; never drives it. */
+  watchPipeline: z.boolean(),
+  /** Structured-read cadence in ms; the WAL watch reacts faster than this. */
+  pipelinePollMs: z.number().int().min(250).max(60_000),
+});
+export type ObservabilityConfig = z.infer<typeof observabilityConfigSchema>;
+
 /** Domain registry — one schema per on-disk config file. */
 export const configDomainSchemas = {
   supervision: supervisionConfigSchema,
@@ -143,6 +179,7 @@ export const configDomainSchemas = {
   dispatch: dispatchConfigSchema,
   validation: validationConfigSchema,
   budgets: budgetsConfigSchema,
+  observability: observabilityConfigSchema,
 } as const;
 
 export const configDomainSchema = z.enum([
@@ -156,6 +193,7 @@ export const configDomainSchema = z.enum([
   "dispatch",
   "validation",
   "budgets",
+  "observability",
 ]);
 export type ConfigDomain = z.infer<typeof configDomainSchema>;
 
@@ -170,6 +208,7 @@ export const CONFIG_DOMAINS: readonly ConfigDomain[] = [
   "dispatch",
   "validation",
   "budgets",
+  "observability",
 ];
 
 /** The fully-resolved effective config across all domains. */
@@ -184,6 +223,7 @@ export const agentOsConfigSchema = z.strictObject({
   dispatch: dispatchConfigSchema,
   validation: validationConfigSchema,
   budgets: budgetsConfigSchema,
+  observability: observabilityConfigSchema,
 });
 export type AgentOsConfig = z.infer<typeof agentOsConfigSchema>;
 
