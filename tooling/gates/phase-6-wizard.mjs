@@ -255,8 +255,10 @@ try {
     gate(
       "W2",
       "a fixture pi-oauth connection is created through the attach-command path",
-      started.body.attachCommand !== undefined && oauth !== undefined,
-      `attachCommand=${started.body.attachCommand !== undefined} oauthConnection=${oauth !== undefined} kind=${oauth?.kind ?? "none"}`,
+      started.body.attachCommand !== undefined &&
+        oauth !== undefined &&
+        oauth.billingSurface === "extra-usage-per-token",
+      `attachCommand=${started.body.attachCommand !== undefined} oauthConnection=${oauth !== undefined} kind=${oauth?.kind ?? "none"} billingSurface=${oauth?.billingSurface ?? "none"}`,
     );
   }
 
@@ -321,11 +323,10 @@ try {
 
     const seenOn = await labelledSurfaces();
     const presentOk =
-      extraUsage !== undefined
-        ? seenOn.includes("providers") &&
-          seenOn.includes("billing") &&
-          seenOn.includes("analytics")
-        : seenOn.length === 0;
+      extraUsage !== undefined &&
+      seenOn.includes("providers") &&
+      seenOn.includes("billing") &&
+      seenOn.includes("analytics");
 
     gate(
       "W4",
