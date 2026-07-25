@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
   DaemonControlFrame,
+  QuotaSample,
   ExtensionToDaemonFrame,
   FleetSummary,
   OrchestratorEvent,
@@ -22,6 +23,12 @@ import { BrainManager } from "./brain.js";
 import { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
+import { AfkService } from "./afk.js";
+import {
+  decideHandoff,
+  worstWindowPctFromSample,
+  type HandoffCandidate,
+} from "./brain-handoff.js";
 
 export type FleetEventSink = (event: OrchestratorEvent) => void;
 
@@ -36,6 +43,38 @@ export interface FleetServiceOptions {
   fakeTmux?: boolean;
   fakePi?: boolean;
   fakeBrain?: boolean;
+  /** Latest quota samples, read live so handoff decisions use current numbers. */
+  quotaSamples?: () => QuotaSample[];
+}
+
+/**
+ * Brain-capable default model per provider. Deliberately conservative: a
+ * handoff target must be a model we already spawn Brains on, not whatever the
+ * provider happens to offer.
+ *
+ * Gateway providers emit provider-qualified refs so a routed Sonnet
+ * (`openrouter/anthropic/…`) is a distinct string from an OAuth Sonnet
+ * (`anthropic/…`). Without that prefix, pickTarget's `c !== currentModel`
+ * filter drops the default same-family refuge and handoff never moves.
+ */
+const DEFAULT_BRAIN_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = {
+  anthropic: "anthropic/claude-sonnet-4-5",
+  "claude-agent-sdk": "claude-agent-sdk/claude-sonnet-4-5",
+  openai: "openai/gpt-4.1",
+  xai: "xai/grok-3",
+  openrouter: "openrouter/anthropic/claude-sonnet-4-5",
+  "vercel-ai-gateway": "vercel-ai-gateway/anthropic/claude-sonnet-4-5",
+};
+
+/** Min interval between successful Brain handoffs — stops thrashing every heartbeat. */
+const BRAIN_HANDOFF_COOLDOWN_MS = 5 * 60 * 1000;
+/** After a failed land, wait this long before reminting a session. */
+const BRAIN_HANDOFF_RETRY_BACKOFF_MS = 30 * 1000;
+
+/** Routing provider id = first segment of a `provider/…` model ref. */
+function modelRoutingProvider(model: string): string {
+  const slash = model.indexOf("/");
+  return (slash === -1 ? model : model.slice(0, slash)).toLowerCase();
 }
 
 type PendingToolResult = {
@@ -58,10 +97,17 @@ export class FleetService {
   readonly sessionKeys: SessionKeyStore;
   readonly tools: ToolSurface;
   readonly brain: BrainManager;
+  readonly afk: AfkService;
   private sink: FleetEventSink = () => undefined;
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   /** ctl.tool_result frames that failed sendControl; retried on session re-hello. */
   private readonly pendingToolResults = new Map<string, PendingToolResult[]>();
+  /**
+   * Last budget handoff attempt — seeded from durable handoff.json on boot so a
+   * restart cannot bypass the cooldown. `landed` selects success cooldown vs
+   * short retry backoff.
+   */
+  private lastHandoff: { atMs: number; toModel: string; landed: boolean } | null = null;
 
   constructor(private readonly options: FleetServiceOptions) {
     const cfg = options.config.effective().config;
@@ -74,6 +120,7 @@ export class FleetService {
     this.gates = new GateRunner(options.home, cfg.validation);
     this.fusionRuns = new FusionRunStore(options.home);
     this.sessionKeys = new SessionKeyStore(options.home);
+    this.afk = new AfkService(join(options.home, "afk"));
     this.tools = new ToolSurface({
       home: options.home,
       config: options.config,
@@ -90,6 +137,7 @@ export class FleetService {
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
       ...(options.fakePi !== undefined ? { fakePi: options.fakePi } : {}),
+      afk: this.afk,
     });
     this.brain = new BrainManager({
       home: options.home,
@@ -108,6 +156,23 @@ export class FleetService {
     this.hydrateTasks();
     this.hydrateRedProofsFromEventLog();
     this.rehydrateRuntime();
+    this.seedHandoffCooldownFromDurable();
+  }
+
+  /**
+   * Seed the in-memory cooldown from the durable handoff record so a daemon
+   * bounce cannot immediately re-handoff while two providers stay over threshold.
+   */
+  private seedHandoffCooldownFromDurable(): void {
+    const durable = this.brain.durableHandoff();
+    if (durable === null) return;
+    const atMs = Date.parse(durable.at);
+    if (!Number.isFinite(atMs)) return;
+    this.lastHandoff = {
+      atMs,
+      toModel: durable.toModel,
+      landed: durable.landed,
+    };
   }
 
   onEvent(sink: FleetEventSink): void {
@@ -120,6 +185,7 @@ export class FleetService {
     this.watcher.onEvent(fanout);
     this.tools.onEvent(fanout);
     this.brain.onEvent(fanout);
+    this.afk.onEvent(fanout);
   }
 
   /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */
@@ -452,6 +518,121 @@ export class FleetService {
     this.tools.reconcileMissingCastRoles();
   }
 
+  /**
+   * Brain budget handoff (master plan §11 Phase 8, [R4]).
+   *
+   * Run on every reconcile tick and callable directly by gates/fixtures. The
+   * decision is made in `decideHandoff`, which is pure; this method only maps
+   * the fleet's live state into it and carries out what it decided.
+   *
+   * The below-threshold case is deliberately silent: emitting an event every
+   * tick for "nothing happened" would bury the one that matters.
+   */
+  evaluateBrainHandoff(): ReturnType<typeof decideHandoff> | null {
+    const brainSnapshot = this.brain.getSnapshot();
+    if (brainSnapshot.model === null) return null;
+    const cfg = this.options.config.effective().config;
+    const samples = this.options.quotaSamples?.() ?? [];
+    const connections = this.options.connections?.list() ?? [];
+
+    // Match the connection that actually routes this model ref (first segment),
+    // not a bare origin family — openrouter/anthropic/… is an openrouter cast.
+    const brainProvider = modelRoutingProvider(brainSnapshot.model);
+    const brainConnection =
+      connections.find((c) => c.provider.toLowerCase() === brainProvider) ?? null;
+
+    const decision = decideHandoff({
+      brainModel: brainSnapshot.model,
+      brainConnectionId: brainConnection?.id ?? null,
+      config: cfg.brain,
+      budgets: cfg.budgets,
+      samples,
+      candidates: this.handoffCandidates(brainSnapshot.model),
+    });
+
+    // Below threshold: clear the post-handoff latch so a later breach can move
+    // the Brain again without waiting out an old cooldown.
+    if (!decision.shouldHandoff || decision.toModel === null) {
+      if (
+        decision.basis !== "none" &&
+        decision.observedPct < decision.thresholdPct
+      ) {
+        this.lastHandoff = null;
+      }
+      return decision;
+    }
+
+    // Suppress thrash: success uses a long cooldown; a failed land uses a short
+    // retry backoff so a broken spawn path cannot remint every reconcile tick.
+    if (this.lastHandoff !== null) {
+      const elapsed = Date.now() - this.lastHandoff.atMs;
+      const windowMs = this.lastHandoff.landed
+        ? BRAIN_HANDOFF_COOLDOWN_MS
+        : BRAIN_HANDOFF_RETRY_BACKOFF_MS;
+      if (elapsed < windowMs) {
+        const remainingSec = Math.ceil((windowMs - elapsed) / 1000);
+        const kind = this.lastHandoff.landed ? "handoff cooldown" : "handoff retry backoff";
+        return {
+          ...decision,
+          shouldHandoff: false,
+          toModel: null,
+          reason: `${decision.metric} at ${decision.observedPct}% crossed ${decision.thresholdPct}% but ${kind} has ${remainingSec}s remaining after move to ${this.lastHandoff.toModel}`,
+        };
+      }
+    }
+
+    this.sink({
+      type: "brain.handoff_triggered",
+      payload: {
+        fromModel: decision.fromModel,
+        toModel: decision.toModel,
+        metric: decision.metric,
+        observedPct: decision.observedPct,
+        thresholdPct: decision.thresholdPct,
+      },
+    });
+    const after = this.brain.handoff(decision.toModel, decision.reason);
+    // Keep one inspectable record (also durable via BrainManager): success
+    // latches the long cooldown; failure latches only the short retry backoff.
+    this.lastHandoff = {
+      atMs: Date.now(),
+      toModel: decision.toModel,
+      landed: after.status === "running",
+    };
+    return decision;
+  }
+
+  /** Last budget handoff time/target/landed, for inspectability and tests. */
+  lastBrainHandoff(): { atMs: number; toModel: string; landed: boolean } | null {
+    return this.lastHandoff;
+  }
+
+  /**
+   * Models the Brain could be moved to: one per healthy, not-limit-reached
+   * connection other than the one it is spending down. A connection at its own
+   * limit is not a refuge. Includes worst-window metrics so decideHandoff can
+   * prefer under-threshold refuges.
+   */
+  private handoffCandidates(currentModel: string): HandoffCandidate[] {
+    const connections = this.options.connections?.list() ?? [];
+    const samples = this.options.quotaSamples?.() ?? [];
+    const currentProvider = modelRoutingProvider(currentModel);
+    const candidates: HandoffCandidate[] = [];
+    for (const connection of connections) {
+      if (connection.limitReached) continue;
+      if (connection.health === "unhealthy") continue;
+      if (connection.provider.toLowerCase() === currentProvider) continue;
+      const model = DEFAULT_BRAIN_MODEL_BY_PROVIDER[connection.provider];
+      if (model === undefined) continue;
+      const sample = samples.find((s) => s.connectionId === connection.id);
+      candidates.push({
+        model,
+        worstWindowPct: worstWindowPctFromSample(sample),
+      });
+    }
+    return candidates;
+  }
+
   private startReconcileTick(): void {
     this.stopReconcileTick();
     const seconds = this.options.config.effective().config.supervision.heartbeatSeconds;
@@ -459,6 +640,7 @@ export class FleetService {
     this.reconcileTimer = setInterval(() => {
       try {
         this.reconcile();
+        this.evaluateBrainHandoff();
       } catch {
         // never let the tick crash the daemon
       }

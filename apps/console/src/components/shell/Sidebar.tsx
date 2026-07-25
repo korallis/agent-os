@@ -71,7 +71,7 @@ export function Sidebar() {
         <Icon
           src="nav-settings.svg"
           className="size-5"
-          tint={isActive("/settings") ? "#f5f5f5" : "#666666"}
+          tint={isActive("/settings") ? "#f5f5f5" : "#8a8a8a"}
           alt=""
         />
       </Link>

@@ -151,6 +151,19 @@ export interface ToolSurfaceDeps {
    * downgrade to a window that echoes a string.
    */
   fakePi?: boolean;
+  /**
+   * `/afk` autonomy posture. When present and armed, an escalation whose text
+   * matches a Captain-recorded FAQ entry is answered from that entry instead of
+   * parking the task. Absent (or unarmed) means every escalation waits, which
+   * is the correct default.
+   */
+  afk?: AfkAutoAnswer;
+}
+
+/** The only thing the tool surface needs from `/afk` — testable in isolation. */
+export interface AfkAutoAnswer {
+  isActive(): boolean;
+  tryAnswer(question: string): { answer: string; rationale: string } | null;
 }
 
 /**
@@ -3020,8 +3033,24 @@ export class ToolSurface {
     }
   }
 
-  private escalate(raw: Record<string, unknown>): { ok: true } {
+  private escalate(raw: Record<string, unknown>): {
+    ok: true;
+    autoAnswered: boolean;
+    answer: string | null;
+  } {
     const input = escalateToCaptainInputSchema.parse(raw);
+
+    // `/afk`: answer only what the Captain pre-decided. A question with no
+    // matching FAQ entry falls through to the normal escalation below and
+    // waits — inventing an answer would be worse than the delay, because the
+    // Brain would act on an instruction the Captain never gave.
+    if (this.deps.afk !== undefined && this.deps.afk.isActive()) {
+      const answered = this.deps.afk.tryAnswer(input.summary);
+      if (answered !== null) {
+        return { ok: true, autoAnswered: true, answer: answered.answer };
+      }
+    }
+
     if (input.taskId !== undefined) {
       const task = this.requireTask(input.taskId);
       if (!isTerminalPhase(task.phase)) {
@@ -3036,7 +3065,7 @@ export class ToolSurface {
         severity: input.severity,
       },
     });
-    return { ok: true };
+    return { ok: true, autoAnswered: false, answer: null };
   }
 
   private notify(raw: Record<string, unknown>): { ok: true } {

@@ -58,6 +58,10 @@ function levelOf(envelope: EventEnvelope): Level {
     case "prompt.installed":
     case "crew.answered":
     case "bridge.tool_call":
+    case "afk.changed":
+    case "afk.auto_answered":
+    case "brain.handoff_triggered":
+    case "brain.handoff_completed":
       return "INFO";
     case "fusion.completed":
       return envelope.event.payload.error != null && envelope.event.payload.error.length > 0
@@ -116,6 +120,12 @@ function sourceOf(envelope: EventEnvelope): string {
       return "scout";
     case "bridge.tool_call":
       return "bridge";
+    case "afk.changed":
+    case "afk.auto_answered":
+      return "afk";
+    case "brain.handoff_triggered":
+    case "brain.handoff_completed":
+      return "brain";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -243,6 +253,16 @@ function messageOf(envelope: EventEnvelope): string {
       return event.payload.accepted
         ? `Bridge ${event.payload.tool} accepted from ${event.payload.sessionId.slice(0, 8)}`
         : `Bridge ${event.payload.tool} refused — ${event.payload.reason ?? "unknown"}`;
+    case "afk.changed":
+      return event.payload.armed
+        ? `AFK armed — ${event.payload.faqEntries} FAQ entr${event.payload.faqEntries === 1 ? "y" : "ies"}${event.payload.until !== null ? ` until ${event.payload.until}` : ""}`
+        : "AFK disarmed";
+    case "afk.auto_answered":
+      return `AFK answered from FAQ — ${event.payload.rationale}`;
+    case "brain.handoff_triggered":
+      return `Brain handoff ${event.payload.fromModel} → ${event.payload.toModel} (${event.payload.metric} ${event.payload.observedPct}% ≥ ${event.payload.thresholdPct}%)`;
+    case "brain.handoff_completed":
+      return `Brain handoff complete — ${event.payload.toModel} in new session ${event.payload.toSessionId ?? "(none)"} (${event.payload.reason})`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {
@@ -411,7 +431,7 @@ export function LogStream() {
       {/* Table + detail panel */}
       <div className="flex-1 min-h-0 flex">
         <div className="flex-1 min-w-0 flex flex-col">
-          <div className="h-9 shrink-0 bg-white/[0.02] border-b border-line-1 flex items-center px-6 font-mono text-[10px] font-medium text-fg-4 tracking-[1px]">
+          <div className="h-9 shrink-0 bg-white/[0.02] border-b border-line-1 flex items-center px-6 font-mono text-[10px] font-medium text-fg-3 tracking-[1px]">
             <span className="w-[110px] shrink-0">TIMESTAMP</span>
             <span className="w-[70px] shrink-0">LEVEL</span>
             <span className="w-[140px] shrink-0">SOURCE</span>
@@ -473,7 +493,7 @@ export function LogStream() {
         {/* Detail panel */}
         <aside className="w-[380px] shrink-0 border-l border-line-1 overflow-y-auto">
           <div className="flex items-center justify-between px-5 py-4">
-            <span className="font-mono text-[10px] font-medium text-fg-4 tracking-[1px]">
+            <span className="font-mono text-[10px] font-medium text-fg-3 tracking-[1px]">
               LOG DETAIL
             </span>
             <Icon src="ls-close.svg" className="size-3.5" />
@@ -509,13 +529,13 @@ export function LogStream() {
                     : "INFO"}
               </span>
               <div className="flex flex-col gap-2">
-                <span className="font-mono text-[10px] text-fg-4 tracking-[1px]">Message</span>
+                <span className="font-mono text-[10px] text-fg-3 tracking-[1px]">Message</span>
                 <p className="font-mono text-[11px] leading-relaxed text-fg-1">
                   {messageOf(selected)}
                 </p>
               </div>
               <div className="flex flex-col gap-2">
-                <span className="font-mono text-[10px] text-fg-4 tracking-[1px]">Metadata</span>
+                <span className="font-mono text-[10px] text-fg-3 tracking-[1px]">Metadata</span>
                 {(
                   [
                     ["Timestamp", timestampOf(selected)],
@@ -531,7 +551,7 @@ export function LogStream() {
                 ))}
               </div>
               <div className="flex flex-col gap-2">
-                <span className="font-mono text-[10px] text-fg-4 tracking-[1px]">Context</span>
+                <span className="font-mono text-[10px] text-fg-3 tracking-[1px]">Context</span>
                 <pre className="rounded-lg bg-panel-2 border border-line-1 p-4 font-mono text-[10px] leading-[1.6] text-fg-2 overflow-x-auto">
                   {JSON.stringify(selected.event.payload, null, 2)}
                 </pre>

@@ -1,5 +1,9 @@
 import type {
+  AnalyticsReconcile,
   AnalyticsSnapshot,
+  BillingSurface,
+  BillingSurfaceUsage,
+  BrainUsage,
   CostCoverage,
   DailyUsagePoint,
   EventEnvelope,
@@ -19,6 +23,15 @@ export type SessionSpawnFact = {
   role: string;
   model: string;
   taskId: string | null;
+};
+
+/**
+ * How a provider bills, per connection. Read live rather than snapshotted so a
+ * connection that switches billing mode is reflected on the next read.
+ */
+export type ConnectionBillingFact = {
+  provider: string;
+  billingSurface: BillingSurface;
 };
 
 export type SessionSpawnPage = {
@@ -63,6 +76,12 @@ export class AnalyticsService {
       facts: [],
       truncated: false,
     }),
+    /**
+     * Connection billing facts, used to bucket spend by billing surface. With
+     * no reader every request buckets as `unattributed`, which is honest — the
+     * surface is genuinely unknown, not `api-metered` by assumption.
+     */
+    private readonly readConnectionBilling: () => ConnectionBillingFact[] = () => [],
   ) {}
 
   snapshot(options: { days?: number; limit?: number } = {}): AnalyticsSnapshot {
@@ -102,6 +121,23 @@ export class AnalyticsService {
     const byDay = new Map<string, CostBucket>();
     const byModel = new Map<string, CostBucket>();
     const byAgent = new Map<string, CostBucket>();
+    const bySurface = new Map<BillingSurface | "unattributed", CostBucket>();
+    const byBrain = new Map<"brain" | "crew", CostBucket>();
+
+    /**
+     * provider → billing surface. A provider with two connections on different
+     * surfaces is genuinely ambiguous for a usage frame that only names the
+     * provider, so it buckets as unattributed rather than guessing one.
+     */
+    const surfaceByProvider = new Map<string, BillingSurface | "ambiguous">();
+    for (const fact of this.readConnectionBilling()) {
+      const existing = surfaceByProvider.get(fact.provider);
+      if (existing === undefined) {
+        surfaceByProvider.set(fact.provider, fact.billingSurface);
+      } else if (existing !== fact.billingSurface) {
+        surfaceByProvider.set(fact.provider, "ambiguous");
+      }
+    }
 
     let totalInput = 0;
     let totalOutput = 0;
@@ -155,6 +191,16 @@ export class AnalyticsService {
 
       const role = sessions.get(usage.sessionId)?.role ?? "unattributed";
       byAgent.set(role, touch(byAgent.get(role) ?? empty()));
+
+      const resolved = surfaceByProvider.get(usage.provider);
+      const surface: BillingSurface | "unattributed" =
+        resolved === undefined || resolved === "ambiguous" ? "unattributed" : resolved;
+      bySurface.set(surface, touch(bySurface.get(surface) ?? empty()));
+
+      // The Brain orchestrates and never edits; separating its tokens is the
+      // only way the Captain can see orchestration overhead as its own line.
+      const lane: "brain" | "crew" = role === "brain" ? "brain" : "crew";
+      byBrain.set(lane, touch(byBrain.get(lane) ?? empty()));
     }
 
     // Task throughput per day, from real phase transitions inside the window.
@@ -232,6 +278,73 @@ export class AnalyticsService {
           ? "complete"
           : "partial";
 
+    const billingSurfaces: BillingSurfaceUsage[] = [...bySurface.entries()]
+      .map(([surface, v]) => ({
+        surface,
+        inputTokens: v.inputTokens,
+        outputTokens: v.outputTokens,
+        costUsd: v.costReportedRequests === 0 ? null : v.costUsd,
+        requests: v.requests,
+        costReportedRequests: v.costReportedRequests,
+      }))
+      .sort((a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens));
+
+    const brainBucket = byBrain.get("brain");
+    const crewBucket = byBrain.get("crew");
+    const brainTokens = (brainBucket?.inputTokens ?? 0) + (brainBucket?.outputTokens ?? 0);
+    const brain: BrainUsage = {
+      brainInputTokens: brainBucket?.inputTokens ?? 0,
+      brainOutputTokens: brainBucket?.outputTokens ?? 0,
+      brainCostUsd:
+        brainBucket === undefined || brainBucket.costReportedRequests === 0
+          ? null
+          : brainBucket.costUsd,
+      brainRequests: brainBucket?.requests ?? 0,
+      crewInputTokens: crewBucket?.inputTokens ?? 0,
+      crewOutputTokens: crewBucket?.outputTokens ?? 0,
+      crewCostUsd:
+        crewBucket === undefined || crewBucket.costReportedRequests === 0
+          ? null
+          : crewBucket.costUsd,
+      crewRequests: crewBucket?.requests ?? 0,
+      brainSharePct:
+        totalTokens === 0 ? 0 : Number(((brainTokens / totalTokens) * 100).toFixed(1)),
+    };
+
+    /**
+     * Every breakdown came from the same single pass over the same events, so
+     * each must sum back to the totals exactly. Tokens and request counts are
+     * integers — an exact comparison is correct and any mismatch is a real bug.
+     * Cost is float-summed, so it reconciles within a sub-cent epsilon.
+     */
+    const sumTokens = (
+      entries: Array<{ inputTokens: number; outputTokens: number; requests?: number }>,
+    ): { input: number; output: number } => ({
+      input: entries.reduce((a, e) => a + e.inputTokens, 0),
+      output: entries.reduce((a, e) => a + e.outputTokens, 0),
+    });
+    const matches = (entries: Array<{ inputTokens: number; outputTokens: number }>): boolean => {
+      const summed = sumTokens(entries);
+      return summed.input === totalInput && summed.output === totalOutput;
+    };
+
+    const reconcile: AnalyticsReconcile = {
+      modelsMatchTotals: matches(models),
+      agentsMatchTotals: matches(agents),
+      dailyMatchTotals: matches(daily),
+      billingSurfacesMatchTotals: matches(billingSurfaces),
+      brainPlusCrewMatchTotals:
+        brain.brainInputTokens + brain.crewInputTokens === totalInput &&
+        brain.brainOutputTokens + brain.crewOutputTokens === totalOutput,
+      exact: false,
+    };
+    reconcile.exact =
+      reconcile.modelsMatchTotals &&
+      reconcile.agentsMatchTotals &&
+      reconcile.dailyMatchTotals &&
+      reconcile.billingSurfacesMatchTotals &&
+      reconcile.brainPlusCrewMatchTotals;
+
     return {
       generatedAt: new Date().toISOString(),
       windowDays: days,
@@ -252,6 +365,9 @@ export class AnalyticsService {
       daily,
       models,
       agents,
+      billingSurfaces,
+      brain,
+      reconcile,
       quota: this.readQuota(),
     };
   }

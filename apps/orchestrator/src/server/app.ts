@@ -13,6 +13,7 @@ import { z } from "zod";
 import {
   apiKeyConnectRequestSchema,
   brainToolNameSchema,
+  afkRequestSchema,
   configDomainSchema,
   configLayerSchema,
   oauthStartRequestSchema,
@@ -52,6 +53,7 @@ import type { FleetService } from "../fleet/service.js";
 import type { PromptService } from "../prompts/service.js";
 import type { AnalyticsService } from "../analytics/service.js";
 import type { PtyTicketStore } from "../pty/tickets.js";
+import { runConfigDoctor } from "../prompts/doctor.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -542,6 +544,56 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       );
       return;
     }
+  });
+
+  // ── Phase 8: /afk posture, config doctor, Brain handoff ───────────────
+
+  app.get("/v1/afk", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { afk: deps.fleet.afk.state(), active: deps.fleet.afk.isActive() };
+  });
+
+  app.post("/v1/afk", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const body = afkRequestSchema.safeParse(request.body);
+    if (!body.success) {
+      sendError(reply, 400, "BAD_REQUEST", "invalid afk body");
+      return;
+    }
+    const state = body.data.armed
+      ? deps.fleet.afk.arm({
+          untilIso: body.data.until ?? null,
+          ...(body.data.faq !== undefined ? { faq: body.data.faq } : {}),
+        })
+      : deps.fleet.afk.disarm();
+    return { afk: state, active: deps.fleet.afk.isActive() };
+  });
+
+  app.get("/v1/config/doctor", async (_request, reply) => {
+    if (deps.prompts === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "prompt service unavailable");
+      return;
+    }
+    return { doctor: runConfigDoctor(deps.prompts) };
+  });
+
+  /**
+   * Evaluate the Brain budget handoff now instead of waiting for the next
+   * reconcile tick. Reports the decision either way — including the
+   * below-threshold case, which the tick deliberately keeps silent.
+   */
+  app.post("/v1/brain/handoff/evaluate", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { decision: deps.fleet.evaluateBrainHandoff() };
   });
 
   app.post("/v1/tools/call", async (request, reply) => {

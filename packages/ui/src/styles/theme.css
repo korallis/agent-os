@@ -30,7 +30,13 @@
   --color-line-2: #333333;
   --color-fg-1: #f5f5f5;
   --color-fg-2: #999999;
-  --color-fg-3: #666666;
+  /* Figma specifies #666666 here, which measures 3.2:1 on --color-panel and
+     3.44:1 on --color-shell — below the WCAG 2.1 AA floor of 4.5:1 for the
+     11px labels this token is used for. Raised to the nearest value that
+     clears 4.5:1 on both surfaces; it stays visibly subordinate to fg-2, so
+     the intended hierarchy is preserved. Master plan §11 Phase 8 requires a
+     WCAG pass on every operational page. */
+  --color-fg-3: #8a8a8a;
   --color-fg-4: #4a4a4a;
   --color-teal-brand: #2dd4bf;
   --color-ok: #4ade80;

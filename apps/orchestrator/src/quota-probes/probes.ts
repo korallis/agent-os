@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { monotonicFactory } from "ulid";
 import type {
   HonestyTier,
@@ -8,6 +10,7 @@ import type {
   QuotaMetric,
   QuotaSample,
 } from "@agent-os/protocol";
+import { quotaMetricSchema } from "@agent-os/protocol";
 import { PROBE_ALLOWLIST, assertTokenUrlAllowed } from "./allowlist.js";
 import { readProbeToken } from "./token-reader.js";
 
@@ -55,6 +58,23 @@ function metric(
 }
 
 /**
+ * Read `<home>/fake-quota/<provider>.json` when present. Test-only seam; the
+ * production path never writes this file.
+ */
+function readQuotaFixture(agentosHome: string | undefined, provider: string): QuotaMetric[] | null {
+  if (agentosHome === undefined || agentosHome.length === 0) return null;
+  const path = join(agentosHome, "fake-quota", `${provider}.json`);
+  if (!existsSync(path)) return null;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    const metrics = quotaMetricSchema.array().safeParse(parsed);
+    return metrics.success ? metrics.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Run probes for one connection. Failures degrade metrics to estimate/stale
  * without invalidating the connection.
  */
@@ -63,6 +83,24 @@ export async function probeConnection(ctx: ProbeContext): Promise<{
   events: OrchestratorEvent[];
 }> {
   const provider = ctx.connection.provider;
+
+  // Explicit fixture seam, same shape as the fake-gate outcome file: a gate
+  // that needs a provider to be at 93% of its window cannot get there by
+  // spending real quota. Never inferred — the file must exist by name, and a
+  // missing or unreadable one falls through to the real probe below rather
+  // than silently fabricating a sample.
+  const fixture = readQuotaFixture(ctx.agentosHome, provider);
+  if (fixture !== null) {
+    const sample: QuotaSample = {
+      id: nextUlid(),
+      connectionId: ctx.connection.id,
+      provider,
+      metrics: fixture,
+      sampledAt: new Date().toISOString(),
+    };
+    return { sample, events: [updatedEvent(ctx, sample)] };
+  }
+
   const providerKey = mapProviderConfigKey(provider);
   const providerCfg =
     providerKey !== null ? ctx.config.providers[providerKey] : null;

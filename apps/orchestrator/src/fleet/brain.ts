@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { monotonicFactory } from "ulid";
 import type {
@@ -24,6 +24,18 @@ const nextUlid = monotonicFactory();
 
 /** Durable SessionKeyStore project id for the orchestrator Brain seat. */
 export const BRAIN_SESSION_PROJECT_ID = "orchestrator";
+
+/** Budget handoff target under AGENTOS_HOME — survives daemon restart. */
+const HANDOFF_STATE_FILE = "handoff.json";
+
+export interface DurableHandoff {
+  toModel: string;
+  fromModel: string | null;
+  reason: string;
+  at: string;
+  /** Whether the post-handoff Brain seat reached running. */
+  landed: boolean;
+}
 
 /**
  * The Brain is an LLM, not a rule engine — but it acts only through the typed
@@ -63,12 +75,23 @@ export class BrainManager {
   private sink: BrainEventSink = () => undefined;
   private config: BrainConfig;
   private readonly fake: boolean;
+  private readonly handoffStatePath: string;
+  /**
+   * Set by handoff(); overrides cast resolution until the Captain changes it.
+   * Restored from disk on boot so a restart does not return to the exhausted cast.
+   */
+  private handoffModel: string | null = null;
 
   constructor(private readonly deps: BrainManagerDeps) {
     this.config = deps.config;
     // Explicit seam only. A missing Pi means the Brain cannot run, which is
     // BRAIN_DOWN — not a window that echoes a string and reports "running".
     this.fake = deps.fakeBrain === true || process.env.AGENTOS_FAKE_BRAIN === "1";
+    const brainDir = join(deps.home, "brain");
+    mkdirSync(brainDir, { recursive: true, mode: 0o700 });
+    this.handoffStatePath = join(brainDir, HANDOFF_STATE_FILE);
+    const durable = this.loadHandoff();
+    this.handoffModel = durable?.toModel ?? null;
     this.snapshot = {
       status: "down",
       sessionId: null,
@@ -79,8 +102,8 @@ export class BrainManager {
       tmuxWindow: null,
       wakeQueueDepth: 0,
       lastReconcileAt: null,
-      handoffFrom: null,
-      handoffReason: null,
+      handoffFrom: durable?.fromModel ?? null,
+      handoffReason: durable?.reason ?? null,
     };
     this.deps.tools.setBrainSnapshot(this.snapshot);
     this.deps.watcher.onDeliver((digest) => this.onWake(digest));
@@ -227,6 +250,115 @@ export class BrainManager {
     return this.getSnapshot();
   }
 
+  /**
+   * Budget handoff (master plan §11 Phase 8, [R4]).
+   *
+   * Moves the Brain to another model when its own connection has spent past the
+   * configured share of its window. The replacement runs in a NEW Pi session
+   * with its own per-model session dir: a Claude transcript is not valid input
+   * to GPT, so nothing is replayed across the boundary. The new Brain rebuilds
+   * its picture the same way a cold start does — read_fleet_state first.
+   *
+   * In-flight tasks are untouched: crewmate panes, leases, and task phases live
+   * in the substrate, not in the Brain's context.
+   */
+  handoff(toModel: string, reason: string): BrainSnapshot {
+    const fromModel = this.snapshot.model;
+    const fromSessionId = this.snapshot.sessionId;
+    if (toModel === fromModel) {
+      return this.getSnapshot();
+    }
+    this.handoffModel = toModel;
+    // start() tears down the prior pane, mints a fresh session id, and resolves
+    // a session dir keyed to the new model — the no-replay guarantee is
+    // structural rather than a rule the caller has to remember.
+    const next = this.start(`brain handoff: ${reason}`);
+    const landed = next.status === "running";
+    this.persistHandoff({
+      toModel,
+      fromModel,
+      reason,
+      at: new Date().toISOString(),
+      landed,
+    });
+    this.snapshot = {
+      ...this.snapshot,
+      handoffFrom: fromModel,
+      handoffReason: reason,
+    };
+    this.deps.tools.setBrainSnapshot(this.snapshot);
+    // handoff_completed means the new seat is live — never record a BRAIN_DOWN
+    // land as success. start() already emits brain.down for the spawn path;
+    // emit a handoff-scoped down so the Captain can see the attempt failed.
+    if (landed) {
+      this.sink({
+        type: "brain.handoff_completed",
+        payload: {
+          fromModel,
+          toModel,
+          fromSessionId,
+          toSessionId: this.snapshot.sessionId,
+          reason,
+        },
+      });
+    } else {
+      this.sink({
+        type: "brain.down",
+        payload: {
+          wakeQueueDepth: this.deps.watcher.queueDepth(),
+          reason: `handoff to ${toModel} did not land: ${reason}`,
+        },
+      });
+    }
+    return { ...this.getSnapshot(), handoffFrom: fromModel, handoffReason: reason };
+  }
+
+  /** The model a handoff moved the Brain to, or null when none has happened. */
+  handoffTarget(): string | null {
+    return this.handoffModel;
+  }
+
+  /**
+   * Durable handoff record (handoff.json) — single source of truth for the
+   * last attempt's target, time, and whether the seat landed running.
+   */
+  durableHandoff(): DurableHandoff | null {
+    return this.loadHandoff();
+  }
+
+  private loadHandoff(): DurableHandoff | null {
+    if (!existsSync(this.handoffStatePath)) return null;
+    try {
+      const raw = JSON.parse(readFileSync(this.handoffStatePath, "utf8")) as unknown;
+      if (
+        typeof raw !== "object" ||
+        raw === null ||
+        typeof (raw as DurableHandoff).toModel !== "string" ||
+        (raw as DurableHandoff).toModel.length === 0
+      ) {
+        return null;
+      }
+      const record = raw as DurableHandoff;
+      return {
+        toModel: record.toModel,
+        fromModel: typeof record.fromModel === "string" ? record.fromModel : null,
+        reason: typeof record.reason === "string" ? record.reason : "restored handoff",
+        at: typeof record.at === "string" ? record.at : new Date(0).toISOString(),
+        // Pre-landed-field records were written only after intended moves; treat
+        // as landed so a restart mid-cooldown still suppresses thrash.
+        landed: typeof record.landed === "boolean" ? record.landed : true,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private persistHandoff(record: DurableHandoff): void {
+    writeFileSync(this.handoffStatePath, `${JSON.stringify(record, null, 2)}\n`, {
+      mode: 0o600,
+    });
+  }
+
   /** Enter BRAIN_DOWN — sessions stay alive; wakes queue; no orchestration. */
   enterDown(reason: string): void {
     this.snapshot = {
@@ -339,6 +471,9 @@ export class BrainManager {
   }
 
   private resolveModel(): string {
+    // A budget handoff wins over configured cast until reset — the whole point
+    // of the handoff is that the configured model can no longer be spent.
+    if (this.handoffModel !== null) return this.handoffModel;
     if (this.config.cast !== "auto") {
       return this.config.cast;
     }
@@ -367,7 +502,15 @@ export class BrainManager {
               x.provider === "vercel-ai-gateway") &&
             x.kind === "pi-api-key",
         );
-        if (c !== undefined) return "anthropic/claude-sonnet-4-5";
+        if (c !== undefined) {
+          // Provider-qualified refs so grant lookup and handoff pickTarget can
+          // distinguish a gateway-routed Sonnet from a direct Anthropic cast.
+          if (c.provider === "openrouter") return "openrouter/anthropic/claude-sonnet-4-5";
+          if (c.provider === "vercel-ai-gateway") {
+            return "vercel-ai-gateway/anthropic/claude-sonnet-4-5";
+          }
+          return "anthropic/claude-sonnet-4-5";
+        }
       }
       if (pref.includes("openai") || pref.includes("chatgpt")) {
         const c = healthy.find((x) => x.provider === "openai");

@@ -104,7 +104,15 @@ export function SettingsModal({
                 <Icon src="st-close.svg" className="size-[18px]" />
               </div>
             </div>
-            <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-8 px-8 pt-7 pb-6">
+            {/* tabIndex makes the scroll region reachable by keyboard: without
+                it a keyboard-only user cannot scroll a panel that has no
+                focusable children (WCAG 2.1.1). */}
+            <div
+              tabIndex={0}
+              role="group"
+              aria-label="Settings content"
+              className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-8 px-8 pt-7 pb-6"
+            >
               {children}
             </div>
             <div className="h-16 shrink-0 border-t border-line-1 flex items-center justify-end gap-3 pr-8">

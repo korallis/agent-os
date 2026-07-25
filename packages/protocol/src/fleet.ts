@@ -151,3 +151,35 @@ export const taskListItemSchema = z.strictObject({
   createdAt: isoTimestampSchema,
 });
 export type TaskListItem = z.infer<typeof taskListItemSchema>;
+
+/**
+ * `/afk` autonomy posture (master plan §11 Phase 8). The FAQ is the entire
+ * mandate: AFK answers what the Captain pre-decided and escalates everything
+ * else. It never invents an answer.
+ */
+export const afkFaqEntrySchema = z.strictObject({
+  /** Case-insensitive substrings; ALL must match for the entry to apply. */
+  match: z.array(z.string().min(1)).min(1),
+  answer: z.string().min(1).max(20_000),
+  rationale: z.string().min(1).max(2000),
+});
+export type AfkFaqEntry = z.infer<typeof afkFaqEntrySchema>;
+
+export const afkStateSchema = z.strictObject({
+  armed: z.boolean(),
+  until: isoTimestampSchema.nullable(),
+  faq: z.array(afkFaqEntrySchema),
+  answered: z.number().int().min(0),
+  escalated: z.number().int().min(0),
+});
+export type AfkState = z.infer<typeof afkStateSchema>;
+
+/** `POST /v1/afk` — arm or disarm the posture. */
+export const afkRequestSchema = z.strictObject({
+  armed: z.boolean(),
+  /** Absolute deadline; an expired posture reads as disarmed. */
+  until: isoTimestampSchema.nullable().optional(),
+  /** Replaces the FAQ when present; omitted keeps the recorded entries. */
+  faq: z.array(afkFaqEntrySchema).optional(),
+});
+export type AfkRequest = z.infer<typeof afkRequestSchema>;
