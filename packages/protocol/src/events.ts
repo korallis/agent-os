@@ -609,7 +609,7 @@ export const sessionWedgedEventSchema = z.strictObject({
     /** Minutes of silence that tripped the detector. */
     idleMinutes: z.number().min(0),
     thresholdMinutes: z.number().min(0),
-    /** How many wedge respawns this task/role has already consumed. */
+    /** Durable wedge-respawn ledger for this task/role after the outcome. */
     respawnsUsed: z.number().int().min(0),
     respawnCap: z.number().int().min(0),
     /** What the substrate did about it. */

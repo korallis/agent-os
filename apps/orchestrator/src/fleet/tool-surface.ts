@@ -675,8 +675,9 @@ export class ToolSurface {
       let escalateSummary: string | null = null;
       if (canRespawn) {
         try {
-          // Spend the bound before spawn so a crash cannot leave the
-          // respawn-once ledger unspent after a partial success.
+          // Ledger invariant: counts attempts that cost the fleet a seat. Spent
+          // before the attempt so a crash cannot lose the spend; rolled back
+          // only when the attempt demonstrably did not reach the stop.
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
           this.respawnCrewmate({
             sessionId: session.sessionId,
@@ -687,7 +688,14 @@ export class ToolSurface {
           action = "escalated";
           escalateSummary = `Seat ${session.role} wedged and could not be respawned — no activity for ${Math.round(idleMinutes)}m`;
           const current = this.sessions.get(session.sessionId) ?? session;
-          this.persistSessionWedged(current);
+          // respawnCrewmate stops first; once status is stopped/lost the seat
+          // was consumed even if spawn failed — spend stands. Leave those
+          // terminal rows alone: rewriting them as wedged with a dead pane
+          // strands a seat nothing reconsiders.
+          if (current.status !== "stopped" && current.status !== "lost") {
+            this.setWedgeRespawns(session.taskId, session.role, used);
+            this.persistSessionWedged(current);
+          }
         }
       } else {
         // Cap consumed: the Captain decides, because a second wedge on the same
@@ -698,10 +706,13 @@ export class ToolSurface {
         this.persistSessionWedged(current);
       }
 
+      // Evidence must agree with the durable ledger after the outcome (including
+      // any rollback for a pre-stop failure).
+      const respawnsUsed = this.getWedgeRespawns(session.taskId, session.role);
       this.emitSessionWedged(session, {
         idleMinutes,
         thresholdMinutes,
-        respawnsUsed: used,
+        respawnsUsed,
         respawnCap,
         action,
       });

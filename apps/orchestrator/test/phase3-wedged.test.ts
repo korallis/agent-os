@@ -193,7 +193,8 @@ describe("structural WEDGED ladder", () => {
     expect(wedged?.type).toBe("session.wedged");
     if (wedged?.type === "session.wedged") {
       expect(wedged.payload.action).toBe("respawned");
-      expect(wedged.payload.respawnsUsed).toBe(0);
+      // Evidence matches the durable ledger after the successful spend.
+      expect(wedged.payload.respawnsUsed).toBe(1);
     }
     const task = service.tools.getTask(taskId);
     expect(task?.wedgeRespawnsByRole[role]).toBe(1);
@@ -394,5 +395,67 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.needsCaptainSummary).toBe("second seat wedged");
     expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
     expect(events.some((e) => e.type === "task.phase_changed")).toBe(false);
+  });
+
+  it("keeps the ledger spent when stop ran but spawn failed, without re-wedging the stopped seat", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    // Force spawn to refuse after stop: builders cannot start in VALIDATING.
+    const task = service.tools.getTask(taskId)!;
+    service.tools.hydrateTask({
+      ...task,
+      phase: "VALIDATING",
+      updatedAt: new Date().toISOString(),
+    });
+    events.length = 0;
+    const acted = service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted[0]?.action).toBe("escalated");
+    const session = service.tools.listSessions().find((s) => s.sessionId === sessionId);
+    expect(session?.status).toBe("stopped");
+    const durable = service.tools.getTask(taskId)!;
+    const durableRow = durable.sessions.find((s) => s.sessionId === sessionId);
+    expect(durableRow?.status).toBe("stopped");
+    expect(durable.wedgeRespawnsByRole[role]).toBe(1);
+    const wedged = events.find((e) => e.type === "session.wedged");
+    expect(wedged?.type).toBe("session.wedged");
+    if (wedged?.type === "session.wedged") {
+      expect(wedged.payload.action).toBe("escalated");
+      expect(wedged.payload.respawnsUsed).toBe(1);
+    }
+    expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
+  });
+
+  it("rolls the ledger back when the respawn attempt fails before stop", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    const originalKill = service.tmux.killWindow.bind(service.tmux);
+    service.tmux.killWindow = () => {
+      throw new Error("simulated stop refusal");
+    };
+    events.length = 0;
+    try {
+      const acted = service.tools.reconcileWedgedSessions(Date.now());
+      expect(acted[0]?.action).toBe("escalated");
+    } finally {
+      service.tmux.killWindow = originalKill;
+    }
+    const session = service.tools.listSessions().find((s) => s.sessionId === sessionId);
+    expect(session?.status).toBe("wedged");
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    const wedged = events.find((e) => e.type === "session.wedged");
+    expect(wedged?.type).toBe("session.wedged");
+    if (wedged?.type === "session.wedged") {
+      expect(wedged.payload.action).toBe("escalated");
+      expect(wedged.payload.respawnsUsed).toBe(0);
+    }
+    expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
   });
 });

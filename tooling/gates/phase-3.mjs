@@ -387,7 +387,7 @@ try {
       "a live-but-silent seat is WEDGED: respawned once with evidence, then escalated",
       respawned !== null &&
         escalated !== null &&
-        respawned.respawnsUsed === 0 &&
+        respawned.respawnsUsed === 1 &&
         escalated.respawnsUsed === 1 &&
         respawned.thresholdMinutes === 1,
       `respawned=${respawned !== null ? `idle ${respawned.idleMinutes}m ${respawned.respawnsUsed}/${respawned.respawnCap}` : "none"} escalated=${escalated !== null ? `${escalated.respawnsUsed}/${escalated.respawnCap}` : "none"}`,
