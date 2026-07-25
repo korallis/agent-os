@@ -49,7 +49,8 @@ export function PromptDiff() {
   const [templates, setTemplates] = useState<PromptTemplate[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [diff, setDiff] = useState<ThreeWayDiff | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [listFailed, setListFailed] = useState(false);
+  const [diffFailedRef, setDiffFailedRef] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,7 +66,7 @@ export function PromptDiff() {
         const customized = body.templates.find((t) => t.customized);
         setSelected((needsDecision ?? customized ?? body.templates[0])?.ref ?? null);
       } catch {
-        if (!cancelled) setFailed(true);
+        if (!cancelled) setListFailed(true);
       }
     })();
     return () => {
@@ -77,6 +78,7 @@ export function PromptDiff() {
     if (selected === null) return;
     let cancelled = false;
     setDiff(null);
+    setDiffFailedRef(null);
     void (async () => {
       try {
         const res = await fetch(`/api/agentos/prompts/diff?ref=${encodeURIComponent(selected)}`, {
@@ -84,9 +86,12 @@ export function PromptDiff() {
         });
         if (!res.ok) throw new Error(String(res.status));
         const body = (await res.json()) as ThreeWayDiff;
-        if (!cancelled) setDiff(body);
+        if (!cancelled) {
+          setDiff(body);
+          setDiffFailedRef(null);
+        }
       } catch {
-        if (!cancelled) setFailed(true);
+        if (!cancelled) setDiffFailedRef(selected);
       }
     })();
     return () => {
@@ -94,7 +99,7 @@ export function PromptDiff() {
     };
   }, [selected]);
 
-  if (failed) {
+  if (listFailed) {
     return <p className="text-[13px] text-danger">Prompt templates unavailable from the daemon.</p>;
   }
   if (templates === null) {
@@ -139,7 +144,11 @@ export function PromptDiff() {
         ))}
       </div>
 
-      {diff === null ? (
+      {diffFailedRef !== null ? (
+        <p className="text-[13px] text-danger">
+          Could not load diff for <span className="font-mono">{diffFailedRef}</span>.
+        </p>
+      ) : diff === null ? (
         <p className="text-[13px] text-fg-3">Loading diff…</p>
       ) : (
         <div className="flex flex-col gap-3">

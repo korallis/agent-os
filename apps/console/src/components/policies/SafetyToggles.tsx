@@ -54,6 +54,7 @@ type Policies = Record<string, boolean>;
 export function SafetyToggles() {
   const [policies, setPolicies] = useState<Policies | null>(null);
   const [pending, setPending] = useState<{ key: string; next: boolean } | null>(null);
+  const [confirmTyped, setConfirmTyped] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -72,8 +73,19 @@ export function SafetyToggles() {
     void load();
   }, []);
 
+  const openDisable = (key: string) => {
+    setConfirmTyped("");
+    setPending({ key, next: false });
+  };
+
+  const cancelPending = () => {
+    setConfirmTyped("");
+    setPending(null);
+  };
+
   const apply = async (key: string, next: boolean) => {
     if (policies === null) return;
+    if (!next && confirmTyped !== key) return;
     setMessage(null);
     try {
       const res = await fetch("/api/agentos/config/global/policies", {
@@ -100,6 +112,7 @@ export function SafetyToggles() {
     } catch {
       setMessage("Could not reach the daemon to write the policy.");
     } finally {
+      setConfirmTyped("");
       setPending(null);
     }
   };
@@ -112,6 +125,7 @@ export function SafetyToggles() {
   }
 
   const disabled = Object.entries(policies).filter(([, on]) => !on);
+  const typedMatches = pending !== null && confirmTyped === pending.key;
 
   return (
     <div className="flex flex-col gap-4">
@@ -153,7 +167,7 @@ export function SafetyToggles() {
               type="button"
               aria-pressed={on}
               aria-label={`${POLICY_COPY[key]?.label ?? key}: ${on ? "on" : "off"}`}
-              onClick={() => (on ? setPending({ key, next: false }) : void apply(key, true))}
+              onClick={() => (on ? openDisable(key) : void apply(key, true))}
               className={cn(
                 "shrink-0 rounded-[20px] px-3 py-1 text-[11px] font-semibold",
                 on ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn",
@@ -179,17 +193,37 @@ export function SafetyToggles() {
             override is stamped on every run it affects, and a persistent badge stays on this page
             until it is turned back on.
           </span>
+          <label className="flex flex-col gap-1.5">
+            <span className="text-[12px] text-fg-2">
+              Type <span className="font-mono text-fg-1">{pending.key}</span> to confirm
+            </span>
+            <input
+              type="text"
+              value={confirmTyped}
+              onChange={(e) => setConfirmTyped(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+              aria-label={`Type ${pending.key} to confirm disable`}
+              className="rounded-lg border border-line-2 bg-shell px-3 py-1.5 font-mono text-[12px] text-fg-1 outline-none focus:border-warn"
+            />
+          </label>
           <div className="flex gap-2">
             <button
               type="button"
+              disabled={!typedMatches}
               onClick={() => void apply(pending.key, false)}
-              className="rounded-lg bg-warn/15 px-3 py-1.5 text-[12px] font-medium text-warn"
+              className={cn(
+                "rounded-lg px-3 py-1.5 text-[12px] font-medium",
+                typedMatches
+                  ? "bg-warn/15 text-warn"
+                  : "cursor-not-allowed bg-panel-2 text-fg-3 opacity-60",
+              )}
             >
               Yes, disable it
             </button>
             <button
               type="button"
-              onClick={() => setPending(null)}
+              onClick={cancelPending}
               className="rounded-lg border border-line-2 px-3 py-1.5 text-[12px] font-medium text-fg-2"
             >
               Cancel

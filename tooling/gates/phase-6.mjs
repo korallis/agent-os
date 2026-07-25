@@ -630,8 +630,9 @@ try {
   }
 
   // G13 — Policies: accurate ◆ diff-from-default, safety toggle refuses an
-  // unconfirmed write, and the three-way prompt diff renders for a customized
-  // template with a shipped update.
+  // unconfirmed write, typed disable confirmation blocks empty confirms, and
+  // the three-way prompt diff renders for a customized template with a shipped
+  // update.
   {
     // Make one key genuinely deviate from its shipped default, and set another
     // to the SAME value the default already has. Only the first may show ◆ —
@@ -684,11 +685,55 @@ try {
     await sleep(600);
     const safetyTab = page.getByRole("button", { name: /^safety$/i }).first();
     let badgeShown = false;
+    let typedBlocksEmpty = false;
     if ((await safetyTab.count()) > 0) {
       await safetyTab.click();
       await sleep(800);
       const safetyText = (await page.textContent("body")) ?? "";
       badgeShown = /SAFETY OVERRIDE/i.test(safetyText) && safetyText.includes("SCOUT read-only");
+
+      // Re-enable scout so the UI disable path can be exercised cleanly.
+      await fetch(`${BASE}/v1/config/global/policies`, {
+        method: "PUT",
+        headers: {
+          authorization: auth.authorization,
+          "content-type": "application/json",
+          "x-agentos-confirm-safety": "true",
+        },
+        body: JSON.stringify({ ...effective.config.policies, scoutReadOnly: true }),
+      });
+      await page.reload({ waitUntil: "networkidle" });
+      await sleep(700);
+      const safetyTab2 = page.getByRole("button", { name: /^safety$/i }).first();
+      if ((await safetyTab2.count()) > 0) {
+        await safetyTab2.click();
+        await sleep(700);
+      }
+
+      // Typed confirmation: open disable dialog, leave the field empty, and
+      // prove the confirm action cannot write (button stays disabled).
+      const scoutToggle = page.getByRole("button", { name: /SCOUT read-only: on/i }).first();
+      if ((await scoutToggle.count()) > 0) {
+        await scoutToggle.click();
+        await sleep(400);
+        const confirmBtn = page.getByRole("button", { name: /Yes, disable it/i }).first();
+        const confirmInput = page.getByLabel(/Type scoutReadOnly to confirm/i).first();
+        const emptyDisabled =
+          (await confirmBtn.count()) > 0 &&
+          (await confirmBtn.isDisabled()) &&
+          (await confirmInput.count()) > 0;
+        // Force a click attempt even if disabled — Playwright still dispatches
+        // when force:true; the UI must not write.
+        if ((await confirmBtn.count()) > 0) {
+          await confirmBtn.click({ force: true }).catch(() => {});
+          await sleep(500);
+        }
+        const afterEmpty = await (
+          await fetch(`${BASE}/v1/config/effective`, { headers: auth })
+        ).json();
+        const stillOn = afterEmpty.config?.policies?.scoutReadOnly === true;
+        typedBlocksEmpty = emptyDisabled && stillOn;
+      }
     }
 
     // Three-way prompt diff for a customized template with a shipped update.
@@ -712,8 +757,9 @@ try {
         unconfirmed.status === 428 &&
         confirmed.ok &&
         badgeShown &&
+        typedBlocksEmpty &&
         diffShown,
-      `diamond=${marksDeviation} unconfirmed=${unconfirmed.status} confirmed=${confirmed.status} badge=${badgeShown} threeWay=${diffShown}`,
+      `diamond=${marksDeviation} unconfirmed=${unconfirmed.status} confirmed=${confirmed.status} badge=${badgeShown} typedBlock=${typedBlocksEmpty} threeWay=${diffShown}`,
     );
   }
 
@@ -747,8 +793,42 @@ try {
       {
         provider: "openrouter",
         label: "balance-split",
+        // Multiple credit/balance metrics so the card renders primary + credit-
+        // split sub-rows (voucher/cash), not a lone currency numeral.
         metrics: [
-          { kind: "sdk-credit-pool", value: 12.5, unit: "usd", tier: "live", source: "API KEY", syncedAt: new Date().toISOString(), reason: null, resetsAt: null, limitReached: false },
+          {
+            kind: "balance",
+            value: 25,
+            unit: "usd",
+            tier: "live",
+            source: "API KEY",
+            syncedAt: new Date().toISOString(),
+            reason: null,
+            resetsAt: null,
+            limitReached: false,
+          },
+          {
+            kind: "voucher-balance",
+            value: 10,
+            unit: "usd",
+            tier: "live",
+            source: "API KEY",
+            syncedAt: new Date().toISOString(),
+            reason: null,
+            resetsAt: null,
+            limitReached: false,
+          },
+          {
+            kind: "cash-balance",
+            value: 15,
+            unit: "usd",
+            tier: "live",
+            source: "API KEY",
+            syncedAt: new Date().toISOString(),
+            reason: null,
+            resetsAt: null,
+            limitReached: false,
+          },
         ],
       },
     ];
@@ -784,7 +864,14 @@ try {
       providersText.includes("weekly plan window exhausted");
     const bestEffortShown =
       providersText.includes("best-effort fixture") && /best-effort/i.test(providersText);
-    const balanceShown = providersText.includes("balance-split fixture");
+    // Balance-split: connection label + primary currency + credit-split sub-rows.
+    const balanceShown =
+      providersText.includes("balance-split fixture") &&
+      providersText.includes("$25.00") &&
+      /voucher/i.test(providersText) &&
+      providersText.includes("$10.00") &&
+      /cash/i.test(providersText) &&
+      providersText.includes("$15.00");
 
     // The usage strip must reflect a NEW quota.updated within 1s over SSE.
     await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
