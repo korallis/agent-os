@@ -1491,7 +1491,7 @@ describe("stow_knowledge path jail", () => {
 });
 
 describe("brain spawn failure", () => {
-  it("enters BRAIN_DOWN and clears authorized session when Pi spawn fails", () => {
+  it("enters BRAIN_DOWN and clears authorized session when Pi spawn fails", async () => {
     const home = temp("agentos-brain-spawn-");
     mkdirSync(join(home, "config"), { recursive: true });
     // Extension must exist on disk so spawn reaches tmux (missing dist fails closed earlier).
@@ -1530,7 +1530,7 @@ describe("brain spawn failure", () => {
       throw new Error("tmux refused window");
     };
 
-    const snap = service.brain.start("api");
+    const snap = await service.brain.start("api");
     expect(snap.status).toBe("down");
     expect(service.tools.isBrainDown()).toBe(true);
     expect(snap.sessionId).not.toBeNull();

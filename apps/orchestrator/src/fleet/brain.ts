@@ -286,7 +286,7 @@ export class BrainManager {
    * In-flight tasks are untouched: crewmate panes, leases, and task phases live
    * in the substrate, not in the Brain's context.
    */
-  handoff(toModel: string, reason: string): BrainSnapshot {
+  async handoff(toModel: string, reason: string): Promise<BrainSnapshot> {
     const fromModel = this.snapshot.model;
     const fromSessionId = this.snapshot.sessionId;
     if (toModel === fromModel) {
@@ -296,7 +296,7 @@ export class BrainManager {
     // start() tears down the prior pane, mints a fresh session id, and resolves
     // a session dir keyed to the new model — the no-replay guarantee is
     // structural rather than a rule the caller has to remember.
-    const next = this.start(`brain handoff: ${reason}`);
+    const next = await this.start(`brain handoff: ${reason}`);
     const landed = next.status === "running";
     this.persistHandoff({
       toModel,

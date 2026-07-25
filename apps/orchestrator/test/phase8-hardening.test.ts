@@ -269,7 +269,7 @@ describe("Brain budget handoff", () => {
     };
   }
 
-  it("suppresses a second handoff while cooldown is active", () => {
+  it("suppresses a second handoff while cooldown is active", async () => {
     const home = temp("agentos-p8-handoff-cd-");
     mkdirSync(join(home, "config"), { recursive: true });
     const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -295,18 +295,18 @@ describe("Brain budget handoff", () => {
       fakeTmux: true,
       fakeBrain: true,
     });
-    service.start();
+    await service.start();
     // Force the Brain onto Anthropic OAuth model string.
-    service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+    await service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
 
-    const first = service.evaluateBrainHandoff();
+    const first = await service.evaluateBrainHandoff();
     expect(first?.shouldHandoff).toBe(true);
     expect(first?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
     expect(first?.reason).toContain("only over-threshold refuge available");
     expect(service.lastBrainHandoff()?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
     expect(service.lastBrainHandoff()?.landed).toBe(true);
 
-    const second = service.evaluateBrainHandoff();
+    const second = await service.evaluateBrainHandoff();
     expect(second?.shouldHandoff).toBe(false);
     expect(second?.reason).toContain("cooldown");
     expect(service.brain.getSnapshot().model).toBe("openrouter/anthropic/claude-sonnet-4-5");
@@ -314,7 +314,7 @@ describe("Brain budget handoff", () => {
     service.stop();
   });
 
-  it("persists the handoff target across daemon restart", () => {
+  it("persists the handoff target across daemon restart", async () => {
     const home = temp("agentos-p8-handoff-dur-");
     mkdirSync(join(home, "config"), { recursive: true });
     const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -330,9 +330,9 @@ describe("Brain budget handoff", () => {
       fakeTmux: true,
       fakeBrain: true,
     });
-    first.start();
+    await first.start();
     // Prefer-order would land on Anthropic; handoff must stick to the refuge.
-    first.brain.handoff("xai/grok-3", "budget threshold crossed");
+    await first.brain.handoff("xai/grok-3", "budget threshold crossed");
     expect(first.brain.getSnapshot().model).toBe("xai/grok-3");
     first.stop();
 
@@ -343,13 +343,13 @@ describe("Brain budget handoff", () => {
       fakeTmux: true,
       fakeBrain: true,
     });
-    restarted.start();
+    await restarted.start();
     expect(restarted.brain.handoffTarget()).toBe("xai/grok-3");
     expect(restarted.brain.getSnapshot().model).toBe("xai/grok-3");
     restarted.stop();
   });
 
-  it("does not emit handoff_completed or thrash when the post-handoff seat is down", () => {
+  it("does not emit handoff_completed or thrash when the post-handoff seat is down", async () => {
     const home = temp("agentos-p8-handoff-down-");
     mkdirSync(join(home, "config"), { recursive: true });
     const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -379,12 +379,12 @@ describe("Brain budget handoff", () => {
     service.onEvent((event) => {
       events.push(event);
     });
-    service.start();
-    service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+    await service.start();
+    await service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
     expect(service.brain.getSnapshot().status).toBe("down");
     events.length = 0;
 
-    const first = service.evaluateBrainHandoff();
+    const first = await service.evaluateBrainHandoff();
     expect(first?.shouldHandoff).toBe(true);
     expect(service.brain.getSnapshot().status).toBe("down");
     expect(service.lastBrainHandoff()?.landed).toBe(false);
@@ -393,7 +393,7 @@ describe("Brain budget handoff", () => {
     expect(events.some((e) => e.type === "brain.down")).toBe(true);
 
     // Short retry backoff — not the success cooldown, but enough to stop thrash.
-    const second = service.evaluateBrainHandoff();
+    const second = await service.evaluateBrainHandoff();
     expect(second?.shouldHandoff).toBe(false);
     expect(second?.reason ?? "").toContain("retry backoff");
     expect(service.lastBrainHandoff()?.landed).toBe(false);
@@ -401,7 +401,7 @@ describe("Brain budget handoff", () => {
     service.stop();
   });
 
-  it("restores success cooldown from durable handoff across restart", () => {
+  it("restores success cooldown from durable handoff across restart", async () => {
     const home = temp("agentos-p8-handoff-cd-restore-");
     mkdirSync(join(home, "config"), { recursive: true });
     const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -426,9 +426,9 @@ describe("Brain budget handoff", () => {
       fakeTmux: true,
       fakeBrain: true,
     });
-    first.start();
-    first.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
-    const decision = first.evaluateBrainHandoff();
+    await first.start();
+    await first.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+    const decision = await first.evaluateBrainHandoff();
     expect(decision?.shouldHandoff).toBe(true);
     expect(first.lastBrainHandoff()?.landed).toBe(true);
     const durable = first.brain.durableHandoff();
@@ -445,16 +445,16 @@ describe("Brain budget handoff", () => {
       fakeTmux: true,
       fakeBrain: true,
     });
-    restarted.start();
+    await restarted.start();
     expect(restarted.lastBrainHandoff()?.toModel).toBe(durable?.toModel);
     expect(restarted.lastBrainHandoff()?.landed).toBe(true);
-    const suppressed = restarted.evaluateBrainHandoff();
+    const suppressed = await restarted.evaluateBrainHandoff();
     expect(suppressed?.shouldHandoff).toBe(false);
     expect(suppressed?.reason ?? "").toContain("handoff cooldown");
     restarted.stop();
   });
 
-  it("fleet path prefers under-threshold xai over exhausted same-family openrouter", () => {
+  it("fleet path prefers under-threshold xai over exhausted same-family openrouter", async () => {
     const home = temp("agentos-p8-handoff-healthy-");
     mkdirSync(join(home, "config"), { recursive: true });
     const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -477,10 +477,10 @@ describe("Brain budget handoff", () => {
       fakeTmux: true,
       fakeBrain: true,
     });
-    service.start();
-    service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+    await service.start();
+    await service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
 
-    const decision = service.evaluateBrainHandoff();
+    const decision = await service.evaluateBrainHandoff();
     expect(decision?.shouldHandoff).toBe(true);
     // Same-family openrouter is over threshold; healthy xai must win.
     expect(decision?.toModel).toBe("xai/grok-3");

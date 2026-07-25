@@ -690,7 +690,7 @@ export class FleetService {
    * The below-threshold case is deliberately silent: emitting an event every
    * tick for "nothing happened" would bury the one that matters.
    */
-  evaluateBrainHandoff(): ReturnType<typeof decideHandoff> | null {
+  async evaluateBrainHandoff(): Promise<ReturnType<typeof decideHandoff> | null> {
     const brainSnapshot = this.brain.getSnapshot();
     if (brainSnapshot.model === null) return null;
     const cfg = this.options.config.effective().config;
@@ -753,7 +753,7 @@ export class FleetService {
         thresholdPct: decision.thresholdPct,
       },
     });
-    const after = this.brain.handoff(decision.toModel, decision.reason);
+    const after = await this.brain.handoff(decision.toModel, decision.reason);
     // Keep one inspectable record (also durable via BrainManager): success
     // latches the long cooldown; failure latches only the short retry backoff.
     this.lastHandoff = {
@@ -802,7 +802,7 @@ export class FleetService {
     this.reconcileTimer = setInterval(() => {
       try {
         this.reconcile();
-        this.evaluateBrainHandoff();
+        void this.evaluateBrainHandoff().catch(() => undefined);
       } catch {
         // never let the tick crash the daemon
       }

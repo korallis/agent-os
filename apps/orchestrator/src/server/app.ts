@@ -821,7 +821,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
       return;
     }
-    return { decision: deps.fleet.evaluateBrainHandoff() };
+    return { decision: await deps.fleet.evaluateBrainHandoff() };
   });
 
   app.post("/v1/tools/call", async (request, reply) => {

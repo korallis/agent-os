@@ -405,7 +405,7 @@ describe("session keys (G6)", () => {
     ).toEqual([]);
   });
 
-  it("never inherits ambient session-dir sentinels into crewmate or Brain spawn env", () => {
+  it("never inherits ambient session-dir sentinels into crewmate or Brain spawn env", async () => {
     const sentinel = "/tmp/ambient-session-dir-CANARY";
     const prevAgentos = process.env.AGENTOS_SESSION_DIR;
     const prevPi = process.env.PI_CODING_AGENT_SESSION_DIR;
@@ -457,7 +457,7 @@ describe("session keys (G6)", () => {
         return originalNewWindow(input);
       }) as typeof service.tmux.newWindow;
 
-      const brainSnap = service.brain.start("session-dir-canary");
+      const brainSnap = await service.brain.start("session-dir-canary");
       expect(brainSnap.status).toBe("running");
       expect(brainSnap.model).not.toBeNull();
       const brainModel = brainSnap.model as string;
