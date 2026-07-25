@@ -125,8 +125,10 @@ export interface BuildSpawnOptions {
   /** Clean-room: add --no-skills --no-extensions --no-context-files, then re-add -e. */
   cleanRoom?: boolean;
   /**
-   * Absolute path to the task gate workspace. Passed to builders as
-   * AGENTOS_GATE_WORKSPACE so the extension can deny tool paths inside it.
+   * Absolute path to the task gate workspace.
+   * - Builders: AGENTOS_GATE_WORKSPACE so the extension can deny tool paths inside it.
+   * - Validators: AGENTOS_GATE_WORKSPACE + AGENTOS_HOME so the extension can
+   *   write-jail them (allow only the gate workspace under Agent OS home).
    */
   gateWorkspace?: string;
 }
@@ -146,12 +148,15 @@ export function buildPiSpawnSpec(options: BuildSpawnOptions): PiSpawnSpec & {
     AGENTOS_SOCKET: options.socketPath,
     AGENTOS_ROLE: options.role,
   };
-  // AGENTOS_HOME is only for the Brain seat (extension socket + secrets layout
-  // awareness). Crewmates must not receive a path into runs/*/gate-workspace.
-  if (options.role === "brain") {
+  // AGENTOS_HOME: Brain (layout awareness) and validators (write-jail fence root).
+  // Builders never receive it — they only need AGENTOS_GATE_WORKSPACE to deny.
+  if (options.role === "brain" || options.role === "validator") {
     extraAllow.AGENTOS_HOME = options.agentosHome;
   }
-  if (options.role === "builder" && options.gateWorkspace !== undefined) {
+  if (
+    (options.role === "builder" || options.role === "validator") &&
+    options.gateWorkspace !== undefined
+  ) {
     extraAllow.AGENTOS_GATE_WORKSPACE = options.gateWorkspace;
   }
   if (options.sessionDir !== undefined) {

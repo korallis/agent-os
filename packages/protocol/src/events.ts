@@ -367,6 +367,20 @@ export const gateResultEventSchema = z.strictObject({
   }),
 });
 
+/**
+ * Daemon recorded a RED baseline proof for a gate source hash.
+ * Survives kill -9 via append-only log replay into process memory.
+ */
+export const gateRedProvenEventSchema = z.strictObject({
+  type: z.literal("gate.red_proven"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    gateSourceHash: z.string().min(1),
+    outcome: z.enum(["EXPECTED_RED", "FAIL"]),
+    provenAt: isoTimestampSchema,
+  }),
+});
+
 export const fusionDispatchedEventSchema = z.strictObject({
   type: z.literal("fusion.dispatched"),
   payload: z.strictObject({
@@ -519,6 +533,7 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   brainDownEventSchema,
   toolInvokedEventSchema,
   gateResultEventSchema,
+  gateRedProvenEventSchema,
   fusionDispatchedEventSchema,
   promptInstalledEventSchema,
   fusionSideCompletedEventSchema,

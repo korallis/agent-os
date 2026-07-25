@@ -123,6 +123,26 @@ export const deliveryBlockedSchema = z.strictObject({
 });
 export type DeliveryBlocked = z.infer<typeof deliveryBlockedSchema>;
 
+/**
+ * Daemon-owned RED baseline proof. Authorised only when HMAC verifies under the
+ * daemon-only gate-proof secret — never from a seat-writable file alone.
+ */
+export const taskRedProofSchema = z.strictObject({
+  gateSourceHash: z.string().min(1),
+  outcome: z.enum(["EXPECTED_RED", "FAIL"]),
+  provenAt: isoTimestampSchema,
+  /** HMAC-SHA256(gateSourceHash) with daemon-only key. */
+  hmac: z.string().min(1),
+});
+export type TaskRedProof = z.infer<typeof taskRedProofSchema>;
+
+/** Daemon-owned verbatim FAIL ledger (text + hash); disk is cache only. */
+export const taskFailLedgerSchema = z.strictObject({
+  text: z.string(),
+  hash: z.string().min(1),
+});
+export type TaskFailLedger = z.infer<typeof taskFailLedgerSchema>;
+
 export const taskSnapshotSchema = z.strictObject({
   id: ulidSchema,
   shape: taskShapeSchema,
@@ -142,6 +162,13 @@ export const taskSnapshotSchema = z.strictObject({
   needsCaptainSummary: z.string().nullable(),
   /** Set when a task-linked worktree quarantines dirty; sticky until Captain resolves. */
   deliveryBlocked: deliveryBlockedSchema.nullable(),
+  /**
+   * Daemon-authoritative RED proof for the current gate revision.
+   * Rebuilt into process memory on boot; never authorised from seat disk alone.
+   */
+  redProof: taskRedProofSchema.nullable().default(null),
+  /** Daemon-authoritative last FAIL lines for verbatim inject. */
+  lastFailLedger: taskFailLedgerSchema.nullable().default(null),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,

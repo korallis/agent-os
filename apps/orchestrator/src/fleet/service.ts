@@ -8,6 +8,7 @@ import type {
   TaskListItem,
   TaskSnapshot,
 } from "@agent-os/protocol";
+import { readLog } from "@agent-os/event-store";
 import type { ConfigService } from "../config/service.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
@@ -105,6 +106,7 @@ export class FleetService {
     });
 
     this.hydrateTasks();
+    this.hydrateRedProofsFromEventLog();
     this.rehydrateRuntime();
   }
 
@@ -396,6 +398,26 @@ export class FleetService {
       } catch {
         // skip corrupt
       }
+    }
+  }
+
+  /**
+   * Replay gate.red_proven from the append-only event log so a kill -9 after
+   * the durable event (and before/without a task.json write) still restores
+   * daemon-authoritative RED proofs. Disk under validation/ is never trusted.
+   */
+  private hydrateRedProofsFromEventLog(): void {
+    const logPath = join(this.options.home, "events", "events.ndjson");
+    if (!existsSync(logPath)) return;
+    try {
+      const { envelopes } = readLog(logPath);
+      for (const envelope of envelopes) {
+        const event = envelope.event;
+        if (event.type !== "gate.red_proven") continue;
+        this.tools.hydrateRedProofFromEvent(event.payload);
+      }
+    } catch {
+      // Corrupt log tails are handled by EventStore boot; best-effort here.
     }
   }
 

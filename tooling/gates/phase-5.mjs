@@ -7,7 +7,7 @@
  *   G3  same-family builder/validator refused at spawn too, not only at cast
  *   G4  validator is write-jailed to the gate workspace; builder never sees it
  *   G5  verbatim FAIL lines are substrate-composed and hash-matched
- *   G6  editing the gate drops RED proof (forged jail-side proof ignored); re-prove restores
+ *   G6  editing the gate drops RED proof (forged sibling/validation disk ignored); re-prove restores
  *   G7  uv/PEP 723: a gate importing a dependency absent from the project runs
  *       in its own cached venv without touching the product tree
  *   G8  gateLanguage "ts" override runs gate.ts via node strip-types
@@ -458,10 +458,12 @@ raise SystemExit(1)
     await releaseTask(token, taskId);
   }
 
-  // G6 — editing the gate drops its RED proof; forged jail-side proof is ignored;
-  // mid-build re-prove restores candidate runs.
+  // G6 — editing the gate drops its RED proof; forged proofs on every seat-writable
+  // path (including the sibling validation/ the daemon used to read) are ignored
+  // because authz is process memory + HMAC only. Mid-build re-prove restores.
   {
     const { createHash } = await import("node:crypto");
+    const { mkdirSync } = await import("node:fs");
     const taskId = await readyTask(token, projectId, "Gate revision", {
       gateSource: RED_THEN_GREEN_GATE,
     });
@@ -475,20 +477,44 @@ raise SystemExit(1)
     });
     const beforeEdit = await callTool(token, "run_gate", { taskId, target: "candidate" });
 
-    // Validator revises the gate AND attempts to forge red-proof.json inside its
-    // write-jail (gate-workspace). Daemon-owned proof lives under validation/.
-    const gatePath = join(home, "runs", taskId, "gate-workspace", "gate.py");
+    // From the validator cwd (gate-workspace), weaken gate.py and plant forged
+    // red-proof.json in every plausible location — including ../validation/ where
+    // the daemon previously read disk. Authz must still refuse the candidate.
+    const gateWs = join(home, "runs", taskId, "gate-workspace");
+    const gatePath = join(gateWs, "gate.py");
     const revised = `${readFileSync(gatePath, "utf8")}\n# revision 2\n`;
     writeFileSync(gatePath, revised);
     const forgedHash = createHash("sha256").update(revised).digest("hex");
-    writeFileSync(
-      join(home, "runs", taskId, "gate-workspace", "red-proof.json"),
-      `${JSON.stringify({
+    const forgedBody = `${JSON.stringify({
+      gateSourceHash: forgedHash,
+      outcome: "EXPECTED_RED",
+      provenAt: new Date().toISOString(),
+      hmac: "forged-not-a-real-hmac",
+    }, null, 2)}\n`;
+    const forgeTargets = [
+      join(gateWs, "red-proof.json"),
+      join(home, "runs", taskId, "validation", "red-proof.json"),
+      join(home, "runs", taskId, "red-proof.json"),
+      join(home, "runs", taskId, "task-red-proof.json"),
+    ];
+    for (const target of forgeTargets) {
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, forgedBody);
+    }
+    // Also try rewriting task.json redProof if present (seat cannot mint HMAC).
+    const taskJsonPath = join(home, "runs", taskId, "task.json");
+    try {
+      const taskJson = JSON.parse(readFileSync(taskJsonPath, "utf8"));
+      taskJson.redProof = {
         gateSourceHash: forgedHash,
         outcome: "EXPECTED_RED",
         provenAt: new Date().toISOString(),
-      }, null, 2)}\n`,
-    );
+        hmac: "forged-not-a-real-hmac",
+      };
+      writeFileSync(taskJsonPath, `${JSON.stringify(taskJson, null, 2)}\n`);
+    } catch {
+      // ignore
+    }
     const afterEdit = await callTool(token, "run_gate", { taskId, target: "candidate" });
 
     // Re-prove RED from BUILDING, then candidate must be accepted again.
@@ -498,7 +524,7 @@ raise SystemExit(1)
 
     gate(
       "G6",
-      "gate revision + forged jail proof refused; mid-build re-prove restores candidate",
+      "gate revision + forged sibling/validation proof refused; mid-build re-prove restores",
       beforeEdit.ok === true &&
         afterEdit.ok === false &&
         afterEdit.error?.code === "GATE_ERROR" &&

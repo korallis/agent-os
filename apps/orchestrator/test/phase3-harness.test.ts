@@ -190,6 +190,24 @@ describe("spawn env delivery", () => {
     expect(apiSpec.env.AGENTOS_GATE_WORKSPACE).toBe(
       join(home, "runs", "task", "gate-workspace"),
     );
+    const validatorSpec = buildPiSpawnSpec({
+      agentosHome: home,
+      detection,
+      args: ["--mode", "json"],
+      cwd: join(home, "runs", "task", "gate-workspace"),
+      sessionId: "01JSESSGRANT0000000000000VA",
+      role: "validator",
+      socketPath: join(home, "v.sock"),
+      extensionPath: join(home, "ext.js"),
+      grantProviderKey: null,
+      gateWorkspace: join(home, "runs", "task", "gate-workspace"),
+    });
+    // Validators get AGENTOS_HOME only as the write-jail fence root, plus the
+    // gate workspace they are allowed to touch.
+    expect(validatorSpec.env.AGENTOS_HOME).toBe(home);
+    expect(validatorSpec.env.AGENTOS_GATE_WORKSPACE).toBe(
+      join(home, "runs", "task", "gate-workspace"),
+    );
     expect(
       Object.keys(apiSpec.env).filter((k) => k.endsWith("_API_KEY") || k === "AWS_ACCESS_KEY_ID"),
     ).toEqual(["OPENAI_API_KEY"]);
@@ -566,6 +584,7 @@ describe("worktree lease reclaim on stop/respawn", () => {
     mkdirSync(join(home, "config"), { recursive: true });
     const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
     config.installDefaults();
+    config.writeGlobal("policies", "{ redBaselineGateRequired: false }\n");
     const service = new FleetService({
       home,
       config,
@@ -1505,6 +1524,7 @@ describe("terminal task lifecycle choke points", () => {
     mkdirSync(join(home, "config"), { recursive: true });
     const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
     config.installDefaults();
+    config.writeGlobal("policies", "{ redBaselineGateRequired: false }\n");
     const service = new FleetService({
       home,
       config,
@@ -1724,6 +1744,84 @@ console.log("PASS");
       else process.env[canaryKey] = prevCanary;
       if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
       else process.env.AGENTOS_FAKE_GATE = prevFake;
+    }
+  });
+});
+
+describe("daemon-owned RED proof (not seat-writable disk)", () => {
+  it("ignores forged validation/red-proof.json; only memory+HMAC authorises", async () => {
+    const { GateRunner } = await import("../src/fleet/gate-runner.js");
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const home = temp("agentos-red-proof-authz-");
+    const runner = new GateRunner(home, {
+      maxValidations: 6,
+      triageAt: 3,
+      gateLanguage: "py",
+      gateTimeoutSeconds: 30,
+    });
+    const taskId = "01JREDPROOF000000000000001";
+    const prevFake = process.env.AGENTOS_FAKE_GATE;
+    process.env.AGENTOS_FAKE_GATE = "1";
+    try {
+      runner.writeGateSource(
+        taskId,
+        `#!/usr/bin/env python3\nprint("EXPECTED_RED")\nprint("FAIL baseline")\n`,
+      );
+      const baseline = runner.run({
+        taskId,
+        target: "baseline",
+        cwd: runner.gateWorkspace(taskId),
+      });
+      expect(baseline.outcome).toBe("EXPECTED_RED");
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(true);
+
+      // Edit gate source → proof must drop for the new revision.
+      const revised = `${baseline.gateSourceHash}\n# rev2\nprint("PASS")\n`;
+      runner.writeGateSource(taskId, revised);
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(false);
+
+      // Forge disk where the daemon used to read (sibling validation/) — ignored.
+      const newHash = runner.gateSourceHash(taskId)!;
+      const valDir = runner.validationDir(taskId);
+      mkdirSync(valDir, { recursive: true });
+      writeFileSync(
+        join(valDir, "red-proof.json"),
+        JSON.stringify({
+          gateSourceHash: newHash,
+          outcome: "EXPECTED_RED",
+          provenAt: new Date().toISOString(),
+          hmac: "forged",
+        }),
+      );
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(false);
+
+      // Forged install without valid HMAC is rejected.
+      expect(
+        runner.installRedProof(taskId, {
+          gateSourceHash: newHash,
+          outcome: "EXPECTED_RED",
+          provenAt: new Date().toISOString(),
+          hmac: "forged",
+        }),
+      ).toBe(false);
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(false);
+
+      // Re-prove records a signed proof in memory.
+      process.env.AGENTOS_FAKE_GATE_OUTCOME = "EXPECTED_RED";
+      runner.run({
+        taskId,
+        target: "baseline",
+        cwd: runner.gateWorkspace(taskId),
+      });
+      delete process.env.AGENTOS_FAKE_GATE_OUTCOME;
+      expect(runner.hasRedProofForCurrentSource(taskId)).toBe(true);
+      const proof = runner.getRedProof(taskId);
+      expect(proof?.hmac).toMatch(/^[a-f0-9]{64}$/);
+    } finally {
+      if (prevFake === undefined) delete process.env.AGENTOS_FAKE_GATE;
+      else process.env.AGENTOS_FAKE_GATE = prevFake;
+      delete process.env.AGENTOS_FAKE_GATE_OUTCOME;
     }
   });
 });

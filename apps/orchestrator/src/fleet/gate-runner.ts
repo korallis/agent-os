@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import type { ValidationConfig } from "@agent-os/protocol";
+import type { TaskFailLedger, TaskRedProof, ValidationConfig } from "@agent-os/protocol";
 import { scrubEnv } from "../security/env-scrub.js";
 
 export type GateOutcome = "PASS" | "FAIL" | "GATE_ERROR" | "EXPECTED_RED";
@@ -25,11 +25,7 @@ export interface GateRunResult {
 }
 
 /** RED-proof ledger entry: which gate revision was proven red, and when. */
-export interface RedProof {
-  gateSourceHash: string;
-  outcome: Extract<GateOutcome, "EXPECTED_RED" | "FAIL">;
-  provenAt: string;
-}
+export type RedProof = TaskRedProof;
 
 /**
  * Minimal allowlist env for gate subprocesses. Brain-authored gates are untrusted
@@ -63,8 +59,17 @@ export function buildGateEnv(
  * Deterministic gate runner (master plan §6.4).
  * Default: gate.py via `uv run` + PEP 723. Override: gate.ts via node strip-types.
  * Never trusts any LLM — including the Brain.
+ *
+ * RED proofs and FAIL ledgers are process-local (daemon memory). Disk under
+ * validation/ is an audit cache only — never the authorisation source.
  */
 export class GateRunner {
+  /** Sole source of truth for RED proofs while the daemon is alive. */
+  private readonly redProofs = new Map<string, RedProof>();
+  /** Sole source of truth for verbatim FAIL inject while the daemon is alive. */
+  private readonly failLedgers = new Map<string, TaskFailLedger>();
+  private proofSecret: Buffer | null = null;
+
   constructor(
     private readonly home: string,
     private config: ValidationConfig,
@@ -81,8 +86,8 @@ export class GateRunner {
   }
 
   /**
-   * Daemon-owned evidence directory outside the validator write-jail.
-   * RED proofs and FAIL ledgers live here so a spawned seat cannot forge them.
+   * Audit/cache directory. Seats must not be trusted to write here; the daemon
+   * never authorises candidate runs from files under this path alone.
    */
   validationDir(taskId: string): string {
     const dir = join(this.home, "runs", taskId, "validation");
@@ -109,32 +114,104 @@ export class GateRunner {
     return join(this.validationDir(taskId), "red-proof.json");
   }
 
-  /**
-   * Record that a specific gate revision was proven semantically RED at
-   * baseline. Keyed by source hash so an edited gate loses its proof.
-   * Written only by the daemon into validation/ — never into the validator jail.
-   */
-  recordRedProof(taskId: string, proof: RedProof): void {
-    writeFileSync(this.redProofPath(taskId), `${JSON.stringify(proof, null, 2)}\n`, {
-      mode: 0o600,
-    });
+  private getProofSecret(): Buffer {
+    if (this.proofSecret !== null) return this.proofSecret;
+    const dir = join(this.home, "secrets");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const path = join(dir, "gate-proof.key");
+    if (existsSync(path)) {
+      this.proofSecret = readFileSync(path);
+    } else {
+      const secret = randomBytes(32);
+      writeFileSync(path, secret, { mode: 0o600 });
+      this.proofSecret = secret;
+    }
+    return this.proofSecret;
   }
 
-  readRedProof(taskId: string): RedProof | null {
-    const path = this.redProofPath(taskId);
-    if (!existsSync(path)) return null;
+  private signGateSourceHash(gateSourceHash: string): string {
+    return createHmac("sha256", this.getProofSecret()).update(gateSourceHash).digest("hex");
+  }
+
+  private verifyProofHmac(proof: RedProof): boolean {
+    const expected = this.signGateSourceHash(proof.gateSourceHash);
     try {
-      return JSON.parse(readFileSync(path, "utf8")) as RedProof;
+      const a = Buffer.from(expected, "utf8");
+      const b = Buffer.from(proof.hmac, "utf8");
+      if (a.length !== b.length) return false;
+      return timingSafeEqual(a, b);
     } catch {
-      return null;
+      return false;
     }
   }
 
   /**
+   * Record that a specific gate revision was proven semantically RED at
+   * baseline. Process memory is authoritative; optional disk write is cache.
+   */
+  recordRedProof(
+    taskId: string,
+    proof: Omit<RedProof, "hmac"> & { hmac?: string },
+  ): RedProof {
+    const signed: RedProof = {
+      gateSourceHash: proof.gateSourceHash,
+      outcome: proof.outcome,
+      provenAt: proof.provenAt,
+      hmac: proof.hmac ?? this.signGateSourceHash(proof.gateSourceHash),
+    };
+    if (!this.verifyProofHmac(signed)) {
+      throw new Error("refusing to record RED proof with invalid HMAC");
+    }
+    this.redProofs.set(taskId, signed);
+    try {
+      writeFileSync(this.redProofPath(taskId), `${JSON.stringify(signed, null, 2)}\n`, {
+        mode: 0o600,
+      });
+    } catch {
+      // Cache is best-effort; memory remains the authority.
+    }
+    return signed;
+  }
+
+  getRedProof(taskId: string): RedProof | null {
+    const proof = this.redProofs.get(taskId);
+    if (proof === undefined) return null;
+    if (!this.verifyProofHmac(proof)) {
+      this.redProofs.delete(taskId);
+      return null;
+    }
+    return proof;
+  }
+
+  /**
+   * Install a durable proof (task record or event replay) into process memory.
+   * Forged proofs without a valid HMAC are rejected.
+   */
+  installRedProof(taskId: string, proof: RedProof): boolean {
+    if (!this.verifyProofHmac(proof)) return false;
+    this.redProofs.set(taskId, proof);
+    return true;
+  }
+
+  /**
+   * Install a proof recovered from the append-only event log. Re-signs with the
+   * daemon secret so the event stream does not need to carry the HMAC material.
+   */
+  installRedProofFromEvent(
+    taskId: string,
+    input: { gateSourceHash: string; outcome: "EXPECTED_RED" | "FAIL"; provenAt: string },
+  ): RedProof {
+    return this.recordRedProof(taskId, {
+      gateSourceHash: input.gateSourceHash,
+      outcome: input.outcome,
+      provenAt: input.provenAt,
+    });
+  }
+
+  /**
    * A candidate run is only meaningful when THIS gate revision has been proven
-   * red at baseline. The daemon hashes the gate file it is about to judge and
-   * compares against the daemon-owned proof — never an on-disk proof the
-   * validator could have written inside its jail.
+   * red at baseline. Authorisation reads process memory only — never a file a
+   * spawned seat could have written under validation/ or gate-workspace/.
    */
   hasRedProofForCurrentSource(
     taskId: string,
@@ -142,30 +219,41 @@ export class GateRunner {
   ): boolean {
     const current = this.gateSourceHash(taskId, language);
     if (current === null) return false;
-    return this.readRedProof(taskId)?.gateSourceHash === current;
+    const proof = this.getRedProof(taskId);
+    if (proof === null) return false;
+    return proof.gateSourceHash === current;
   }
 
   /** Persist the exact FAIL bytes plus their hash for verbatim re-injection. */
-  private writeFailLedger(taskId: string, failLines: string[]): void {
-    const dir = this.validationDir(taskId);
+  private writeFailLedger(taskId: string, failLines: string[]): TaskFailLedger {
     const text = failLines.join("\n") + (failLines.length > 0 ? "\n" : "");
-    writeFileSync(join(dir, "last-fail.txt"), text, { mode: 0o600 });
-    writeFileSync(join(dir, "last-fail.sha256"), `${hash(text)}\n`, { mode: 0o600 });
+    const ledger: TaskFailLedger = { text, hash: hash(text) };
+    this.failLedgers.set(taskId, ledger);
+    try {
+      const dir = this.validationDir(taskId);
+      writeFileSync(join(dir, "last-fail.txt"), text, { mode: 0o600 });
+      writeFileSync(join(dir, "last-fail.sha256"), `${ledger.hash}\n`, { mode: 0o600 });
+    } catch {
+      // Cache is best-effort.
+    }
+    return ledger;
+  }
+
+  getFailLedger(taskId: string): TaskFailLedger | null {
+    return this.failLedgers.get(taskId) ?? null;
+  }
+
+  installFailLedger(taskId: string, ledger: TaskFailLedger): void {
+    this.failLedgers.set(taskId, ledger);
   }
 
   /**
    * Hash of the last FAIL bytes. `send_to_crew` re-hashes what it is about to
-   * inject and compares, so the substrate can prove the builder received the
-   * gate's exact words rather than a Brain paraphrase.
+   * inject and compares against daemon memory, so the substrate can prove the
+   * builder received the gate's exact words rather than a Brain paraphrase.
    */
   lastFailHash(taskId: string): string | null {
-    const path = join(this.validationDir(taskId), "last-fail.sha256");
-    if (!existsSync(path)) return null;
-    try {
-      return readFileSync(path, "utf8").trim();
-    } catch {
-      return null;
-    }
+    return this.failLedgers.get(taskId)?.hash ?? null;
   }
 
   static hashText(text: string): string {
@@ -294,16 +382,12 @@ export class GateRunner {
   }
 
   readLastFailLines(taskId: string): string[] {
-    const path = join(this.validationDir(taskId), "last-fail.txt");
-    if (!existsSync(path)) return [];
-    try {
-      return readFileSync(path, "utf8")
-        .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0);
-    } catch {
-      return [];
-    }
+    const ledger = this.failLedgers.get(taskId);
+    if (ledger === undefined) return [];
+    return ledger.text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
   }
 }
 

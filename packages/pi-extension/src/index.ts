@@ -5,8 +5,10 @@ export {
   extractAssistantText,
   gateWorkspaceBlockReason,
   pathIsInsideGate,
+  pathIsInsideRoot,
   resolveToolPath,
   usageFromAssistantMessage,
+  validatorJailBlockReason,
   type ExtensionHostOptions,
   type PiExtensionApi,
 } from "./extension.js";

@@ -7,6 +7,7 @@ import agentOsPiExtension, {
   AgentOsExtensionHost,
   extractAssistantText,
   gateWorkspaceBlockReason,
+  validatorJailBlockReason,
   pathIsInsideGate,
   usageFromAssistantMessage,
   type PiExtensionApi,
@@ -29,6 +30,7 @@ afterEach(() => {
   delete process.env.AGENTOS_ROLE;
   delete process.env.AGENTOS_SESSION_DIR;
   delete process.env.AGENTOS_GATE_WORKSPACE;
+  delete process.env.AGENTOS_HOME;
 });
 
 describe("agent-os extension socket frames", () => {
@@ -495,5 +497,119 @@ describe("builder gate-workspace tool fence", () => {
         });
       });
     });
+  });
+});
+
+describe("validator write-jail tool fence", () => {
+  it("validatorJailBlockReason allows gate workspace and denies sibling validation/", () => {
+    const agentHome = "/Users/captain/.agentos";
+    const gate = `${agentHome}/runs/task1/gate-workspace`;
+    const cwd = gate;
+    expect(
+      validatorJailBlockReason(
+        "write",
+        { path: `${gate}/gate.py` },
+        gate,
+        agentHome,
+        cwd,
+      ),
+    ).toBeNull();
+    expect(
+      validatorJailBlockReason(
+        "write",
+        { path: `${agentHome}/runs/task1/validation/red-proof.json` },
+        gate,
+        agentHome,
+        cwd,
+      ),
+    ).toMatch(/write-jailed/);
+    expect(
+      validatorJailBlockReason(
+        "bash",
+        { command: "cat ../validation/red-proof.json" },
+        gate,
+        agentHome,
+        cwd,
+      ),
+    ).toMatch(/write-jailed/);
+    expect(
+      validatorJailBlockReason(
+        "read",
+        { path: "/tmp/outside.txt" },
+        gate,
+        agentHome,
+        cwd,
+      ),
+    ).toBeNull();
+  });
+
+  it("blocks validator tool_call into validation/ and emits ext.tool_blocked", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-val-jail-"));
+    dirs.push(dir);
+    const gateDir = join(dir, "runs", "task", "gate-workspace");
+    const socketPath = join(dir, "hub.sock");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE2";
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "validator";
+    process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+    process.env.AGENTOS_HOME = dir;
+
+    const frames: unknown[] = [];
+    let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
+
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString("utf8");
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line.length === 0) continue;
+            frames.push(JSON.parse(line));
+            if (frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              server.close();
+              resolve();
+            }
+          }
+        });
+      });
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const pi: PiExtensionApi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        expect(toolCallHandler).toBeTypeOf("function");
+        void host!.connect().then(() => {
+          const result = toolCallHandler?.({
+            toolName: "write",
+            toolCallId: "tc-val",
+            input: { path: join(dir, "runs", "task", "validation", "red-proof.json") },
+          }) as { block?: boolean; reason?: string } | undefined;
+          expect(result?.block).toBe(true);
+          expect(result?.reason ?? "").toMatch(/write-jailed/);
+          setTimeout(() => {
+            if (!frames.some((f) => (f as { type?: string }).type === "ext.tool_blocked")) {
+              host?.close();
+              server.close();
+              reject(new Error("ext.tool_blocked not received"));
+            }
+          }, 2000);
+        });
+      });
+    });
+
+    const blocked = frames.find(
+      (f) => (f as { type?: string }).type === "ext.tool_blocked",
+    );
+    const parsed = extensionToDaemonFrameSchema.parse(blocked);
+    expect(parsed.type).toBe("ext.tool_blocked");
   });
 });

@@ -548,6 +548,62 @@ export function gateWorkspaceBlockReason(
   return null;
 }
 
+/** True when `candidate` resolves inside `root` (../ cannot walk in). */
+export function pathIsInsideRoot(
+  candidate: string,
+  root: string,
+  cwd: string,
+  home: string = process.env.HOME ?? "",
+  gateWorkspace: string = process.env.AGENTOS_GATE_WORKSPACE ?? "",
+): boolean {
+  if (candidate.length === 0) return false;
+  const resolved = resolveToolPath(candidate, cwd, home, gateWorkspace);
+  const base = resolve(root);
+  const rel = relative(base, resolved);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+/**
+ * Validator write-jail: allow paths inside the gate workspace; deny anything
+ * else that resolves under AGENTOS_HOME. Fail closed when resolution fails.
+ */
+export function validatorJailBlockReason(
+  toolName: string,
+  input: Record<string, unknown>,
+  gateWorkspace: string,
+  agentosHome: string,
+  cwd: string = process.cwd(),
+  home: string = process.env.HOME ?? "",
+): string | null {
+  const gate = resolve(gateWorkspace);
+  const agentHome = resolve(agentosHome);
+  for (const candidate of collectToolPathCandidates(toolName, input)) {
+    let resolved: string;
+    try {
+      resolved = resolveToolPath(candidate, cwd, home, gate);
+    } catch {
+      return `validator write-jail: failed to resolve path token (fail closed)`;
+    }
+    const insideGate =
+      relative(gate, resolved) === "" ||
+      (() => {
+        const rel = relative(gate, resolved);
+        return !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
+      })();
+    if (insideGate) continue;
+    const insideAgentHome =
+      relative(agentHome, resolved) === "" ||
+      (() => {
+        const rel = relative(agentHome, resolved);
+        return !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
+      })();
+    if (insideAgentHome) {
+      return `validator is write-jailed to the gate workspace (${gate}): refused path ${resolved}`;
+    }
+  }
+  return null;
+}
+
 /**
  * Pi extension entry — Pi loads this when passed with `-e`.
  * Uses AGENTOS_SOCKET / AGENTOS_SESSION_ID / AGENTOS_ROLE / AGENTOS_SESSION_DIR
@@ -609,10 +665,9 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
     registerAgentOsTools(pi, host);
   }
 
-  // Builder gate-dir fence: deny tool calls whose resolved paths fall inside
-  // the task gate workspace. Report via ext.tool_blocked for audit.
-  // Fail closed: any unexpected error still blocks the tool call.
+  // Path fences: report via ext.tool_blocked for audit. Fail closed on error.
   const gateWorkspace = process.env.AGENTOS_GATE_WORKSPACE;
+  const agentosHome = process.env.AGENTOS_HOME;
   if (role === "builder" && gateWorkspace !== undefined && gateWorkspace.length > 0) {
     pi.on?.("tool_call", (event: unknown) => {
       try {
@@ -643,6 +698,58 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
           err instanceof Error
             ? `builder gate-dir fence error: ${err.message}`
             : "builder gate-dir fence error: unexpected failure";
+        try {
+          host.toolBlocked("unknown", reason);
+        } catch {
+          // still block even if audit emit fails
+        }
+        return { block: true, reason };
+      }
+    });
+  }
+
+  // Validator write-jail: allow only the gate workspace under AGENTOS_HOME.
+  if (
+    role === "validator" &&
+    gateWorkspace !== undefined &&
+    gateWorkspace.length > 0 &&
+    agentosHome !== undefined &&
+    agentosHome.length > 0
+  ) {
+    pi.on?.("tool_call", (event: unknown) => {
+      try {
+        if (event === null || typeof event !== "object") {
+          const reason = "validator write-jail: malformed tool_call event";
+          try {
+            host.toolBlocked("unknown", reason);
+          } catch {
+            // still block
+          }
+          return { block: true, reason };
+        }
+        const toolName =
+          typeof (event as { toolName?: unknown }).toolName === "string"
+            ? (event as { toolName: string }).toolName
+            : "";
+        const rawInput = (event as { input?: unknown }).input;
+        const input =
+          rawInput !== null && typeof rawInput === "object"
+            ? (rawInput as Record<string, unknown>)
+            : {};
+        const reason = validatorJailBlockReason(
+          toolName,
+          input,
+          gateWorkspace,
+          agentosHome,
+        );
+        if (reason === null) return undefined;
+        host.toolBlocked(toolName.length > 0 ? toolName : "unknown", reason);
+        return { block: true, reason };
+      } catch (err) {
+        const reason =
+          err instanceof Error
+            ? `validator write-jail error: ${err.message}`
+            : "validator write-jail error: unexpected failure";
         try {
           host.toolBlocked("unknown", reason);
         } catch {

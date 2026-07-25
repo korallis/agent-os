@@ -343,10 +343,19 @@ export class ToolSurface {
     const normalized: TaskSnapshot = {
       ...task,
       deliveryBlocked: task.deliveryBlocked ?? null,
+      redProof: task.redProof ?? null,
+      lastFailLedger: task.lastFailLedger ?? null,
     };
     this.tasks.set(normalized.id, normalized);
     if (normalized.idempotencyKey !== null) {
       this.idempotency.set(normalized.idempotencyKey, normalized);
+    }
+    // Restore daemon-authoritative proof/ledger into process memory (HMAC-checked).
+    if (normalized.redProof !== null) {
+      this.deps.gates.installRedProof(normalized.id, normalized.redProof);
+    }
+    if (normalized.lastFailLedger !== null) {
+      this.deps.gates.installFailLedger(normalized.id, normalized.lastFailLedger);
     }
     task = normalized;
     for (const s of task.sessions) {
@@ -364,6 +373,26 @@ export class ToolSurface {
       };
       this.sessions.set(s.sessionId, fleetSession);
     }
+  }
+
+  /**
+   * Rebuild RED proofs from the append-only event log (kill -9 path).
+   * Later events win; task.json install may already have seeded memory.
+   */
+  hydrateRedProofFromEvent(payload: {
+    taskId: string;
+    gateSourceHash: string;
+    outcome: "EXPECTED_RED" | "FAIL";
+    provenAt: string;
+  }): void {
+    const proof = this.deps.gates.installRedProofFromEvent(payload.taskId, payload);
+    const task = this.tasks.get(payload.taskId);
+    if (task === undefined) return;
+    this.tasks.set(payload.taskId, {
+      ...task,
+      redProof: proof,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   /**
@@ -720,6 +749,8 @@ export class ToolSurface {
       worktreePath: null,
       needsCaptainSummary: null,
       deliveryBlocked: null,
+      redProof: null,
+      lastFailLedger: null,
       idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
       updatedAt: now,
@@ -1285,7 +1316,7 @@ export class ToolSurface {
           thinking: input.thinking,
           cleanRoom: input.cleanRoom,
           grantProviderKey: grant,
-          ...(input.role === "builder"
+          ...(input.role === "builder" || input.role === "validator"
             ? { gateWorkspace: this.deps.gates.gateWorkspace(task.id) }
             : {}),
         });
@@ -2086,6 +2117,35 @@ export class ToolSurface {
       },
     });
 
+    // Stamp daemon-owned proof/ledger onto the durable task record.
+    // Emit gate.red_proven before task.json so kill -9 can rebuild from the log.
+    const proof = this.deps.gates.getRedProof(task.id);
+    const ledger = this.deps.gates.getFailLedger(task.id);
+    if (
+      input.target === "baseline" &&
+      (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") &&
+      proof !== null
+    ) {
+      this.sink({
+        type: "gate.red_proven",
+        payload: {
+          taskId: task.id,
+          gateSourceHash: proof.gateSourceHash,
+          outcome: proof.outcome,
+          provenAt: proof.provenAt,
+        },
+      });
+    }
+    if (proof !== null || ledger !== null) {
+      task = {
+        ...task,
+        redProof: proof ?? task.redProof,
+        lastFailLedger: ledger ?? task.lastFailLedger,
+        updatedAt: new Date().toISOString(),
+      };
+      this.saveTask(task);
+    }
+
     if (input.target === "baseline") {
       if (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") {
         // Mid-build re-prove stays in BUILDING/VALIDATING so the rebuild loop
@@ -2114,6 +2174,7 @@ export class ToolSurface {
         task = {
           ...task,
           validationAttempt: attempt,
+          lastFailLedger: ledger ?? task.lastFailLedger,
           updatedAt: new Date().toISOString(),
         };
         this.saveTask(task);
