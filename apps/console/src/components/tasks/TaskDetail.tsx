@@ -4,6 +4,9 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import { useEventStream } from "@/lib/useEventStream";
+import { FusionColumns } from "@/components/tasks/FusionColumns";
+import { ValidationEvidence } from "@/components/tasks/ValidationEvidence";
+import { BrainDecisionLane } from "@/components/tasks/BrainDecisionLane";
 
 type TaskSnapshot = {
   id: string;
@@ -175,6 +178,16 @@ export function TaskDetail({ taskId }: { taskId: string }) {
           )}
         </div>
       </section>
+
+      <FusionColumns taskId={task.id} />
+
+      <ValidationEvidence
+        taskId={task.id}
+        validationAttempt={task.validationAttempt}
+        maxValidations={task.maxValidations}
+      />
+
+      <BrainDecisionLane taskId={task.id} />
     </main>
   );
 }
