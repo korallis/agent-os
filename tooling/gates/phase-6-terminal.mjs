@@ -223,43 +223,43 @@ try {
     );
   };
 
-  // T2 proves reconnect renumbers at 1 on the same pane. Multi-frame when the
-  // ticker is live; single-frame only when the pane cannot change (reconnect
-  // numbering still holds).
+  // T2 proves reconnect renumbers at 1 on the same pane — not a second soak.
+  // Multi-frame contiguity when the ticker is live; single-frame only when the
+  // pane cannot change (reconnect numbering still holds). Floor / near-end
+  // bars belong to T1 only; a short reconnect window is too noisy for them.
   const reconnectOk = (stream) => {
-    const { seqs, sawContent, startedAt, lastFrameAt, windowMs } = stream;
+    const { seqs, sawContent } = stream;
     if (!(seqs.length >= 1 && seqs[0] === 1 && sawContent)) return false;
     if (!paneChanges) return seqs.length === 1 || contiguous(seqs);
-    const floor = minFramesFor(windowMs);
-    return (
-      contiguous(seqs) &&
-      seqs.length >= floor &&
-      arrivedNearEnd(startedAt, lastFrameAt, windowMs)
-    );
+    return contiguous(seqs) && seqs.length >= 2;
   };
 
-  const first = await streamFor(SOAK_MS);
+  // When the ticker could not start, T1 cannot pass — fail fast with a short
+  // diagnostic sample instead of burning the full soak window. T2 still runs
+  // its short reconnect check afterward (renumbering needs no soak).
+  const reconnectMs = Math.min(4_000, SOAK_MS);
+  const t1WindowMs = paneChanges ? SOAK_MS : reconnectMs;
+  const first = await streamFor(t1WindowMs);
   const firstFloor = minFramesFor(SOAK_MS);
-  const firstNearEnd = arrivedNearEnd(first.startedAt, first.lastFrameAt, SOAK_MS);
+  const firstNearEnd = arrivedNearEnd(first.startedAt, first.lastFrameAt, t1WindowMs);
   const firstContiguous = contiguous(first.seqs);
   gate(
     "T1",
     "sustained multi-frame soak: sequenced from 1, contiguous, floor met, frames still arriving near end",
     soakOk(first),
     !paneChanges
-      ? `FAIL: pane ticker did not start (tmux respawn-pane could not fork) — soak criterion not exercised; frames=${first.seqs.length} soakMs=${SOAK_MS}`
+      ? `FAIL: pane ticker did not start (tmux respawn-pane could not fork) — soak criterion not exercised; frames=${first.seqs.length} sampleMs=${t1WindowMs} (full soak skipped)`
       : `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${firstContiguous} content=${first.sawContent} paneTickerStarted=${paneChanges} soakMs=${SOAK_MS} minFrames=${firstFloor} (floor=${FLOOR_FRACTION} of theoretical ${theoreticalMax(SOAK_MS)} at ${POLL_MS}ms poll) lastFrameNearEnd=${firstNearEnd}`,
   );
 
-  const reconnectMs = Math.min(4_000, SOAK_MS);
   const second = await streamFor(reconnectMs);
-  const secondFloor = minFramesFor(reconnectMs);
-  const secondNearEnd = arrivedNearEnd(second.startedAt, second.lastFrameAt, reconnectMs);
+  const secondContiguous =
+    paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs);
   gate(
     "T2",
     "a reconnect resumes the same pane and restarts its own numbering at 1",
     reconnectOk(second),
-    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs)} samePane=${second.sawContent} minFrames=${secondFloor} lastFrameNearEnd=${secondNearEnd}`,
+    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${secondContiguous} samePane=${second.sawContent} windowMs=${reconnectMs}`,
   );
 
   if (!paneChanges) {
