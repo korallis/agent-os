@@ -1468,7 +1468,19 @@ describe("crewmate cwd isolation", () => {
 
 describe("terminal task lifecycle choke points", () => {
   it("cancel_task halts live sessions before releasing worktree leases", () => {
-    const service = fleet({ fakePi: true });
+    const home = temp("agentos-cancel-halt-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    service.start();
+
     const { taskId, model } = seedTask(service, {
       name: "cancel-halt",
       shape: "SHIP",
@@ -1502,6 +1514,20 @@ describe("terminal task lifecycle choke points", () => {
     expect(service.worktrees.list().some((l) => l.taskId === taskId && l.state === "leased")).toBe(
       false,
     );
+
+    // Durable task.json must keep halt state (stopped sessions + cleared worktree
+    // refs). In-memory-only checks previously masked transition clobbering halt.
+    const durable = JSON.parse(
+      readFileSync(join(home, "runs", taskId, "task.json"), "utf8"),
+    ) as {
+      phase: string;
+      worktreePath: string | null;
+      sessions: Array<{ sessionId: string; status: string; worktreePath: string | null }>;
+    };
+    expect(durable.phase).toBe("CANCELLED");
+    expect(durable.sessions.find((s) => s.sessionId === sessionId)?.status).toBe("stopped");
+    expect(durable.worktreePath).toBeNull();
+    expect(durable.sessions.find((s) => s.sessionId === sessionId)?.worktreePath).toBeNull();
   });
 
   it("refuses spawn_crewmate on terminal tasks for every role", () => {

@@ -586,6 +586,8 @@ export class ToolSurface {
   private releaseWorktreeLeases(filter: {
     sessionId?: string;
     taskId?: string | null;
+    /** When true, skip leases whose session is still live (running/settled). */
+    onlyHaltedSessions?: boolean;
   }): void {
     for (const lease of this.deps.worktrees.list()) {
       if (lease.state !== "leased" && lease.state !== "reclaiming") continue;
@@ -596,6 +598,16 @@ export class ToolSurface {
         filter.taskId !== null &&
         lease.taskId === filter.taskId;
       if (!sessionMatch && !taskMatch) continue;
+      if (filter.onlyHaltedSessions === true && lease.sessionId !== null) {
+        const session = this.sessions.get(lease.sessionId);
+        if (
+          session !== undefined &&
+          session.status !== "stopped" &&
+          session.status !== "lost"
+        ) {
+          continue;
+        }
+      }
       this.releaseOneWorktreeLease(lease.id);
     }
   }
@@ -798,16 +810,16 @@ export class ToolSurface {
       ];
     }
 
-    let next = {
+    const nextBase = {
       ...task,
       cast,
       policyOverrides,
       updatedAt: new Date().toISOString(),
     };
+    this.saveTask(nextBase);
+    let next = nextBase;
     if (task.phase === "QUEUED") {
-      next = this.transition(next, "DISPATCH_RESOLVED", "cast resolved");
-    } else {
-      this.saveTask(next);
+      next = this.transition(nextBase, "DISPATCH_RESOLVED", "cast resolved");
     }
 
     this.sink({
@@ -1032,6 +1044,7 @@ export class ToolSurface {
           input.role === "builder" && branch !== null ? branch : task.branch,
         updatedAt: now,
       };
+      this.saveTask(task);
 
       if (input.role === "builder" && task.phase !== "BUILDING") {
         task = this.transition(task, "BUILDING", "builder spawned");
@@ -1039,8 +1052,6 @@ export class ToolSurface {
         task = this.transition(task, "PLANNING", "planner spawned");
       } else if (input.role === "validator" && task.phase === "DISPATCH_RESOLVED") {
         task = this.transition(task, "GATE_AUTHORING", "validator spawned");
-      } else {
-        this.saveTask(task);
       }
 
       this.sink({
@@ -1633,8 +1644,9 @@ export class ToolSurface {
       task = this.transition(task, "DELIVERING", "deliver_task");
     }
 
-    // After halt begins, any abort must still release remaining leases so the
-    // pool cannot strand under stopped sessions (scout violation, dirty tree, etc.).
+    // After halt begins, abort must reclaim leases only for sessions already
+    // stopped/lost. Never release a tree a live Pi still has as cwd (partial
+    // halt failure); reconcile reclaims those once panes are gone.
     let deliveryComplete = false;
     try {
       this.haltTaskSessions(task.id, "deliver_task halt");
@@ -1737,7 +1749,10 @@ export class ToolSurface {
       return task;
     } finally {
       if (!deliveryComplete) {
-        this.releaseWorktreeLeases({ taskId: input.taskId });
+        this.releaseWorktreeLeases({
+          taskId: input.taskId,
+          onlyHaltedSessions: true,
+        });
       }
     }
   }
@@ -1989,7 +2004,8 @@ export class ToolSurface {
     reason: string | null,
     options: { allowDone?: boolean } = {},
   ): TaskSnapshot {
-    const from = task.phase;
+    const current = this.tasks.get(task.id) ?? task;
+    const from = current.phase;
     // DONE is only reachable through deliver_task after assertDoneInvariant.
     if (to === "DONE" && options.allowDone !== true) {
       throw new ToolSurfaceError(
@@ -1998,7 +2014,7 @@ export class ToolSurface {
       );
     }
     if (to === "DONE") {
-      this.assertDoneInvariant(task);
+      this.assertDoneInvariant(current);
     }
     assertTransition(task.id, from, to);
     // Terminal exit choke point: halt every live session, then release leases
@@ -2007,18 +2023,16 @@ export class ToolSurface {
     if (isTerminalPhase(to)) {
       this.haltAndReleaseTask(task.id, reason ?? `phase ${to}`);
     }
-    // Prefer the store copy so a release that stamped deliveryBlocked is not
-    // overwritten by a stale caller snapshot. deliveryBlocked is NEVER cleared
-    // by a phase transition — only resolve_delivery_block (Captain) or a
-    // successful deliver_task after assertDoneInvariant may clear it.
-    const stored = this.tasks.get(task.id);
-    const stickyBlock = stored?.deliveryBlocked ?? task.deliveryBlocked;
+    // Phase-only delta on fresh store state (halt/release may have mutated
+    // sessions, worktree refs, deliveryBlocked). deliveryBlocked is never
+    // cleared here — only resolve_delivery_block or successful deliver_task.
+    const base = this.tasks.get(task.id) ?? current;
     const updated: TaskSnapshot = {
-      ...task,
+      ...base,
       phase: to,
-      failureCause: to === "FAILED" ? (task.failureCause ?? "UNKNOWN") : task.failureCause,
-      needsCaptainSummary: to === "NEEDS_CAPTAIN" ? (reason ?? task.needsCaptainSummary) : task.needsCaptainSummary,
-      deliveryBlocked: stickyBlock,
+      failureCause: to === "FAILED" ? (base.failureCause ?? "UNKNOWN") : base.failureCause,
+      needsCaptainSummary:
+        to === "NEEDS_CAPTAIN" ? (reason ?? base.needsCaptainSummary) : base.needsCaptainSummary,
       updatedAt: new Date().toISOString(),
     };
     this.saveTask(updated);
@@ -2092,15 +2106,14 @@ export class ToolSurface {
           ),
           updatedAt: new Date().toISOString(),
         };
+        this.saveTask(withSession);
         if (!isTerminalPhase(withSession.phase) && withSession.phase !== "SESSION_LOST") {
           try {
             this.transition(withSession, "SESSION_LOST", reason);
-            return;
           } catch {
-            // Illegal from this phase — still persist the session status.
+            // Illegal from this phase — session status already persisted.
           }
         }
-        this.saveTask(withSession);
       }
     }
   }
