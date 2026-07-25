@@ -1407,7 +1407,31 @@ export class ToolSurface {
       // Status stays "running" (historical harness contract); the wake is what
       // the Brain sees. Fusion sides finalize via completeFusionSide after the
       // dispatch path registers ownership.
+      // A PROGRESS wake is classified first so the zero-token absorb path is
+      // exercised end-to-end (same class a real extension lifecycle would emit).
+      // Synthetic ext.usage mirrors a real provider frame so analytics and
+      // Console gates can assert non-zero telemetry without a paid model.
       if (fake) {
+        const slash = input.model.indexOf("/");
+        const provider = slash === -1 ? "unknown" : input.model.slice(0, slash);
+        const modelName = slash === -1 ? input.model : input.model.slice(slash + 1);
+        this.sink({
+          type: "ext.usage",
+          payload: {
+            sessionId,
+            provider,
+            model: modelName,
+            inputTokens: 128,
+            outputTokens: 64,
+            costUsd: null,
+          },
+        });
+        this.deps.watcher.classify({
+          class: "PROGRESS",
+          taskId: task.id,
+          sessionId,
+          summary: `progress on ${task.title}`,
+        });
         this.deps.watcher.classify({
           class: "AGENT_SETTLED",
           taskId: task.id,

@@ -122,6 +122,27 @@ describe("EventStore", () => {
     store.close();
   });
 
+  it("supports newest-first reverse scan with truncation", () => {
+    const { store } = EventStore.open(home);
+    const envelopes = Array.from({ length: 10 }, (_, i) => store.append(configChanged(i)));
+    const newest = store.eventsBeforeId(null, 3);
+    expect(newest.events).toHaveLength(3);
+    expect(newest.truncated).toBe(true);
+    expect(newest.events.map((e) => e.seq)).toEqual([10, 9, 8]);
+
+    const page2 = store.eventsBeforeId(newest.events[2]?.id ?? null, 3);
+    expect(page2.events.map((e) => e.seq)).toEqual([7, 6, 5]);
+
+    const since = envelopes[0]?.ts ?? new Date(0).toISOString();
+    const windowed = store.eventsSince(since, 4);
+    expect(windowed.events).toHaveLength(4);
+    expect(windowed.truncated).toBe(true);
+    // Newest-first: truncation drops the oldest in-window frames.
+    expect(windowed.events.map((e) => e.seq)).toEqual([10, 9, 8, 7]);
+    expect(store.countSince(since)).toBe(10);
+    store.close();
+  });
+
   it("fans out appended events to subscribers", () => {
     const { store } = EventStore.open(home);
     const seen: number[] = [];
@@ -131,6 +152,59 @@ describe("EventStore", () => {
     unsubscribe();
     store.append(configChanged(3));
     expect(seen).toEqual([1, 2]);
+    store.close();
+  });
+
+  it("returns task-scoped events with truncation meaningful for that task", () => {
+    const { store } = EventStore.open(home);
+    const taskA = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const taskB = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+    const toolInvoked = (taskId: string, i: number): OrchestratorEvent => ({
+      type: "tool.invoked",
+      payload: {
+        invocationId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        tool: "create_task",
+        taskId,
+        ok: true,
+        errorCode: null,
+        durationMs: i,
+      },
+    });
+    // Noise without taskId + frames for another task must not pollute task A.
+    for (let i = 0; i < 5; i++) store.append(configChanged(i));
+    for (let i = 0; i < 3; i++) store.append(toolInvoked(taskB, i));
+    for (let i = 0; i < 4; i++) store.append(toolInvoked(taskA, i));
+
+    const all = store.eventsForTask(taskA, ["tool.invoked"], 10);
+    expect(all.events).toHaveLength(4);
+    expect(all.truncated).toBe(false);
+    expect(all.events.every((e) => e.event.type === "tool.invoked")).toBe(true);
+    expect(
+      all.events.every((e) => {
+        if (e.event.type !== "tool.invoked") return false;
+        return e.event.payload.taskId === taskA;
+      }),
+    ).toBe(true);
+    // Chronological order (oldest first).
+    expect(
+      all.events.map((e) =>
+        e.event.type === "tool.invoked" ? e.event.payload.durationMs : -1,
+      ),
+    ).toEqual([0, 1, 2, 3]);
+
+    const limited = store.eventsForTask(taskA, ["tool.invoked"], 2);
+    expect(limited.events).toHaveLength(2);
+    expect(limited.truncated).toBe(true);
+    // Truncation keeps newest frames for this task.
+    expect(
+      limited.events.map((e) =>
+        e.event.type === "tool.invoked" ? e.event.payload.durationMs : -1,
+      ),
+    ).toEqual([2, 3]);
+
+    const empty = store.eventsForTask("01ARZ3NDEKTSV4RRFFQ69G5FC1", null, 10);
+    expect(empty.events).toHaveLength(0);
+    expect(empty.truncated).toBe(false);
     store.close();
   });
 });

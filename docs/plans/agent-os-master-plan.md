@@ -425,7 +425,7 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 
 pnpm workspaces + Turborepo (§2.1). Marketing lives at `apps/marketing` (verbatim migration from the former root `src/`); shared design-system primitives live in `packages/ui`. [A]
 
-**Phase 5 as-built** (cross-family auto-validation in the task lifecycle: RED-before-builder, HMAC source-hash RED proofs, dual-site same-family refusal, uv/PEP 723 + `gate.ts` runners, verbatim FAIL inject, halt at cap from BUILDING/VALIDATING) is the current daemon tree; Phase 4 fleet/fusion substrate remains. Console auto-validate evidence columns, Fleet chart/table fixtures, and Analytics panels remain Phase 6. Authoritative route inventory: §7. Executable gates: `tooling/gates/phase-{1,2,3,4,5}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
+**Phase 6 first slice as-built** (Console completion partial): `GET /v1/analytics` derives usage/cost/throughput from the append-only event log (no second accounting store); Fleet Dashboard + Analytics bind to that snapshot with honesty rules (underivable → null/`—` with reason; cost coverage distinguishes absent vs zero); Notifications is live on the wake queue (including ABSORBED); Task Detail ships fusion side-by-side (`promptsIdentical` + shared hash), validation evidence (FAIL vs GATE_ERROR), and a Brain decision lane; shared empty/error/`not-found` treatments; executable browser gates `tooling/gates/phase-6.mjs` G1–G8 (incl. G3: Figma placeholder strings absent). Phase 5 auto-validate substrate and Phase 4 fleet/fusion substrate remain. **Still deferred** (next Phase 6 slice / later): Agent Detail/Logs, Pipeline Runs / Workflow Run History UI, Model Performance, Recent Alerts, Settings Billing, Network I/O Detail, Providers four quota-card archetypes, ticketed terminal attach, Policies three-way-diff UI, provider wizard E2E. Authoritative route inventory: §7. Executable gates: `tooling/gates/phase-{1,2,3,4,5,6}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
 
 ```
 agent-os/
@@ -435,7 +435,7 @@ agent-os/
 ├── tsconfig.base.json                # strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes
 ├── eslint.config.mjs                 # @typescript-eslint/no-explicit-any: error
 ├── .github/workflows/
-│   ├── ci.yml                        # typecheck/lint/build/test + phase-1…5 gates
+│   ├── ci.yml                        # typecheck/lint/build/test + phase-1…6 gates
 │   └── pi-canary.yml                 # weekly: harness contract suite vs latest Pi [R2]
 ├── docs/{plans,qa,screenshots}/
 ├── apps/
@@ -446,19 +446,21 @@ agent-os/
 │   │       ├── app/
 │   │       │   ├── layout.tsx
 │   │       │   ├── page.tsx                    # redirect → /fleet [B]
-│   │       │   ├── fleet/page.tsx              # Home Dashboard (summary live; chart/table fixtures → Phase 6)
+│   │       │   ├── fleet/page.tsx              # Home Dashboard (live fleet + analytics-derived panels)
 │   │       │   ├── runs/page.tsx               # Live Log Stream (SSE; fusion.* + prompt.installed)
 │   │       │   ├── policies/page.tsx           # effective config + source-layer chips
 │   │       │   ├── settings/page.tsx
 │   │       │   ├── providers/page.tsx
 │   │       │   ├── tasks/page.tsx              # Inference Jobs board (`/v1/tasks` + SSE)
-│   │       │   ├── tasks/[id]/page.tsx         # task detail (cast/session columns; fusion columns → Phase 6)
+│   │       │   ├── tasks/[id]/page.tsx         # task detail (fusion columns, validation, Brain lane)
 │   │       │   ├── projects/page.tsx           # project registry (`/v1/projects`)
-│   │       │   ├── analytics/page.tsx          # Token Usage (placeholder → Phase 6/8)
+│   │       │   ├── analytics/page.tsx          # Token Usage (`/v1/analytics`; honesty-bound)
+│   │       │   ├── notifications/page.tsx      # wake queue incl. absorbed (zero-token proof)
 │   │       │   ├── onboarding/page.tsx
+│   │       │   ├── not-found.tsx · error.tsx   # shared empty/error treatments
 │   │       │   └── api/agentos/[...path]/      # loopback BFF [B] — bearer never to browser
-│   │       ├── components/{shell,fleet,runs,policies,settings,tasks,projects,providers,analytics,onboarding}/
-│   │       └── lib/{daemon.ts, useEventStream.ts}
+│   │       ├── components/{shell,fleet,runs,policies,settings,tasks,projects,providers,analytics,notifications,onboarding}/
+│   │       └── lib/{daemon.ts, useEventStream.ts, useTaskEvents.ts, fetchTaskEvents.ts, useDebouncedRefreshKey.ts}
 │   └── orchestrator/                 # agentosd + agentos CLI (colocated)
 │       ├── package.json              # bin: { agentos, agentosd }
 │       ├── defaults/                 # [R3] shipped Policy Pack: *.json5 + prompts/**
@@ -468,7 +470,8 @@ agent-os/
 │           ├── cli.ts · doctor.ts · daemon.ts · home.ts · version.ts
 │           ├── config/               # resolver + service (layered Policy Packs)
 │           ├── prompts/              # layered prompt packs + three-way diff data [Phase 4]
-│           ├── server/               # fastify: health, config, events SSE, fleet/tasks/projects/tools/fusion/prompts
+│           ├── analytics/            # [Phase 6] log-derived usage/cost snapshot (no second store)
+│           ├── server/               # fastify: health, config, events SSE, fleet/tasks/projects/tools/fusion/prompts/analytics
 │           ├── substrate/            # task-machine.ts, family.ts
 │           ├── fleet/                # service, brain, tool-surface, fusion-runs, sessions,
 │           │                         # worktree-pool, tmux, watcher, gate-runner, projects, secondmates
@@ -477,7 +480,7 @@ agent-os/
 │           ├── quota-probes/         # [R5] allowlist + adapters + scheduler
 │           └── security/             # env-scrub, auth-store, secret-canary, …
 ├── packages/
-│   ├── protocol/                     # zod: REST, SSE, config, tools, fleet, tasks, sockets, prompts
+│   ├── protocol/                     # zod: REST, SSE, config, tools, fleet, tasks, sockets, prompts, analytics
 │   ├── event-store/                  # NDJSON writer + rebuildable SQLite projection [B]
 │   ├── ui/                           # dual-source [R6.3]: promoted marketing components
 │   │                                 #   (SiteHeader, GlassCard, MagneticButton, …) + Figma
@@ -487,11 +490,11 @@ agent-os/
 │   └── fusion-core/                  # pure fusion contract/templates/attribution (no I/O) [B]
 ├── scripts/verify-no-deprecated.mjs
 └── tooling/
-    ├── gates/phase-{1,2,3,4,5}.mjs   # executable phase gates
+    ├── gates/phase-{1,2,3,4,5,6}.mjs # executable phase gates (phase-6: Playwright + real daemon)
     └── screenshots/capture-console.mjs  # Playwright PR evidence (pnpm screenshots)
 ```
 
-**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); Phase 4 ships `dispatch_fusion` executors for opinion / fusion / plan-fusion plus `fleet/fusion-runs.ts`, `fleet/sessions.ts`, and `prompts/service.ts`. **Phase 5** ships lifecycle auto-validate (`gate-runner` + tool-surface RED proofs / FAIL ledgers / seat fences; `tooling/gates/phase-5.mjs` G1–G9). Console fusion side-by-side columns and auto-validate evidence UI remain Phase 6.
+**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); Phase 4 ships `dispatch_fusion` executors for opinion / fusion / plan-fusion plus `fleet/fusion-runs.ts`, `fleet/sessions.ts`, and `prompts/service.ts`. **Phase 5** ships lifecycle auto-validate (`gate-runner` + tool-surface RED proofs / FAIL ledgers / seat fences; `tooling/gates/phase-5.mjs` G1–G9). **Phase 6 first slice** ships Console fusion side-by-side columns, auto-validate evidence UI, Fleet/Analytics log-derived panels, Notifications, and empty/error treatments (`tooling/gates/phase-6.mjs` G1–G8); Policies three-way-diff UI and remaining §7 frames stay deferred.
 ---
 
 ## 4. Provider Connection Subsystem
@@ -831,32 +834,32 @@ Unchanged from Rev 2 in discipline (write-once phases, SHA-256, redaction), with
 | Figma section / frame | Node id | Route | Live in |
 |---|---|---|---|
 | Landing Page · "Orchestrate AI Agents At Scale" | `8:11470` | `apps/marketing` home | Phase 0 (visual refresh at Captain's option) |
-| Dashboard · Home Dashboard | `10:11978` | `/fleet` | **Phase 3 partial live** (fleet summary chips + brain status); Swarm Activity / Token Consumption / Top Agents / Recent Tasks remain Figma fixtures → Phase 6 |
+| Dashboard · Home Dashboard | `10:11978` | `/fleet` | **Phase 6 first slice live** — summary + Swarm Activity / Top Agents / Recent Tasks / budget bar from daemon + `/v1/analytics` (no Figma sample figures; pure-fiction upsell/tips panels removed) |
 | Dashboard · All Agents | `17:4` | `/tasks` (board) | **Phase 3 live** (`/v1/tasks` + SSE) |
-| Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | **Phase 3 live** foundation; daemon fusion artifacts Phase 4 → Console fusion columns Phase 6 |
-| Dashboard · Swarm Activity | `37:2871` | `/fleet` activity + `/runs` overview | pixel Phase 1; **live data Phase 6** |
-| Dashboard · Notifications | `17:940` | `/notifications` (wake queue / needs-you) | Phase 3 (route deferred; needs-you chip on `/fleet`) |
-| Dashboard · Token Usage | `37:2265` | `/analytics` | UI Phase 1 placeholder → probes Phase 2 → full Phase 6/8 |
+| Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | **Phase 6 first slice live** — fusion columns (`promptsIdentical` + hash), validation evidence (FAIL ≠ GATE_ERROR), Brain decision lane; ticketed terminal attach still deferred |
+| Dashboard · Swarm Activity | `37:2871` | `/fleet` activity + `/runs` overview | **Phase 6 first slice live** on `/fleet` (sparkline over task throughput); `/runs` history chrome still deferred |
+| Dashboard · Notifications | `17:940` | `/notifications` (wake queue / needs-you) | **Phase 6 first slice live** (`/v1/fleet/wakes`, incl. ABSORBED) |
+| Dashboard · Token Usage | `37:2265` | `/analytics` | **Phase 6 first slice live** (`GET /v1/analytics`; null/`—` honesty + cost coverage); deeper Model Performance / Network I/O remain Phase 8 |
 | Dashboard · Onboarding Guide | `37:1300` | `/onboarding` (§4.10 wizard) | Phase 2 |
-| Dashboard · User Profile | `37:1553` | `/settings` (profile section) | Phase 6 |
-| Agent Detail · Agent Detail / Agent Logs / Create New Agent / Edit Agent | `41:2` / `41:456` / `41:1226` / `41:1605` | crewmate/session detail · terminal log view · new-task dispatch · task/config edit | Phase 3 foundation on `/tasks/[id]`; full agent chrome Phase 6 |
+| Dashboard · User Profile | `37:1553` | `/settings` (profile section) | Phase 6 (remaining) |
+| Agent Detail · Agent Detail / Agent Logs / Create New Agent / Edit Agent | `41:2` / `41:456` / `41:1226` / `41:1605` | crewmate/session detail · terminal log view · new-task dispatch · task/config edit | Phase 3 foundation on `/tasks/[id]`; full agent chrome **Phase 6 remaining** |
 | Inference Jobs · Inference Jobs | `41:2412` | `/tasks` | **Phase 3 live** |
-| Inference Jobs · Pipeline Runs | `41:5136` | `/runs` history / fusion runs | daemon fusion REST Phase 4; Console history UI Phase 6 |
+| Inference Jobs · Pipeline Runs | `41:5136` | `/runs` history / fusion runs | daemon fusion REST Phase 4; Console history UI **Phase 6 remaining** |
 | Inference Jobs · Live Log Stream | `41:3973` | `/runs` | **Phase 1 live** (daemon SSE; filters/pause/search/detail) |
 | Inference Jobs · Model Performance | `41:4355` | `/analytics` (per-model) | Phase 8 |
-| Inference Jobs · Recent Alerts | `41:5674` | wake queue / `quota.threshold` surfaces | Phase 3–6 |
+| Inference Jobs · Recent Alerts | `41:5674` | wake queue / `quota.threshold` surfaces | **Phase 6 remaining** (Notifications covers wake history; threshold chrome deferred) |
 | Inference Jobs · Cluster Nodes / GPU Cluster Detail | `41:730` / `41:1892` | secondmate fleet topology | Phase 7 |
 | Workflows · Workflow List | `41:6896` | `/projects` | **Phase 3 live** project registry |
-| Workflows · Run History | `41:7213` | `/runs` history | Phases 4–6 |
+| Workflows · Run History | `41:7213` | `/runs` history | **Phase 6 remaining** |
 | Workflows · Network I/O Detail | `41:4815` | `/analytics` detail | Phase 8 |
-| Settings · API Providers | `41:6186` | `/providers` | Phase 2 connect flows |
-| Settings · Billing | `41:6309` | budgets (Policies ▸ Budgets + quota) | Phases 2/6 |
-| Settings · Workspace | `41:6672` | `/settings` (+ `/policies` adapted modal for effective config) | UI Phase 1 (`/policies` live on `/v1/config/effective`; form wiring Phase 6) |
-| Empty State · Not Found / Server Error / No Data / No Results | `37:3731` / `37:3760` / `37:3792` / `37:3812` | shared empty/error treatments | Phase 1 onward |
+| Settings · API Providers | `41:6186` | `/providers` | Phase 2 connect flows; four quota-card archetypes **Phase 6 remaining** |
+| Settings · Billing | `41:6309` | budgets (Policies ▸ Budgets + quota) | Phase 2 probes; Billing chrome **Phase 6 remaining** |
+| Settings · Workspace | `41:6672` | `/settings` (+ `/policies` adapted modal for effective config) | UI Phase 1 (`/policies` live on `/v1/config/effective`; form wiring + three-way prompt diff **Phase 6 remaining**) |
+| Empty State · Not Found / Server Error / No Data / No Results | `37:3731` / `37:3760` / `37:3792` / `37:3812` | shared empty/error treatments | **Phase 6 first slice** (`EmptyState` + Next `not-found` / `error` boundaries) |
 | Other · Delete Agent / KB Upload / Test Agent modals | `41:1519` / `41:3790` / `41:6787` | modals on their owning screens | with owners |
 | **SKIPPED (R6.3-Q1 — Captain: "skip"):** Login (Sign In/Up/Forgot, `37:3447/37:3607/37:3689`); Pricing & Upgrade/Checkout/Payment Success (`37:3849/37:4074/37:4230`); Settings · Team Members (`37:4297/41:6442`); Knowledge Base (`41:2767/41:3226/41:3505`) — **not implemented**; only frames mapping to the local single-user product are built. Retained here as future/marketing candidates | | not built | — |
 
-**Future-phase screens [R6.3]:** frames whose data arrives later are implemented **pixel-faithful with placeholder data at UI-build time** and wired live in their phase — never left as empty panes. As of Phase 4: `/tasks` and `/projects` are live; daemon fusion REST/SSE is gated; Task Detail fusion columns, Fleet chart/table fixtures, and Policies three-way-diff UI remain Phase 6.
+**Future-phase / no-mocks [R6.3 + Phase 6 honesty]:** visual treatment (tokens, spacing, typography) stays frame-faithful. **Values must bind to daemon state** — underivable figures are `null` and render as an em dash with a stated reason, never a plausible stand-in. **Panels whose content is pure fiction with no local derivable source** (e.g. SaaS upsell, invented dollar savings tips) are **removed** rather than re-skinned. Figma sample strings must not reappear (`tooling/gates/phase-6.mjs` G3). As of Phase 6 first slice: Fleet/Analytics/Notifications/Task Detail evidence are live; remaining inventory rows marked **Phase 6 remaining** or later stay deferred — never filled with mock numbers.
 
 Carried forward unchanged: nav destinations (now the Figma icon rail + top bar); ⌘K **Brain chat** drawer [R3]; one SSE stream; on-demand ticketed terminal; red for security/auth/hard failures incl. the `LIMIT REACHED` pill [R5]; unknown quota renders `?`; extension-fed live columns [R2]; safety-override amber badge [R3]; per-metric honesty tier + source + synced-at [R5].
 
@@ -891,7 +894,7 @@ If the Brain is down: the header chip goes red and a full-width banner section s
 
 ### 7.2 Task Detail with live fusion columns (`/tasks/[id]`)
 
-Content unchanged (three extension-fed live columns with per-column cost/context meters, phase progression, auto-validate evidence, read-only terminal with take-over). [R3] delta: the header shows the **effective config chips** for the task — clicking opens the Policies page scoped to this task's resolved config; a **Brain decisions** lane shows each tool call with its one-line rationale. **[R6.2] framing:** the page is a stacked editorial article about the task — a hero (intent + phase progression as display typography), the three plan columns as a full-bleed section-grid, the validation evidence as its own hairline-divided section, the terminal as a designed section that expands in place — not tabs-and-panes chrome.
+**Phase 6 first slice:** fusion side-by-side columns headed by clean-room proof (`promptsIdentical` + shared prompt hash; red when sides diverge); validation evidence that distinguishes **GATE_ERROR** (infrastructure, consumes no attempt) from **FAIL** (real rejection); **Brain decisions** lane (refusals as prominent as successes, e.g. `POLICY_VIOLATION`). Evidence is fed from task-scoped events (`GET /v1/tasks/:id/events`) plus fusion REST — not placeholders. Still deferred: ticketed terminal attach / take-over, 10‑min no-drop-frame soak, full extension-fed cost/context meters per column. [R3] delta retained: effective config chips open Policies scoped to the task. **[R6.2] framing** (IA only): stacked article about the task — hero, plan columns, validation section, terminal section — not tabs-and-panes chrome.
 
 ### 7.3 Provider Connections & Usage (`/providers`) **[R5 — quota cards added]**
 
@@ -988,7 +991,7 @@ Slimmed: infrastructure-only (everything behavioral moved to Policies) **[R3]**:
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Also specified (not wireframed) **[CONSENSUS]**: Projects, Task Board, Analytics (usage/cost by connection/role/project/day + billing-surface + **Brain-token breakdown** [R3], estimate confidence), Sessions.
+Also specified (not wireframed) **[CONSENSUS]**: Projects, Task Board, Sessions. **Analytics / Token Usage** (`/analytics`, schema `packages/protocol/src/analytics.ts`): **Phase 6 first slice** ships `GET /v1/analytics` as a pure reader over the event log (join `ext.usage` to `session.spawned` role/model/task attribution — **no separate accounting store**). Honesty: underivable → `null` / em dash with reason; `costCoverage` ∈ {`complete`,`partial`,`absent`} so subscription legs that report no per-token cost never collapse into a fake $0 bill; budget bar only when a ceiling is configured **and** cost is known. Phase 8 still owns reconcile ±0, billing-surface / Brain-token breakdown depth, and estimate-confidence polish.
 
 ### 7.7 Onboarding Wizard (`/onboarding`) **[R6]**
 
@@ -1051,6 +1054,9 @@ Rev-2 table retained; [R3] additions:
 | GET/POST | `/v1/brain/history` · `/v1/brain/message` | Brain chat (streamed) | renamed from `liaison` [R3] |
 | GET | `/v1/connections/:id/quota` | → latest `QuotaMetric[]` (tier/source/syncedAt per metric) | **[R5]** |
 | POST | `/v1/connections/:id/quota/refresh` | on-demand probe → fresh metrics | **[R5]** courtesy-limited (min interval) |
+| GET | `/v1/analytics?days=` | → `AnalyticsSnapshot` (totals, daily, models, agents, quota samples; `truncated` when read bounds hit) | **[Phase 6]** log-derived only; schema `packages/protocol/src/analytics.ts`; cost honesty via `costCoverage` |
+| GET | `/v1/tasks/:id/events?types=&limit=` | → `{ taskId, events, truncated }` | **[Phase 6]** task-scoped evidence frames; `truncated` is per-task, not global log size |
+| GET | `/v1/fleet/wakes` (alias `/v1/wakes`) | → `{ wakes: WakeDigest[] }` | **[Phase 6]** Console Notifications; includes ABSORBED wakes |
 
 New SSE members **[R3]**: `policy.changed { domain, layer, safetyOverride: boolean }`, `brain.decision { taskId?, tool, rationale }`, `brain.status { state: "running" | "down" | "restarting", queuedWakes: number }`; **[R4]**: `brain.handoff { fromCast, toCast, trigger: "budget-80pct" | "window-80pct" | "manual" | "revert", metric: string }`; **[R5]**: `quota.updated { connectionId, metrics: QuotaMetric[] }` and `quota.threshold { connectionId, metric, level: "80pct" | "95pct" | "limit-reached" | "low-balance" | "reset-imminent" }`; **[Phase 4]**: `prompt.installed { refs }`, `fusion.side_completed { taskId, runId, role, model, family, promptHash, artifactPath }`, `fusion.completed { taskId, runId, kind, promptsIdentical, aggregatorFamily, contractOk, error? }` — added to the Rev-2 `OrchestratorEvent` union (which is otherwise retained: `task.state`, `agent.delta/tool/settled/context`, `run.gate`, `provider.*`, `fleet.*`, `fusion.dispatched`, `needs.captain`).
 
@@ -1196,11 +1202,11 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [ ] **Family-classification gate [R6]:** `claude-agent-sdk/<x>` counts as family `anthropic` in every cross-family check — a `claude-agent-sdk` builder with an `anthropic/*` validator fails `resolve_cast` (and vice versa).
 - [ ] **Wizard resumability gate [R6]:** kill the Console mid-wizard (and separately, restart the daemon) → the wizard resumes at the same step with prior verifications intact.
 
-**Phase 3 — Tool surface, the Brain, fleet execution, SCOUT, watcher, recovery (3 wk)** **[R3 — expanded]** — substrate + real Pi harness path shipped (`tooling/gates/phase-3.mjs` G1–G13; vitest `phase3-*.test.ts`). Console full-live wiring of Fleet chart/table fixtures is Phase 6 (deliberately deferred).
+**Phase 3 — Tool surface, the Brain, fleet execution, SCOUT, watcher, recovery (3 wk)** **[R3 — expanded]** — substrate + real Pi harness path shipped (`tooling/gates/phase-3.mjs` G1–G13; vitest `phase3-*.test.ts`). Console full-live Fleet panels shipped in **Phase 6 first slice** (was deliberately deferred here).
 - [x] **Tool-surface gates:** catalog tools schema-validated in `packages/protocol`; illegal transition `run_gate` before `GATE_AUTHORING` → `ILLEGAL_TRANSITION` (G3); same-family builder/validator `resolve_cast` → `POLICY_VIOLATION` (G4); tool calls evidence-logged. Secondmate tools return typed `NOT_FOUND` until Phase 7.
 - [x] **Brain decision loop (scripted):** with `AGENTOS_FAKE_BRAIN` / `AGENTOS_FAKE_PI` (explicit-only; never inferred from a missing binary), a SHIP (local-only, fusion off) on a real git fixture runs end-to-end: tmux window, leased worktree, local `ao/*` branch (G5). Real Brain on a live connection remains opt-in (no paid subscription in CI). **[CONSENSUS, re-targeted]**
 - [x] **Brain reconcile gate [R3]:** SIGKILL Brain pane → fresh Brain session reconciles (`read_fleet_state` path) (G13).
-- [x] **BRAIN_DOWN gate [R3]:** Brain respawn blocked (fixture) → `brain.status=down`, orchestration tools refuse with `BRAIN_DOWN` (G7). Console banner + durable wake-queue drain coverage remains Phase 6 polish.
+- [x] **BRAIN_DOWN gate [R3]:** Brain respawn blocked (fixture) → `brain.status=down`, orchestration tools refuse with `BRAIN_DOWN` (G7). Console wake-queue surface shipped Phase 6 first slice (`/notifications`); dedicated BRAIN_DOWN banner polish may still deepen.
 - [x] SCOUT: delivery git audit catches write sabotage → `scout.write_violation` + worktree quarantine (G9). Extension write-block remains part of the role tool policy path. **[CONSENSUS + R2]**
 - [x] Zero-token absorb path: watcher absorbs configured benign classes (e.g. `PROGRESS`) without delivering to the Brain (vitest); long soak 30-min proof remains Phase 8.
 - [x] Settled path: extension `agent_settled` marks session settled (harness tests); stage-completion discipline enforced via tool surface + fake-Pi settle. [R2]
@@ -1210,15 +1216,15 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] Reclaim: stop/respawn/reconcile reclaim leases; dirty SCOUT tree quarantines (G9, harness). Full 20-cycle soak matrix remains Phase 8.
 - [x] **Absorb-rule path [R3]:** supervision `absorb[]` drives watcher classification (vitest); config hot-reload feeds supervision into the fleet service. Dedicated absorb-class add/remove gate still thin — soak in Phase 8.
 
-**Phase 4 — Fusion primitives (2 wk)** — daemon + gates shipped (`tooling/gates/phase-4.mjs` G1–G11; vitest `phase4-fusion.test.ts`). Console fusion side-by-side columns and Policies three-way-diff UI remain Phase 6 (deliberately deferred).
-- [x] `/opinion` artifacts + per-side telemetry (`promptsIdentical` + per-side `promptHash` on the durable run record); REST detail + SSE for live consumers. Console side-by-side columns → Phase 6. **[CONSENSUS]**
+**Phase 4 — Fusion primitives (2 wk)** — daemon + gates shipped (`tooling/gates/phase-4.mjs` G1–G11; vitest `phase4-fusion.test.ts`). Console fusion side-by-side columns shipped **Phase 6 first slice**; Policies three-way-diff UI remains Phase 6 remaining (deliberately deferred).
+- [x] `/opinion` artifacts + per-side telemetry (`promptsIdentical` + per-side `promptHash` on the durable run record); REST detail + SSE for live consumers. Console side-by-side columns → **Phase 6 first slice**. **[CONSENSUS]**
 - [x] Clean-room: byte-identical prompts (render-once); no model-visible tools on crew; no cross-reads (`read_run_artifacts` → `UNAUTHORIZED_TOOL`); extension injects nothing model-visible (G2, G11). [B]+[R2]
 - [x] `/fusion` contract enforcement (`FUSION_CONTRACT` via `@agent-os/fusion-core`; G4). [A]+[B]
 - [x] Session-key gate: key change → new session dir; restart resumes only the missing role (G6). **[CONSENSUS]**
 - [x] Aggregator family retention: fusion agent runs on the architect side's family (first planner in the cast); recorded on the run record (G5). [B]
 - [x] **Template gates [R3]:** editing `prompts/fusion/fusion.md` (global) changes the next run's rendered instruction (hash-verified, G7); a project prompt override wins over global (G9); `{{VAR}}` interpolation rejects undefined variables with a typed error (G8); customized-template detection + three-way diff data served (`shippedAtInstall` hash — install text not retained; G10).
 
-**Phase 5 — Cross-family auto-validation (3 wk)** — daemon + gates shipped (`tooling/gates/phase-5.mjs` G1–G9; vitest harness coverage in `phase3-harness` / related). Console auto-validate evidence rendering remains Phase 6 (deliberately deferred).
+**Phase 5 — Cross-family auto-validation (3 wk)** — daemon + gates shipped (`tooling/gates/phase-5.mjs` G1–G9; vitest harness coverage in `phase3-harness` / related). Console auto-validate evidence rendering shipped **Phase 6 first slice** (was deliberately deferred here).
 - [x] `GATE_ERROR` ≠ RED; named `EXPECTED_RED` before builder starts. [B] (G1, G2)
 - [x] Baseline-pass fixture → `GATE DEFECT`, no builder spawn. [A] (G2)
 - [x] Same-family builder/validator impossible via API, CLI, profile import, recovery, **and Brain tool calls** [R3]; override stamped. (G3 + spawn re-check; family re-derived server-side)
@@ -1228,13 +1234,19 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] **`uv` gate-runtime gates [R4]:** a `gate.py` with PEP 723 inline deps runs in an isolated cached venv — a gate importing a library absent from the target repo executes without touching the product's `node_modules`/venv (isolation fixture); missing `uv` fails `doctor` at setup, and is reported as an infrastructure error, never as a gate `RED`; a project with `validation.gateLanguage: "ts"` runs `gate.ts` via `node --experimental-strip-types` (override honored). (G7, G8)
 - [x] E2E: unresolved fixture halts exactly at the configured cap (and at a *reconfigured* cap — config honored [R3]). (G9; `BUILDING → VALIDATION_EXHAUSTED` edge so the cap is reachable when FAIL lands from BUILDING)
 
-**Phase 6 — Console completion (2 wk)** — Rev-2 gates plus Policies page [R3]:
-- [ ] Playwright: all **9** pages render from a seeded daemon; Fleet reflects change ≤1 s. [A]
-- [ ] Task Detail: three extension-fed columns + terminal, 10 min, no dropped frames (seq assertions); Brain-decision lane renders tool calls with rationales. [A]+[R2]+[R3]
+**Phase 6 — Console completion (2 wk)** — first slice shipped (`tooling/gates/phase-6.mjs` G1–G8; CI Playwright chromium); remainder open:
+- [x] **Browser shell gates (G1, G2, G8):** Console pages render against a seeded daemon (incl. `/notifications`); Fleet reflects a new task ≤1 s over SSE; unknown route → shared Not Found. [A]
+- [x] **No-mocks gate (G3):** Figma sample placeholder strings (e.g. `23,094`, invented agent roster, `Upgrade to Pro`, `AI Optimization Tips`) are **absent** from every rendered page. [R6.3 honesty]
+- [x] **Analytics honesty (G4):** `/analytics` renders the daemon's own `GET /v1/analytics` figures; cost absence stated when coverage is not complete. Schema + service: `packages/protocol/src/analytics.ts`, `apps/orchestrator/src/analytics/`.
+- [x] **Notifications (G5):** `/notifications` renders the real wake queue including ABSORBED (zero-token watcher evidence).
+- [x] **Task Detail evidence (G6):** Brain decision lane + validation evidence with FAIL vs GATE_ERROR meaning; fusion columns with clean-room proof. Full 10‑min terminal no-drop-frame soak still open below.
+- [x] **Quota strip honesty (G7, partial [R5]):** analytics/fleet quota surface renders a seeded sample with provider + honesty tier (not empty-state copy alone). Full four card archetypes + `LIMIT REACHED` pill linkage remain open below.
+- [ ] Task Detail: full extension-fed per-column cost/context meters + ticketed terminal, 10 min, no dropped frames (seq assertions). [A]+[R2]+[R3]
 - [ ] Provider wizard E2E (`pi-api-key` + fixture `pi-oauth`); extra-usage labeling assertions across card/wizard/task/analytics. [A]+[R2]
 - [ ] **Policies page gates [R3]:** layered chain view shows correct per-key source; diff-from-default marks (◆) accurate; safety-policy toggle requires confirmation, stamps overrides, and raises the persistent badge; prompt three-way diff renders for a customized template with a shipped update.
-- [ ] **Usage & quota UI gates [R5]:** the Fleet usage strip renders per-connection name · window bar · % left · balance from seeded `quota_samples` and updates on `quota.updated` within 1 s; the quota card grid renders all four card archetypes (weekly-window, limit-reached, best-effort, balance-split) with tier badges, source rows, synced timestamps, and working per-card refresh; the `LIMIT REACHED` pill renders red and links to the exclusion reason (Playwright).
+- [ ] **Usage & quota UI gates [R5] (remaining):** Fleet usage strip updates on `quota.updated` within 1 s; Providers quota card grid renders all four card archetypes (weekly-window, limit-reached, best-effort, balance-split) with tier badges, source rows, synced timestamps, and working per-card refresh; the `LIMIT REACHED` pill renders red and links to the exclusion reason (Playwright).
 - [ ] Terminal reconnect resumes the same tmux window. [B]
+- [ ] Remaining §7 frames: Agent Detail/Logs, Pipeline Runs, Workflow Run History, Model Performance, Recent Alerts chrome, Settings Billing, Network I/O Detail.
 - [ ] **Figma-fidelity gate [R6.3, replaces R6.2's brand-parity gate]:** every shipped screen has a **Figma-frame-vs-implementation side-by-side** in the evidence pack (per breakpoint where the frame specifies); implementation was built from `get_design_context` per screen (figma-design-to-code skill), not eyeballed screenshots; visual diffs reviewed against the canonical frames in the §7 inventory. **Kept from R6.2:** marketing renders identically after component promotion (no-regression parity on marketing routes).
 
 **Phase 7 — Secondmates & fleet operations (v1.x, 3 wk)** — Rev-2 gates plus:

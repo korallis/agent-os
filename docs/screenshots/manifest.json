@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-07-24T23:11:01.084Z",
+  "capturedAt": "2026-07-25T09:21:22.181Z",
   "pages": [
     {
       "path": "/fleet",
@@ -22,29 +22,34 @@
       "file": "docs/screenshots/04-providers-quota.png"
     },
     {
+      "path": "/notifications",
+      "status": 200,
+      "file": "docs/screenshots/05-notifications.png"
+    },
+    {
       "path": "/runs",
       "status": 200,
-      "file": "docs/screenshots/05-runs-live-log.png"
+      "file": "docs/screenshots/06-runs-live-log.png"
     },
     {
       "path": "/analytics",
       "status": 200,
-      "file": "docs/screenshots/06-analytics.png"
+      "file": "docs/screenshots/07-analytics.png"
     },
     {
       "path": "/policies",
       "status": 200,
-      "file": "docs/screenshots/07-policies.png"
+      "file": "docs/screenshots/08-policies.png"
     },
     {
       "path": "/settings",
       "status": 200,
-      "file": "docs/screenshots/08-settings.png"
+      "file": "docs/screenshots/09-settings.png"
     },
     {
       "path": "/onboarding",
       "status": 200,
-      "file": "docs/screenshots/09-onboarding-wizard.png"
+      "file": "docs/screenshots/10-onboarding-wizard.png"
     }
   ]
 }

@@ -4,22 +4,35 @@ import { useEffect, useState } from "react";
 import type { QuotaSample } from "@agent-os/protocol";
 
 /**
- * Live quota strip for Token Usage (§7.3). Falls back to empty when daemon
- * has no samples yet — Figma chart layout remains in the parent page.
+ * Live quota strip for Token Usage (§7.3).
+ *
+ * Loading, unavailable, and genuinely empty are distinct — a failed probe
+ * fetch must not read as "connect providers".
  */
 export function QuotaUsageStrip() {
   const [samples, setSamples] = useState<QuotaSample[]>([]);
+  const [status, setStatus] = useState<"loading" | "ready" | "unavailable">("loading");
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
         const res = await fetch("/api/agentos/quota");
-        if (!res.ok) return;
+        if (!res.ok) {
+          if (!cancelled) {
+            setStatus((prev) => (prev === "ready" ? prev : "unavailable"));
+          }
+          return;
+        }
         const body = (await res.json()) as { samples: QuotaSample[] };
-        if (!cancelled) setSamples(body.samples);
+        if (!cancelled) {
+          setSamples(body.samples);
+          setStatus("ready");
+        }
       } catch {
-        // daemon down — leave empty
+        if (!cancelled) {
+          setStatus((prev) => (prev === "ready" ? prev : "unavailable"));
+        }
       }
     };
     void load();
@@ -30,10 +43,24 @@ export function QuotaUsageStrip() {
     };
   }, []);
 
+  if (status === "loading" && samples.length === 0) {
+    return (
+      <p className="mb-4 text-[12px] text-fg-3">Loading quota probes…</p>
+    );
+  }
+
+  if (status === "unavailable" && samples.length === 0) {
+    return (
+      <p className="mb-4 text-[12px] text-fg-3">
+        Quota probes unavailable — the daemon could not be reached.
+      </p>
+    );
+  }
+
   if (samples.length === 0) {
     return (
       <p className="mb-4 text-[12px] text-fg-3">
-        Live quota probes will appear here once providers are connected (Phase 2).
+        Quota probes will appear here once providers are connected.
       </p>
     );
   }

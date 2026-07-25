@@ -66,3 +66,9 @@ jobs:
 
       - name: Phase 5 gates
         run: node tooling/gates/phase-5.mjs
+
+      - name: Install Playwright chromium (Phase 6 browser gates)
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Phase 6 gates
+        run: node tooling/gates/phase-6.mjs

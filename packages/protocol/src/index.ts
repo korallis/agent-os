@@ -16,6 +16,7 @@ export * from "./tasks.js";
 export * from "./tools.js";
 export * from "./fleet.js";
 export * from "./prompts.js";
+export * from "./analytics.js";
 
 import { z } from "zod";
 

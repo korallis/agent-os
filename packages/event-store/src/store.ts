@@ -112,8 +112,74 @@ export class EventStore {
     return { events: truncated ? events.slice(0, limit) : events, truncated };
   }
 
+  /**
+   * Newest-first page for evidence surfaces and reverse scans.
+   * `beforeId` is exclusive (events strictly older than that ULID).
+   * Unknown `beforeId` is treated as "from the newest end".
+   */
+  eventsBeforeId(
+    beforeId: string | null,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    let beforeSeq: number | null = null;
+    if (beforeId !== null) {
+      beforeSeq = this.projection.seqOfEventId(beforeId);
+    }
+    const events = this.projection.eventsBeforeSeq(beforeSeq, limit + 1);
+    const truncated = events.length > limit;
+    return { events: truncated ? events.slice(0, limit) : events, truncated };
+  }
+
+  /**
+   * Time-bounded scan: events at or after `sinceTs`, newest-first.
+   * When the page is truncated, the oldest in-window frames are dropped so
+   * recent usage/throughput stay visible. `truncated` is true when more events
+   * exist in the window than `limit`.
+   */
+  eventsSince(
+    sinceTs: string,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const events = this.projection.eventsSinceTs(sinceTs, limit + 1);
+    const truncated = events.length > limit;
+    return { events: truncated ? events.slice(0, limit) : events, truncated };
+  }
+
+  /**
+   * Newest-first page of a single event type (not day-windowed).
+   * Used for session.spawned attribution across the full durable log.
+   */
+  eventsByType(
+    type: string,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const events = this.projection.eventsByType(type, limit + 1);
+    const truncated = events.length > limit;
+    return { events: truncated ? events.slice(0, limit) : events, truncated };
+  }
+
+  /**
+   * Task-scoped history for evidence surfaces.
+   * `truncated` means this task has more matching events than `limit` —
+   * independent of global log size. Returns chronological order (oldest first).
+   */
+  eventsForTask(
+    taskId: string,
+    types: readonly string[] | null,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const total = this.projection.countForTask(taskId, types);
+    const newestFirst = this.projection.eventsForTask(taskId, types, limit);
+    const truncated = total > newestFirst.length;
+    return { events: newestFirst.reverse(), truncated };
+  }
+
   count(): number {
     return this.projection.count();
+  }
+
+  countSince(sinceTs: string): number {
+    return this.projection.countSinceTs(sinceTs);
   }
 
   lastSeq(): number {

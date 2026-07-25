@@ -25,6 +25,7 @@ import { enableQuotaProviders } from "./quota-probes/enable.js";
 import type { QuotaSample } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
 import { PromptService } from "./prompts/service.js";
+import { AnalyticsService } from "./analytics/service.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
@@ -222,6 +223,51 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       }
     });
 
+    // Analytics is a pure reader over durable state — no separate accounting
+    // store to drift out of sync with the event log. The reader is time-bounded
+    // to the requested window (newest-first so truncation drops oldest frames)
+    // and surfaces truncation when the bound is hit. Session attribution uses a
+    // separate non-windowed session.spawned lookup.
+    const analytics = new AnalyticsService(
+      ({ days, limit }) => {
+        const since = new Date();
+        since.setUTCDate(since.getUTCDate() - (days - 1));
+        since.setUTCHours(0, 0, 0, 0);
+        const sinceTs = since.toISOString();
+        const page = eventStore.eventsSince(sinceTs, limit);
+        // Prefer the projection count when available so we report truncation
+        // even if the page itself filled exactly to the limit boundary.
+        const inWindow = eventStore.countSince(sinceTs);
+        return {
+          events: page.events,
+          truncated: page.truncated || inWindow > limit,
+        };
+      },
+      () => [...quotaSamples.values()],
+      () => {
+        const { events: spawns, truncated: spawnTruncated } = eventStore.eventsByType(
+          "session.spawned",
+          100_000,
+        );
+        const facts: Array<{
+          sessionId: string;
+          role: string;
+          model: string;
+          taskId: string | null;
+        }> = [];
+        for (const envelope of spawns) {
+          if (envelope.event.type !== "session.spawned") continue;
+          facts.push({
+            sessionId: envelope.event.payload.sessionId,
+            role: envelope.event.payload.role,
+            model: envelope.event.payload.model,
+            taskId: envelope.event.payload.taskId,
+          });
+        }
+        return { facts, truncated: spawnTruncated };
+      },
+    );
+
     const deps = {
       store,
       config,
@@ -236,6 +282,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       quotaSamples,
       fleet,
       prompts,
+      analytics,
     };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });

@@ -1,0 +1,141 @@
+"use client";
+
+import { useMemo } from "react";
+import { cn } from "@agent-os/ui";
+import type { TaskEventsState } from "@/lib/useTaskEvents";
+
+/**
+ * Brain decision lane (master plan §7.2).
+ *
+ * Every judgment the Brain made about this task, as the tool calls it actually
+ * issued through the typed surface. Refusals are shown as prominently as
+ * successes: a `POLICY_VIOLATION` or `ILLEGAL_TRANSITION` is the substrate
+ * correcting the Brain, and that record is the evidence the substrate — not the
+ * model — is what enforces the rules.
+ *
+ * Empty, truncated, and unavailable history are rendered as distinct states.
+ * When a refresh fails but prior events exist, those events stay on screen with
+ * a staleness note — a failed fetch never looks like "nothing happened".
+ */
+
+interface Invocation {
+  tool: string;
+  ok: boolean;
+  errorCode: string | null;
+  durationMs: number;
+  ts: string;
+}
+
+export function BrainDecisionLane({
+  taskEvents,
+}: {
+  taskEvents: TaskEventsState;
+}) {
+  const { events, truncated, unavailable, loaded } = taskEvents;
+
+  const calls = useMemo(() => {
+    const mine: Invocation[] = [];
+    for (const envelope of events) {
+      if (envelope.event.type !== "tool.invoked") continue;
+      mine.push({
+        tool: envelope.event.payload.tool,
+        ok: envelope.event.payload.ok,
+        errorCode: envelope.event.payload.errorCode,
+        durationMs: envelope.event.payload.durationMs,
+        ts: envelope.ts,
+      });
+    }
+    return mine;
+  }, [events]);
+
+  if (!loaded) {
+    return (
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-fg-1">Brain decisions</h3>
+          <span className="text-[11px] text-fg-3">loading…</span>
+        </div>
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">Loading decision history…</p>
+        </div>
+      </section>
+    );
+  }
+
+  const hasData = calls.length > 0;
+  if (!hasData && !unavailable && !truncated) return null;
+
+  const refused = calls.filter((c) => !c.ok).length;
+
+  let statusLabel: string;
+  if (hasData) {
+    statusLabel = `${calls.length} tool call${calls.length === 1 ? "" : "s"}${
+      refused > 0 ? ` · ${refused} refused by the substrate` : ""
+    }${truncated ? " · history truncated" : ""}${
+      unavailable ? " · refresh unavailable (showing last loaded)" : ""
+    }`;
+  } else if (unavailable) {
+    statusLabel = "history unavailable";
+  } else {
+    statusLabel = "history truncated";
+  }
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-fg-1">Brain decisions</h3>
+        <span className="text-[11px] text-fg-3">{statusLabel}</span>
+      </div>
+      {hasData ? (
+        <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">
+          {unavailable && (
+            <p className="px-4 py-2 text-[11px] text-warn border-b border-line-1/60">
+              Latest refresh failed — showing last loaded history.
+            </p>
+          )}
+          <ul className="divide-y divide-line-1/60">
+            {calls.map((call, i) => (
+              <li key={`${call.ts}-${i}`} className="flex items-center gap-3 px-4 py-2.5">
+                <span
+                  className={cn(
+                    "shrink-0 size-1.5 rounded-full",
+                    call.ok ? "bg-ok" : "bg-danger",
+                  )}
+                />
+                <span className="flex-1 min-w-0 font-mono text-[12px] text-fg-1 truncate">
+                  {call.tool}
+                </span>
+                {!call.ok && call.errorCode !== null && (
+                  <span
+                    className="shrink-0 rounded-md border border-danger/30 bg-danger/10 px-2 py-0.5 text-[10px] font-semibold text-danger"
+                    title="The substrate refused this move — the Brain must choose a legal one"
+                  >
+                    {call.errorCode}
+                  </span>
+                )}
+                <span className="shrink-0 text-[11px] text-fg-3 w-14 text-right">
+                  {call.durationMs}ms
+                </span>
+                <span className="shrink-0 text-[11px] text-fg-3 w-20 text-right">
+                  {new Date(call.ts).toLocaleTimeString("en-GB")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : unavailable ? (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            History unavailable — the event log could not be loaded for this task.
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            Event history was truncated before this task&apos;s tool calls were reached.
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}

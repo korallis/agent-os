@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { desc, eq, gt } from "drizzle-orm";
+import { desc, eq, gt, gte, lt } from "drizzle-orm";
 import type { EventEnvelope } from "@agent-os/protocol";
 import { MIGRATIONS, configRevisions, connections, events, quotaSamples } from "./schema.js";
 
@@ -71,6 +71,7 @@ export class SqliteProjection {
         id: envelope.id,
         ts: envelope.ts,
         type: envelope.event.type,
+        taskId: taskIdFromEnvelope(envelope),
         envelope: JSON.stringify(envelope),
       })
       .onConflictDoNothing();
@@ -150,6 +151,102 @@ export class SqliteProjection {
     return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
   }
 
+  /**
+   * Newest-first page: events with seq strictly less than `beforeSeq`
+   * (or the newest `limit` events when `beforeSeq` is null).
+   */
+  eventsBeforeSeq(beforeSeq: number | null, limit: number): EventEnvelope[] {
+    const query = this.db.select({ envelope: events.envelope }).from(events);
+    const rows =
+      beforeSeq === null
+        ? query.orderBy(desc(events.seq)).limit(limit).all()
+        : query
+            .where(lt(events.seq, beforeSeq))
+            .orderBy(desc(events.seq))
+            .limit(limit)
+            .all();
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /**
+   * Events at or after an ISO timestamp, newest-first within the page.
+   * Truncation therefore drops the oldest in-window frames, not the newest.
+   */
+  eventsSinceTs(sinceTs: string, limit: number): EventEnvelope[] {
+    const rows = this.db
+      .select({ envelope: events.envelope })
+      .from(events)
+      .where(gte(events.ts, sinceTs))
+      .orderBy(desc(events.seq))
+      .limit(limit)
+      .all();
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /** Count of events at or after an ISO timestamp (truncation detection). */
+  countSinceTs(sinceTs: string): number {
+    const row = this.sqlite
+      .prepare("SELECT COUNT(*) AS n FROM events WHERE ts >= ?")
+      .get(sinceTs) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Events of a given type, newest-first (not day-windowed).
+   * Used for session.spawned attribution of long-lived sessions.
+   */
+  eventsByType(type: string, limit: number): EventEnvelope[] {
+    const rows = this.db
+      .select({ envelope: events.envelope })
+      .from(events)
+      .where(eq(events.type, type))
+      .orderBy(desc(events.seq))
+      .limit(limit)
+      .all();
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /**
+   * Events whose projected task_id matches, optionally filtered by type.
+   * Newest-first page so truncation drops the oldest frames for this task.
+   * Uses the apply-time task_id column + index (not json_extract per scan).
+   */
+  eventsForTask(taskId: string, types: readonly string[] | null, limit: number): EventEnvelope[] {
+    if (types !== null && types.length === 0) return [];
+    const typeFilter =
+      types === null
+        ? ""
+        : ` AND type IN (${types.map(() => "?").join(", ")})`;
+    const params: unknown[] =
+      types === null ? [taskId, limit] : [taskId, ...types, limit];
+    const rows = this.sqlite
+      .prepare(
+        `SELECT envelope FROM events
+         WHERE task_id = ?${typeFilter}
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(...params) as { envelope: string }[];
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /** Count of events whose projected task_id matches (optional type filter). */
+  countForTask(taskId: string, types: readonly string[] | null): number {
+    if (types !== null && types.length === 0) return 0;
+    const typeFilter =
+      types === null
+        ? ""
+        : ` AND type IN (${types.map(() => "?").join(", ")})`;
+    const params: unknown[] = types === null ? [taskId] : [taskId, ...types];
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM events
+         WHERE task_id = ?${typeFilter}`,
+      )
+      .get(...params) as { n: number };
+    return row.n;
+  }
+
   seqOfEventId(id: string): number | null {
     const rows = this.db.select({ seq: events.seq }).from(events).where(eq(events.id, id)).limit(1).all();
     return rows[0]?.seq ?? null;
@@ -200,6 +297,11 @@ export class SqliteProjection {
   close(): void {
     this.sqlite.close();
   }
+}
+
+function taskIdFromEnvelope(envelope: EventEnvelope): string | null {
+  const payload = envelope.event.payload as { taskId?: unknown };
+  return typeof payload.taskId === "string" ? payload.taskId : null;
 }
 
 // Silence unused-export noise if drizzle tables are only used for types elsewhere.

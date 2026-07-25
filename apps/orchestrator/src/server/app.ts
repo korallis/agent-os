@@ -30,6 +30,7 @@ import {
   type OnboardingState,
   type QuotaSample,
   type StatusResponse,
+  type TaskEventsResponse,
 } from "@agent-os/protocol";
 import type { EventStore } from "@agent-os/event-store";
 import { ConfigService, ConfigWriteError } from "../config/service.js";
@@ -45,6 +46,7 @@ import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
 import { resolveAuthJsonPathsWithFallback } from "../security/auth-store.js";
 import type { FleetService } from "../fleet/service.js";
 import type { PromptService } from "../prompts/service.js";
+import type { AnalyticsService } from "../analytics/service.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -69,6 +71,8 @@ export interface ServerDeps {
   fleet?: FleetService;
   /** Phase 4 layered prompt packs. */
   prompts?: PromptService;
+  /** Phase 6 usage & cost analytics derived from the event log. */
+  analytics?: AnalyticsService;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -231,6 +235,15 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     return { wakes: deps.fleet.watcher.getHistory(200) };
   });
 
+  // Console + phase-6 gates hit the fleet-prefixed path.
+  app.get("/v1/fleet/wakes", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { wakes: deps.fleet.watcher.getHistory(200) };
+  });
+
   app.get("/v1/projects", async (_request, reply) => {
     if (deps.fleet === undefined) {
       sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
@@ -308,6 +321,54 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       return;
     }
     return { task };
+  });
+
+  /**
+   * Task-scoped event history for Task Detail evidence (tool.invoked, gate.result,
+   * session/fusion frames). Truncation is meaningful for THIS task only.
+   */
+  const taskEventsQuerySchema = z.object({
+    types: z.string().optional(),
+    limit: z.coerce.number().int().min(1).max(10_000).default(5_000),
+  });
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/tasks/:id/events",
+    (request, reply): TaskEventsResponse | undefined => {
+      const query = taskEventsQuerySchema.safeParse(request.query);
+      if (!query.success) {
+        sendError(reply, 400, "BAD_REQUEST", "invalid task events query");
+        return undefined;
+      }
+      const types =
+        query.data.types === undefined || query.data.types.trim() === ""
+          ? null
+          : query.data.types
+              .split(",")
+              .map((t) => t.trim())
+              .filter((t) => t.length > 0);
+      if (types !== null && types.length === 0) {
+        sendError(reply, 400, "BAD_REQUEST", "empty types filter");
+        return undefined;
+      }
+      const { events, truncated } = deps.store.eventsForTask(
+        request.params.id,
+        types,
+        query.data.limit,
+      );
+      return { taskId: request.params.id, events, truncated };
+    },
+  );
+
+  // ── Analytics (master plan §7 Token Usage / §8.2) ───────────────────────
+  app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {
+    if (deps.analytics === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "analytics service unavailable");
+      return;
+    }
+    const parsed = Number(request.query.days ?? "14");
+    const days = Number.isInteger(parsed) && parsed >= 1 && parsed <= 365 ? parsed : 14;
+    return deps.analytics.snapshot({ days });
   });
 
   // ── Fusion runs (master plan §7.4) ──────────────────────────────────────
@@ -640,6 +701,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
 
   const replayQuerySchema = z.object({
     after: z.string().optional(),
+    /** Exclusive upper bound for newest-first pages (`order=desc`). */
+    before: z.string().optional(),
+    /**
+     * `asc` — oldest-first after `after` (SSE Last-Event-ID semantics, default).
+     * `desc` — newest-first before `before` (evidence surfaces).
+     */
+    order: z.enum(["asc", "desc"]).default("asc"),
     limit: z.coerce.number().int().min(1).max(10_000).default(1000),
   });
 
@@ -648,6 +716,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     if (!query.success) {
       sendError(reply, 400, "BAD_REQUEST", "invalid replay query");
       return undefined;
+    }
+    if (query.data.order === "desc") {
+      const { events, truncated } = deps.store.eventsBeforeId(
+        query.data.before ?? null,
+        query.data.limit,
+      );
+      return { events, truncated };
     }
     const { events, truncated } = deps.store.eventsAfterId(
       query.data.after ?? null,
