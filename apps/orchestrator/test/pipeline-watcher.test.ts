@@ -220,6 +220,157 @@ describe("PipelineWatcher", () => {
     watcher.stop();
   });
 
+  it("does not replay multi-chunk quiet growth after flipping to firehose", () => {
+    // LOG_CHUNK_MAX is 16KiB; growth above that used to leave residual unread
+    // bytes when quiet walked in chunks — those bytes then polluted firehose.
+    const QUIET_GROWTH = 20_000;
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-quiet-chunk-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const logPath = join(gateHome, "logs", "review.log");
+    writeFileSync(logPath, "seed\n");
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    let streamLogs = false;
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: streamLogs }),
+    });
+    watcher.start();
+    expect(events.filter((e) => e.type === "pipeline.log_appended")).toHaveLength(0);
+
+    const quietMarker = "QUIET_ONLY_MARKER";
+    const quietPayload = quietMarker + "x".repeat(QUIET_GROWTH - quietMarker.length);
+    appendFileSync(logPath, quietPayload);
+    events.length = 0;
+    // One quiet tick must snap the offset to EOF, not leave residual chunks.
+    watcher.tick();
+    expect(events.filter((e) => e.type === "pipeline.log_appended")).toHaveLength(0);
+
+    events.length = 0;
+    streamLogs = true;
+    appendFileSync(logPath, "FIREHOSE_ONLY\n");
+    watcher.tick();
+    const logs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(logs.length).toBe(1);
+    if (logs[0]?.type === "pipeline.log_appended") {
+      expect(logs[0].payload.chunk).toContain("FIREHOSE_ONLY");
+      expect(logs[0].payload.chunk).not.toContain(quietMarker);
+    }
+
+    watcher.stop();
+  });
+
+  it("retries log_appended after a throwing sink instead of dropping bytes", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-log-sink-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const logPath = join(gateHome, "logs", "review.log");
+    writeFileSync(logPath, "seed\n");
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    let failNextLog = true;
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => {
+        if (failNextLog && e.type === "pipeline.log_appended") {
+          failNextLog = false;
+          throw new Error("simulated log append failure");
+        }
+        events.push(e);
+      },
+    });
+    watcher.start();
+    events.length = 0;
+    appendFileSync(logPath, "must-retry-after-sink-throw\n");
+    watcher.tick();
+    expect(events.filter((e) => e.type === "pipeline.log_appended")).toHaveLength(0);
+
+    watcher.tick();
+    const logs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(logs).toHaveLength(1);
+    if (logs[0]?.type === "pipeline.log_appended") {
+      expect(logs[0].payload.chunk).toContain("must-retry-after-sink-throw");
+    }
+    watcher.stop();
+  });
+
+  it("re-seeds log offsets on stop/start instead of replaying while stopped", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-log-restart-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const logPath = join(gateHome, "logs", "review.log");
+    writeFileSync(logPath, "seed\n");
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+    });
+    watcher.start();
+    watcher.stop();
+
+    appendFileSync(logPath, "written-while-stopped\n");
+    events.length = 0;
+    watcher.start();
+    expect(
+      events
+        .filter((e) => e.type === "pipeline.log_appended")
+        .some(
+          (e) =>
+            e.type === "pipeline.log_appended" && e.payload.chunk.includes("written-while-stopped"),
+        ),
+    ).toBe(false);
+
+    events.length = 0;
+    appendFileSync(logPath, "after-restart\n");
+    watcher.tick();
+    const logs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(logs).toHaveLength(1);
+    if (logs[0]?.type === "pipeline.log_appended") {
+      expect(logs[0].payload.chunk).toContain("after-restart");
+      expect(logs[0].payload.chunk).not.toContain("written-while-stopped");
+    }
+    watcher.stop();
+  });
+
   it("surfaces a recently completed run using unix-second timestamps", () => {
     const gateHome = mkdtempSync(join(tmpdir(), "p9-completed-"));
     homes.push(gateHome);

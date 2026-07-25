@@ -292,6 +292,9 @@ export class PipelineWatcher {
     // A (re)start must re-project current runs — fingerprints from a prior
     // session would suppress the frames the Console needs to leave unreadable.
     this.lastFingerprint.clear();
+    // Drop prior log offsets so the next first-sight re-seeds to current size
+    // instead of replaying every byte written while the watcher was stopped.
+    this.logOffsets.clear();
     this.incompatibilityReported = false;
     this.structuredReadFailures = 0;
     const compat = this.checkCompatibility();
@@ -554,8 +557,9 @@ export class PipelineWatcher {
 
   /**
    * Track the active step log offset every tick. When `emit` is false (quiet
-   * profile), still advance the offset so a later profile flip does not
-   * first-sight-seed past everything written while quiet.
+   * profile), jump the offset to EOF in one step so a later profile flip cannot
+   * replay residual quiet-period bytes. When emitting, sink first and only
+   * advance the offset after sink returns (same ordering as run fingerprints).
    */
   private emitLogTail(runId: string, step: string, logPath: string, emit: boolean): void {
     try {
@@ -575,6 +579,13 @@ export class PipelineWatcher {
         if (size < known) this.logOffsets.set(key, size);
         return;
       }
+      // Non-streaming: snap to EOF immediately. Chunked catch-up here would leave
+      // a residual unread region after multi-LOG_CHUNK_MAX growth that a later
+      // firehose/working flip would dump into the durable event log.
+      if (!emit) {
+        this.logOffsets.set(key, size);
+        return;
+      }
       const toRead = Math.min(LOG_CHUNK_MAX, size - known);
       const buffer = Buffer.alloc(toRead);
       const fd = openSync(logPath, "r");
@@ -584,12 +595,16 @@ export class PipelineWatcher {
         closeSync(fd);
       }
       const chunk = buffer.toString("utf8");
-      this.logOffsets.set(key, known + toRead);
-      if (!emit || chunk.trim().length === 0) return;
+      if (chunk.trim().length === 0) {
+        this.logOffsets.set(key, known + toRead);
+        return;
+      }
+      // Sink before advancing: if append fails, the next tick retries these bytes.
       this.sink({
         type: "pipeline.log_appended",
         payload: { runId, step, chunk },
       });
+      this.logOffsets.set(key, known + toRead);
     } catch {
       // Log tailing is best-effort; structured state is the source of truth.
     }

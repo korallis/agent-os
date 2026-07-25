@@ -30,7 +30,9 @@
       surface: ["*"],
       streamPipelineLogs: true,
       pipelineLogChars: 200000,
-      wakeOn: ["captain.escalation", "pipeline.unavailable", "scout.write_violation"],
+      // Task-linked scout audits already raise captain.escalation (critical);
+      // listing scout.write_violation here would double-wake on the same failure.
+      wakeOn: ["captain.escalation", "pipeline.unavailable"],
     },
   },
 
