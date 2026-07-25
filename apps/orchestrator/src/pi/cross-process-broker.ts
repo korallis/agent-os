@@ -15,10 +15,15 @@ import { join } from "node:path";
  * Cross-process Pi auth-store broker (master plan §5.9, §11 Phase 7).
  *
  * Secondmates get isolated homes, but they share ONE Pi auth store — that is
- * the whole point of the design: the Captain logs in once. Two processes
- * refreshing or rewriting the same credential concurrently is how an auth store
- * gets corrupted, so login and refresh windows are serialised with a lock that
- * lives beside the store rather than inside any one process.
+ * the whole point of the design: the Captain logs in once. Agent OS processes
+ * serialise grant resolution and login exclusive windows with a lock that lives
+ * beside the store rather than inside any one process.
+ *
+ * This orders Agent-OS-local critical sections (spawn grants, login holds)
+ * across primaries and secondmates. It does not claim to wrap Pi's internal
+ * multi-minute OAuth UI write atomicity; holdLoginUntilAuthSettled keeps the
+ * lock until the auth store mtime advances so concurrent grants wait out that
+ * window.
  *
  * The in-process `PiAuthBroker` remains correct for intra-process ordering;
  * this sits underneath it and is the only thing that can order a primary

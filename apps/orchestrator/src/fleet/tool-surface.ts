@@ -70,7 +70,11 @@ import type { WakeWatcher } from "./watcher.js";
 import { GateRunner } from "./gate-runner.js";
 import type { FusionRunStore } from "./fusion-runs.js";
 import type { SecondmateRegistry } from "./secondmates.js";
-import { SecondmateHandoverError, type SecondmateFleet } from "./secondmate-fleet.js";
+import {
+  SecondmateCapacityError,
+  SecondmateHandoverError,
+  type SecondmateFleet,
+} from "./secondmate-fleet.js";
 import type { PiAuthBroker } from "../pi/auth-broker.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
@@ -614,14 +618,37 @@ export class ToolSurface {
     rawInput: Record<string, unknown>,
     options: { idempotencyKey?: string } = {},
   ): ToolCallResult {
-    if (tool === "route_to_secondmate" || tool === "read_secondmate_bearings") {
+    if (
+      tool === "route_to_secondmate" ||
+      tool === "read_secondmate_bearings" ||
+      tool === "provision_secondmate"
+    ) {
       const started = Date.now();
       const invocationId = nextUlid();
       return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
         ok: false,
         error: err(
           "INTERNAL",
-          `${tool} requires invokeAsync (I/O probe / remote handover)`,
+          `${tool} requires invokeAsync (I/O probe / remote handover / provision)`,
+        ),
+      });
+    }
+    // Spawn/fusion take the cross-process auth lock asynchronously when a
+    // broker is configured — refuse the sync path so the event loop never
+    // busy-waits under contention.
+    if (
+      this.deps.authBroker !== undefined &&
+      (tool === "spawn_crewmate" ||
+        tool === "respawn_crewmate" ||
+        tool === "dispatch_fusion")
+    ) {
+      const started = Date.now();
+      const invocationId = nextUlid();
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err(
+          "INTERNAL",
+          `${tool} requires invokeAsync when PiAuthBroker is configured (async spawn grant)`,
         ),
       });
     }
@@ -629,7 +656,7 @@ export class ToolSurface {
   }
 
   /**
-   * Async tool entry for secondmate I/O (handover POST, bearings probe).
+   * Async tool entry for secondmate I/O and spawn-grant paths.
    * Sync tools are delegated to the same finish path.
    */
   async invokeAsync(
@@ -645,6 +672,26 @@ export class ToolSurface {
     if (tool === "read_secondmate_bearings") {
       return this.finishInvokeAsync(tool, rawInput, options, () =>
         this.readSecondmateBearings(rawInput),
+      );
+    }
+    if (tool === "provision_secondmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, async () =>
+        this.provisionSecondmate(rawInput),
+      );
+    }
+    if (tool === "spawn_crewmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.spawnCrewmateAsync(rawInput),
+      );
+    }
+    if (tool === "respawn_crewmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.respawnCrewmateAsync(rawInput),
+      );
+    }
+    if (tool === "dispatch_fusion") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.dispatchFusionAsync(rawInput),
       );
     }
     return this.invoke(tool, rawInput, options);
@@ -770,6 +817,12 @@ export class ToolSurface {
         error: err("CONFLICT", error.message, error.details),
       });
     }
+    if (error instanceof SecondmateCapacityError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err("POLICY_VIOLATION", error.message, error.details),
+      });
+    }
     if (error instanceof ZodError) {
       return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
         ok: false,
@@ -855,6 +908,7 @@ export class ToolSurface {
         return this.notify(raw);
       case "route_to_secondmate":
       case "read_secondmate_bearings":
+      case "provision_secondmate":
         throw new ToolSurfaceError(
           "INTERNAL",
           `${tool} must be invoked via invokeAsync`,
@@ -1228,6 +1282,20 @@ export class ToolSurface {
     return { taskId: next.id, cast };
   }
 
+  /**
+   * Production spawn path: holds the cross-process auth lock for grant resolution
+   * without busy-waiting the event loop.
+   */
+  private async spawnCrewmateAsync(raw: Record<string, unknown>): Promise<{
+    session: FleetSession;
+    task: TaskSnapshot;
+  }> {
+    if (this.deps.authBroker !== undefined) {
+      return this.deps.authBroker.withSpawnGrant(async () => this.spawnCrewmate(raw));
+    }
+    return this.spawnCrewmate(raw);
+  }
+
   private spawnCrewmate(raw: Record<string, unknown>): {
     session: FleetSession;
     task: TaskSnapshot;
@@ -1497,11 +1565,9 @@ export class ToolSurface {
           });
           return win.target;
         };
-        // Auth-store touch goes through the single PiAuthBroker choke point.
-        tmuxWindow =
-          this.deps.authBroker !== undefined
-            ? this.deps.authBroker.withSpawnGrantSync(runSpawn)
-            : runSpawn();
+        // Grant resolution goes through PiAuthBroker.withSpawnGrant on the
+        // async path (spawnCrewmateAsync). Sync path is tests without a broker.
+        tmuxWindow = runSpawn();
       }
 
       const now = new Date().toISOString();
@@ -1691,6 +1757,40 @@ export class ToolSurface {
       cleanRoom: true,
       vars: {},
     });
+  }
+
+  private async respawnCrewmateAsync(raw: Record<string, unknown>): Promise<unknown> {
+    const input = respawnCrewmateInputSchema.parse(raw);
+    const session = this.sessions.get(input.sessionId);
+    if (session === undefined || session.taskId === null) {
+      throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
+    }
+    this.stopCrewmate({ sessionId: input.sessionId, reason: input.reason });
+    return this.spawnCrewmateAsync({
+      taskId: session.taskId,
+      role: session.role,
+      model: session.model,
+      thinking: session.thinking,
+      cleanRoom: true,
+      vars: {},
+    });
+  }
+
+  /**
+   * Production fusion path: one cross-process spawn-grant window covers grant
+   * resolution for every side (no event-loop busy-wait).
+   */
+  private async dispatchFusionAsync(raw: Record<string, unknown>): Promise<{
+    runId: string;
+    promptsIdentical: boolean;
+    aggregatorFamily: string | null;
+    contractOk?: boolean;
+    spawned: boolean;
+  }> {
+    if (this.deps.authBroker !== undefined) {
+      return this.deps.authBroker.withSpawnGrant(async () => this.dispatchFusion(raw));
+    }
+    return this.dispatchFusion(raw);
   }
 
   /**
@@ -3234,11 +3334,51 @@ export class ToolSurface {
     return { ok: true };
   }
 
+  private provisionSecondmate(raw: Record<string, unknown>): {
+    secondmate: {
+      name: string;
+      home: string;
+      port: number;
+      domain: string;
+      brainModel: string | null;
+      createdAt: string;
+    };
+  } {
+    if (this.deps.secondmates === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
+    }
+    const name = typeof raw.name === "string" ? raw.name : "";
+    const domain = typeof raw.domain === "string" ? raw.domain : "";
+    if (name.length === 0 || domain.length === 0) {
+      throw new ToolSurfaceError("VALIDATION_ERROR", "name and domain are required");
+    }
+    const port = typeof raw.port === "number" ? raw.port : undefined;
+    const brainModel = typeof raw.brainModel === "string" ? raw.brainModel : undefined;
+    const maxConcurrentTasks =
+      typeof raw.maxConcurrentTasks === "number" ? raw.maxConcurrentTasks : undefined;
+    try {
+      const secondmate = this.deps.secondmates.registry.provision({
+        name,
+        domain,
+        ...(port !== undefined ? { port } : {}),
+        ...(brainModel !== undefined ? { brainModel } : {}),
+        ...(maxConcurrentTasks !== undefined ? { maxConcurrentTasks } : {}),
+      });
+      return { secondmate };
+    } catch (error) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        error instanceof Error ? error.message : "provision failed",
+      );
+    }
+  }
+
   /**
    * Hand a task to a secondmate. POST the task to the secondmate first; only
    * after acceptance is it released on the primary. A failed POST leaves the
    * task on the primary with a typed error — dropping work is worse than
    * refusing to route. Domain must match the target charter via routeFor.
+   * Capacity (maxConcurrentTasks) is enforced on the live secondmate.
    */
   private async routeToSecondmate(raw: Record<string, unknown>): Promise<{
     name: string;
@@ -3320,7 +3460,7 @@ export class ToolSurface {
       remoteTaskId = handed.remoteTaskId;
     } catch (error) {
       const message =
-        error instanceof SecondmateHandoverError
+        error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError
           ? error.message
           : error instanceof Error
             ? error.message
@@ -3336,7 +3476,12 @@ export class ToolSurface {
           remoteTaskId: null,
         },
       });
-      if (error instanceof SecondmateHandoverError) throw error;
+      if (
+        error instanceof SecondmateHandoverError ||
+        error instanceof SecondmateCapacityError
+      ) {
+        throw error;
+      }
       throw new SecondmateHandoverError(message);
     }
 

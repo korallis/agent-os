@@ -130,8 +130,10 @@ export class BrainManager {
    * Start or respawn the Brain. Blocked when config.respawnBlocked (BRAIN_DOWN fixture).
    * Always tears down any prior Brain pane/socket before spawning so respawn and
    * daemon-restart reclaim cannot leave an unauthorized live pane in BRAIN_DOWN.
+   *
+   * Async so spawn-grant lock acquisition never busy-waits on the event loop.
    */
-  start(reason = "boot"): BrainSnapshot {
+  async start(reason = "boot"): Promise<BrainSnapshot> {
     if (this.config.respawnBlocked) {
       this.teardownPriorBrain();
       this.enterDown(`respawn blocked (${reason})`);
@@ -236,7 +238,7 @@ export class BrainManager {
         };
         const tmuxWindow =
           this.deps.authBroker !== undefined
-            ? this.deps.authBroker.withSpawnGrantSync(runSpawn)
+            ? await this.deps.authBroker.withSpawnGrant(async () => runSpawn())
             : runSpawn();
         this.snapshot = { ...this.snapshot, tmuxWindow };
       } catch (error) {

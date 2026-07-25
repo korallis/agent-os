@@ -121,7 +121,7 @@ describe("cross-process auth broker", () => {
 });
 
 describe("PiAuthBroker choke point", () => {
-  it("withSpawnGrantSync acquires the cross-process lock", () => {
+  it("withSpawnGrant acquires the cross-process lock asynchronously", async () => {
     const dir = temp("agentos-p7-choke-");
     const piHome = join(dir, "pi");
     mkdirSync(join(piHome, "agent"), { recursive: true });
@@ -129,7 +129,7 @@ describe("PiAuthBroker choke point", () => {
     const peer = new CrossProcessAuthBroker(join(piHome, "agent"));
 
     let ran = false;
-    broker.withSpawnGrantSync(() => {
+    await broker.withSpawnGrant(async () => {
       ran = true;
       // While held, a peer process cannot acquire.
       expect(peer.tryAcquire("peer")).toBe(false);

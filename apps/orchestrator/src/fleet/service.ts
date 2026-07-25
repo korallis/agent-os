@@ -24,6 +24,7 @@ import { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
 import { SecondmateRegistry } from "./secondmates.js";
 import { SecondmateFleet } from "./secondmate-fleet.js";
+// SecondmateRegistry type used in provisionSecondmate return type
 import type { PromptService } from "../prompts/service.js";
 import { AfkService } from "./afk.js";
 import {
@@ -204,8 +205,8 @@ export class FleetService {
   }
 
   /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */
-  start(): void {
-    this.brain.start("daemon-boot");
+  async start(): Promise<void> {
+    await this.brain.start("daemon-boot");
     this.startReconcileTick();
   }
 
@@ -392,20 +393,42 @@ export class FleetService {
   }
 
   /**
-   * Start a provisioned secondmate as a live agentosd process.
-   * Token lives under primary runtime/; shared Pi home is the primary managed pi.
+   * Provision a secondmate through the fleet surface (REST / tools / CLI).
+   * Seeds charter + brain cast under the isolated home.
    */
-  startSecondmate(name: string): {
+  provisionSecondmate(input: {
+    name: string;
+    domain: string;
+    port?: number;
+    brainModel?: string;
+    maxConcurrentTasks?: number;
+  }): ReturnType<SecondmateRegistry["provision"]> {
+    return this.secondmates.provision(input);
+  }
+
+  /**
+   * Start a provisioned secondmate as a live agentosd process.
+   * Waits until the secondmate is healthy. Token lives under primary runtime/;
+   * shared Pi home is the primary managed pi. Charter brainModel is applied
+   * to the secondmate brain config before spawn.
+   */
+  async startSecondmate(name: string): Promise<{
     name: string;
     pid: number;
     port: number;
     tokenPath: string;
     startedAt: string;
-  } {
+  }> {
     const agentosdBin = this.options.agentosdBin;
     if (agentosdBin === undefined) {
       throw new Error("agentosd binary path not configured — cannot start secondmate");
     }
+    const record = this.secondmates.get(name);
+    if (record === null) {
+      throw new Error(`no secondmate named ${name}`);
+    }
+    const { charter } = this.secondmateFleet.readCharter(record);
+    this.secondmateFleet.applyCharterToBrainConfig(record, charter);
     const sharedPiHome =
       this.options.pi?.managedHome ??
       `${this.options.home}/pi`;
@@ -423,23 +446,52 @@ export class FleetService {
     });
   }
 
-  stopSecondmate(name: string): { stopped: boolean; name: string } {
+  async stopSecondmate(name: string): Promise<{ stopped: boolean; name: string }> {
     return this.secondmates.stop(name);
   }
 
-  stop(): void {
-    this.secondmates.stopAll();
+  /**
+   * Write + sync a secondmate charter. When the secondmate is running, pushes
+   * brain cast via its REST API and respawns its Brain so the live model moves.
+   */
+  async syncSecondmateCharter(
+    name: string,
+    charter: {
+      name: string;
+      domains: string[];
+      brainModel: string | null;
+      maxConcurrentTasks: number;
+      acceptsRouting: boolean;
+    },
+  ): Promise<{ charter: typeof charter; brainSynced: boolean; brainModel: string | null }> {
+    const record = this.secondmates.get(name);
+    if (record === null) {
+      throw new Error(`no secondmate named ${name}`);
+    }
+    return this.secondmateFleet.syncCharter(record, charter);
+  }
+
+  async stop(): Promise<void> {
+    await this.secondmates.stopAll();
     // leave tmux windows alive — they survive daemon restarts
     this.stopReconcileTick();
   }
 
-  reloadConfig(): void {
+  /**
+   * Re-read effective config into fleet subsystems. When `restartBrain` is
+   * true (brain domain writes / charter sync), respawn so resolveModel() takes
+   * effect on the live snapshot.
+   */
+  async reloadConfig(options: { restartBrain?: boolean } = {}): Promise<void> {
     const cfg = this.options.config.effective().config;
     this.worktrees.updateConfig(cfg.worktrees);
     this.watcher.updateConfig(cfg.supervision);
     this.gates.updateConfig(cfg.validation);
     this.brain.updateConfig(cfg.brain);
     this.startReconcileTick();
+    if (options.restartBrain === true) {
+      await this.brain.start("config-reload");
+    }
   }
 
   summary(): FleetSummary {
@@ -510,7 +562,7 @@ export class FleetService {
     if (snap.status !== "running" && snap.status !== "starting") return;
     if (snap.tmuxWindow === null) return;
     if (this.tmux.hasWindow(snap.tmuxWindow)) return;
-    this.brain.start("pane-died");
+    void this.brain.start("pane-died").catch(() => undefined);
   }
 
   private hydrateTasks(): void {

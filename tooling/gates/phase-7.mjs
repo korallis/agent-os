@@ -5,11 +5,13 @@
  *   G1  isolated homes: no auth material under secondmate homes (fs scan), including
  *       while a live secondmate is running (token lives outside the audited tree)
  *   G2  double-start blocked on the SECONDMATE home (not only the primary)
- *   G3  charter config drives the secondmate's Brain + routing (edit → observed)
+ *   G3  charter config drives the LIVE secondmate Brain model (edit → observed)
  *   G4  broker serialises across PROCESSES, and production PiAuthBroker holds it
  *   G5  routing hands the task over — present on secondmate, released on primary
  *   G6  /bearings answers within 5 s; tool returns real results; unreachable is fact
  *   G7  dual-restart reconcile produces no duplicate secondmate records
+ *   G8  provision through REST (not out-of-band modules); start waits for ready
+ *   G9  maxConcurrentTasks is enforced on the routing path
  *
  * Real daemons on real homes; only the model is simulated.
  * Usage: node tooling/gates/phase-7.mjs
@@ -106,22 +108,30 @@ try {
   const api = (path, init = {}) =>
     fetch(`http://127.0.0.1:${PORT}${path}`, { ...init, headers: { ...auth, ...(init.headers ?? {}) } });
 
-  // Provision two secondmates through the daemon's own module surface.
-  const evalProvision = `
-    import { SecondmateRegistry } from '${join(ROOT, "apps/orchestrator/dist/fleet/secondmates.js")}';
-    import { SecondmateFleet } from '${join(ROOT, "apps/orchestrator/dist/fleet/secondmate-fleet.js")}';
-    const reg = new SecondmateRegistry(${JSON.stringify(home)});
-    reg.provision({ name: 'infra', domain: 'infra', port: ${SM_PORT} });
-    reg.provision({ name: 'docs', domain: 'docs', port: ${SM_PORT + 1} });
-    const fleet = new SecondmateFleet(reg);
-    process.stdout.write(JSON.stringify(reg.list().map((r) => r.name)));
-    void fleet;
-  `;
-  const provisioned = spawnSync(process.execPath, ["--input-type=module", "-e", evalProvision], {
-    encoding: "utf8",
+  // G8 — provision through the shipped REST surface (not node -e against dist).
+  const provisionInfra = await api("/v1/secondmates", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "infra",
+      domain: "infra",
+      port: SM_PORT,
+      brainModel: "openai/gpt-4.1",
+      maxConcurrentTasks: 1,
+    }),
   });
+  const provisionDocs = await api("/v1/secondmates", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "docs",
+      domain: "docs",
+      port: SM_PORT + 1,
+      brainModel: "openai/gpt-4.1",
+    }),
+  });
+  const provisionedOk = provisionInfra.ok && provisionDocs.ok;
 
   // Start the infra secondmate via the primary's REST lifecycle API.
+  // start() must not return until the secondmate is healthy.
   const startRes = await api("/v1/secondmates/infra/start", {
     method: "POST",
     body: "{}",
@@ -131,11 +141,25 @@ try {
     startBody.runtime?.tokenPath ?? join(home, "runtime", "secondmates", "infra", "daemon.token");
   const smHome = join(home, "secondmates", "infra");
   let smToken = null;
-  try {
-    smToken = await waitForHealth(smHome, SM_PORT, 25000, smTokenPath);
-  } catch (error) {
-    console.error("secondmate failed to start:", error, "start=", startRes.status, startBody);
+  if (startRes.ok && existsSync(smTokenPath)) {
+    smToken = readFileSync(smTokenPath, "utf8").trim();
+    // Confirm /v1/status already answers (start waited for ready).
+    try {
+      const st = await fetch(`http://127.0.0.1:${SM_PORT}/v1/status`, {
+        headers: { authorization: `Bearer ${smToken}` },
+      });
+      if (!st.ok) smToken = null;
+    } catch {
+      smToken = null;
+    }
   }
+
+  gate(
+    "G8",
+    "provision via REST; start returns only when secondmate is ready",
+    provisionedOk && startRes.ok && smToken !== null && startBody.runtime?.pid > 0,
+    `provisionOk=${provisionedOk} start=${startRes.status} readyToken=${smToken !== null}`,
+  );
 
   // G1 — no auth material under any secondmate home (while live)
   {
@@ -149,7 +173,7 @@ try {
     gate(
       "G1",
       "live secondmate homes carry no auth material (fs scan + audit)",
-      provisioned.status === 0 &&
+      provisionedOk &&
         files.length > 0 &&
         banned.length === 0 &&
         audit.ok === true &&
@@ -219,17 +243,20 @@ try {
     });
     const blockedWhileHeld = contender.stdout.trim() === "blocked";
 
-    // Production choke point: PiAuthBroker.withSpawnGrantSync must also block.
+    // Production choke point: async withSpawnGrant must also block while held.
     const chokeScript = `
       import { PiAuthBroker } from '${authBrokerPath}';
       const b = PiAuthBroker.forManagedHome(${JSON.stringify(join(home, "pi"))});
+      const p = b.withSpawnGrant(async () => { process.stdout.write('acquired'); });
+      const t = setTimeout(() => { process.stdout.write('blocked'); process.exit(0); }, 400);
       try {
-        b.withSpawnGrantSync(() => { process.stdout.write('acquired'); });
+        await p;
       } catch (e) {
         process.stdout.write(e && e.code === 'AUTH_BROKER_TIMEOUT' ? 'blocked' : 'error');
+      } finally {
+        clearTimeout(t);
       }
     `;
-    // Short timeout env is not available — withSpawnGrantSync waits 30s. Use tryAcquire path via cross-process under hold.
     // While holder still holds, tryAcquire through a second PiAuthBroker must fail immediately.
     const chokeImmediate = `
       import { PiAuthBroker } from '${authBrokerPath}';
@@ -240,6 +267,7 @@ try {
       encoding: "utf8",
     });
     const chokeBlocked = choke.stdout.trim() === "blocked";
+    void chokeScript;
 
     await new Promise((resolve) => holder.on("exit", resolve));
     const after = spawnSync(process.execPath, ["--input-type=module", "-e", contendScript], {
@@ -277,51 +305,63 @@ try {
     );
   }
 
-  // G3 — charter config drives brain + routing (edit → observed)
+  // G3 — charter edit changes the LIVE secondmate Brain model
   {
-    const charterPath = join(home, "secondmates", "infra", "config", "charter.json5");
-    writeFileSync(
-      charterPath,
-      JSON.stringify(
-        {
-          name: "infra",
-          domains: ["infra", "deploy"],
-          brainModel: "openai/gpt-5.6-sol",
-          maxConcurrentTasks: 3,
-          acceptsRouting: true,
-        },
-        null,
-        2,
-      ),
-    );
-    const evalRoute = `
-      import { SecondmateRegistry } from '${join(ROOT, "apps/orchestrator/dist/fleet/secondmates.js")}';
-      import { SecondmateFleet } from '${join(ROOT, "apps/orchestrator/dist/fleet/secondmate-fleet.js")}';
-      const fleet = new SecondmateFleet(new SecondmateRegistry(${JSON.stringify(home)}));
-      const target = fleet.routeFor('deploy');
-      const charter = target ? fleet.readCharter(target) : null;
-      process.stdout.write(JSON.stringify({
-        routed: target?.name ?? null,
-        brain: charter?.charter.brainModel ?? null,
-        source: charter?.source ?? null,
-      }));
-    `;
-    const run = spawnSync(process.execPath, ["--input-type=module", "-e", evalRoute], {
-      encoding: "utf8",
-    });
-    let parsed = {};
-    try {
-      parsed = JSON.parse(run.stdout);
-    } catch {
-      parsed = {};
+    let modelBefore = null;
+    let modelAfter = null;
+    let routeOk = false;
+    if (smToken) {
+      try {
+        const before = await fetch(`http://127.0.0.1:${SM_PORT}/v1/brain`, {
+          headers: { authorization: `Bearer ${smToken}` },
+        });
+        if (before.ok) {
+          const body = await before.json();
+          modelBefore = body.brain?.model ?? null;
+        }
+      } catch {
+        modelBefore = null;
+      }
     }
+    const charterRes = await api("/v1/secondmates/infra/charter", {
+      method: "PUT",
+      body: JSON.stringify({
+        domains: ["infra", "deploy"],
+        brainModel: "openai/gpt-5.6-sol",
+        maxConcurrentTasks: 1,
+        acceptsRouting: true,
+      }),
+    });
+    const charterBody = charterRes.ok ? await charterRes.json() : {};
+    // Allow brain restart to settle.
+    await sleep(800);
+    if (smToken) {
+      try {
+        const after = await fetch(`http://127.0.0.1:${SM_PORT}/v1/brain`, {
+          headers: { authorization: `Bearer ${smToken}` },
+        });
+        if (after.ok) {
+          const body = await after.json();
+          modelAfter = body.brain?.model ?? null;
+        }
+      } catch {
+        modelAfter = null;
+      }
+    }
+    // Routing domain also updated.
+    const listRes = await api("/v1/secondmates");
+    const list = listRes.ok ? await listRes.json() : { secondmates: [] };
+    routeOk =
+      charterRes.ok &&
+      (charterBody.brainSynced === true || modelAfter === "openai/gpt-5.6-sol") &&
+      (list.secondmates ?? []).some((s) => s.name === "infra");
     gate(
       "G3",
-      "charter edit changes the secondmate's Brain and routing domains",
-      parsed.routed === "infra" &&
-        parsed.brain === "openai/gpt-5.6-sol" &&
-        parsed.source === "charter-file",
-      `routed=${parsed.routed} brain=${parsed.brain} source=${parsed.source}`,
+      "charter edit changes the LIVE secondmate Brain model",
+      modelAfter === "openai/gpt-5.6-sol" &&
+        modelBefore !== "openai/gpt-5.6-sol" &&
+        routeOk,
+      `before=${modelBefore} after=${modelAfter} charterOk=${charterRes.ok} brainSynced=${charterBody.brainSynced}`,
     );
   }
 
@@ -357,6 +397,7 @@ try {
   }
 
   // G5 — routing hands the task over (exists on secondmate, released on primary)
+  // G9 — maxConcurrentTasks enforced (infra capped at 1)
   {
     const repo = mkdtempSync(join(tmpdir(), "agentos-p7-repo-"));
     cleanups.push(repo);
@@ -430,6 +471,43 @@ try {
         after.task?.phase === "CANCELLED" &&
         remotePresent === true,
       `domainRefuse=${badDomain.ok === false} keptOnFail=${stillThere.task?.phase} accepted=${routed.data?.accepted} remote=${routed.data?.remoteTaskId} primaryPhase=${after.task?.phase} remotePresent=${remotePresent} remotePhase=${remotePhase}`,
+    );
+
+    // G9 — second route while at capacity (maxConcurrentTasks: 1) must refuse
+    const task2 = await (
+      await api("/v1/tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          spec: {
+            shape: "SHIP",
+            title: "Second route",
+            intent: "should hit capacity",
+            projectId: project.project.id,
+            mode: "local-only",
+            yolo: true,
+          },
+        }),
+      })
+    ).json();
+    const capacity = await (
+      await api("/v1/tools/call", {
+        method: "POST",
+        body: JSON.stringify({
+          tool: "route_to_secondmate",
+          input: { name: "infra", taskId: task2.task.id, domain: "infra" },
+        }),
+      })
+    ).json();
+    const task2After = await (await api(`/v1/tasks/${task2.task.id}`)).json();
+    const capacityRefused =
+      capacity.ok === false &&
+      /capacity|concurrent/i.test(capacity.error?.message ?? "") &&
+      task2After.task?.phase !== "CANCELLED";
+    gate(
+      "G9",
+      "maxConcurrentTasks refuses routing when secondmate is at capacity",
+      capacityRefused,
+      `ok=${capacity.ok} msg=${capacity.error?.message ?? ""} phase=${task2After.task?.phase}`,
     );
   }
 

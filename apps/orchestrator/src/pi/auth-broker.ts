@@ -3,24 +3,33 @@ import {
   AuthBrokerTimeoutError,
   CrossProcessAuthBroker,
 } from "./cross-process-broker.js";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-
-const SPAWN_LOCK_TIMEOUT_MS = 30_000;
-const SPAWN_LOCK_POLL_MS = 50;
-
-function sleepMs(ms: number): void {
-  const sab = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(sab), 0, 0, ms);
-}
 
 /**
  * Pi auth broker locks (master plan §4.5).
  *
- * Single choke point for every production path that touches the shared Pi auth
- * store: login/logout exclusive windows and spawn grants that resolve provider
- * credentials. In-process ordering (login queue / strict-serial) sits on top of
- * the cross-process lock so primaries and secondmates cannot race the store.
+ * Single choke point for every production path that touches Agent-OS-local grant
+ * resolution and login exclusive windows. In-process ordering (login queue /
+ * strict-serial) sits on top of the cross-process lock so primaries and
+ * secondmates cannot race grant resolution against each other.
+ *
+ * What is serialised:
+ *   - withSpawnGrant: reading/resolving provider grants for a spawn (Agent-OS-local)
+ *   - withLoginLock / holdLoginUntilAuthSettled: exclusive login windows so two
+ *     Agent OS processes do not interleave grant resolution with a live login
+ *
+ * What is not claimed: Pi's multi-minute interactive OAuth UI runs in a separate
+ * process after the attach command is minted. holdLoginUntilAuthSettled keeps
+ * the cross-process lock held until the shared auth store's mtime advances (or
+ * a bounded timeout), so concurrent spawn grants wait out that window. The lock
+ * cannot observe Pi's internal write atomicity — only Agent-OS-side mutual
+ * exclusion around the store directory.
  */
+
+/** Default hold for an interactive OAuth login window. */
+const LOGIN_HOLD_TIMEOUT_MS = 5 * 60_000;
+const LOGIN_HOLD_POLL_MS = 250;
 
 export class PiAuthBroker {
   private mode: PiAuthBrokerMode = "concurrent";
@@ -28,12 +37,15 @@ export class PiAuthBroker {
   private readonly queue: Array<() => void> = [];
   private serialChain: Promise<void> = Promise.resolve();
   private readonly crossProcess: CrossProcessAuthBroker;
+  private readonly authStoreDir: string;
+  private loginHoldInFlight: Promise<void> | null = null;
 
   /**
    * @param authStoreDir directory containing the shared Pi auth store
    *   (typically `<managedPiHome>/agent`). The cross-process lock lives beside it.
    */
   constructor(authStoreDir: string) {
+    this.authStoreDir = authStoreDir;
     this.crossProcess = new CrossProcessAuthBroker(authStoreDir);
   }
 
@@ -57,8 +69,9 @@ export class PiAuthBroker {
   }
 
   /**
-   * Run an exclusive login/logout flow. Concurrent login attempts queue, and
-   * the cross-process lock is held for the entire critical section.
+   * Run an exclusive login/logout critical section under the cross-process lock.
+   * Covers Agent-OS-local work in `fn` only — for interactive OAuth, prefer
+   * holdLoginUntilAuthSettled so the lock spans the credential write window.
    */
   async withLoginLock<T>(fn: () => Promise<T>): Promise<T> {
     return this.crossProcess.withAuthLock("login", async () => {
@@ -75,9 +88,56 @@ export class PiAuthBroker {
   }
 
   /**
+   * Hold the cross-process login lock until the shared auth store mtime advances
+   * past `baselineMtimeMs` (credential write observed) or `timeoutMs` elapses.
+   * Spawn grants wait while this hold is active. Fire-and-forget after minting
+   * an OAuth attach command so the HTTP handler can return immediately.
+   */
+  holdLoginUntilAuthSettled(options: {
+    baselineMtimeMs: number;
+    timeoutMs?: number;
+  }): Promise<void> {
+    const timeoutMs = options.timeoutMs ?? LOGIN_HOLD_TIMEOUT_MS;
+    const authJson = join(this.authStoreDir, "auth.json");
+    const run = this.crossProcess.withAuthLock(
+      "login",
+      async () => {
+        await this.acquireLogin();
+        try {
+          const deadline = Date.now() + timeoutMs;
+          while (Date.now() < deadline) {
+            if (authStoreAdvanced(authJson, options.baselineMtimeMs)) return;
+            await new Promise((r) => setTimeout(r, LOGIN_HOLD_POLL_MS));
+          }
+        } finally {
+          this.releaseLogin();
+        }
+      },
+      timeoutMs + 5_000,
+    );
+    this.loginHoldInFlight = run.finally(() => {
+      if (this.loginHoldInFlight === run) this.loginHoldInFlight = null;
+    });
+    return this.loginHoldInFlight;
+  }
+
+  /** Current auth.json mtime, or 0 when missing — used as OAuth baseline. */
+  authStoreMtimeMs(): number {
+    const authJson = join(this.authStoreDir, "auth.json");
+    try {
+      if (!existsSync(authJson)) return 0;
+      return statSync(authJson).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * Steady-state spawn grant. Always takes the cross-process auth lock so a
    * concurrent login/refresh on another process cannot rewrite the store while
    * we resolve a grant. Intra-process: concurrent unless strict-serial / login held.
+   *
+   * Async only — never busy-wait on the daemon event loop.
    */
   async withSpawnGrant<T>(fn: () => Promise<T>): Promise<T> {
     return this.crossProcess.withAuthLock("spawn-grant", async () => {
@@ -94,30 +154,6 @@ export class PiAuthBroker {
       }
       return fn();
     });
-  }
-
-  /**
-   * Synchronous spawn-grant lock for the substrate's sync spawn path.
-   * Same cross-process choke point as withSpawnGrant — call sites must not
-   * touch the auth store without going through this class.
-   */
-  withSpawnGrantSync<T>(fn: () => T): T {
-    const deadline = Date.now() + SPAWN_LOCK_TIMEOUT_MS;
-    for (;;) {
-      if (this.crossProcess.tryAcquire("spawn-grant")) break;
-      if (Date.now() >= deadline) {
-        throw new AuthBrokerTimeoutError(
-          `timed out waiting ${SPAWN_LOCK_TIMEOUT_MS}ms for the Pi auth lock`,
-          this.crossProcess.holder(),
-        );
-      }
-      sleepMs(SPAWN_LOCK_POLL_MS);
-    }
-    try {
-      return fn();
-    } finally {
-      this.crossProcess.release();
-    }
   }
 
   private acquireLogin(): Promise<void> {
@@ -153,3 +189,14 @@ export class PiAuthBroker {
     return run;
   }
 }
+
+function authStoreAdvanced(authJson: string, baselineMtimeMs: number): boolean {
+  try {
+    if (!existsSync(authJson)) return false;
+    return statSync(authJson).mtimeMs > baselineMtimeMs;
+  } catch {
+    return false;
+  }
+}
+
+export { AuthBrokerTimeoutError };

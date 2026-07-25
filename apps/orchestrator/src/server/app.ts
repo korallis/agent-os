@@ -511,6 +511,88 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     return deps.fleet.secondmates.auditNoAuthMaterial();
   });
 
+  /** Provision a secondmate through the shipped API surface (not out-of-band). */
+  app.post("/v1/secondmates", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const body = request.body as {
+      name?: unknown;
+      domain?: unknown;
+      port?: unknown;
+      brainModel?: unknown;
+      maxConcurrentTasks?: unknown;
+    } | null;
+    const name = typeof body?.name === "string" ? body.name : "";
+    const domain = typeof body?.domain === "string" ? body.domain : "";
+    if (name.length === 0 || domain.length === 0) {
+      sendError(reply, 400, "BAD_REQUEST", "name and domain are required");
+      return;
+    }
+    try {
+      const secondmate = deps.fleet.provisionSecondmate({
+        name,
+        domain,
+        ...(typeof body?.port === "number" ? { port: body.port } : {}),
+        ...(typeof body?.brainModel === "string" ? { brainModel: body.brainModel } : {}),
+        ...(typeof body?.maxConcurrentTasks === "number"
+          ? { maxConcurrentTasks: body.maxConcurrentTasks }
+          : {}),
+      });
+      return { secondmate };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "provision failed";
+      sendError(reply, 400, "BAD_REQUEST", message);
+    }
+  });
+
+  app.put<{ Params: { name: string } }>(
+    "/v1/secondmates/:name/charter",
+    async (request, reply) => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return;
+      }
+      const body = request.body as {
+        domains?: unknown;
+        brainModel?: unknown;
+        maxConcurrentTasks?: unknown;
+        acceptsRouting?: unknown;
+      } | null;
+      const domains = Array.isArray(body?.domains)
+        ? body.domains.filter((d): d is string => typeof d === "string")
+        : null;
+      if (domains === null || domains.length === 0) {
+        sendError(reply, 400, "BAD_REQUEST", "domains array is required");
+        return;
+      }
+      const brainModel =
+        body?.brainModel === null
+          ? null
+          : typeof body?.brainModel === "string"
+            ? body.brainModel
+            : null;
+      const maxConcurrentTasks =
+        typeof body?.maxConcurrentTasks === "number" ? body.maxConcurrentTasks : 2;
+      const acceptsRouting =
+        typeof body?.acceptsRouting === "boolean" ? body.acceptsRouting : true;
+      try {
+        const result = await deps.fleet.syncSecondmateCharter(request.params.name, {
+          name: request.params.name,
+          domains,
+          brainModel,
+          maxConcurrentTasks,
+          acceptsRouting,
+        });
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "charter sync failed";
+        sendError(reply, 400, "BAD_REQUEST", message);
+      }
+    },
+  );
+
   app.post<{ Params: { name: string } }>(
     "/v1/secondmates/:name/start",
     async (request, reply) => {
@@ -519,7 +601,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         return;
       }
       try {
-        const runtime = deps.fleet.startSecondmate(request.params.name);
+        const runtime = await deps.fleet.startSecondmate(request.params.name);
         return { runtime };
       } catch (error) {
         const message = error instanceof Error ? error.message : "start failed";
@@ -536,7 +618,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         return;
       }
       try {
-        return deps.fleet.stopSecondmate(request.params.name);
+        return await deps.fleet.stopSecondmate(request.params.name);
       } catch (error) {
         const message = error instanceof Error ? error.message : "stop failed";
         sendError(reply, 400, "BAD_REQUEST", message);
@@ -751,7 +833,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
       return;
     }
-    const brain = deps.fleet.brain.start("api");
+    const brain = await deps.fleet.brain.start("api");
     return { brain };
   });
 
@@ -787,35 +869,37 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 400, "BAD_REQUEST", "invalid oauth start body");
       return;
     }
-    const run = async () => {
-      const connection = deps.connections!.upsertConnection({
-        provider: body.data.provider,
-        kind: "pi-oauth",
-        billingMode: body.data.billingMode ?? null,
-      });
-      // Visible tmux login is driven by the host; we record the attach contract.
-      // Inject PI_CONFIG_DIR (managed isolation) so login lands in the same store spawns use.
-      const session = "agentos";
-      const window = `login-${body.data.provider}`;
-      const attachCommand = buildOAuthAttachCommand({
-        session,
-        window,
-        provider: body.data.provider,
-        pi: deps.pi,
-        home: deps.home,
-      });
-      return {
-        connectionId: connection.id,
-        tmuxSession: session,
-        tmuxWindow: window,
-        attachCommand,
-      };
-    };
-    // Login flows serialise on the cross-process auth lock (single choke point).
+    const connection = deps.connections.upsertConnection({
+      provider: body.data.provider,
+      kind: "pi-oauth",
+      billingMode: body.data.billingMode ?? null,
+    });
+    // Visible tmux login is driven by the host; we record the attach contract.
+    // Inject PI_CONFIG_DIR (managed isolation) so login lands in the same store spawns use.
+    const session = "agentos";
+    const window = `login-${body.data.provider}`;
+    const attachCommand = buildOAuthAttachCommand({
+      session,
+      window,
+      provider: body.data.provider,
+      pi: deps.pi,
+      home: deps.home,
+    });
+    // Hold the cross-process login lock until the shared auth store mtime
+    // advances (credential write observed) or the hold times out. Spawn grants
+    // wait out this window. The HTTP response returns immediately so the
+    // Captain can run the attach command; Agent-OS-local mutual exclusion —
+    // not Pi's internal write atomicity — is what this serialises.
     if (deps.authBroker !== undefined) {
-      return deps.authBroker.withLoginLock(run);
+      const baseline = deps.authBroker.authStoreMtimeMs();
+      void deps.authBroker.holdLoginUntilAuthSettled({ baselineMtimeMs: baseline });
     }
-    return run();
+    return {
+      connectionId: connection.id,
+      tmuxSession: session,
+      tmuxWindow: window,
+      attachCommand,
+    };
   });
 
   app.post("/v1/connections/api-key", async (request, reply) => {
@@ -1308,6 +1392,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
           type: "policy.changed",
           payload: { domain: "policies", layer: "global", safetyOverride },
         });
+      }
+      // Push effective config into fleet; brain domain writes respawn the Brain
+      // so cast changes (including charter-driven secondmate models) are live.
+      if (deps.fleet !== undefined) {
+        void deps.fleet
+          .reloadConfig({ restartBrain: domain === "brain" })
+          .catch(() => undefined);
       }
       return { applied: true as const, domain, layer, contentHash };
     } catch (error) {

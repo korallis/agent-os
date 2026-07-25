@@ -219,6 +219,15 @@ export const readSecondmateBearingsInputSchema = z.strictObject({
 });
 export type ReadSecondmateBearingsInput = z.infer<typeof readSecondmateBearingsInputSchema>;
 
+export const provisionSecondmateInputSchema = z.strictObject({
+  name: z.string().min(1).max(64),
+  domain: z.string().min(1).max(64),
+  port: z.number().int().min(1024).max(65535).optional(),
+  brainModel: z.string().min(3).optional(),
+  maxConcurrentTasks: z.number().int().min(1).max(32).optional(),
+});
+export type ProvisionSecondmateInput = z.infer<typeof provisionSecondmateInputSchema>;
+
 export const stowKnowledgeInputSchema = z.strictObject({
   projectId: ulidSchema,
   notes: z.string().min(1).max(50_000),
@@ -284,6 +293,7 @@ export const brainToolNameSchema = z.enum([
   "notify_captain",
   "route_to_secondmate",
   "read_secondmate_bearings",
+  "provision_secondmate",
   "stow_knowledge",
   "read_policy",
   "advance_phase",

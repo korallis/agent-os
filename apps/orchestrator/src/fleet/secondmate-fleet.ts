@@ -33,6 +33,8 @@ export type SecondmateEventSink = (event: OrchestratorEvent) => void;
 const BEARINGS_TIMEOUT_MS = 5_000;
 /** How long a task handover POST waits before failing closed (task stays on primary). */
 const HANDOVER_TIMEOUT_MS = 10_000;
+/** How long charter→brain sync remote calls wait. */
+const SYNC_TIMEOUT_MS = 10_000;
 
 export class SecondmateHandoverError extends Error {
   readonly code = "SECONDMATE_HANDOVER_FAILED" as const;
@@ -43,6 +45,18 @@ export class SecondmateHandoverError extends Error {
   ) {
     super(message);
     this.name = "SecondmateHandoverError";
+  }
+}
+
+export class SecondmateCapacityError extends Error {
+  readonly code = "SECONDMATE_AT_CAPACITY" as const;
+
+  constructor(
+    message: string,
+    readonly details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "SecondmateCapacityError";
   }
 }
 
@@ -75,27 +89,30 @@ export class SecondmateFleet {
     const baseUrl = `http://127.0.0.1:${input.record.port}`;
     const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
+    await this.assertAdmissionCapacity(input.record, baseUrl, auth);
+
     const remoteProjectId = await this.ensureRemoteProject(baseUrl, auth, input.project);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), HANDOVER_TIMEOUT_MS);
     try {
-      const response = await fetch(`${baseUrl}/v1/tasks`, {
-        method: "POST",
-        headers: auth,
-        signal: controller.signal,
-        body: JSON.stringify({
-          spec: {
-            shape: input.task.shape,
-            title: input.task.title,
-            intent: input.task.intent,
-            projectId: remoteProjectId,
-            mode: input.task.mode,
-            ...(input.task.shape === "SHIP" ? { yolo: input.task.yolo } : {}),
-          },
-          idempotencyKey: `routed-from-primary:${input.task.id}`,
-        }),
-      });
+      const response = await fetchWithTimeout(
+        `${baseUrl}/v1/tasks`,
+        {
+          method: "POST",
+          headers: auth,
+          body: JSON.stringify({
+            spec: {
+              shape: input.task.shape,
+              title: input.task.title,
+              intent: input.task.intent,
+              projectId: remoteProjectId,
+              mode: input.task.mode,
+              ...(input.task.shape === "SHIP" ? { yolo: input.task.yolo } : {}),
+            },
+            idempotencyKey: `routed-from-primary:${input.task.id}`,
+          }),
+        },
+        HANDOVER_TIMEOUT_MS,
+      );
       if (!response.ok) {
         const text = await response.text().catch(() => "");
         throw new SecondmateHandoverError(
@@ -113,12 +130,58 @@ export class SecondmateFleet {
       return { remoteTaskId };
     } catch (error) {
       if (error instanceof SecondmateHandoverError) throw error;
+      if (error instanceof SecondmateCapacityError) throw error;
       throw new SecondmateHandoverError(
         error instanceof Error ? error.message : "handover failed",
         { domain: input.domain },
       );
-    } finally {
-      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Refuse routing when the secondmate is already at charter.maxConcurrentTasks.
+   * Counts active + queued from the live fleet summary (fail closed on probe fail).
+   */
+  private async assertAdmissionCapacity(
+    record: SecondmateRecord,
+    baseUrl: string,
+    auth: Record<string, string>,
+  ): Promise<void> {
+    const { charter } = this.readCharter(record);
+    const cap = charter.maxConcurrentTasks;
+    try {
+      const response = await fetchWithTimeout(
+        `${baseUrl}/v1/fleet`,
+        { headers: auth },
+        HANDOVER_TIMEOUT_MS,
+      );
+      if (!response.ok) {
+        throw new SecondmateHandoverError(
+          `secondmate ${record.name} fleet probe failed (HTTP ${response.status}) — cannot admit`,
+          { status: response.status },
+        );
+      }
+      const body = (await response.json()) as {
+        summary?: { active?: number; queued?: number };
+      };
+      const active = body.summary?.active ?? 0;
+      const queued = body.summary?.queued ?? 0;
+      const load = active + queued;
+      if (load >= cap) {
+        throw new SecondmateCapacityError(
+          `secondmate ${record.name} is at capacity (${load}/${cap} concurrent tasks)`,
+          { load, cap, active, queued },
+        );
+      }
+    } catch (error) {
+      if (error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError) {
+        throw error;
+      }
+      throw new SecondmateHandoverError(
+        error instanceof Error
+          ? error.message
+          : `secondmate ${record.name} capacity probe failed`,
+      );
     }
   }
 
@@ -127,7 +190,11 @@ export class SecondmateFleet {
     auth: Record<string, string>,
     project: { name: string; path: string; mode: ProjectMode; trusted: boolean; yolo: boolean },
   ): Promise<string> {
-    const listRes = await fetch(`${baseUrl}/v1/projects`, { headers: auth });
+    const listRes = await fetchWithTimeout(
+      `${baseUrl}/v1/projects`,
+      { headers: auth },
+      HANDOVER_TIMEOUT_MS,
+    );
     if (listRes.ok) {
       const listBody = (await listRes.json()) as {
         projects?: Array<{ id: string; path: string }>;
@@ -135,17 +202,21 @@ export class SecondmateFleet {
       const match = (listBody.projects ?? []).find((p) => p.path === project.path);
       if (match !== undefined) return match.id;
     }
-    const createRes = await fetch(`${baseUrl}/v1/projects`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        name: project.name,
-        path: project.path,
-        mode: project.mode,
-        trusted: project.trusted,
-        yolo: project.yolo,
-      }),
-    });
+    const createRes = await fetchWithTimeout(
+      `${baseUrl}/v1/projects`,
+      {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({
+          name: project.name,
+          path: project.path,
+          mode: project.mode,
+          trusted: project.trusted,
+          yolo: project.yolo,
+        }),
+      },
+      HANDOVER_TIMEOUT_MS,
+    );
     if (!createRes.ok) {
       const text = await createRes.text().catch(() => "");
       throw new SecondmateHandoverError(
@@ -163,6 +234,22 @@ export class SecondmateFleet {
 
   private charterPath(record: SecondmateRecord): string {
     return join(record.home, "config", "charter.json5");
+  }
+
+  private brainConfigPath(record: SecondmateRecord): string {
+    return join(record.home, "config", "brain.json5");
+  }
+
+  /**
+   * Write the charter's brainModel into the secondmate home's brain config so
+   * BrainManager.resolveModel() uses it on the next start/reload.
+   */
+  applyCharterToBrainConfig(record: SecondmateRecord, charter: SecondmateCharter): void {
+    const dir = join(record.home, "config");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const cast = charter.brainModel ?? "auto";
+    const body = `// brain.json5 — driven by secondmate charter (master plan §5.9)\n{\n  cast: ${JSON.stringify(cast)},\n}\n`;
+    writeFileSync(this.brainConfigPath(record), body, { mode: 0o600 });
   }
 
   /**
@@ -211,6 +298,11 @@ export class SecondmateFleet {
       `// charter.json5 — secondmate ${record.name} (master plan §5.9)\n${JSON.stringify(validated, null, 2)}\n`,
       { mode: 0o600 },
     );
+    this.applyCharterToBrainConfig(record, validated);
+    this.registry.updateRecord(record.name, {
+      brainModel: validated.brainModel,
+      domain: validated.domains[0] ?? record.domain,
+    });
     this.sink({
       type: "secondmate.charter_changed",
       payload: {
@@ -219,6 +311,71 @@ export class SecondmateFleet {
         domains: validated.domains,
       },
     });
+  }
+
+  /**
+   * Write charter + brain config, then if the secondmate is running push the
+   * brain cast via its REST config API and respawn its Brain so the live model
+   * matches the charter.
+   */
+  async syncCharter(
+    record: SecondmateRecord,
+    charter: SecondmateCharter,
+  ): Promise<{ charter: SecondmateCharter; brainSynced: boolean; brainModel: string | null }> {
+    this.writeCharter(record, charter);
+    const validated = secondmateCharterSchema.parse(charter);
+    const token = this.registry.readRuntimeToken(record.name);
+    const runtime = this.registry.readRuntime(record.name);
+    if (token === null || runtime === null) {
+      return { charter: validated, brainSynced: false, brainModel: validated.brainModel };
+    }
+    const baseUrl = `http://127.0.0.1:${record.port}`;
+    const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    const cast = validated.brainModel ?? "auto";
+    // Strict JSON so Fastify's application/json parser accepts the body.
+    const brainBody = JSON.stringify({ cast });
+    try {
+      const put = await fetchWithTimeout(
+        `${baseUrl}/v1/config/global/brain`,
+        {
+          method: "PUT",
+          headers: auth,
+          body: brainBody,
+        },
+        SYNC_TIMEOUT_MS,
+      );
+      if (!put.ok) {
+        throw new Error(`config write HTTP ${put.status}`);
+      }
+      const start = await fetchWithTimeout(
+        `${baseUrl}/v1/brain/start`,
+        { method: "POST", headers: auth, body: "{}" },
+        SYNC_TIMEOUT_MS,
+      );
+      if (!start.ok) {
+        throw new Error(`brain start HTTP ${start.status}`);
+      }
+      const brainRes = await fetchWithTimeout(
+        `${baseUrl}/v1/brain`,
+        { headers: auth },
+        SYNC_TIMEOUT_MS,
+      );
+      if (brainRes.ok) {
+        const body = (await brainRes.json()) as { brain?: { model?: string | null } };
+        return {
+          charter: validated,
+          brainSynced: true,
+          brainModel: body.brain?.model ?? validated.brainModel,
+        };
+      }
+      return { charter: validated, brainSynced: true, brainModel: validated.brainModel };
+    } catch (error) {
+      throw new SecondmateHandoverError(
+        error instanceof Error
+          ? `charter brain sync failed: ${error.message}`
+          : "charter brain sync failed",
+      );
+    }
   }
 
   /**
@@ -267,13 +424,12 @@ export class SecondmateFleet {
         brainStatus: null,
       };
     }
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), BEARINGS_TIMEOUT_MS);
     try {
-      const response = await fetch(`http://127.0.0.1:${record.port}/v1/fleet`, {
-        headers: { authorization: `Bearer ${token}` },
-        signal: controller.signal,
-      });
+      const response = await fetchWithTimeout(
+        `http://127.0.0.1:${record.port}/v1/fleet`,
+        { headers: { authorization: `Bearer ${token}` } },
+        BEARINGS_TIMEOUT_MS,
+      );
       if (!response.ok) {
         return {
           ...base,
@@ -304,8 +460,6 @@ export class SecondmateFleet {
         queued: null,
         brainStatus: null,
       };
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -315,5 +469,27 @@ export class SecondmateFleet {
    */
   private readToken(record: SecondmateRecord): string | null {
     return this.registry.readRuntimeToken(record.name);
+  }
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new SecondmateHandoverError(`remote call timed out after ${timeoutMs}ms`, {
+        url,
+        timeoutMs,
+      });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }

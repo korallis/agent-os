@@ -333,7 +333,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
 
     // Start Brain after listen so REST is available during reconcile.
     try {
-      fleet.start();
+      await fleet.start();
     } catch (error) {
       logger.warn({ err: error }, "brain start failed — entering degraded mode");
       fleet.brain.enterDown(error instanceof Error ? error.message : "brain start failed");
@@ -375,7 +375,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         if (closed) return;
         closed = true;
         try {
-          runningFleet.stop();
+          await runningFleet.stop();
           quotaScheduler.stop();
           runningStore.append({
             type: "daemon.stopping",
