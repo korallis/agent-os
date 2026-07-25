@@ -151,8 +151,11 @@ export interface ToolCallResult {
 /**
  * Durable secondmate handover intent/acceptance under runs/<taskId>/handover.json.
  *
- * Invariant: from the moment remote acceptance is possible until the primary is
- * durably terminal, a periodic pass must always have a durable record to act on.
+ * Invariant: from the moment remote acceptance becomes possible until the primary
+ * is durably terminal, exactly one durable record claims the task, it is
+ * crash-safe (tmp+rename), and only a definite outcome may clear it. While any
+ * record exists, retargeting to a different secondmate is refused — pending
+ * claims as firmly as accepted (the remote may already own the work).
  * - pending: written before the remote POST; kept on ambiguous POST failure
  *   (timeout/network/200-without-id) so reconcile can re-drive with the remote
  *   idempotency key; cleared only on definite refusal (clean 4xx / capacity).
@@ -3316,8 +3319,10 @@ export class ToolSurface {
 
       const runDir = join(this.deps.home, "runs", task.id);
       mkdirSync(runDir, { recursive: true, mode: 0o700 });
+      const deliveryTarget = join(runDir, "delivery.json");
+      const deliveryTmp = `${deliveryTarget}.${process.pid}.tmp`;
       writeFileSync(
-        join(runDir, "delivery.json"),
+        deliveryTmp,
         JSON.stringify(
           {
             mode: task.mode,
@@ -3330,6 +3335,7 @@ export class ToolSurface {
         ) + "\n",
         { mode: 0o600 },
       );
+      renameSync(deliveryTmp, deliveryTarget);
 
       // DONE is only written here; clear the stamp only after the invariant holds.
       // Sessions and leases are already halted/released — transition will no-op those steps.
@@ -3620,15 +3626,16 @@ export class ToolSurface {
     }
     const task = this.requireTask(input.taskId);
     const prior = this.readHandoverRecord(task.id);
-    if (prior !== null && prior.status === "accepted" && prior.remoteTaskId !== null) {
+    if (prior !== null) {
       if (prior.secondmateName !== input.name) {
         throw new ToolSurfaceError(
           "CONFLICT",
-          `task ${task.id} already handed to secondmate ${prior.secondmateName}`,
+          `task ${task.id} already has in-flight handover to secondmate ${prior.secondmateName}`,
         );
       }
-      // Includes already-terminal primary: remote accept is final; never false-fail.
-      return this.finalizeAcceptedHandover(prior);
+      if (prior.status === "accepted" && prior.remoteTaskId !== null) {
+        return this.finalizeAcceptedHandover(prior);
+      }
     }
     if (isTerminalPhase(task.phase)) {
       throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
@@ -4121,9 +4128,10 @@ export class ToolSurface {
   private persistTask(task: TaskSnapshot): void {
     const dir = join(this.deps.home, "runs", task.id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(dir, "task.json"), `${JSON.stringify(task, null, 2)}\n`, {
-      mode: 0o600,
-    });
+    const target = join(dir, "task.json");
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(task, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, target);
   }
 
   /** Record a session status reported by its extension (running → settled). */

@@ -1081,6 +1081,83 @@ describe("handover crash recovery and post-accept finalization", () => {
     service.secondmateFleet.handoverTask = original;
   });
 
+  it("refuses retarget while pending handover claims the task", async () => {
+    const home = temp("agentos-p7-handover-retarget-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await service.start();
+    service.provisionSecondmate({ name: "infra", domain: "infra" });
+    service.provisionSecondmate({ name: "docs", domain: "docs" });
+    const project = service.projects.register({
+      name: "retarget",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const created = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "pending retarget",
+        intent: "must not retarget",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const taskId = (created.data as { id: string }).id;
+    const handoverPath = join(home, "runs", taskId, "handover.json");
+
+    const original = service.secondmateFleet.handoverTask.bind(service.secondmateFleet);
+    service.secondmateFleet.handoverTask = async () => {
+      throw new SecondmateHandoverError("simulated timeout after possible accept", undefined, false);
+    };
+    const ambiguous = await service.tools.invokeAsync("route_to_secondmate", {
+      name: "infra",
+      taskId,
+      domain: "infra",
+    });
+    expect(ambiguous.ok).toBe(false);
+    expect(existsSync(handoverPath)).toBe(true);
+    const pendingBefore = JSON.parse(readFileSync(handoverPath, "utf8")) as {
+      secondmateName: string;
+      status: string;
+    };
+    expect(pendingBefore.secondmateName).toBe("infra");
+    expect(pendingBefore.status).toBe("pending");
+
+    let retargetCalled = false;
+    service.secondmateFleet.handoverTask = async () => {
+      retargetCalled = true;
+      return { remoteTaskId: "01ARZ3NDEKTSV4RRFFQ69G5FHC" };
+    };
+    const retarget = await service.tools.invokeAsync("route_to_secondmate", {
+      name: "docs",
+      taskId,
+      domain: "docs",
+    });
+    expect(retarget.ok).toBe(false);
+    expect(retarget.error?.code).toBe("CONFLICT");
+    expect(String(retarget.error?.message ?? "")).toContain("infra");
+    expect(retargetCalled).toBe(false);
+    const pendingAfter = JSON.parse(readFileSync(handoverPath, "utf8")) as {
+      secondmateName: string;
+      status: string;
+    };
+    expect(pendingAfter.secondmateName).toBe("infra");
+    expect(pendingAfter.status).toBe("pending");
+
+    service.secondmateFleet.handoverTask = original;
+  });
+
   it("reconcile tick re-drives pending handovers (not boot-only)", async () => {
     const home = temp("agentos-p7-handover-tick-");
     mkdirSync(join(home, "config"), { recursive: true });
