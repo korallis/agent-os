@@ -112,7 +112,7 @@ v1 is shipped when all of the following are true (each restated as an executable
 | Model I/O | **All model calls go through Pi**; no AI SDK dependency | **[R2]**. |
 | HTTP server | **Fastify 5.x**; PTY WebSocket via `ws` on the same HTTP server's upgrade path (loopback + exact-origin) | **[CONSENSUS]** + **[Phase 6 as-built]** |
 | Semantic events transport | **SSE** (ULID ids, `Last-Event-ID` replay); **WebSocket only for the terminal attach channel** | [B]. |
-| Daemon ⇄ worker channel | **Per-session Unix domain sockets**, zod-validated NDJSON frames; the Brain's tool surface rides the same channel | **[R2]+[R3]**. |
+| Daemon ⇄ worker channel | **Per-session Unix domain sockets**, NDJSON frames zod-validated **both ways** at runtime (`PROTOCOL_VERSION` `1.3.0`); the Brain's tool surface rides the same channel | **[R2]+[R3]+[Phase 13]**. |
 | Console↔daemon auth | **Next Route Handlers as loopback BFF**; PTY via single-use **30 s** tickets (minted over REST; spent on WS upgrade) | [B]; TTL tightened as-built. |
 | Schema/validation | **zod 4.x** in `packages/protocol` — REST, SSE, socket frames, tool surface, **config schemas** | **[CONSENSUS]**; tool + config schemas added [R3]. |
 | State | **SQLite (WAL) via `better-sqlite3`** projection + **append-only NDJSON event logs** as truth | **[CONSENSUS]** |
@@ -575,7 +575,9 @@ Unchanged from Rev 2: `PiSpawnSpec` (only `pi-manager` builds Pi command lines),
 
 ### 4.8 Env hygiene at spawn
 
-Unchanged from Rev 2: allowlist-built env, ≤1 provider key matching the cast, `assertSingleProviderKey`, `shell: false`, absolute `pi` path recorded, redacted env manifest, cwd path-jail. Gates: spawned Pi sees only intended credentials; auth.json priority observed via telemetry (`BILLING_MISMATCH` on mismatch). **[CONSENSUS + R2]**
+Allowlist-built env (never a `process.env` spread), ≤1 provider key matching the cast, `assertSingleProviderKey`, `shell: false`, absolute `pi` path recorded, redacted env manifest, cwd path-jail. Spawned Pi sees only intended credentials; auth.json priority observed via telemetry (`BILLING_MISMATCH` on mismatch). **[CONSENSUS + R2]**
+
+**SSH agent is opt-in, never ambient, never for gates [Phase 13].** `SSH_AUTH_SOCK` is **not** in the base allowlist. Forwarding it hands the holder the Captain's forwarded keys (`git push`, `ssh` to trusted hosts, commit signing as them). `scrubEnv` grants it only when `grantSshAgent: true` is set on that spawn; `extraAllow` cannot re-inject it behind the flag. `buildGateEnv` never sets the grant — Brain-authored gate subprocesses are untrusted code and must not inherit the Captain's agent. Tests: `apps/orchestrator/test/phase13-env-hygiene.test.ts`.
 
 ### 4.9 Quota & Balance Probes — live plan-remaining and API-balance metering **[R5 — expanded from Rev 2's telemetry-first metering]**
 
@@ -1058,7 +1060,7 @@ Rev-2 table retained; [R3] additions:
 | GET/PUT | `/v1/config/:layer/:domain` | JSON5 body → validated write | **[R3]** layer ∈ {global, project, task}; typed path-precise validation errors; safety-policy (`policies`) writes require `x-agentos-confirm-safety: true` (else **428** `CONFIRMATION_REQUIRED`) and emit `policy.changed` |
 | GET | `/v1/prompts` | → `{ templates: PromptTemplateInfo[] }` | **[Phase 4]** layered pack list (ref, layer, contentHash, customized, upstreamChanged) |
 | GET | `/v1/prompts/diff?ref=` | → three-way diff data | **[Phase 4]** `shippedAtInstall` is the install-time **hash** (text not retained); `shippedNow` / `yours` are full text |
-| GET | `/v1/tasks/:id/fusion` · GET `/v1/tasks/:id/fusion/:runId` | → run list / detail (sides, artifacts, spans, `promptsIdentical`, `aggregatorFamily`) | **[Phase 4]** durable fusion run records under `runs/<taskId>/fusion/` |
+| GET | `/v1/tasks/:id/fusion` · GET `/v1/tasks/:id/fusion/:runId` | → run list / detail (sides, artifacts, spans, `promptsIdentical`, `aggregatorFamily`) | **[Phase 4]** durable fusion run records under `runs/<taskId>/fusion/`. **[Phase 13]** `:id`/`:runId` ULID-validated; every `side.artifactPath` read is containment-checked against `AGENTOS_HOME` (run.json is crewmate-writable — absolute uncontained reads were an arbitrary file-read vector) |
 | POST | `/v1/config/project-trust` | `{ projectId, ackHash }` | **[R3]** acknowledges `.agentos/` overrides |
 | GET | `/v1/brain/status` · POST `/v1/brain/restart` | Brain process health / respawn | **[R3]** |
 | GET/POST | `/v1/brain/history` · `/v1/brain/message` | Brain chat (streamed) | renamed from `liaison` [R3] |
@@ -1073,7 +1075,7 @@ Rev-2 table retained; [R3] additions:
 | GET | `/v1/runs/history` | → `{ runs: RunHistoryRow[] }` | **[Phase 6]** daemon-side per-task gate/fusion aggregates; `gateFailures` (FAIL) ≠ `gateErrors` (GATE_ERROR) |
 | GET | `/v1/fleet/wakes` (alias `/v1/wakes`) | → `{ wakes: WakeDigest[] }` | **[Phase 6]** Console Notifications; includes ABSORBED wakes |
 | GET | `/v1/events/replay?types=&limit=` | → `{ events, truncated }` | **[Phase 6]** when `types` is set, newest-first **matching frames only** (empty = no matches); powers Recent Alerts sparse type filter |
-| GET | `/v1/network?limit=` | → `{ requests, truncated }` | **[Phase 6 fifth slice]** newest-first `net.request` frames (real outbound calls; credentials already redacted at capture) |
+| GET | `/v1/network?limit=` | → `{ requests, truncated }` | **[Phase 6 fifth slice]** newest-first `net.request` frames (real outbound calls; credentials already redacted at capture). **[Phase 13]** `limit` clamped to a positive integer range (default 200, max 1000); negatives/NaN fall back to 200 — SQLite treats a negative LIMIT as unlimited |
 | GET | `/v1/network/:id` | → `{ request }` or 404 | **[Phase 6 fifth slice]** single frame by `requestId`; powers `/network/[id]` |
 | GET/POST | `/v1/afk` | → `{ afk, active }` / body `{ armed, until? }` | **[Phase 8]** autonomy posture; FAQ-only auto-answer via `escalate_to_captain` |
 | GET | `/v1/config/doctor` | → `{ doctor }` (customized ∩ upstream-changed templates) | **[Phase 8]** `agentos config doctor`; upgrade never overwrites customized templates |
@@ -1083,7 +1085,9 @@ New SSE members **[R3]**: `policy.changed { domain, layer, safetyOverride: boole
 
 ### 8.3 Daemon ⇄ extension socket protocol
 
-Rev-2 `ExtFrame`/`CtlFrame` retained in full (telemetry up: hello/lifecycle/message/tool/tool_blocked/usage/context/status/ask; control down: ack/injectMessage/answer/setModel/setThinking/shutdown). **[R3] addition — the Brain's tool channel** rides the same socket for the `brain` role:
+NDJSON frames over per-session Unix sockets; **`PROTOCOL_VERSION` is `1.3.0`** (`packages/protocol`). Frames are **zod-validated on both sides at runtime**: the daemon validates inbound extension frames; the extension validates inbound control frames with `daemonControlFrameSchema` (not a bare cast). **[Phase 13]** also bounds extension reconnect (failed-connect retries with backoff, bounded pending buffer that drops oldest with a reported count, capped un-newlined read buffer; socket-hub shares the read-buffer cap).
+
+Rev-2 telemetry up (hello/lifecycle/message/tool/tool_blocked/usage/context/status/ask) and control down (ack/injectMessage/answer/setModel/setThinking/shutdown) retained. **[R3] addition — the Brain's tool channel** rides the same socket for the `brain` role:
 
 ```ts
 // Brain → daemon (tool invocation; issued by the brain-bridge when the Brain calls a bridge tool)
@@ -1174,10 +1178,10 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 ### 10.2 Controls (fused; [R3] deltas marked)
 
 1. **Secrets at rest:** keychain for API keys + daemon token; Pi auth store vendor-owned/opaque, never written; mtime/hash watch. [A]+[R2] **[R5] — one narrow read exception:** the quota-probe module may read stored OAuth bearer tokens exclusively to call **read-only usage/balance GET endpoints** from a **code-baked allowlist** (never config — a config-supplied URL receiving a bearer token would be an exfiltration vector); tokens are never used for inference, never persisted elsewhere, never logged (redaction covers probe I/O); probe failures never invalidate the connection. Everything else about the opacity boundary stands.
-2. **Secrets in flight:** allowlist env, ≤1 cast-matching provider key, redacted env manifests, `shell: false`, absolute `pi` path recorded. **[CONSENSUS + R2]**
+2. **Secrets in flight:** allowlist env, ≤1 cast-matching provider key, redacted env manifests, `shell: false`, absolute `pi` path recorded. **`SSH_AUTH_SOCK` is opt-in only (`grantSshAgent`) and never granted to gate subprocesses** (§4.8). **[CONSENSUS + R2 + Phase 13]**
 3. **Log redaction:** pino + regex scrubbers; `/login` terminals live-only. **[CONSENSUS]** Config-locked (§2.6 #13).
-4. **Network surface:** loopback-only (config-locked), BFF-held bearer, exact-origin, single-use PTY tickets (30 s; WS upgrade path matches REST loopback + origin guards), 0600 Unix sockets, guard policies from disk not socket. [A]+[B]+[R2]
-5. **Role tool policies:** guard extension blocks forbidden `tool_call`s pre-execution (scout all-writes; validator outside artifact dir; builder outside worktree; fusion tools-off) + fs path-jail; violations → `SECURITY`, terminate, quarantine. [B]+[R2]
+4. **Network surface:** loopback-only (config-locked), BFF-held bearer, exact-origin, single-use PTY tickets (30 s; WS upgrade path matches REST loopback + origin guards), 0600 Unix sockets, guard policies from disk not socket; `/v1/network?limit=` clamped to a positive range so a negative never becomes SQLite-unlimited (§8.2). [A]+[B]+[R2]+[Phase 13]
+5. **Role tool policies:** guard extension blocks forbidden `tool_call`s pre-execution (scout all-writes; validator outside artifact dir; builder outside worktree; fusion tools-off) + fs path-jail; violations → `SECURITY`, terminate, quarantine. **Artifact paths served over REST are containment-checked against `AGENTOS_HOME`.** [B]+[R2]+[Phase 13]
 6. **The Brain is powerful but bounded [R3]:** it acts only through the typed tool surface; every call is policy-checked, transition-validated, evidence-logged; it cannot write config (`read_policy` only), cannot alter gate output, cannot exceed budgets, cannot weaken safety policies. Only the Captain changes policy — via Console (authenticated) or config files (OS-user-writable only). Weakening overrides are stamped into `summary.json` and badged in the Console.
 7. **Guarded writes:** SCOUT triple enforcement; `ao/*` pushes only; force-push/hard-reset/clean/merge/branch-deletion denial (safety policy #12, default ON); FF-only secondmate sync; artifact path-jail; verified-reset precondition. **[CONSENSUS]**
 8. **Process limits:** timeout, output cap, max descendants, max workers, cancellation grace; per-role `maxTurnSeconds` + `costCeilingUsd` from policy. [B]+[R2]
