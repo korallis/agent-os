@@ -858,6 +858,142 @@ describe("/opinion live path", () => {
     expect(service.fusionRuns.get(taskId, runId)?.completedAt).toBeTruthy();
   });
 
+  it("boot hydrate finalizes mid-dispatch runs left with a never-spawned side", () => {
+    const { service, events } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    // Simulate kill-9 mid dispatchFusion loop: first side persisted with a
+    // sessionId, second side still sessionId null.
+    const spawnA = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
+    expect(spawnA.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session
+      .sessionId;
+
+    const runId = "01JMIDDISPATCHFUSION000000001";
+    service.fusionRuns.create({
+      runId,
+      taskId,
+      kind: "opinion",
+      templateRef: null,
+      templateLayer: null,
+      templateHash: null,
+      renderedHash: "mid-dispatch-hash",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          family: "anthropic",
+          sessionId: sessionA,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: null,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: new Date().toISOString(),
+    });
+
+    const dirA = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    }).dir;
+    mkdirSync(join(dirA, "outputs"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dirA, "outputs", `${sessionA}.md`), "partial side a\n", {
+      mode: 0o600,
+    });
+
+    events.length = 0;
+    // Daemon restart: rehydrate ownership and reconcile open runs.
+    service.tools.hydrateFusionOwnership();
+
+    const run = service.fusionRuns.get(taskId, runId);
+    expect(run).not.toBeNull();
+    expect(run!.completedAt).toBeTruthy();
+    expect(run!.error).toMatch(/never spawned/);
+    expect(run!.sides.every((s) => s.settledAt != null)).toBe(true);
+    expect(run!.sides[0]?.sessionId).toBe(sessionA);
+    expect(run!.sides[1]?.sessionId).toBeNull();
+    expect(run!.sides[1]?.artifactPath).toBeNull();
+
+    const types = events.map((e) => e.type);
+    expect(types).toContain("fusion.side_completed");
+    expect(types).toContain("fusion.completed");
+    const completed = events.find((e) => e.type === "fusion.completed");
+    if (completed?.type === "fusion.completed") {
+      expect(completed.payload.error).toMatch(/never spawned/);
+    }
+
+    // All-settled but completedAt-null crash window: hydrate must complete.
+    const settledRunId = "01JALLSETTLEDNOCOMPLETE00001";
+    const settledAt = new Date().toISOString();
+    service.fusionRuns.create({
+      runId: settledRunId,
+      taskId,
+      kind: "opinion",
+      templateRef: null,
+      templateLayer: null,
+      templateHash: null,
+      renderedHash: "all-settled-hash",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          family: "anthropic",
+          sessionId: "ghost-a",
+          promptHash: "same",
+          artifactPath: null,
+          settledAt,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: "ghost-b",
+          promptHash: "same",
+          artifactPath: null,
+          settledAt,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: settledAt,
+    });
+    events.length = 0;
+    service.tools.hydrateFusionOwnership();
+    const settledRun = service.fusionRuns.get(taskId, settledRunId);
+    expect(settledRun?.completedAt).toBeTruthy();
+    expect(events.map((e) => e.type)).toContain("fusion.completed");
+  });
+
   it("does not re-attribute a prior /opinion run's bytes to a sequential same-cast run", () => {
     const { service } = fleet();
     const { taskId } = seedShipTask(service);

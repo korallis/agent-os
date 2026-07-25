@@ -356,6 +356,9 @@ export class ToolSurface {
    * Rebuild fusion side ownership from durable run.json after a daemon restart.
    * Sides with a sessionId that have not yet settled remain in-flight so
    * settle/session_end can still write artifacts and emit fusion.completed.
+   * Open runs are then reconciled via the shared finalize path so a kill-9
+   * mid-dispatch (null sessionId) or a crash after the last settle cannot
+   * leave a run permanently on fusion.dispatched.
    */
   hydrateFusionOwnership(): void {
     for (const task of this.tasks.values()) {
@@ -379,6 +382,35 @@ export class ToolSurface {
             this.sessionDirs.set(side.sessionId, record.dir);
           }
         });
+      }
+    }
+
+    // Boot counterpart of halt finalize: settle never-spawned sides and
+    // complete runs whose sides are all done but completedAt is still null.
+    for (const task of this.tasks.values()) {
+      for (const run of this.deps.fusionRuns.listForTask(task.id)) {
+        if (run.completedAt != null) continue;
+        const hasNeverSpawned = run.sides.some(
+          (s) =>
+            s.sessionId === null &&
+            s.settledAt == null &&
+            s.artifactPath === null,
+        );
+        if (hasNeverSpawned) {
+          this.finalizeOpenFusionRun(
+            task.id,
+            run.runId,
+            "fusion side never spawned (daemon interrupted mid-dispatch)",
+          );
+          continue;
+        }
+        if (
+          run.sides.every(
+            (s) => s.settledAt != null || s.artifactPath !== null,
+          )
+        ) {
+          this.tryCompleteFusionRun(task.id, run.runId);
+        }
       }
     }
   }
@@ -2390,48 +2422,71 @@ export class ToolSurface {
       this.completeFusionSide(sessionId, error);
     }
 
-    // Durable runs may still have unsettled sides that lost map ownership
-    // (e.g. a prior halt path). Re-arm and settle so hydrate cannot re-arm
-    // a run with no live settle path on the next boot.
+    // Durable open runs: never-spawned sides, lost ownership, tryComplete.
+    // Same finalizeOpenFusionRun used by boot hydrate — one lifecycle rule.
     for (const run of this.deps.fusionRuns.listForTask(taskId)) {
       if (run.completedAt != null) continue;
-      const sideCount = run.sides.length;
-      for (let sideIndex = 0; sideIndex < sideCount; sideIndex++) {
-        const latest = this.deps.fusionRuns.get(taskId, run.runId);
-        if (latest === null) break;
-        if (latest.completedAt != null) break;
-        const side = latest.sides[sideIndex];
-        if (side === undefined) continue;
-        if (side.settledAt != null || side.artifactPath !== null) continue;
-        if (side.sessionId === null) {
-          const settledAt = new Date().toISOString();
-          const sides = latest.sides.map((s, i) =>
-            i === sideIndex ? { ...s, settledAt } : s,
-          );
-          this.deps.fusionRuns.save({ ...latest, sides });
-          this.sink({
-            type: "fusion.side_completed",
-            payload: {
-              taskId,
-              runId: latest.runId,
-              role: side.role,
-              model: side.model,
-              family: side.family,
-              promptHash: side.promptHash,
-              artifactPath: null,
-            },
-          });
-          this.tryCompleteFusionRun(taskId, latest.runId, error);
-          continue;
-        }
-        this.fusionBySessionId.set(side.sessionId, {
-          taskId,
-          runId: latest.runId,
-          sideIndex,
-        });
-        this.completeFusionSide(side.sessionId, error);
-      }
+      this.finalizeOpenFusionRun(taskId, run.runId, error);
     }
+  }
+
+  /**
+   * Single durable-run finalize: settle never-spawned (null sessionId) sides,
+   * complete remaining session-owned sides, and tryComplete when every side
+   * is done (including all-settled runs that still lack completedAt).
+   * Used by halt/cancel and boot hydrate so the rule is not forked.
+   */
+  private finalizeOpenFusionRun(
+    taskId: string,
+    runId: string,
+    error?: string | null,
+  ): void {
+    if (error != null && error.length > 0) {
+      this.latchFusionError(taskId, runId, error);
+    }
+
+    const initial = this.deps.fusionRuns.get(taskId, runId);
+    if (initial === null || initial.completedAt != null) return;
+
+    const sideCount = initial.sides.length;
+    for (let sideIndex = 0; sideIndex < sideCount; sideIndex++) {
+      const latest = this.deps.fusionRuns.get(taskId, runId);
+      if (latest === null) break;
+      if (latest.completedAt != null) break;
+      const side = latest.sides[sideIndex];
+      if (side === undefined) continue;
+      if (side.settledAt != null || side.artifactPath !== null) continue;
+      if (side.sessionId === null) {
+        const settledAt = new Date().toISOString();
+        const sides = latest.sides.map((s, i) =>
+          i === sideIndex ? { ...s, settledAt } : s,
+        );
+        this.deps.fusionRuns.save({ ...latest, sides });
+        this.sink({
+          type: "fusion.side_completed",
+          payload: {
+            taskId,
+            runId: latest.runId,
+            role: side.role,
+            model: side.model,
+            family: side.family,
+            promptHash: side.promptHash,
+            artifactPath: null,
+          },
+        });
+        this.tryCompleteFusionRun(taskId, latest.runId, error);
+        continue;
+      }
+      this.fusionBySessionId.set(side.sessionId, {
+        taskId,
+        runId: latest.runId,
+        sideIndex,
+      });
+      this.completeFusionSide(side.sessionId, error);
+    }
+
+    // Crash window: all sides already settled but completedAt still null.
+    this.tryCompleteFusionRun(taskId, runId, error);
   }
 
   private deliverTask(raw: Record<string, unknown>): TaskSnapshot {
