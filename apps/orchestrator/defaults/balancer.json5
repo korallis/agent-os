@@ -1,0 +1,32 @@
+{
+  // Config surface #12 — auto-balancer (master plan §11 Phase 10, [R7]).
+  //
+  // OFF by default. With the toggle off, cast behaviour is byte-identical to
+  // not having the feature at all: no advisory is injected and no event is
+  // emitted. Opt-in means opt-in.
+  enabled: false,
+
+  // Models the balancer may spread work across. This roster MUST span at least
+  // two model families while enabled — a single-family roster makes
+  // cross-family builder/validator and /opinion impossible to cast legally, so
+  // it is refused at write time rather than failing every task afterwards.
+  //
+  // `brainCapable` marks the models that may also host the Brain seat, so the
+  // balancer and the Brain handoff draw from ONE roster instead of two
+  // divergent lists.
+  roster: [
+    { model: "anthropic/claude-sonnet-4-5", brainCapable: true },
+    { model: "openai/gpt-4.1", brainCapable: true },
+    { model: "xai/grok-3", brainCapable: false },
+  ],
+
+  // Stop preferring a connection once its worst window passes this. Deliberately
+  // BELOW brain.handoff.thresholdPct (80): crew work steers away first, and the
+  // Brain only moves when steering was not enough. One pressure ladder.
+  steerAwayPct: 60,
+
+  // Use reported dollar cost as a tiebreak where coverage allows. Ignored when
+  // no provider reports cost — which is the normal case on subscription plans,
+  // and why headroom rather than dollars is the primary signal.
+  useReportedCost: true,
+}

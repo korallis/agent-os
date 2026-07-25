@@ -249,6 +249,17 @@ export const stowKnowledgeInputSchema = z.strictObject({
 });
 export type StowKnowledgeInput = z.infer<typeof stowKnowledgeInputSchema>;
 
+/**
+ * Ask the balancer which models it would spread this task across.
+ * ADVISORY ONLY — the Brain remains the allocator, and `resolve_cast` still
+ * validates whatever cast the Brain actually chooses. A suggestion carries no
+ * authority to weaken the cross-family rule.
+ */
+export const suggestCastInputSchema = z.strictObject({
+  roles: z.array(agentRoleSchema).min(1),
+});
+export type SuggestCastInput = z.infer<typeof suggestCastInputSchema>;
+
 export const readPolicyInputSchema = z.strictObject({
   domain: configDomainSchema,
 });
@@ -296,6 +307,7 @@ export const brainToolNameSchema = z.enum([
   "read_secondmate_bearings",
   "provision_secondmate",
   "stow_knowledge",
+  "suggest_cast",
   "read_policy",
   "advance_phase",
 ]);

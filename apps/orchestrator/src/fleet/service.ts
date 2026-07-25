@@ -51,13 +51,8 @@ export interface FleetServiceOptions {
   fakeBrain?: boolean;
   /** Latest quota samples, read live so handoff decisions use current numbers. */
   quotaSamples?: () => QuotaSample[];
-  /** Absolute path to agentosd.js for spawning secondmate processes. */
-  agentosdBin?: string;
-  /**
-   * Primary daemon listen port when known at construction. Prefer
-   * {@link setPrimaryPort} after bind when the port is ephemeral (0).
-   */
-  primaryPort?: number;
+  /** Cost coverage for the balancer's optional dollar refinement. */
+  costCoverage?: () => "complete" | "partial" | "absent";
 }
 
 /**
@@ -160,6 +155,8 @@ export class FleetService {
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
       ...(options.fakePi !== undefined ? { fakePi: options.fakePi } : {}),
       afk: this.afk,
+      ...(options.quotaSamples !== undefined ? { quotaSamples: options.quotaSamples } : {}),
+      ...(options.costCoverage !== undefined ? { costCoverage: options.costCoverage } : {}),
     });
     this.brain = new BrainManager({
       home: options.home,

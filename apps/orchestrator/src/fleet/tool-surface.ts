@@ -25,6 +25,7 @@ import {
   familiesConflict,
   notifyCaptainInputSchema,
   readPolicyInputSchema,
+  suggestCastInputSchema,
   readTaskInputSchema,
   resolveCastInputSchema,
   resolveDeliveryBlockInputSchema,
@@ -59,12 +60,14 @@ import {
   type ToolError,
   type ToolErrorCode,
 } from "@agent-os/protocol";
+import type { QuotaSample } from "@agent-os/protocol";
 import type { ConfigService } from "../config/service.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import { resolveProviderKeyGrant } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
 import { buildPiSpawnSpec } from "../pi/manager.js";
 import { familyFromModel } from "../substrate/family.js";
+import { buildCandidates, suggestCast, type BalancerSuggestion } from "./balancer.js";
 import {
   assertTransition,
   canRunGate,
@@ -206,6 +209,10 @@ export interface ToolSurfaceDeps {
    * is the correct default.
    */
   afk?: AfkAutoAnswer;
+  /** Live quota samples for balancer headroom ranking. */
+  quotaSamples?: () => QuotaSample[];
+  /** Whether reported cost covers every request — balancer refinement only. */
+  costCoverage?: () => "complete" | "partial" | "absent";
 }
 
 /** The only thing the tool surface needs from `/afk` — testable in isolation. */
@@ -1775,6 +1782,8 @@ export class ToolSurface {
         );
       case "stow_knowledge":
         return this.stowKnowledge(raw);
+      case "suggest_cast":
+        return this.suggestCastAdvisory(raw);
       case "read_policy":
         return this.readPolicy(raw);
       case "advance_phase":
@@ -4826,6 +4835,57 @@ export class ToolSurface {
     mkdirSync(notesRoot, { recursive: true });
     writeFileSync(full, input.notes, { mode: 0o600 });
     return { path: full };
+  }
+
+  /**
+   * Auto-balancer advisory (§11 Phase 10). Returns which models the balancer
+   * would spread this task across, WITH the inputs behind the choice.
+   *
+   * Deliberately advisory: the Brain stays the allocator and `resolve_cast`
+   * still validates whatever it actually picks. If the balancer cannot make a
+   * legal suggestion it REFUSES and says why, rather than proposing a cast the
+   * substrate would reject — and it never suggests a familyCheckOverride to
+   * make its own suggestion legal.
+   */
+  private suggestCastAdvisory(raw: Record<string, unknown>): BalancerSuggestion {
+    const input = suggestCastInputSchema.parse(raw);
+    const cfg = this.deps.config.effective().config;
+    const balancer = cfg.balancer;
+
+    const candidates = buildCandidates({
+      roster: balancer.roster,
+      connections: this.deps.connections?.list() ?? [],
+      samples: this.deps.quotaSamples?.() ?? [],
+    });
+
+    const suggestion = suggestCast({
+      config: balancer,
+      candidates,
+      roles: input.roles,
+      // Cost is a refinement, never the ranking signal. It is only "usable"
+      // when the Captain asked for it AND a provider actually reported it.
+      costUsable: balancer.useReportedCost && this.deps.costCoverage?.() === "complete",
+    });
+
+    if (suggestion.enabled) {
+      this.sink({
+        type: "balancer.suggested",
+        payload: {
+          taskId: null,
+          suggestions: suggestion.suggestions,
+          considered: suggestion.considered.map((c) => ({
+            model: c.model,
+            usedPct: c.usedPct,
+            tier: c.tier,
+            limitReached: c.limitReached,
+          })),
+          costUsable: suggestion.costUsable,
+          basis: suggestion.basis,
+          refusal: suggestion.refusal,
+        },
+      });
+    }
+    return suggestion;
   }
 
   private readPolicy(raw: Record<string, unknown>): unknown {

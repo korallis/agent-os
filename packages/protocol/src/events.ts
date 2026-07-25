@@ -701,6 +701,32 @@ export const pipelineUnavailableEventSchema = z.strictObject({
   }),
 });
 
+/**
+ * A balancer suggestion, recorded with the inputs it used (§11 Phase 10).
+ * "Why this model?" must be answerable from the log rather than inferred.
+ */
+export const balancerSuggestedEventSchema = z.strictObject({
+  type: z.literal("balancer.suggested"),
+  payload: z.strictObject({
+    taskId: ulidSchema.nullable(),
+    suggestions: z.array(
+      z.strictObject({ role: z.string(), model: z.string(), family: z.string(), reason: z.string() }),
+    ),
+    /** Every candidate considered and the headroom that ranked it. */
+    considered: z.array(
+      z.strictObject({
+        model: z.string(),
+        usedPct: z.number().nullable(),
+        tier: z.string().nullable(),
+        limitReached: z.boolean(),
+      }),
+    ),
+    costUsable: z.boolean(),
+    basis: z.string(),
+    refusal: z.string().nullable(),
+  }),
+});
+
 export const captainEscalationEventSchema = z.strictObject({
   type: z.literal("captain.escalation"),
   payload: z.strictObject({
@@ -775,6 +801,7 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   pipelineRunUpdatedEventSchema,
   pipelineLogAppendedEventSchema,
   pipelineUnavailableEventSchema,
+  balancerSuggestedEventSchema,
   captainEscalationEventSchema,
   taskDeliveryBlockResolvedEventSchema,
 ]);
