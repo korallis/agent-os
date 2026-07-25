@@ -30,9 +30,10 @@ import {
  * pid may clear that pid's record.
  *
  * Registry mutation ownership: every check-then-act that mutates shared
- * registry state (provision, updateRecord, start, stop) runs on one serial
- * mutation chain. A fifth mutator must use the same owner — do not add a
- * separate lock.
+ * registry state (provision, updateRecord, start, stop, stopAll, orphan
+ * reaping) runs on one serial mutation chain. Public mutators enqueue;
+ * exclusive helpers run only while that chain entry is held. Do not mutate
+ * registry state from outside enqueueMutation.
  */
 
 export interface SecondmateRecord {
@@ -95,8 +96,8 @@ export class SecondmateRegistry {
   private readonly children = new Map<string, ChildProcess>();
   /**
    * Single serial owner for all registry mutations (provision / updateRecord /
-   * start / stop). Concurrent ops never interleave port allocation, spawn,
-   * kill, or bookkeeping.
+   * start / stop / stopAll / orphan reaping). Concurrent ops never interleave
+   * port allocation, spawn, kill, or bookkeeping.
    */
   private mutationChain: Promise<void> = Promise.resolve();
 
@@ -604,8 +605,44 @@ export class SecondmateRegistry {
    * Stop every secondmate this primary knows about: live children, provisioned
    * homes, and runtime.json orphans left after a primary crash/restart (those
    * are not re-adopted into `children` and would otherwise keep homes/ports).
+   *
+   * Runs as one mutation-chain entry so concurrent start/provision cannot
+   * resurrect a just-stopped secondmate or sneak past a name snapshot. Re-checks
+   * for late arrivals before releasing the chain.
    */
   async stopAll(): Promise<void> {
+    return this.enqueueMutation(() => this.stopAllExclusive());
+  }
+
+  private async stopAllExclusive(): Promise<void> {
+    const processed = new Set<string>();
+    for (;;) {
+      let foundNew = false;
+      for (const name of this.discoverSecondmateNames()) {
+        if (processed.has(name)) continue;
+        foundNew = true;
+        processed.add(name);
+        try {
+          if (this.get(name) !== null) {
+            await this.stopExclusive(name);
+          } else {
+            await this.stopOrphanRuntime(name);
+          }
+        } catch {
+          // best-effort — still try to kill a runtime-only orphan
+          try {
+            await this.stopOrphanRuntime(name);
+          } catch {
+            // ignore
+          }
+        }
+      }
+      if (!foundNew) return;
+    }
+  }
+
+  /** Names known via children, charters, or runtime/ bookkeeping. */
+  private discoverSecondmateNames(): Set<string> {
     const names = new Set<string>();
     for (const name of this.children.keys()) names.add(name);
     for (const record of this.list()) names.add(record.name);
@@ -614,21 +651,13 @@ export class SecondmateRegistry {
         if (entry.isDirectory()) names.add(entry.name);
       }
     }
-    for (const name of names) {
-      try {
-        await this.stop(name);
-      } catch {
-        // best-effort — still try to kill a runtime-only orphan
-        try {
-          await this.stopOrphanRuntime(name);
-        } catch {
-          // ignore
-        }
-      }
-    }
+    return names;
   }
 
-  /** Kill a secondmate known only via runtime.json (no charter / children entry). */
+  /**
+   * Kill a secondmate known only via runtime.json (no charter / children entry).
+   * Caller must already hold the registry mutation chain.
+   */
   private async stopOrphanRuntime(name: string): Promise<void> {
     const runtime = this.readRuntime(name);
     if (runtime === null || !isProcessAlive(runtime.pid)) {
