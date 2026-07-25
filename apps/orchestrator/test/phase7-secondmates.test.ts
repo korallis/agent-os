@@ -4,7 +4,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CrossProcessAuthBroker } from "../src/pi/cross-process-broker.js";
 import { PiAuthBroker } from "../src/pi/auth-broker.js";
-import { SecondmateRegistry } from "../src/fleet/secondmates.js";
+import {
+  SecondmateRegistry,
+  secondmateTmuxSocket,
+} from "../src/fleet/secondmates.js";
 import { SecondmateFleet } from "../src/fleet/secondmate-fleet.js";
 import { FleetService } from "../src/fleet/service.js";
 import { ConfigService } from "../src/config/service.js";
@@ -166,9 +169,36 @@ describe("PiAuthBroker choke point", () => {
     await grant;
     expect(acquired).toBe(true);
   });
+
+  it("beginLoginHold resolves only after the cross-process lock is held", async () => {
+    const dir = temp("agentos-p7-login-hold-");
+    const piHome = join(dir, "pi");
+    mkdirSync(join(piHome, "agent"), { recursive: true });
+    const broker = PiAuthBroker.forManagedHome(piHome);
+    const peer = new CrossProcessAuthBroker(join(piHome, "agent"));
+
+    const { settled } = await broker.beginLoginHold({
+      baselineMtimeMs: 0,
+      timeoutMs: 200,
+    });
+    // Attach command may be minted only after this point — peer must be blocked.
+    expect(broker.holdsAuthLock()).toBe(true);
+    expect(peer.tryAcquire("spawn-grant")).toBe(false);
+    await settled;
+    expect(broker.holdsAuthLock()).toBe(false);
+    expect(peer.tryAcquire("spawn-grant")).toBe(true);
+    peer.release();
+  });
 });
 
 describe("secondmate homes", () => {
+  it("assigns a distinct tmux socket per secondmate name", () => {
+    expect(secondmateTmuxSocket("infra")).toBe("agentos-infra");
+    expect(secondmateTmuxSocket("docs")).toBe("agentos-docs");
+    // Must not collide with the default primary socket name.
+    expect(secondmateTmuxSocket("infra")).not.toBe("agentos");
+  });
+
   it("provisions an isolated home carrying no auth material", () => {
     const home = temp("agentos-p7-home-");
     const registry = new SecondmateRegistry(home);

@@ -47,6 +47,14 @@ const START_READY_TIMEOUT_MS = 25_000;
 const STOP_EXIT_TIMEOUT_MS = 10_000;
 const READY_POLL_MS = 100;
 
+/**
+ * Per-secondmate tmux server name. Must never equal the primary's socket —
+ * sharing would let BrainManager.teardownPriorBrain kill the primary Brain.
+ */
+export function secondmateTmuxSocket(name: string): string {
+  return `agentos-${name}`;
+}
+
 export class SecondmateStartError extends Error {
   readonly code = "SECONDMATE_START_FAILED" as const;
 
@@ -352,6 +360,9 @@ export class SecondmateRegistry {
         AGENTOS_PI_HOME: options.sharedPiHome,
         // Non-copy grant path: API keys resolve from the primary secrets tree.
         AGENTOS_SECRETS_HOME: this.primaryHome,
+        // Own tmux server after env spread — primary AGENTOS_TMUX_SOCKET must
+        // not be inherited (would share session/window namespace with the primary).
+        AGENTOS_TMUX_SOCKET: secondmateTmuxSocket(record.name),
       },
       // Ignore stdio so a chatty child cannot fill pipe buffers and stall.
       stdio: ["ignore", "ignore", "ignore"],
@@ -438,13 +449,17 @@ export class SecondmateRegistry {
           `secondmate ${record.name} exited before ready (code ${child.exitCode})`,
         );
       }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
       try {
         if (existsSync(tokenPath)) {
           const token = readFileSync(tokenPath, "utf8").trim();
           if (token.length > 0) {
-            const res = await fetch(`http://127.0.0.1:${record.port}/v1/status`, {
-              headers: { authorization: `Bearer ${token}` },
-            });
+            const res = await fetchWithTimeout(
+              `http://127.0.0.1:${record.port}/v1/status`,
+              { headers: { authorization: `Bearer ${token}` } },
+              remaining,
+            );
             if (res.ok) {
               const body = (await res.json()) as { daemon?: { home?: string } };
               if (body.daemon?.home === record.home) return;
@@ -452,7 +467,7 @@ export class SecondmateRegistry {
           }
         }
       } catch {
-        // not ready yet
+        // not ready yet (including per-attempt timeout)
       }
       await sleep(READY_POLL_MS);
     }
@@ -599,6 +614,21 @@ function resolvePrimaryPortFromEnv(): number | null {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Bound a single readiness probe so a hung TCP connect cannot outlive the deadline. */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function waitForExit(

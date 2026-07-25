@@ -926,16 +926,16 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       pi: deps.pi,
       home: deps.home,
     });
-    // Hold the cross-process login lock until the shared auth store mtime
-    // advances (credential write observed) or the hold times out. Spawn grants
-    // wait out this window. The HTTP response returns immediately so the
-    // Captain can run the attach command; Agent-OS-local mutual exclusion —
-    // not Pi's internal write atomicity — is what this serialises.
+    // Exclusive window must begin BEFORE the attach command is returned, so a
+    // concurrent withSpawnGrant cannot resolve grants mid-login. Acquire first;
+    // fire-and-forget only the long mtime poll / release.
     if (deps.authBroker !== undefined) {
       const baseline = deps.authBroker.authStoreMtimeMs();
-      void deps.authBroker
-        .holdLoginUntilAuthSettled({ baselineMtimeMs: baseline })
-        .catch((error: unknown) => {
+      try {
+        const { settled } = await deps.authBroker.beginLoginHold({
+          baselineMtimeMs: baseline,
+        });
+        void settled.catch((error: unknown) => {
           const message =
             error instanceof Error ? error.message : "login hold failed";
           deps.logger.error({ err: error }, `auth broker login hold failed: ${message}`);
@@ -948,6 +948,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
             },
           });
         });
+      } catch (error: unknown) {
+        const message =
+          error instanceof Error ? error.message : "login hold acquire failed";
+        deps.logger.error({ err: error }, `auth broker login hold acquire failed: ${message}`);
+        sendError(reply, 503, "CONFLICT", message);
+        return;
+      }
     }
     return {
       connectionId: connection.id,

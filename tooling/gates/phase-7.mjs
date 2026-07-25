@@ -14,6 +14,7 @@
  *   G9  maxConcurrentTasks is enforced on the routing path
  *   G10 secondmate api-key grants resolve from primary secrets without copying
  *   G11 primary bound port blocks secondmate provision without AGENTOS_PORT
+ *   G12 secondmate own tmux server; primary Brain survives secondmate start
  *
  * Real daemons on real homes; only the model is simulated.
  * Usage: node tooling/gates/phase-7.mjs
@@ -162,6 +163,40 @@ try {
     provisionedOk && startRes.ok && smToken !== null && startBody.runtime?.pid > 0,
     `provisionOk=${provisionedOk} start=${startRes.status} readyToken=${smToken !== null}`,
   );
+
+  // G12 — isolation: secondmate gets its own tmux server; starting it must not
+  // kill the primary Brain (shared socket would share agentos:brain).
+  {
+    const smTmuxSocket = "agentos-infra";
+    const primaryList = spawnSync(
+      "tmux",
+      ["-L", TMUX_SOCKET, "list-windows", "-t", "agentos", "-F", "#{window_name}"],
+      { encoding: "utf8" },
+    );
+    const smList = spawnSync(
+      "tmux",
+      ["-L", smTmuxSocket, "list-windows", "-t", "agentos", "-F", "#{window_name}"],
+      { encoding: "utf8" },
+    );
+    const primaryWindows = (primaryList.stdout ?? "").trim().split("\n").filter(Boolean);
+    const smWindows = (smList.stdout ?? "").trim().split("\n").filter(Boolean);
+    const primaryBrainAlive =
+      primaryList.status === 0 && primaryWindows.includes("brain");
+    const smBrainAlive = smList.status === 0 && smWindows.includes("brain");
+    // Different servers: the secondmate socket must not be the primary socket,
+    // and each server must own its brain window independently.
+    const isolated =
+      smTmuxSocket !== TMUX_SOCKET &&
+      primaryBrainAlive &&
+      smBrainAlive &&
+      startRes.ok;
+    gate(
+      "G12",
+      "secondmate own tmux server; primary Brain survives secondmate start",
+      isolated,
+      `primarySocket=${TMUX_SOCKET} smSocket=${smTmuxSocket} primaryBrain=${primaryBrainAlive} smBrain=${smBrainAlive} primaryWins=${primaryWindows.join(",")} smWins=${smWindows.join(",")}`,
+    );
+  }
 
   // G1 — no auth material under any secondmate home (while live)
   {
@@ -724,6 +759,8 @@ try {
     // ignore
   }
   spawnSync("tmux", ["-L", TMUX_SOCKET, "kill-server"], { encoding: "utf8" });
+  spawnSync("tmux", ["-L", "agentos-infra", "kill-server"], { encoding: "utf8" });
+  spawnSync("tmux", ["-L", "agentos-docs", "kill-server"], { encoding: "utf8" });
   for (const p of cleanups) {
     try {
       rmSync(p, { recursive: true, force: true });

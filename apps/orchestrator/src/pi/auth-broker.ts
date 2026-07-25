@@ -94,37 +94,69 @@ export class PiAuthBroker {
   }
 
   /**
+   * Acquire the exclusive login lock, then poll for auth-store mtime in the
+   * background. Resolves once the lock is held so callers can mint an OAuth
+   * attach command only after concurrent spawn grants are blocked.
+   *
+   * Fire-and-forget `settled` for the long mtime poll / release — never the
+   * acquisition itself.
+   */
+  async beginLoginHold(options: {
+    baselineMtimeMs: number;
+    timeoutMs?: number;
+  }): Promise<{ settled: Promise<void> }> {
+    const timeoutMs = options.timeoutMs ?? LOGIN_HOLD_TIMEOUT_MS;
+    const authJson = join(this.authStoreDir, "auth.json");
+
+    let signalAcquired!: () => void;
+    let signalAcquireFailed!: (error: unknown) => void;
+    const acquired = new Promise<void>((resolve, reject) => {
+      signalAcquired = resolve;
+      signalAcquireFailed = reject;
+    });
+
+    const run = this.crossProcess
+      .withAuthLock(
+        "login",
+        async () => {
+          await this.acquireLogin();
+          try {
+            signalAcquired();
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+              if (authStoreAdvanced(authJson, options.baselineMtimeMs)) return;
+              await new Promise((r) => setTimeout(r, LOGIN_HOLD_POLL_MS));
+            }
+          } finally {
+            this.releaseLogin();
+          }
+        },
+        timeoutMs + 5_000,
+      )
+      .catch((error: unknown) => {
+        signalAcquireFailed(error);
+        throw error;
+      });
+
+    this.loginHoldInFlight = run.finally(() => {
+      if (this.loginHoldInFlight === run) this.loginHoldInFlight = null;
+    });
+
+    await acquired;
+    return { settled: this.loginHoldInFlight };
+  }
+
+  /**
    * Hold the cross-process login lock until the shared auth store mtime advances
    * past `baselineMtimeMs` (credential write observed) or `timeoutMs` elapses.
-   * Spawn grants wait while this hold is active. Fire-and-forget after minting
-   * an OAuth attach command so the HTTP handler can return immediately.
+   * Awaits the full settle window — prefer beginLoginHold when the attach
+   * command must return after acquire but before settle.
    */
   holdLoginUntilAuthSettled(options: {
     baselineMtimeMs: number;
     timeoutMs?: number;
   }): Promise<void> {
-    const timeoutMs = options.timeoutMs ?? LOGIN_HOLD_TIMEOUT_MS;
-    const authJson = join(this.authStoreDir, "auth.json");
-    const run = this.crossProcess.withAuthLock(
-      "login",
-      async () => {
-        await this.acquireLogin();
-        try {
-          const deadline = Date.now() + timeoutMs;
-          while (Date.now() < deadline) {
-            if (authStoreAdvanced(authJson, options.baselineMtimeMs)) return;
-            await new Promise((r) => setTimeout(r, LOGIN_HOLD_POLL_MS));
-          }
-        } finally {
-          this.releaseLogin();
-        }
-      },
-      timeoutMs + 5_000,
-    );
-    this.loginHoldInFlight = run.finally(() => {
-      if (this.loginHoldInFlight === run) this.loginHoldInFlight = null;
-    });
-    return this.loginHoldInFlight;
+    return this.beginLoginHold(options).then(({ settled }) => settled);
   }
 
   /** Current auth.json mtime, or 0 when missing — used as OAuth baseline. */

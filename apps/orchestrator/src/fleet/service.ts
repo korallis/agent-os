@@ -459,7 +459,8 @@ export class FleetService {
         AGENTOS_FAKE_GATE: process.env.AGENTOS_FAKE_GATE,
         AGENTOS_FAKE_GIT: process.env.AGENTOS_FAKE_GIT,
         AGENTOS_FAKE_TMUX: process.env.AGENTOS_FAKE_TMUX,
-        AGENTOS_TMUX_SOCKET: process.env.AGENTOS_TMUX_SOCKET,
+        // Do not forward AGENTOS_TMUX_SOCKET — start() forces a per-secondmate
+        // server so the primary Brain cannot share a session/window namespace.
       },
     });
   }
