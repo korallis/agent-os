@@ -1,6 +1,5 @@
 import type { Server } from "node:http";
-import { spawnSync } from "node:child_process";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 import type { PtyTicketStore } from "./tickets.js";
 import type { TmuxController } from "../fleet/tmux.js";
 
@@ -18,10 +17,15 @@ import type { TmuxController } from "../fleet/tmux.js";
  * stream raw output but requires a writable FIFO per session, and a true PTY
  * would need a native addon. Capture-pane reads the same pane the human would
  * see, with no native dependency and no write path to abuse.
+ *
+ * Capture is async so a slow or stuck tmux cannot block the daemon event loop.
+ * Liveness is inferred from capture failures (no separate list-windows probe).
  */
 
 const POLL_MS = 500;
 const MAX_CAPTURE_LINES = 400;
+/** Consecutive capture failures before treating the pane as gone. */
+const GONE_AFTER_FAILURES = 2;
 
 export interface PtyServerDeps {
   server: Server;
@@ -90,6 +94,8 @@ export function attachPtyServer(deps: PtyServerDeps): { close: () => Promise<voi
     }
 
     wss.handleUpgrade(request, socket, head, (ws) => {
+      // Required for clientTracking so wss.clients (and close()) include this socket.
+      wss.emit("connection", ws, request);
       streamPane(ws, target, deps.tmux);
     });
   };
@@ -113,31 +119,81 @@ export function attachPtyServer(deps: PtyServerDeps): { close: () => Promise<voi
   };
 }
 
+function safeSend(ws: WebSocket, data: string): boolean {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    ws.send(data);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
   let last = "";
   let closed = false;
+  let failures = 0;
+  let inFlight = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
 
-  const tick = (): void => {
-    if (closed) return;
-    if (!tmux.hasWindow(target)) {
-      ws.send(JSON.stringify({ type: "closed", reason: "pane is gone" }));
-      ws.close();
-      return;
-    }
-    const captured = capturePane(target, tmux.socketName);
-    if (captured !== null && captured !== last) {
-      last = captured;
-      ws.send(JSON.stringify({ type: "pane", content: captured }));
+  const stop = (): void => {
+    closed = true;
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
     }
   };
 
-  const timer = setInterval(tick, POLL_MS);
+  const endStream = (reason: string): void => {
+    if (closed) return;
+    stop();
+    safeSend(ws, JSON.stringify({ type: "closed", reason }));
+    try {
+      ws.close();
+    } catch {
+      // already closing or closed
+    }
+  };
+
+  const tick = (): void => {
+    if (closed || inFlight) return;
+    inFlight = true;
+    void (async () => {
+      try {
+        const captured = await tmux.capturePane(target, MAX_CAPTURE_LINES);
+        if (closed) return;
+        if (captured === null) {
+          failures += 1;
+          if (failures >= GONE_AFTER_FAILURES) {
+            endStream("pane is gone");
+          }
+          return;
+        }
+        failures = 0;
+        if (captured !== last) {
+          if (safeSend(ws, JSON.stringify({ type: "pane", content: captured }))) {
+            last = captured;
+          } else if (
+            ws.readyState === WebSocket.CLOSING ||
+            ws.readyState === WebSocket.CLOSED
+          ) {
+            stop();
+          }
+        }
+      } finally {
+        inFlight = false;
+      }
+    })();
+  };
+
+  timer = setInterval(tick, POLL_MS);
   tick();
 
   // Read-only: anything the client sends is ignored rather than forwarded to
   // the pane. Say so explicitly instead of silently dropping it.
   ws.on("message", () => {
-    ws.send(
+    safeSend(
+      ws,
       JSON.stringify({
         type: "notice",
         reason: "read-only stream — use the attach command to take over",
@@ -146,21 +202,9 @@ function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
   });
 
   ws.on("close", () => {
-    closed = true;
-    clearInterval(timer);
+    stop();
   });
   ws.on("error", () => {
-    closed = true;
-    clearInterval(timer);
+    stop();
   });
-}
-
-function capturePane(target: string, socketName: string): string | null {
-  const result = spawnSync(
-    "tmux",
-    ["-L", socketName, "capture-pane", "-p", "-t", target, "-S", `-${MAX_CAPTURE_LINES}`],
-    { encoding: "utf8", timeout: 5_000 },
-  );
-  if (result.status !== 0) return null;
-  return result.stdout ?? "";
 }

@@ -30,11 +30,14 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
   const [message, setMessage] = useState<string | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const boundSession = useRef(sessionId);
+  /** Bumped on session change, reconnect, and unmount to drop stale in-flight work. */
+  const connectGen = useRef(0);
 
   // Never let one seat's pane persist under another seat's id.
   useEffect(() => {
     if (boundSession.current !== sessionId) {
       boundSession.current = sessionId;
+      connectGen.current += 1;
       socketRef.current?.close();
       socketRef.current = null;
       setStatus("idle");
@@ -45,18 +48,26 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     return () => {
+      connectGen.current += 1;
       socketRef.current?.close();
       socketRef.current = null;
     };
   }, []);
 
   const connect = async (): Promise<void> => {
+    const gen = ++connectGen.current;
+    const forSession = sessionId;
+
+    socketRef.current?.close();
+    socketRef.current = null;
+
     setStatus("connecting");
     setMessage(null);
     try {
-      const res = await fetch(`/api/agentos/sessions/${sessionId}/attach-ticket`, {
+      const res = await fetch(`/api/agentos/sessions/${forSession}/attach-ticket`, {
         method: "POST",
       });
+      if (gen !== connectGen.current || boundSession.current !== forSession) return;
       if (!res.ok) {
         setStatus("error");
         setMessage(
@@ -67,14 +78,27 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
         return;
       }
       const body = (await res.json()) as AttachTicketResponse;
+      if (gen !== connectGen.current || boundSession.current !== forSession) return;
       // Connect DIRECTLY to the loopback daemon: Next route handlers cannot
       // proxy a WS upgrade. The ticket is the credential, which is why it is
       // single-use and short-lived — the daemon token never leaves the server.
+      socketRef.current?.close();
       const ws = new WebSocket(body.wsUrl);
+      if (gen !== connectGen.current || boundSession.current !== forSession) {
+        ws.close();
+        return;
+      }
       socketRef.current = ws;
 
-      ws.onopen = () => setStatus("streaming");
+      ws.onopen = () => {
+        if (gen !== connectGen.current) {
+          ws.close();
+          return;
+        }
+        setStatus("streaming");
+      };
       ws.onmessage = (event) => {
+        if (gen !== connectGen.current) return;
         try {
           const frame = JSON.parse(String(event.data)) as PaneFrame;
           if (frame.type === "pane" && frame.content !== undefined) {
@@ -90,13 +114,16 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
         }
       };
       ws.onerror = () => {
+        if (gen !== connectGen.current) return;
         setStatus("error");
         setMessage("Terminal stream failed.");
       };
       ws.onclose = () => {
+        if (gen !== connectGen.current) return;
         setStatus((prev) => (prev === "error" ? prev : "closed"));
       };
     } catch {
+      if (gen !== connectGen.current || boundSession.current !== forSession) return;
       setStatus("error");
       setMessage("Could not reach agentosd to attach.");
     }
