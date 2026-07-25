@@ -5,11 +5,13 @@ import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type {
   AnalyticsSnapshot,
+  BillingSurface,
   BudgetsConfig,
   ProviderConnection,
   QuotaSample,
 } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
+import { selectPrimaryQuotaMetric } from "@/lib/selectPrimaryQuotaMetric";
 import { useEventStream } from "@/lib/useEventStream";
 import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
 
@@ -26,23 +28,39 @@ import { useStickyRefreshKey } from "@/lib/useDebouncedRefreshKey";
 
 type LoadState = "loading" | "ready" | "unavailable";
 
-const BILLING_LABEL: Record<string, { label: string; tone: string; note: string }> = {
+const BILLING_LABEL: Record<BillingSurface, { label: string; tone: string; note: string }> = {
+  "plan-quota": {
+    label: "PLAN QUOTA",
+    tone: "text-teal-brand border-teal-brand/30 bg-teal-brand/10",
+    note: "Bills against the subscription plan window (session/weekly percent), not a currency meter.",
+  },
   "extra-usage-per-token": {
     label: "EXTRA USAGE — PER TOKEN",
     tone: "text-warn border-warn/30 bg-warn/10",
     note: "Anthropic bills third-party-harness usage from extra usage per token, not plan limits.",
+  },
+  "api-metered": {
+    label: "API KEY — METERED",
+    tone: "text-fg-2 border-line-2 bg-line-1",
+    note: "Metered against the key's own balance or account credits.",
   },
   "sdk-credit-pool": {
     label: "SDK CREDIT POOL",
     tone: "text-ok border-ok/30 bg-ok/10",
     note: "Bills to the subscription's Agent SDK monthly credit pool.",
   },
-  "api-key-metered": {
-    label: "API KEY — METERED",
-    tone: "text-fg-2 border-line-2 bg-line-1",
-    note: "Metered against the key's own balance or account credits.",
-  },
 };
+
+function amountSourceLabel(
+  sample: QuotaSample | undefined,
+  moneySource: string | undefined,
+): string {
+  if (moneySource !== undefined) return moneySource;
+  if (sample === undefined) return "no probe";
+  const { primary } = selectPrimaryQuotaMetric(sample.metrics);
+  if (primary !== undefined) return primary.source;
+  return "no currency metric";
+}
 
 function spendNote(
   analyticsStatus: LoadState,
@@ -199,7 +217,7 @@ export function BillingView() {
           <div className="rounded-2xl border border-line-2 bg-panel overflow-hidden">
             <ul className="divide-y divide-line-1/60">
               {connections.map((c) => {
-                const billing = BILLING_LABEL[c.billingSurface ?? "api-key-metered"];
+                const billing = BILLING_LABEL[c.billingSurface];
                 const sample = samples.find((s) => s.connectionId === c.id);
                 const money = sample?.metrics.find(
                   (m) => m.unit === "usd" || m.unit === "credits",
@@ -209,25 +227,21 @@ export function BillingView() {
                     <span className="flex-1 min-w-0 flex flex-col gap-1">
                       <span className="text-[13px] font-medium text-fg-1">{c.label}</span>
                       <span className="flex flex-wrap items-center gap-2">
-                        {billing !== undefined && (
-                          <span
-                            className={cn(
-                              "rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-                              billing.tone,
-                            )}
-                          >
-                            {billing.label}
-                          </span>
-                        )}
+                        <span
+                          className={cn(
+                            "rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                            billing.tone,
+                          )}
+                        >
+                          {billing.label}
+                        </span>
                         {c.limitReached && (
                           <span className="rounded-[20px] bg-danger/15 px-2 py-0.5 text-[10px] font-semibold text-danger">
                             LIMIT REACHED
                           </span>
                         )}
                       </span>
-                      {billing !== undefined && (
-                        <span className="text-[11px] text-fg-3">{billing.note}</span>
-                      )}
+                      <span className="text-[11px] text-fg-3">{billing.note}</span>
                     </span>
                     <span className="shrink-0 text-right flex flex-col gap-0.5">
                       <span className="text-[13px] font-medium text-fg-1">
@@ -238,7 +252,7 @@ export function BillingView() {
                             : `${money.value} credits`}
                       </span>
                       <span className="text-[10px] uppercase tracking-wide text-fg-3">
-                        {money?.source ?? "no probe"}
+                        {amountSourceLabel(sample, money?.source)}
                       </span>
                     </span>
                   </li>
