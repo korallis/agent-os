@@ -414,6 +414,8 @@ export class ToolSurface {
    * For each non-terminal task that already has crewmate sessions, compare the
    * resolved cast against SessionKeyStore and respawn ONLY roles whose session
    * directory is absent — surviving dirs (and their live panes) are left alone.
+   * Live sessions whose key dir vanished are marked lost before respawn so a
+   * wiped directory cannot leave an orphan "running" row blocking the gate.
    */
   reconcileMissingCastRoles(): Array<{ taskId: string; role: string; model: string }> {
     const respawned: Array<{ taskId: string; role: string; model: string }> = [];
@@ -428,14 +430,19 @@ export class ToolSurface {
           (c) => c.role === slot.role && c.model === slot.model,
         );
         if (castEntry === undefined) continue;
-        const alreadyLive = [...this.sessions.values()].some(
-          (s) =>
+        for (const s of [...this.sessions.values()]) {
+          if (
             s.taskId === task.id &&
             s.role === slot.role &&
             s.model === slot.model &&
-            (s.status === "starting" || s.status === "running" || s.status === "settled"),
-        );
-        if (alreadyLive) continue;
+            (s.status === "starting" || s.status === "running" || s.status === "settled")
+          ) {
+            this.markSessionLost(
+              s.sessionId,
+              "session-key directory missing (reconcile)",
+            );
+          }
+        }
         try {
           this.spawnCrewmate({
             taskId: task.id,
@@ -1071,11 +1078,13 @@ export class ToolSurface {
       let tmuxWindow = `agentos:${windowName}`;
       if (fake) {
         // Deterministic side output so fusion gates can assert artifacts without
-        // a paid model. Stay alive so pane-liveness reconcile does not spuriously
-        // SESSION_LOST the moment a short-lived `echo` exits under real tmux.
-        const fakeOutput = join(sessionDir, "output.md");
+        // a paid model. Per-session path matches the real extension layout so
+        // sequential runs never share a file. Stay alive so pane-liveness
+        // reconcile does not spuriously SESSION_LOST on short-lived echo.
+        const outputsDir = join(sessionDir, "outputs");
+        mkdirSync(outputsDir, { recursive: true, mode: 0o700 });
         writeFileSync(
-          fakeOutput,
+          join(outputsDir, `${sessionId}.md`),
           `fake-pi ${input.role} ${input.model} session=${sessionId}\n`,
           { mode: 0o600 },
         );
@@ -1444,31 +1453,51 @@ export class ToolSurface {
     // Spawn one clean-room Pi per side, each with the identical instruction and
     // its own per-model session key. side_completed / completed fire on settle.
     if (spawnSides) {
-      const spawned: FusionSide[] = [];
+      const spawnedSessionIds: Array<string | null> = sides.map(() => null);
       for (let i = 0; i < sides.length; i++) {
         const side = sides[i]!;
         const cast = input.casts[i]!;
-        const result = this.spawnCrewmate({
-          taskId: task.id,
-          role: side.role,
-          model: side.model,
-          thinking: cast.thinking,
-          cleanRoom: cast.cleanRoom,
-          vars: {},
-          prompt: instruction,
-        });
-        const sessionId = result.session.sessionId;
-        spawned.push({ ...side, sessionId });
-        this.fusionBySessionId.set(sessionId, {
-          taskId: task.id,
-          runId,
-          sideIndex: i,
-        });
-        // Fake-Pi writes output.md during spawn and never sends agent_settled
-        // over the extension channel — finalize the side as soon as ownership
-        // is registered. Real Pi finalizes via markSessionStatus / session_end.
-        if (this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1") {
-          this.completeFusionSide(sessionId);
+        try {
+          const result = this.spawnCrewmate({
+            taskId: task.id,
+            role: side.role,
+            model: side.model,
+            thinking: cast.thinking,
+            cleanRoom: cast.cleanRoom,
+            vars: {},
+            prompt: instruction,
+          });
+          const sessionId = result.session.sessionId;
+          spawnedSessionIds[i] = sessionId;
+          this.fusionBySessionId.set(sessionId, {
+            taskId: task.id,
+            runId,
+            sideIndex: i,
+          });
+          // Fake-Pi writes per-session output during spawn and never sends
+          // agent_settled over the extension channel — finalize as soon as
+          // ownership is registered. Real Pi finalizes via settle / session_end.
+          if (this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1") {
+            this.completeFusionSide(sessionId);
+          }
+        } catch (error) {
+          // Partial spawn must not leave a durable in-flight run: finalize
+          // already-spawned sides, mark the rest failed, complete the run,
+          // then rethrow so the tool call still returns the typed error.
+          const message =
+            error instanceof ToolSurfaceError
+              ? error.message
+              : error instanceof Error
+                ? error.message
+                : String(error);
+          this.failRemainingFusionSides(
+            task.id,
+            runId,
+            spawnedSessionIds,
+            i,
+            message,
+          );
+          throw error;
         }
       }
       // Persist sessionIds even when no side has settled yet (real Pi path),
@@ -1476,7 +1505,7 @@ export class ToolSurface {
       const latest = this.deps.fusionRuns.get(task.id, runId) ?? run;
       const withSessions = latest.sides.map((s, i) => ({
         ...s,
-        sessionId: s.sessionId ?? spawned[i]?.sessionId ?? null,
+        sessionId: s.sessionId ?? spawnedSessionIds[i] ?? null,
       }));
       this.deps.fusionRuns.save({ ...latest, sides: withSessions });
     } else {
@@ -1490,6 +1519,71 @@ export class ToolSurface {
     return contractOk === null
       ? { runId, promptsIdentical, aggregatorFamily, spawned: spawnSides }
       : { runId, promptsIdentical, aggregatorFamily, contractOk, spawned: spawnSides };
+  }
+
+  /**
+   * After a mid-cast spawn failure: capture any unfinished spawned sides,
+   * mark the rest settled (no artifact), and emit fusion.completed with the
+   * failure so Console never sits on "dispatched". Avoids completeFusionSide
+   * so tryCompleteFusionRun cannot emit a success completed first.
+   */
+  private failRemainingFusionSides(
+    taskId: string,
+    runId: string,
+    spawnedSessionIds: Array<string | null>,
+    failedAtIndex: number,
+    errorMessage: string,
+  ): void {
+    const latest = this.deps.fusionRuns.get(taskId, runId);
+    if (latest === null) return;
+    const now = new Date().toISOString();
+
+    const sides = latest.sides.map((s, i) => {
+      const sessionId = s.sessionId ?? spawnedSessionIds[i] ?? null;
+      if (i < failedAtIndex) {
+        if (s.settledAt != null || s.artifactPath !== null) {
+          return { ...s, sessionId };
+        }
+        const content = sessionId !== null ? this.readSideOutput(sessionId) : null;
+        const artifactPath =
+          content === null
+            ? null
+            : this.deps.fusionRuns.writeSideArtifact(
+                taskId,
+                runId,
+                i,
+                s.model,
+                content,
+              );
+        this.sink({
+          type: "fusion.side_completed",
+          payload: {
+            taskId,
+            runId,
+            role: s.role,
+            model: s.model,
+            family: s.family,
+            promptHash: s.promptHash,
+            artifactPath,
+          },
+        });
+        return { ...s, sessionId, artifactPath, settledAt: now };
+      }
+      return {
+        ...s,
+        sessionId,
+        settledAt: s.settledAt ?? now,
+      };
+    });
+    this.deps.fusionRuns.save({ ...latest, sides });
+
+    for (const [sid, ref] of this.fusionBySessionId) {
+      if (ref.runId === runId) this.fusionBySessionId.delete(sid);
+    }
+    const finalRun = this.deps.fusionRuns.get(taskId, runId);
+    if (finalRun !== null) {
+      this.emitFusionCompleted(finalRun, errorMessage);
+    }
   }
 
   /**
@@ -1561,17 +1655,20 @@ export class ToolSurface {
   }
 
   /**
-   * Read the extension-written side answer from the session directory.
-   * Returns null when no real output was captured — never fabricates a
-   * placeholder so absent model work is not misreported as an artifact.
+   * Read the extension-written side answer for this session only.
+   * Path is `$SESSION_DIR/outputs/$sessionId.md` so sequential runs that share
+   * a per-model session key never re-attribute a prior run's bytes.
+   * Null / empty / whitespace-only reads are treated as no artifact.
    */
   private readSideOutput(sessionId: string): string | null {
     const sessionDir = this.sessionDirs.get(sessionId);
     if (sessionDir === undefined) return null;
-    const outputPath = join(sessionDir, "output.md");
+    const outputPath = join(sessionDir, "outputs", `${sessionId}.md`);
     if (!existsSync(outputPath)) return null;
     try {
-      return readFileSync(outputPath, "utf8");
+      const content = readFileSync(outputPath, "utf8");
+      if (content.trim().length === 0) return null;
+      return content;
     } catch {
       return null;
     }
@@ -1601,7 +1698,7 @@ export class ToolSurface {
     }
   }
 
-  private emitFusionCompleted(run: FusionRun): void {
+  private emitFusionCompleted(run: FusionRun, error?: string | null): void {
     this.sink({
       type: "fusion.completed",
       payload: {
@@ -1611,6 +1708,7 @@ export class ToolSurface {
         promptsIdentical: run.promptsIdentical,
         aggregatorFamily: run.aggregatorFamily,
         contractOk: run.contractOk,
+        ...(error != null && error.length > 0 ? { error } : {}),
       },
     });
   }

@@ -215,14 +215,25 @@ describe("session keys (G6)", () => {
     const { service } = fleet();
     const { taskId, projectId } = seedShipTask(service);
 
-    const spawn = service.tools.invoke("spawn_crewmate", {
+    // End-to-end G6: spawn the full cross-family cast live, then wipe one side.
+    const spawnA = service.tools.invoke("spawn_crewmate", {
       taskId,
       role: "planner",
       model: "anthropic/claude-fable-5",
       thinking: "high",
       cleanRoom: true,
     });
-    expect(spawn.ok).toBe(true);
+    const spawnB = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      cleanRoom: true,
+    });
+    expect(spawnA.ok).toBe(true);
+    expect(spawnB.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session.sessionId;
+    const sessionB = (spawnB.data as { session: { sessionId: string } }).session.sessionId;
 
     const keyA = SessionKeyStore.computeKey({
       projectId,
@@ -235,13 +246,7 @@ describe("session keys (G6)", () => {
       model: "openai/gpt-5.6-sol",
     });
     expect(keyA).not.toBe(keyB);
-    expect(existsSync(join(service.sessionKeys.ensure({
-      projectId,
-      role: "planner",
-      model: "anthropic/claude-fable-5",
-    }).dir, "session.json"))).toBe(true);
 
-    // Model change → new session directory (live ensure path).
     const dirA = service.tools.ensureSessionKey({
       projectId,
       role: "planner",
@@ -253,6 +258,8 @@ describe("session keys (G6)", () => {
       model: "openai/gpt-5.6-sol",
     });
     expect(dirA).not.toBe(dirB);
+    expect(existsSync(join(dirA, "session.json"))).toBe(true);
+    expect(existsSync(join(dirB, "session.json"))).toBe(true);
 
     // buildPiSpawnSpec carries AGENTOS_SESSION_DIR through the scrubbed env.
     const detection: PiDetection = {
@@ -279,30 +286,15 @@ describe("session keys (G6)", () => {
     expect(spec.env.AGENTOS_SESSION_DIR).toBe(dirB);
     expect(spec.envKeys).toContain("AGENTOS_SESSION_DIR");
 
-    // Restart resumes only the missing role: one model ensured, the other is missing.
-    const missing = service.sessionKeys.missingRoles(projectId, [
-      { role: "planner", model: "anthropic/claude-fable-5" },
-      { role: "planner", model: "openai/gpt-5.6-sol" },
-    ]);
-    // Both were ensured above via ensureSessionKey — empty missing set.
-    expect(missing).toEqual([]);
-
-    // Wipe the openai session dir and prove missingRoles + reconcile respawn only that slot.
+    // Wipe exactly the openai session dir; anthropic survives.
     rmSync(dirB, { recursive: true, force: true });
-    const missingAfterWipe = service.sessionKeys.missingRoles(projectId, [
-      { role: "planner", model: "anthropic/claude-fable-5" },
-      { role: "planner", model: "openai/gpt-5.6-sol" },
-    ]);
-    expect(missingAfterWipe).toEqual([
-      { role: "planner", model: "openai/gpt-5.6-sol" },
-    ]);
+    expect(
+      service.sessionKeys.missingRoles(projectId, [
+        { role: "planner", model: "anthropic/claude-fable-5" },
+        { role: "planner", model: "openai/gpt-5.6-sol" },
+      ]),
+    ).toEqual([{ role: "planner", model: "openai/gpt-5.6-sol" }]);
 
-    const before = service.tools.listSessions().length;
-    const survivingAnthropic = service.tools
-      .listSessions()
-      .filter((s) => s.model === "anthropic/claude-fable-5")
-      .map((s) => s.sessionId)
-      .sort();
     const respawned = service.tools.reconcileMissingCastRoles();
     expect(respawned).toEqual([
       {
@@ -311,18 +303,29 @@ describe("session keys (G6)", () => {
         model: "openai/gpt-5.6-sol",
       },
     ]);
-    // Exactly the missing role is respawned; the surviving anthropic session is untouched.
-    expect(service.tools.listSessions().length).toBeGreaterThan(before);
-    expect(
-      service.tools
-        .listSessions()
-        .filter((s) => s.model === "anthropic/claude-fable-5")
-        .map((s) => s.sessionId)
-        .sort(),
-    ).toEqual(survivingAnthropic);
+
+    // Surviving anthropic session id is untouched; wiped openai was marked lost
+    // and a fresh openai session is running.
+    const anthropicLive = service.tools
+      .listSessions()
+      .filter(
+        (s) =>
+          s.model === "anthropic/claude-fable-5" &&
+          (s.status === "running" || s.status === "starting" || s.status === "settled"),
+      )
+      .map((s) => s.sessionId);
+    expect(anthropicLive).toEqual([sessionA]);
     expect(
       service.tools.listSessions().some(
-        (s) => s.model === "openai/gpt-5.6-sol" && (s.status === "running" || s.status === "starting"),
+        (s) => s.sessionId === sessionB && s.status === "lost",
+      ),
+    ).toBe(true);
+    expect(
+      service.tools.listSessions().some(
+        (s) =>
+          s.model === "openai/gpt-5.6-sol" &&
+          s.sessionId !== sessionB &&
+          (s.status === "running" || s.status === "starting"),
       ),
     ).toBe(true);
     expect(
@@ -653,7 +656,10 @@ describe("/opinion live path", () => {
       role: "planner",
       model: "anthropic/claude-fable-5",
     }).dir;
-    writeFileSync(join(dirA, "output.md"), "hydrated side answer\n", { mode: 0o600 });
+    mkdirSync(join(dirA, "outputs"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dirA, "outputs", `${sessionA}.md`), "hydrated side answer\n", {
+      mode: 0o600,
+    });
 
     // Boot reconcile path: rebuild ownership from run.json (no live dispatch map).
     service.tools.hydrateFusionOwnership();
@@ -676,14 +682,14 @@ describe("/opinion live path", () => {
     });
     expect(service.fusionRuns.get(taskId, runId)?.sides[0]?.inputTokens).toBe(7);
 
-    // No real model output for side B — drop the fake-pi seam file so stop
+    // No real model output for side B — remove the per-session capture so stop
     // finalizes with artifactPath null rather than a placeholder.
     const dirB = service.sessionKeys.ensure({
       projectId,
       role: "planner",
       model: "openai/gpt-5.6-sol",
     }).dir;
-    rmSync(join(dirB, "output.md"), { force: true });
+    rmSync(join(dirB, "outputs", `${sessionB}.md`), { force: true });
 
     events.length = 0;
     const stopped = service.tools.invoke("stop_crewmate", {
@@ -702,5 +708,117 @@ describe("/opinion live path", () => {
       expect(sideBEvent.payload.artifactPath).toBeNull();
       expect(sideBEvent.payload.model).toBe("openai/gpt-5.6-sol");
     }
+  });
+
+  it("does not re-attribute a prior /opinion run's bytes to a sequential same-cast run", () => {
+    const { service } = fleet();
+    const { taskId } = seedShipTask(service);
+    const casts = [
+      {
+        role: "planner" as const,
+        model: "anthropic/claude-fable-5",
+        thinking: "high" as const,
+        family: "anthropic" as const,
+        cleanRoom: true,
+      },
+      {
+        role: "planner" as const,
+        model: "openai/gpt-5.6-sol",
+        thinking: "low" as const,
+        family: "openai" as const,
+        cleanRoom: true,
+      },
+    ];
+
+    const first = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      casts,
+    });
+    expect(first.ok).toBe(true);
+    const runId1 = (first.data as { runId: string }).runId;
+    const detail1 = service.fusionRuns.detail(taskId, runId1);
+    expect(detail1?.sideArtifacts).toHaveLength(2);
+    const firstBytes = detail1!.sideArtifacts.map((s) => s.content).sort();
+
+    const second = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      casts,
+    });
+    expect(second.ok).toBe(true);
+    const runId2 = (second.data as { runId: string }).runId;
+    expect(runId2).not.toBe(runId1);
+    const detail2 = service.fusionRuns.detail(taskId, runId2);
+    expect(detail2?.sideArtifacts).toHaveLength(2);
+    const secondBytes = detail2!.sideArtifacts.map((s) => s.content).sort();
+
+    // Each run's artifacts embed its own session ids — never the prior run's.
+    for (const content of secondBytes) {
+      expect(firstBytes.includes(content)).toBe(false);
+      expect(content).toMatch(/session=01/);
+    }
+    const run2 = service.fusionRuns.get(taskId, runId2)!;
+    for (const side of run2.sides) {
+      expect(side.sessionId).not.toBeNull();
+      expect(
+        detail2!.sideArtifacts.some((a) => a.content.includes(side.sessionId!)),
+      ).toBe(true);
+    }
+  });
+
+  it("finalizes a partial multi-side spawn failure instead of stranding dispatched", () => {
+    const { service, events } = fleet();
+    const { taskId } = seedShipTask(service);
+    events.length = 0;
+
+    // Only one worktree slot: first side spawns, second fails mid-cast.
+    service.worktrees.updateConfig({
+      poolSize: 1,
+      reclaimPolicy: "verified-reset",
+      networkPolicy: "fetch-allowed",
+    });
+
+    const result = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      casts: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          thinking: "high",
+          family: "anthropic",
+          cleanRoom: true,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          thinking: "low",
+          family: "openai",
+          cleanRoom: true,
+        },
+      ],
+    });
+    expect(result.ok).toBe(false);
+
+    const types = events.map((e) => e.type);
+    expect(types).toContain("fusion.dispatched");
+    expect(types).toContain("fusion.completed");
+    const completed = events.find((e) => e.type === "fusion.completed");
+    if (completed?.type === "fusion.completed") {
+      expect(completed.payload.error).toBeTruthy();
+    }
+
+    const runs = service.fusionRuns.listForTask(taskId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const run = runs[0]!;
+    expect(run.sides.every((s) => s.settledAt != null || s.artifactPath !== null)).toBe(
+      true,
+    );
+    // First side got a session + artifact; the failed side has no session.
+    expect(run.sides[0]?.sessionId).not.toBeNull();
+    expect(run.sides[0]?.artifactPath).not.toBeNull();
+    expect(run.sides[1]?.sessionId).toBeNull();
+    expect(run.sides[1]?.settledAt).toBeTruthy();
   });
 });

@@ -411,6 +411,8 @@ export const fusionCompletedEventSchema = z.strictObject({
     promptsIdentical: z.boolean(),
     aggregatorFamily: modelFamilySchema.nullable(),
     contractOk: z.boolean().nullable(),
+    /** Set when the run finished because a side failed to spawn (or similar). */
+    error: z.string().nullable().optional(),
   }),
 });
 

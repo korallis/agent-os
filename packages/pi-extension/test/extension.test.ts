@@ -115,15 +115,16 @@ describe("assistant output capture", () => {
     expect(usageFromAssistantMessage({ role: "user" })).toBeNull();
   });
 
-  it("writes output.md and emits usage from message_end on settle", async () => {
+  it("writes per-session outputs/<sessionId>.md and emits usage on settle", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agentos-ext-out-"));
     dirs.push(dir);
     const socketPath = join(dir, "hub.sock");
     const sessionDir = join(dir, "session");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const frames: unknown[] = [];
 
     process.env.AGENTOS_SOCKET = socketPath;
-    process.env.AGENTOS_SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    process.env.AGENTOS_SESSION_ID = sessionId;
     process.env.AGENTOS_ROLE = "planner";
     process.env.AGENTOS_SESSION_DIR = sessionDir;
 
@@ -176,8 +177,10 @@ describe("assistant output capture", () => {
       });
     });
 
-    expect(existsSync(join(sessionDir, "output.md"))).toBe(true);
-    expect(readFileSync(join(sessionDir, "output.md"), "utf8")).toBe("real side answer");
+    const outPath = join(sessionDir, "outputs", `${sessionId}.md`);
+    expect(existsSync(outPath)).toBe(true);
+    expect(readFileSync(outPath, "utf8")).toBe("real side answer");
+    expect(existsSync(join(sessionDir, "output.md"))).toBe(false);
 
     const types = frames.map((f) => (f as { type: string }).type);
     expect(types).toContain("ext.hello");
@@ -193,5 +196,45 @@ describe("assistant output capture", () => {
     expect(usage.outputTokens).toBe(25);
     expect(usage.costUsd).toBe(0.4);
     expect(usage.model).toBe("gpt-5.6-sol");
+  });
+
+  it("skips writing an output file when the assistant produced no text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-empty-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "hub.sock");
+    const sessionDir = join(dir, "session");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "planner";
+    process.env.AGENTOS_SESSION_DIR = sessionDir;
+
+    const handlers = new Map<string, (...args: unknown[]) => void>();
+    const pi: PiExtensionApi = {
+      version: "0.82.0",
+      on: (event, handler) => {
+        handlers.set(event, handler);
+      },
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer();
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        void host!.connect().then(() => {
+          handlers.get("agent_settled")?.();
+          setTimeout(() => {
+            server.close();
+            resolve();
+          }, 50);
+        });
+      });
+    });
+
+    expect(existsSync(join(sessionDir, "outputs", `${sessionId}.md`))).toBe(false);
+    expect(existsSync(join(sessionDir, "output.md"))).toBe(false);
   });
 });

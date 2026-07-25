@@ -432,7 +432,8 @@ function messageFromEvent(event: unknown): unknown {
  * Uses AGENTOS_SOCKET / AGENTOS_SESSION_ID / AGENTOS_ROLE / AGENTOS_SESSION_DIR
  * from the scrubbed spawn env. Registers the agent-os tool surface when
  * `pi.registerTool` exists. Persists assistant text to
- * `$AGENTOS_SESSION_DIR/output.md` for fusion side artifacts.
+ * `$AGENTOS_SESSION_DIR/outputs/$AGENTOS_SESSION_ID.md` for fusion side
+ * artifacts (per-session file so sequential runs never share a path).
  */
 export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtensionHost | undefined {
   const socketPath = process.env.AGENTOS_SOCKET;
@@ -446,9 +447,13 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
 
   const persistOutput = (): void => {
     if (sessionDir === undefined || sessionDir.length === 0) return;
+    const text = assistantChunks.join("\n\n");
+    // Absent model work must look absent — do not invent empty answer files.
+    if (text.trim().length === 0) return;
     try {
-      mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-      writeFileSync(join(sessionDir, "output.md"), assistantChunks.join("\n\n"), {
+      const outputsDir = join(sessionDir, "outputs");
+      mkdirSync(outputsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(outputsDir, `${sessionId}.md`), text, {
         mode: 0o600,
       });
     } catch {
