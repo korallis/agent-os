@@ -186,6 +186,10 @@ export const LEGAL_TASK_TRANSITIONS: Readonly<Record<TaskPhase, readonly TaskPha
   BUILDING: [
     "VALIDATING",
     "DELIVERING",
+    // A candidate gate can FAIL straight from BUILDING (rebuild loop), so the
+    // validation cap must be reachable from here too — otherwise the halt
+    // throws ILLEGAL_TRANSITION and the attempt counter climbs past its cap.
+    "VALIDATION_EXHAUSTED",
     "CANCELLED",
     "FAILED",
     "NEEDS_CAPTAIN",

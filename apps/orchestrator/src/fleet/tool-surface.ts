@@ -64,7 +64,7 @@ import type { ProjectRegistry } from "./projects.js";
 import type { WorktreePool } from "./worktree-pool.js";
 import type { TmuxController } from "./tmux.js";
 import type { WakeWatcher } from "./watcher.js";
-import type { GateRunner } from "./gate-runner.js";
+import { GateRunner } from "./gate-runner.js";
 import type { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
@@ -225,6 +225,14 @@ export class ToolSurface {
       usage,
       ref.sideIndex,
     );
+  }
+
+  /**
+   * True when the Captain stamped a cross-family override onto this task.
+   * Overrides are evidence-stamped in `policyOverrides` — never implicit.
+   */
+  private hasFamilyOverride(task: TaskSnapshot): boolean {
+    return task.policyOverrides.some((o) => o.policyId === "crossFamilyBuilderValidator");
   }
 
   /** Fusion runs recorded for a task, newest first. */
@@ -1054,6 +1062,32 @@ export class ToolSurface {
     }
 
     const family = familyFromModel(input.model);
+
+    // Cross-family is a scheduler invariant, not a cast-time courtesy. Enforce
+    // it again at spawn — server-derived from the model string — so a caller
+    // that skips or reshapes resolve_cast cannot slip a same-family
+    // builder/validator pair past the check (master plan §11 Phase 5:
+    // "same-family builder/validator impossible via API, CLI, profile import,
+    // recovery, AND Brain tool calls").
+    if (this.cfg().policies.crossFamilyBuilderValidator && !this.hasFamilyOverride(task)) {
+      const counterpartRole = input.role === "validator" ? "builder" : "validator";
+      if (input.role === "validator" || input.role === "builder") {
+        const counterpartFamilies = new Set<string>();
+        for (const cast of task.cast.filter((c) => c.role === counterpartRole)) {
+          counterpartFamilies.add(familyFromModel(cast.model));
+        }
+        for (const session of task.sessions.filter((s) => s.role === counterpartRole)) {
+          counterpartFamilies.add(familyFromModel(session.model));
+        }
+        if (counterpartFamilies.has(family)) {
+          throw new ToolSurfaceError(
+            "POLICY_VIOLATION",
+            `cannot spawn ${input.role} on family ${family}: the task's ${counterpartRole} is the same family`,
+            { role: input.role, family, counterpartRole },
+          );
+        }
+      }
+    }
     const sessionId = nextUlid();
     const windowName = `${input.role}-${sessionId.slice(0, 8).toLowerCase()}`;
 
@@ -1065,6 +1099,8 @@ export class ToolSurface {
 
     const poolRoles = new Set(["builder", "scout", "planner", "fusion", "healthcheck"]);
     if (input.role === "validator") {
+      // Write-jail: a validator only ever sees the gate workspace, never the
+      // product tree it is judging.
       cwd = this.deps.gates.gateWorkspace(task.id);
       worktreePath = cwd;
     } else if (input.role === "brain") {
@@ -1976,6 +2012,21 @@ export class ToolSurface {
         );
       }
       cwd = builderPath;
+
+      // A candidate verdict only means something if THIS revision of the gate
+      // was proven red at baseline. Editing the gate drops the proof, so a
+      // validator cannot weaken the gate after the fact and call the build
+      // green (master plan §11 Phase 5: "gate revisions re-prove RED").
+      if (
+        this.cfg().policies.redBaselineGateRequired &&
+        !this.deps.gates.hasRedProofForCurrentSource(task.id)
+      ) {
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          `gate revision has no RED baseline proof for task ${task.id} — re-run run_gate(baseline) before judging a candidate`,
+          { gateSourceHash: this.deps.gates.gateSourceHash(task.id) },
+        );
+      }
     }
 
     const result = this.deps.gates.run({
@@ -2029,7 +2080,13 @@ export class ToolSurface {
           task = this.transition(task, "BUILDING", "gate fail — rebuild");
         }
       } else {
-        throw new ToolSurfaceError("GATE_ERROR", `candidate gate error: ${result.stderr}`);
+        // GATE_ERROR is not RED: an infrastructure failure must not burn a
+        // validation attempt or advance the task toward exhaustion.
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          `candidate gate error (infrastructure, not a RED verdict): ${result.stderr}`,
+          { infrastructureError: result.infrastructureError },
+        );
       }
     }
 
@@ -2040,24 +2097,35 @@ export class ToolSurface {
     };
   }
 
-  private sendToCrew(raw: Record<string, unknown>): { sent: boolean } {
+  private sendToCrew(raw: Record<string, unknown>): { sent: boolean; failHash?: string } {
     const input = sendToCrewInputSchema.parse(raw);
     const session = this.sessions.get(input.sessionId);
     if (session === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
     }
     let message = input.message ?? "";
+    let failHash: string | undefined;
     if (input.gateFailRef !== undefined) {
-      // Verbatim FAIL injection — Brain cannot paraphrase.
+      // Verbatim FAIL injection. The substrate composes the bytes from the
+      // gate's own ledger and hash-matches them, so the Brain cannot paraphrase,
+      // summarise or soften what the gate actually said.
       const taskId = session.taskId;
       const lines =
-        taskId !== null
-          ? (this.failLines.get(taskId) ?? this.deps.gates.readLastFailLines(taskId))
-          : [];
-      message = lines.join("\n");
-      if (message.length === 0) {
+        taskId !== null ? this.deps.gates.readLastFailLines(taskId) : [];
+      message = lines.join("\n") + (lines.length > 0 ? "\n" : "");
+      if (lines.length === 0) {
         throw new ToolSurfaceError("NOT_FOUND", "no gate fail lines held for verbatim inject");
       }
+      const expected = taskId !== null ? this.deps.gates.lastFailHash(taskId) : null;
+      const actual = GateRunner.hashText(message);
+      if (expected !== null && expected !== actual) {
+        throw new ToolSurfaceError(
+          "GATE_ERROR",
+          "verbatim FAIL hash mismatch — refusing to inject altered gate output",
+          { expected, actual },
+        );
+      }
+      failHash = actual;
     }
     if (message.length === 0) {
       throw new ToolSurfaceError("VALIDATION_ERROR", "message or gateFailRef required");
@@ -2085,7 +2153,7 @@ export class ToolSurface {
         `no live channel to session ${input.sessionId} — message not delivered`,
       );
     }
-    return { sent };
+    return failHash === undefined ? { sent } : { sent, failHash };
   }
 
   /** Record a blocking question a crewmate asked over its extension socket. */

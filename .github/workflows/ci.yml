@@ -24,6 +24,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq tmux
           tmux -V
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/uv" --version
           git config --global user.email "ci@agent-os.local"
           git config --global user.name "Agent OS CI"
           git config --global init.defaultBranch main
@@ -60,3 +63,6 @@ jobs:
 
       - name: Phase 4 gates
         run: node tooling/gates/phase-4.mjs
+
+      - name: Phase 5 gates
+        run: node tooling/gates/phase-5.mjs

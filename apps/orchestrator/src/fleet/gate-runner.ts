@@ -14,6 +14,21 @@ export interface GateRunResult {
   outputHash: string;
   durationMs: number;
   failLines: string[];
+  /** sha256 of the gate SOURCE this outcome came from (revision identity). */
+  gateSourceHash: string;
+  /**
+   * True when the gate could not run at all (missing runtime, timeout, crash).
+   * Infrastructure failure is never a RED verdict — a gate that did not execute
+   * has proven nothing about the code.
+   */
+  infrastructureError: boolean;
+}
+
+/** RED-proof ledger entry: which gate revision was proven red, and when. */
+export interface RedProof {
+  gateSourceHash: string;
+  outcome: Extract<GateOutcome, "EXPECTED_RED" | "FAIL">;
+  provenAt: string;
 }
 
 /**
@@ -72,6 +87,75 @@ export class GateRunner {
     return file;
   }
 
+  /** sha256 of the current gate source — its revision identity. */
+  gateSourceHash(taskId: string, language: "py" | "ts" = this.config.gateLanguage): string | null {
+    const dir = this.gateWorkspace(taskId);
+    const file = language === "py" ? join(dir, "gate.py") : join(dir, "gate.ts");
+    if (!existsSync(file)) return null;
+    return hash(readFileSync(file, "utf8"));
+  }
+
+  private redProofPath(taskId: string): string {
+    return join(this.gateWorkspace(taskId), "red-proof.json");
+  }
+
+  /**
+   * Record that a specific gate revision was proven semantically RED at
+   * baseline. Keyed by source hash so an edited gate loses its proof.
+   */
+  recordRedProof(taskId: string, proof: RedProof): void {
+    writeFileSync(this.redProofPath(taskId), `${JSON.stringify(proof, null, 2)}\n`, {
+      mode: 0o600,
+    });
+  }
+
+  readRedProof(taskId: string): RedProof | null {
+    const path = this.redProofPath(taskId);
+    if (!existsSync(path)) return null;
+    try {
+      return JSON.parse(readFileSync(path, "utf8")) as RedProof;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A candidate run is only meaningful when THIS gate revision has been proven
+   * red at baseline. Editing the gate invalidates the proof — otherwise a
+   * validator could weaken the gate after the fact and call the build green.
+   */
+  hasRedProofForCurrentSource(
+    taskId: string,
+    language: "py" | "ts" = this.config.gateLanguage,
+  ): boolean {
+    const current = this.gateSourceHash(taskId, language);
+    if (current === null) return false;
+    return this.readRedProof(taskId)?.gateSourceHash === current;
+  }
+
+  /** Persist the exact FAIL bytes plus their hash for verbatim re-injection. */
+  private writeFailLedger(taskId: string, failLines: string[]): void {
+    const dir = this.gateWorkspace(taskId);
+    const text = failLines.join("\n") + (failLines.length > 0 ? "\n" : "");
+    writeFileSync(join(dir, "last-fail.txt"), text, { mode: 0o600 });
+    writeFileSync(join(dir, "last-fail.sha256"), `${hash(text)}\n`, { mode: 0o600 });
+  }
+
+  /**
+   * Hash of the last FAIL bytes. `send_to_crew` re-hashes what it is about to
+   * inject and compares, so the substrate can prove the builder received the
+   * gate's exact words rather than a Brain paraphrase.
+   */
+  lastFailHash(taskId: string): string | null {
+    const path = join(this.gateWorkspace(taskId), "last-fail.sha256");
+    if (!existsSync(path)) return null;
+    return readFileSync(path, "utf8").trim();
+  }
+
+  static hashText(text: string): string {
+    return hash(text);
+  }
+
   /**
    * Run the gate against baseline or candidate cwd.
    * Outcome is parsed from stdout lines: PASS | FAIL | GATE_ERROR | EXPECTED_RED.
@@ -126,14 +210,22 @@ export class GateRunner {
       status = uv.status ?? 1;
       stdout = uv.stdout ?? "";
       stderr = uv.stderr ?? "";
-      if (uv.error && (uv.error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (uv.error !== undefined) {
+        const code = (uv.error as NodeJS.ErrnoException).code;
+        // Missing runtime or a timeout is INFRASTRUCTURE, never a RED verdict:
+        // a gate that never executed has proven nothing about the code.
         return {
           outcome: "GATE_ERROR",
           stdout: "",
-          stderr: "uv not found — install uv (hard v1 dependency)",
+          stderr:
+            code === "ENOENT"
+              ? "uv not found — install uv (hard v1 dependency); this is an infrastructure error, not a gate failure"
+              : `gate runtime error (${code ?? uv.error.message}) — infrastructure error, not a gate failure`,
           outputHash: hash(""),
           durationMs: Date.now() - started,
           failLines: [],
+          gateSourceHash: hash(readFileSync(gateFile, "utf8")),
+          infrastructureError: true,
         };
       }
     } else {
@@ -157,12 +249,17 @@ export class GateRunner {
       .split("\n")
       .filter((l) => l.startsWith("FAIL") || l.includes("FAIL "))
       .map((l) => l.trim());
+    const gateSourceHash = hash(readFileSync(gateFile, "utf8"));
 
-    // Persist last FAIL lines for verbatim send_to_crew
-    const failPath = join(dir, "last-fail.txt");
     if (outcome === "FAIL" || outcome === "EXPECTED_RED") {
-      writeFileSync(failPath, failLines.join("\n") + (failLines.length > 0 ? "\n" : ""), {
-        mode: 0o600,
+      this.writeFailLedger(input.taskId, failLines);
+    }
+    // A baseline that is genuinely red proves THIS revision of the gate.
+    if (input.target === "baseline" && (outcome === "EXPECTED_RED" || outcome === "FAIL")) {
+      this.recordRedProof(input.taskId, {
+        gateSourceHash,
+        outcome,
+        provenAt: new Date().toISOString(),
       });
     }
 
@@ -173,6 +270,10 @@ export class GateRunner {
       outputHash: hash(stdout),
       durationMs: Date.now() - started,
       failLines,
+      gateSourceHash,
+      // A non-zero exit with no recognised verdict line means the gate crashed
+      // rather than judged; treat it as infrastructure, not as RED.
+      infrastructureError: outcome === "GATE_ERROR",
     };
   }
 
