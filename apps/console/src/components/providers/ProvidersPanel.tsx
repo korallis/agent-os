@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
-import type { ProviderConnection, QuotaSample } from "@agent-os/protocol";
+import type { ProviderConnection, QuotaMetric, QuotaSample } from "@agent-os/protocol";
 import { Icon } from "@/components/shell/Icon";
 
 function ProviderLogo({ letter, className }: { letter: string; className?: string }) {
@@ -49,6 +49,72 @@ const CONNECT_ROWS: readonly {
   { provider: "kimi-coding", oauth: false, apiKey: true },
   { provider: "vercel-ai-gateway", oauth: false, apiKey: true },
 ];
+
+/**
+ * Currency amounts render VERBATIM as the vendor reported them — no FX
+ * conversion (master plan §13.1 R21). Percent windows read as "N% used" so a
+ * bar and its number never disagree about direction.
+ */
+function formatMetricValue(metric: QuotaMetric): string {
+  switch (metric.unit) {
+    case "percent":
+      return `${metric.value}% used`;
+    case "usd":
+      return `$${metric.value.toFixed(2)}`;
+    case "credits":
+      return `${metric.value} credits`;
+    case "messages":
+      return `~${metric.value} msgs`;
+    case "tokens":
+      return `${metric.value.toLocaleString()} tokens`;
+    default:
+      return String(metric.value);
+  }
+}
+
+/** Human sub-row label per metric kind (§7.3 card anatomy). */
+function metricLabel(kind: QuotaMetric["kind"]): string {
+  switch (kind) {
+    case "session-window-pct":
+      return "session";
+    case "weekly-window-pct":
+      return "weekly";
+    case "model-scoped-weekly-pct":
+      return "model cap";
+    case "extra-usage-spend":
+      return "extra usage";
+    case "sdk-credit-pool":
+      return "sdk credit pool";
+    case "plan-window-pct":
+      return "plan window";
+    case "paid-credits":
+      return "paid credits";
+    case "account-credits":
+      return "account credits";
+    case "key-limit-remaining":
+      return "key limit left";
+    case "balance":
+      return "balance";
+    case "voucher-balance":
+      return "voucher";
+    case "cash-balance":
+      return "cash";
+    default:
+      return String(kind).replace(/-/g, " ");
+  }
+}
+
+/** "RESETS IN 5D" style countdown; null when the probe reported no reset. */
+function resetsInLabel(resetsAt: string | null): string | null {
+  if (resetsAt === null) return null;
+  const ms = Date.parse(resetsAt) - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const days = Math.floor(ms / 86_400_000);
+  if (days >= 1) return `RESETS IN ${days}D`;
+  const hours = Math.floor(ms / 3_600_000);
+  if (hours >= 1) return `RESETS IN ${hours}H`;
+  return `RESETS IN ${Math.max(1, Math.floor(ms / 60_000))}M`;
+}
 
 function tierBadge(tier: string): string {
   if (tier === "live") return "● LIVE";
@@ -243,6 +309,7 @@ export function ProvidersPanel() {
           {connections.map((c) => {
             const sample = sampleFor(c.id);
             const primary = sample?.metrics[0];
+            const subMetrics = sample?.metrics.slice(1) ?? [];
             return (
               <div
                 key={c.id}
@@ -272,16 +339,59 @@ export function ProvidersPanel() {
                 {primary !== undefined ? (
                   <>
                     <p className="text-[28px] font-semibold tabular-nums text-fg-1">
-                      {primary.unit === "percent"
-                        ? `${primary.value}% used`
-                        : `${primary.value} ${primary.unit}`}
+                      {formatMetricValue(primary)}
                     </p>
                     {primary.unit === "percent" && (
-                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-shell">
-                        <div
-                          className="h-full rounded-full bg-teal-brand"
-                          style={{ width: `${Math.min(100, primary.value)}%` }}
-                        />
+                      <>
+                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-shell">
+                          <div
+                            className={cn(
+                              "h-full rounded-full",
+                              primary.limitReached ? "bg-danger" : "bg-teal-brand",
+                            )}
+                            style={{ width: `${Math.min(100, primary.value)}%` }}
+                          />
+                        </div>
+                        <p className="mt-1 text-[11px] text-fg-3">
+                          {Math.max(0, 100 - primary.value)}% left
+                          {resetsInLabel(primary.resetsAt) !== null &&
+                            ` · ${resetsInLabel(primary.resetsAt)}`}
+                        </p>
+                      </>
+                    )}
+                    {/* Sub-rows: additional windows, model caps, credit splits (§7.3) */}
+                    {subMetrics.length > 0 && (
+                      <div className="mt-3 flex flex-col gap-1.5 border-t border-line-2 pt-2">
+                        {subMetrics.map((m, i) => (
+                          <div key={`${m.kind}-${i}`} className="flex flex-col gap-1">
+                            <div className="flex items-baseline justify-between gap-2">
+                              <span className="text-[11px] uppercase tracking-wide text-fg-3">
+                                {metricLabel(m.kind)}
+                              </span>
+                              <span className="text-[12px] font-medium tabular-nums text-fg-1">
+                                {formatMetricValue(m)}
+                              </span>
+                            </div>
+                            {m.unit === "percent" && (
+                              <div className="h-1 overflow-hidden rounded-full bg-shell">
+                                <div
+                                  className={cn(
+                                    "h-full rounded-full",
+                                    m.limitReached ? "bg-danger" : "bg-fg-3",
+                                  )}
+                                  style={{ width: `${Math.min(100, m.value)}%` }}
+                                />
+                              </div>
+                            )}
+                            {(resetsInLabel(m.resetsAt) !== null || m.tier !== primary.tier) && (
+                              <span className="text-[10px] text-fg-3">
+                                {[resetsInLabel(m.resetsAt), m.tier !== primary.tier ? tierBadge(m.tier) : null]
+                                  .filter((x): x is string => x !== null)
+                                  .join(" · ")}
+                              </span>
+                            )}
+                          </div>
+                        ))}
                       </div>
                     )}
                     <p className="mt-2 text-[11px] uppercase tracking-wide text-fg-3">
