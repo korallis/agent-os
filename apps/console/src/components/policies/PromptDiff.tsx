@@ -77,8 +77,8 @@ export function PromptDiff() {
   useEffect(() => {
     if (selected === null) return;
     let cancelled = false;
-    setDiff(null);
-    setDiffFailedRef(null);
+    // Do not clear diff synchronously — treat a mismatched ref as loading so
+    // we never cascade a render before the async fetch settles.
     void (async () => {
       try {
         const res = await fetch(`/api/agentos/prompts/diff?ref=${encodeURIComponent(selected)}`, {
@@ -91,7 +91,10 @@ export function PromptDiff() {
           setDiffFailedRef(null);
         }
       } catch {
-        if (!cancelled) setDiffFailedRef(selected);
+        if (!cancelled) {
+          setDiff(null);
+          setDiffFailedRef(selected);
+        }
       }
     })();
     return () => {
@@ -144,11 +147,11 @@ export function PromptDiff() {
         ))}
       </div>
 
-      {diffFailedRef !== null ? (
+      {diffFailedRef === selected && selected !== null ? (
         <p className="text-[13px] text-danger">
           Could not load diff for <span className="font-mono">{diffFailedRef}</span>.
         </p>
-      ) : diff === null ? (
+      ) : diff === null || diff.ref !== selected ? (
         <p className="text-[13px] text-fg-3">Loading diff…</p>
       ) : (
         <div className="flex flex-col gap-3">

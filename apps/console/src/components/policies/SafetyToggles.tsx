@@ -70,7 +70,20 @@ export function SafetyToggles() {
   };
 
   useEffect(() => {
-    void load();
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/agentos/config/effective", { cache: "no-store" });
+        if (!res.ok) throw new Error(String(res.status));
+        const body = (await res.json()) as { config?: { policies?: Policies } };
+        if (!cancelled) setPolicies(body.config?.policies ?? null);
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const openDisable = (key: string) => {

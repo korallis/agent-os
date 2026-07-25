@@ -15,7 +15,8 @@ export default async function NetworkDetailPage({
     <>
       <Topbar title="Network I/O" />
       <main className="flex-1 flex flex-col gap-5 p-8">
-        <NetworkDetail requestId={id} />
+        {/* key remounts on id change so detail state never shows a prior request */}
+        <NetworkDetail key={id} requestId={id} />
       </main>
     </>
   );

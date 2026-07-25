@@ -84,10 +84,9 @@ export function NetworkDetail({ requestId }: { requestId: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    // Reset on id change so a slow response cannot land under a different
-    // request's URL — the same identity bug already fixed on Session Detail.
-    setState("loading");
-    setRequest(null);
+    // Parent remounts this component via key={requestId} on navigation so we
+    // never need a sync state reset here (avoids cascading renders + the
+    // cross-id identity bug already fixed on Session Detail).
     void (async () => {
       try {
         const res = await fetch(`/api/agentos/network/${requestId}`, { cache: "no-store" });

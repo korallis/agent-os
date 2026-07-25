@@ -71,15 +71,17 @@ export function PoliciesModal() {
 
   // Shipped defaults per domain — fetched once the domain list is known so the
   // ◆ mark compares values rather than inferring deviation from the layer name.
-  const domainList = data !== null ? Object.keys(data.config) : [];
-  const domainKey = domainList.join(",");
+  // domainKey (not the array) is the effect identity so we do not re-fetch on
+  // every render of a fresh keys() array.
+  const domainKey = data !== null ? Object.keys(data.config).join(",") : "";
   useEffect(() => {
-    if (domainList.length === 0) return;
+    if (domainKey.length === 0) return;
+    const domainsToLoad = domainKey.split(",");
     let cancelled = false;
     void (async () => {
       const next: Record<string, Record<string, string>> = {};
       await Promise.all(
-        domainList.map(async (name) => {
+        domainsToLoad.map(async (name) => {
           try {
             const res = await fetch(`/api/agentos/config/shipped/${name}`, { cache: "no-store" });
             if (!res.ok) return;
