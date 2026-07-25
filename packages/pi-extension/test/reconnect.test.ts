@@ -91,6 +91,60 @@ describe("extension host reconnect", () => {
     expect(true).toBe(true);
   });
 
+  it("cold-start via connectWithRetry emits exactly one ext.hello", async () => {
+    // Dual-driver race: connectWithRetry used to loop connect() while the
+    // close handler also scheduleReconnect()'d on the same failures. Both
+    // saw socket===null ~retryMs apart, both connected, orphaning a socket
+    // and sending two ext.hello frames for one session. Count hellos.
+    const dir = mkdtempSync(join(tmpdir(), "p13-reconnect-single-hello-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "session.sock");
+
+    let helloCount = 0;
+    const host = new AgentOsExtensionHost({
+      socketPath,
+      sessionId: "01SESSION0000000000000004",
+      role: "builder",
+      piVersion: "0.82.0",
+      retryMs: 30,
+      maxRetries: 50,
+    });
+
+    // Production boot path — must not race an independent retry loop.
+    const boot = host.connectWithRetry();
+
+    // Window long enough for a dual-driver race to arm two attempts.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const server = await listen(socketPath);
+    server.on("connection", (socket) => {
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (line.length === 0) continue;
+          try {
+            const frame = JSON.parse(line) as { type?: unknown };
+            if (frame.type === "ext.hello") helloCount += 1;
+          } catch {
+            // ignore non-JSON
+          }
+        }
+      });
+    });
+
+    const ok = await boot;
+    // Late second hello from an orphaned socket would arrive shortly after.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    expect(ok).toBe(true);
+    expect(helloCount).toBe(1);
+    host.close();
+  });
+
   it("reports dropped pending frames as a lifecycle detail on reconnect", async () => {
     const dir = mkdtempSync(join(tmpdir(), "p13-dropped-frames-"));
     dirs.push(dir);

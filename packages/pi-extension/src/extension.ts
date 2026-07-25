@@ -99,6 +99,8 @@ const MAX_BUFFER_CHARS = 1_000_000;
 
 export class AgentOsExtensionHost {
   private socket: Socket | null = null;
+  /** Socket that is connecting but not yet assigned to `socket`. */
+  private pendingSocket: Socket | null = null;
   private buffer = "";
   /** Optional reporter for frames dropped while disconnected. */
   onDroppedFrames?: (count: number) => void;
@@ -106,6 +108,11 @@ export class AgentOsExtensionHost {
   /** Frames discarded while disconnected — reported on reconnect, never hidden. */
   private droppedFrames = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Single owner of an in-flight TCP connect; concurrent callers share it. */
+  private connectInflight: Promise<void> | null = null;
+  private connecting = false;
+  /** Waiters for cold-start / reconnect success after the first failed attempt. */
+  private connectionWaiters: Array<(ok: boolean) => void> = [];
   private readonly inflight = new Map<string, PendingToolCall>();
   private attempts = 0;
   private closed = false;
@@ -115,12 +122,55 @@ export class AgentOsExtensionHost {
 
   constructor(private readonly options: ExtensionHostOptions) {}
 
+  private resolveConnectionWaiters(ok: boolean): void {
+    const waiters = this.connectionWaiters.splice(0);
+    for (const waiter of waiters) waiter(ok);
+  }
+
   connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    if (this.closed) return Promise.reject(new Error("extension closed"));
+    if (this.socket !== null) return Promise.resolve();
+    if (this.connectInflight !== null) return this.connectInflight;
+
+    this.connecting = true;
+    this.connectInflight = new Promise<void>((resolve, reject) => {
       const socket = createConnection(this.options.socketPath);
+      this.pendingSocket = socket;
+      let settled = false;
+
+      const settleOk = (): void => {
+        if (settled) return;
+        settled = true;
+        this.connecting = false;
+        this.connectInflight = null;
+        if (this.pendingSocket === socket) this.pendingSocket = null;
+        resolve();
+      };
+      const settleErr = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        this.connecting = false;
+        this.connectInflight = null;
+        if (this.pendingSocket === socket) this.pendingSocket = null;
+        reject(error);
+      };
+
       socket.on("connect", () => {
+        // Shut-down seat: destroy and do not adopt the socket.
+        if (this.closed) {
+          socket.destroy();
+          settleErr(new Error("extension closed"));
+          return;
+        }
+        // Serialize concurrent attempts: only one live socket at a time.
+        if (this.socket !== null) {
+          socket.destroy();
+          settleOk();
+          return;
+        }
         this.attempts = 0;
         this.socket = socket;
+        if (this.pendingSocket === socket) this.pendingSocket = null;
         this.sendHello();
         for (const frame of this.pending) {
           this.write(frame);
@@ -139,11 +189,12 @@ export class AgentOsExtensionHost {
           );
           this.onDroppedFrames?.(dropped);
         }
-        resolve();
+        this.resolveConnectionWaiters(true);
+        settleOk();
       });
       socket.on("error", (error) => {
         if (this.socket === null) {
-          reject(error);
+          settleErr(error instanceof Error ? error : new Error(String(error)));
         }
       });
       socket.on("close", () => {
@@ -152,47 +203,79 @@ export class AgentOsExtensionHost {
         // that needs it: the FAILED reconnect. That left a single >retryMs
         // daemon outage ending telemetry for the life of the process.
         if (this.socket === socket) this.socket = null;
+        if (this.pendingSocket === socket) this.pendingSocket = null;
+        if (!settled) {
+          settleErr(new Error("connection closed before connect"));
+        }
         this.scheduleReconnect();
       });
       socket.on("data", (chunk) => this.onData(chunk.toString("utf8")));
     });
+
+    return this.connectInflight;
   }
 
   /**
    * Connect, retrying while the daemon is starting or restarting. Pi must never
    * crash because agentosd is momentarily absent.
+   *
+   * One reconnect driver only: the first attempt is direct; further retries
+   * are owned solely by {@link scheduleReconnect} so cold-start cannot arm a
+   * second independent loop that races and orphans sockets / double-hellos.
    */
   async connectWithRetry(): Promise<boolean> {
-    const retryMs = this.options.retryMs ?? 250;
-    const maxRetries = this.options.maxRetries ?? 20;
-    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-      try {
-        await this.connect();
-        return true;
-      } catch {
-        if (retryMs === 0 || attempt === maxRetries) return false;
-        await new Promise((r) => setTimeout(r, retryMs));
-      }
+    if (this.closed) return false;
+    if (this.socket !== null) return true;
+    try {
+      await this.connect();
+      return true;
+    } catch {
+      if (this.closed) return false;
+      if (this.socket !== null) return true;
+      return new Promise<boolean>((resolve) => {
+        this.connectionWaiters.push(resolve);
+        // close handler usually arms scheduleReconnect already; if retries are
+        // disabled or exhausted without a timer, fail the waiters immediately.
+        if (this.reconnectTimer === null && !this.connecting && this.socket === null) {
+          const retryMs = this.options.retryMs ?? 250;
+          const maxRetries = this.options.maxRetries ?? 20;
+          if (retryMs === 0 || this.attempts >= maxRetries) {
+            this.resolveConnectionWaiters(false);
+          } else {
+            this.scheduleReconnect();
+          }
+        }
+      });
     }
-    return false;
   }
 
   private scheduleReconnect(): void {
-    if (this.closed) return;
-    // Already connected, or a retry is already pending — never stack timers.
-    if (this.socket !== null || this.reconnectTimer !== null) return;
+    if (this.closed) {
+      this.resolveConnectionWaiters(false);
+      return;
+    }
+    // Already connected, connecting, or a retry is already pending — one owner.
+    if (this.socket !== null || this.connecting || this.reconnectTimer !== null) {
+      return;
+    }
     const retryMs = this.options.retryMs ?? 250;
-    if (retryMs === 0) return;
+    if (retryMs === 0) {
+      this.resolveConnectionWaiters(false);
+      return;
+    }
     this.attempts += 1;
     const maxRetries = this.options.maxRetries ?? 20;
-    if (this.attempts > maxRetries) return;
+    if (this.attempts > maxRetries) {
+      this.resolveConnectionWaiters(false);
+      return;
+    }
     // Back off so a daemon that is down for minutes is not hammered every
     // 250ms, while a quick restart is still picked up almost immediately.
     const delay = Math.min(retryMs * 2 ** Math.min(this.attempts - 1, 6), 30_000);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      // Stale timer after a later success or close() must not orphan a live socket.
-      if (this.closed || this.socket !== null) return;
+      // Stale timer after a later success, in-flight connect, or close().
+      if (this.closed || this.socket !== null || this.connecting) return;
       void this.connect().catch(() => undefined);
     }, delay);
     this.reconnectTimer.unref?.();
@@ -365,6 +448,7 @@ export class AgentOsExtensionHost {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.resolveConnectionWaiters(false);
     for (const [id, waiter] of this.inflight) {
       this.inflight.delete(id);
       waiter.resolve({
@@ -372,6 +456,8 @@ export class AgentOsExtensionHost {
         error: { code: "DISCONNECTED", message: "extension socket closed" },
       });
     }
+    this.pendingSocket?.destroy();
+    this.pendingSocket = null;
     this.socket?.destroy();
     this.socket = null;
   }
