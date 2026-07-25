@@ -45,7 +45,7 @@ function gitRepo(): string {
   return dir;
 }
 
-function fleet(options: { fakePi?: boolean } = {}): FleetService {
+async function fleet(options: { fakePi?: boolean } = {}): Promise<FleetService> {
   const home = temp("agentos-harness-home-");
   mkdirSync(join(home, "config"), { recursive: true });
   const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -60,9 +60,9 @@ function fleet(options: { fakePi?: boolean } = {}): FleetService {
     fakeBrain: true,
     ...(options.fakePi === true ? { fakePi: true } : {}),
   });
-  // Orchestration tools are blocked while the Brain is down; these cases are
-  // about the harness, not about BRAIN_DOWN.
-  service.start();
+  // Orchestration tools are blocked while the Brain is down; start() is async
+  // (handover reconcile before brain boot) and must settle before tool use.
+  await service.start();
   return service;
 }
 
@@ -439,8 +439,8 @@ describe("spawn env delivery", () => {
 });
 
 describe("missing Pi is an error, not a stub", () => {
-  it("spawn_crewmate returns PI_UNAVAILABLE when Pi is not installed", () => {
-    const service = fleet();
+  it("spawn_crewmate returns PI_UNAVAILABLE when Pi is not installed", async () => {
+    const service = await fleet();
     const { taskId } = seedTask(service, { name: "harness", shape: "SHIP", role: "builder" });
 
     const spawned = service.tools.invoke("spawn_crewmate", {
@@ -454,8 +454,8 @@ describe("missing Pi is an error, not a stub", () => {
     expect(spawned.error?.code).toBe("PI_UNAVAILABLE");
   });
 
-  it("PI_UNAVAILABLE releases the worktree lease so the pool is not exhausted", () => {
-    const service = fleet();
+  it("PI_UNAVAILABLE releases the worktree lease so the pool is not exhausted", async () => {
+    const service = await fleet();
     const { taskId } = seedTask(service, { name: "pool-leak", shape: "SHIP", role: "builder" });
 
     for (let i = 0; i < 3; i++) {
@@ -476,8 +476,8 @@ describe("missing Pi is an error, not a stub", () => {
 });
 
 describe("worktree idle reuse moves HEAD to the new branch", () => {
-  it("after deliver + re-lease, git HEAD matches the new lease branch", () => {
-    const service = fleet({ fakePi: true });
+  it("after deliver + re-lease, git HEAD matches the new lease branch", async () => {
+    const service = await fleet({ fakePi: true });
     const repo = gitRepo();
     const project = service.projects.register({
       name: "reuse",
@@ -562,8 +562,8 @@ describe("worktree idle reuse moves HEAD to the new branch", () => {
 });
 
 describe("tool bridge authorization", () => {
-  it("refuses orchestration tools from a session that is not the Brain", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses orchestration tools from a session that is not the Brain", async () => {
+    const service = await fleet({ fakePi: true });
     service.tools.setBrainSessionId("01JBR4N0000000000000000000");
 
     const refused = service.tools.invokeFromSession(
@@ -612,8 +612,8 @@ describe("tool bridge authorization", () => {
 });
 
 describe("SCOUT read-only enforcement", () => {
-  it("audits the worktree with git and quarantines a scout that wrote", () => {
-    const service = fleet({ fakePi: true });
+  it("audits the worktree with git and quarantines a scout that wrote", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, { name: "scouted", shape: "SCOUT", role: "scout" });
 
     const spawned = service.tools.invoke("spawn_crewmate", {
@@ -639,8 +639,8 @@ describe("SCOUT read-only enforcement", () => {
     expect(lease?.state).toBe("quarantined");
   });
 
-  it("fails closed when git status cannot verify the worktree", () => {
-    const service = fleet({ fakePi: true });
+  it("fails closed when git status cannot verify the worktree", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, { name: "scout-audit-fail", shape: "SCOUT", role: "scout" });
 
     const spawned = service.tools.invoke("spawn_crewmate", {
@@ -665,8 +665,8 @@ describe("SCOUT read-only enforcement", () => {
 });
 
 describe("worktree lease reclaim on stop/respawn", () => {
-  it("stop/respawn cycles never exceed poolSize leased trees", () => {
-    const service = fleet({ fakePi: true });
+  it("stop/respawn cycles never exceed poolSize leased trees", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "respawn-pool",
       shape: "SHIP",
@@ -708,8 +708,8 @@ describe("worktree lease reclaim on stop/respawn", () => {
     }
   });
 
-  it("respawns after dirty stop that quarantined the task branch", () => {
-    const service = fleet({ fakePi: true });
+  it("respawns after dirty stop that quarantined the task branch", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "dirty-respawn",
       shape: "SHIP",
@@ -760,7 +760,7 @@ describe("worktree lease reclaim on stop/respawn", () => {
     );
   });
 
-  it("persists stopped status across restart and does not emit SESSION_LOST", () => {
+  it("persists stopped status across restart and does not emit SESSION_LOST", async () => {
     const home = temp("agentos-stop-persist-");
     mkdirSync(join(home, "config"), { recursive: true });
     const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -773,7 +773,7 @@ describe("worktree lease reclaim on stop/respawn", () => {
       fakeBrain: true,
       fakePi: true,
     });
-    service.start();
+    await service.start();
 
     const { taskId, model } = seedTask(service, {
       name: "stop-persist",
@@ -819,8 +819,8 @@ describe("worktree lease reclaim on stop/respawn", () => {
 });
 
 describe("scout spawn requires cast", () => {
-  it("refuses scout spawn in QUEUED before leasing a worktree", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses scout spawn in QUEUED before leasing a worktree", async () => {
+    const service = await fleet({ fakePi: true });
     const project = service.projects.register({
       name: "scout-queued",
       path: gitRepo(),
@@ -856,8 +856,8 @@ describe("scout spawn requires cast", () => {
 });
 
 describe("deliver_task dirty worktree fail-closed", () => {
-  it("quarantines and preserves uncommitted files instead of resetting", () => {
-    const service = fleet({ fakePi: true });
+  it("quarantines and preserves uncommitted files instead of resetting", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "dirty-deliver",
       shape: "SHIP",
@@ -891,8 +891,8 @@ describe("deliver_task dirty worktree fail-closed", () => {
     expect((task.data as { phase: string }).phase).not.toBe("DONE");
   });
 
-  it("refuses a second deliver_task after dirty quarantine (never reaches DONE)", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses a second deliver_task after dirty quarantine (never reaches DONE)", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "dirty-deliver-retry",
       shape: "SHIP",
@@ -939,8 +939,8 @@ describe("deliver_task dirty worktree fail-closed", () => {
 });
 
 describe("delivery invariant choke points", () => {
-  it("stamps deliveryBlocked when stop_crewmate quarantines a dirty tree", () => {
-    const service = fleet({ fakePi: true });
+  it("stamps deliveryBlocked when stop_crewmate quarantines a dirty tree", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "dirty-stop-block",
       shape: "SHIP",
@@ -985,8 +985,8 @@ describe("delivery invariant choke points", () => {
     );
   });
 
-  it("refuses advance_phase to DONE in favour of deliver_task", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses advance_phase to DONE in favour of deliver_task", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "advance-done-block",
       shape: "SHIP",
@@ -1021,8 +1021,8 @@ describe("delivery invariant choke points", () => {
     );
   });
 
-  it("refuses advance_phase to DONE while a dirty tree is outstanding", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses advance_phase to DONE while a dirty tree is outstanding", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "advance-dirty-done",
       shape: "SHIP",
@@ -1079,8 +1079,8 @@ describe("delivery invariant choke points", () => {
     );
   });
 
-  it("refuses advance_phase to CANCELLED in favour of cancel_task", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses advance_phase to CANCELLED in favour of cancel_task", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, {
       name: "advance-cancel-block",
       shape: "SHIP",
@@ -1096,8 +1096,8 @@ describe("delivery invariant choke points", () => {
     expect(cancelled.error?.message).toContain("cancel_task");
   });
 
-  it("keeps deliveryBlocked sticky across BUILDING→VALIDATING after dirty stop", () => {
-    const service = fleet({ fakePi: true });
+  it("keeps deliveryBlocked sticky across BUILDING→VALIDATING after dirty stop", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "sticky-block-advance",
       shape: "SHIP",
@@ -1159,8 +1159,8 @@ describe("delivery invariant choke points", () => {
     expect(snap.deliveryBlocked).not.toBeNull();
   });
 
-  it("stamps deliveryBlocked on SCOUT force-quarantine write violation", () => {
-    const service = fleet({ fakePi: true });
+  it("stamps deliveryBlocked on SCOUT force-quarantine write violation", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, {
       name: "scout-block-stamp",
       shape: "SCOUT",
@@ -1210,8 +1210,8 @@ describe("delivery invariant choke points", () => {
     ).not.toBe("DONE");
   });
 
-  it("resolve_delivery_block is Captain-only and keeps dirty tree from DONE", () => {
-    const service = fleet({ fakePi: true });
+  it("resolve_delivery_block is Captain-only and keeps dirty tree from DONE", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "captain-resolve-block",
       shape: "SHIP",
@@ -1288,8 +1288,8 @@ describe("resolveExtensionPath fail-closed", () => {
 });
 
 describe("brain pane death reconcile", () => {
-  it("respawns the Brain when its tmux window is gone", () => {
-    const service = fleet({ fakePi: true });
+  it("respawns the Brain when its tmux window is gone", async () => {
+    const service = await fleet({ fakePi: true });
     const before = service.brain.getSnapshot();
     expect(before.status).toBe("running");
     expect(before.tmuxWindow).not.toBeNull();
@@ -1310,8 +1310,8 @@ describe("brain pane death reconcile", () => {
 });
 
 describe("send_to_crew delivery", () => {
-  it("throws CONFLICT when both inject and send-keys fail", () => {
-    const service = fleet({ fakePi: true });
+  it("throws CONFLICT when both inject and send-keys fail", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, { name: "dead-channels", shape: "SHIP", role: "builder" });
     const spawned = service.tools.invoke("spawn_crewmate", {
       taskId,
@@ -1376,8 +1376,8 @@ describe("worktree verified-reset fail-closed", () => {
 });
 
 describe("crewmate questions", () => {
-  it("routes an answer back to the session that asked", () => {
-    const service = fleet({ fakePi: true });
+  it("routes an answer back to the session that asked", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, { name: "asker", shape: "SHIP", role: "builder" });
     const spawned = service.tools.invoke("spawn_crewmate", {
       taskId,
@@ -1413,8 +1413,8 @@ describe("crewmate questions", () => {
     expect(unknown.error?.code).toBe("NOT_FOUND");
   });
 
-  it("keeps a pending question retryable when delivery fails", () => {
-    const service = fleet({ fakePi: true });
+  it("keeps a pending question retryable when delivery fails", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, { name: "retry-ask", shape: "SHIP", role: "builder" });
     const spawned = service.tools.invoke("spawn_crewmate", {
       taskId,
@@ -1462,8 +1462,8 @@ describe("crewmate questions", () => {
 });
 
 describe("stow_knowledge path jail", () => {
-  it("rejects path traversal and keeps notes under docs/notes", () => {
-    const service = fleet({ fakePi: true });
+  it("rejects path traversal and keeps notes under docs/notes", async () => {
+    const service = await fleet({ fakePi: true });
     const project = service.projects.register({
       name: "stow-jail",
       path: gitRepo(),
@@ -1549,8 +1549,8 @@ describe("brain spawn failure", () => {
 });
 
 describe("extension lifecycle drives session state", () => {
-  it("marks a session settled on agent_settled and absorbs PROGRESS", () => {
-    const service = fleet({ fakePi: true });
+  it("marks a session settled on agent_settled and absorbs PROGRESS", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, { name: "lifecycle", shape: "SHIP", role: "builder" });
     const spawned = service.tools.invoke("spawn_crewmate", {
       taskId,
@@ -1586,8 +1586,8 @@ describe("extension lifecycle drives session state", () => {
 });
 
 describe("crewmate cwd isolation", () => {
-  it("never spawns a crewmate cwd equal to the project primary checkout", () => {
-    const service = fleet({ fakePi: true });
+  it("never spawns a crewmate cwd equal to the project primary checkout", async () => {
+    const service = await fleet({ fakePi: true });
     const repo = gitRepo();
     const project = service.projects.register({
       name: "cwd-isolation",
@@ -1668,8 +1668,8 @@ describe("crewmate cwd isolation", () => {
     }
   });
 
-  it("deliver_task stops a live session before releasing its worktree lease", () => {
-    const service = fleet({ fakePi: true });
+  it("deliver_task stops a live session before releasing its worktree lease", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "deliver-halt",
       shape: "SHIP",
@@ -1700,7 +1700,7 @@ describe("crewmate cwd isolation", () => {
 });
 
 describe("terminal task lifecycle choke points", () => {
-  it("cancel_task halts live sessions before releasing worktree leases", () => {
+  it("cancel_task halts live sessions before releasing worktree leases", async () => {
     const home = temp("agentos-cancel-halt-");
     mkdirSync(join(home, "config"), { recursive: true });
     const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -1713,7 +1713,7 @@ describe("terminal task lifecycle choke points", () => {
       fakeBrain: true,
       fakePi: true,
     });
-    service.start();
+    await service.start();
 
     const { taskId, model } = seedTask(service, {
       name: "cancel-halt",
@@ -1764,8 +1764,8 @@ describe("terminal task lifecycle choke points", () => {
     expect(durable.sessions.find((s) => s.sessionId === sessionId)?.worktreePath).toBeNull();
   });
 
-  it("refuses spawn_crewmate on terminal tasks for every role", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses spawn_crewmate on terminal tasks for every role", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "spawn-terminal",
       shape: "SHIP",
@@ -1791,8 +1791,8 @@ describe("terminal task lifecycle choke points", () => {
     }
   });
 
-  it("deliver abort after halt releases remaining task leases", () => {
-    const service = fleet({ fakePi: true });
+  it("deliver abort after halt releases remaining task leases", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "deliver-abort-release",
       shape: "SHIP",
@@ -1825,8 +1825,8 @@ describe("terminal task lifecycle choke points", () => {
     );
   });
 
-  it("periodic reconcile reclaims leases under stopped sessions", () => {
-    const service = fleet({ fakePi: true });
+  it("periodic reconcile reclaims leases under stopped sessions", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "reconcile-orphan-lease",
       shape: "SHIP",
@@ -2054,8 +2054,8 @@ describe("daemon-owned RED proof (not seat-writable disk)", () => {
 });
 
 describe("candidate gate isolation and builder worktree ownership", () => {
-  it("refuses run_gate(candidate) without an isolated builder worktree", () => {
-    const service = fleet({ fakePi: true });
+  it("refuses run_gate(candidate) without an isolated builder worktree", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId } = seedTask(service, {
       name: "gate-no-wt",
       shape: "SHIP",
@@ -2092,8 +2092,8 @@ describe("candidate gate isolation and builder worktree ownership", () => {
     }
   });
 
-  it("scout spawn does not clobber task.worktreePath used by candidate gates", () => {
-    const service = fleet({ fakePi: true });
+  it("scout spawn does not clobber task.worktreePath used by candidate gates", async () => {
+    const service = await fleet({ fakePi: true });
     const repo = gitRepo();
     const project = service.projects.register({
       name: "path-clobber",
@@ -2161,8 +2161,8 @@ describe("candidate gate isolation and builder worktree ownership", () => {
     }
   });
 
-  it("stop_crewmate clears task.worktreePath so idle reuse cannot be judged against a stale ref", () => {
-    const service = fleet({ fakePi: true });
+  it("stop_crewmate clears task.worktreePath so idle reuse cannot be judged against a stale ref", async () => {
+    const service = await fleet({ fakePi: true });
     const repo = gitRepo();
     const project = service.projects.register({
       name: "stale-ref",
@@ -2240,8 +2240,8 @@ describe("candidate gate isolation and builder worktree ownership", () => {
     ).toBe(path2);
   });
 
-  it("session_end releases the worktree lease so settle-and-exit does not exhaust the pool", () => {
-    const service = fleet({ fakePi: true });
+  it("session_end releases the worktree lease so settle-and-exit does not exhaust the pool", async () => {
+    const service = await fleet({ fakePi: true });
     const { taskId, model } = seedTask(service, {
       name: "session-end-lease",
       shape: "SHIP",
