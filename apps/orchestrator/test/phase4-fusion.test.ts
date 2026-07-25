@@ -817,8 +817,16 @@ describe("/opinion live path", () => {
     expect(afterStop?.sides[1]?.settledAt).toBeTruthy();
     expect(afterStop?.sides[1]?.artifactPath).toBeNull();
     expect(afterStop?.completedAt).toBeTruthy();
+    expect(afterStop?.error).toBe("test stop");
     expect(events.map((e) => e.type)).toContain("fusion.side_completed");
     expect(events.map((e) => e.type)).toContain("fusion.completed");
+    // One terminal lifecycle event from stop_crewmate — not also
+    // "fusion side settled" from releaseSettled.
+    expect(events.filter((e) => e.type === "session.stopped")).toHaveLength(1);
+    const stopEvent = events.find((e) => e.type === "session.stopped");
+    if (stopEvent?.type === "session.stopped") {
+      expect(stopEvent.payload.reason).toBe("test stop");
+    }
     const completedStop = events.find((e) => e.type === "fusion.completed");
     if (completedStop?.type === "fusion.completed") {
       expect(completedStop.payload.error).toBe("test stop");
@@ -1089,6 +1097,7 @@ describe("/opinion live path", () => {
     expect(run).not.toBeNull();
     expect(run!.sides.every((s) => s.settledAt != null)).toBe(true);
     expect(run!.sides[0]?.artifactPath).not.toBeNull();
+    expect(run!.error).toBe("captain cancelled mid-opinion");
 
     // Hydrate must not re-arm a finished run after cancel.
     service.tools.hydrateFusionOwnership();
@@ -1096,6 +1105,192 @@ describe("/opinion live path", () => {
     service.tools.markSessionStatus(sessionA, "settled");
     expect(events.map((e) => e.type)).not.toContain("fusion.side_completed");
     expect(events.map((e) => e.type)).not.toContain("fusion.completed");
+  });
+
+  it("latches an earlier side failure when a later side settles cleanly", () => {
+    const { service, events } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    const spawnA = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
+    const spawnB = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      cleanRoom: true,
+    });
+    expect(spawnA.ok).toBe(true);
+    expect(spawnB.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session
+      .sessionId;
+    const sessionB = (spawnB.data as { session: { sessionId: string } }).session
+      .sessionId;
+
+    const runId = "01JLATCHERRORFUSION000000001";
+    service.fusionRuns.create({
+      runId,
+      taskId,
+      kind: "opinion",
+      templateRef: null,
+      templateLayer: null,
+      templateHash: null,
+      renderedHash: "latch-hash",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          family: "anthropic",
+          sessionId: sessionA,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: sessionB,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: new Date().toISOString(),
+    });
+
+    const dirB = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+    }).dir;
+    mkdirSync(join(dirB, "outputs"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dirB, "outputs", `${sessionB}.md`), "clean side b\n", {
+      mode: 0o600,
+    });
+
+    service.tools.hydrateFusionOwnership();
+    events.length = 0;
+
+    // Side A fails first; side B settles cleanly second. Completion must keep
+    // the failure rather than last-writer-wins success.
+    service.tools.markSessionLost(sessionA, "pane died side A");
+    service.tools.markSessionStatus(sessionB, "settled");
+
+    const completed = events.find((e) => e.type === "fusion.completed");
+    expect(completed?.type).toBe("fusion.completed");
+    if (completed?.type === "fusion.completed") {
+      expect(completed.payload.error).toContain("pane died side A");
+    }
+    const durable = service.fusionRuns.get(taskId, runId);
+    expect(durable?.completedAt).toBeTruthy();
+    expect(durable?.error).toContain("pane died side A");
+    // session.lost is the only terminal lifecycle event for side A (no
+    // intermediate session.stopped from releaseSettled).
+    expect(
+      events.filter(
+        (e) =>
+          e.type === "session.lost" &&
+          e.payload.sessionId === sessionA,
+      ),
+    ).toHaveLength(1);
+    expect(
+      events.filter(
+        (e) =>
+          e.type === "session.stopped" &&
+          e.payload.sessionId === sessionA,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("deliver_task abort finalizes in-flight fusion sides", () => {
+    const { service, events } = fleet();
+    const { taskId } = seedShipTask(service);
+
+    // Builder first so phase is BUILDING (deliverable). Dirty tree aborts deliver.
+    const spawnBuilder = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model: "anthropic/claude-fable-5",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawnBuilder.ok).toBe(true);
+    const builderPath = (
+      spawnBuilder.data as { session: { worktreePath: string } }
+    ).session.worktreePath;
+
+    // In-flight fusion side still open when deliver aborts.
+    const spawnPlanner = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawnPlanner.ok).toBe(true);
+    const plannerSession = (
+      spawnPlanner.data as { session: { sessionId: string } }
+    ).session.sessionId;
+
+    const runId = "01JDELIVERABORTFUSION0000001";
+    service.fusionRuns.create({
+      runId,
+      taskId,
+      kind: "opinion",
+      templateRef: null,
+      templateLayer: null,
+      templateHash: null,
+      renderedHash: "deliver-abort",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: plannerSession,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: new Date().toISOString(),
+    });
+    service.tools.hydrateFusionOwnership();
+
+    writeFileSync(join(builderPath, "builder-wip.txt"), "must not discard\n");
+
+    events.length = 0;
+    const deliver = service.tools.invoke("deliver_task", { taskId });
+    expect(deliver.ok).toBe(false);
+    expect(deliver.error?.code).toBe("CONFLICT");
+
+    const run = service.fusionRuns.get(taskId, runId);
+    expect(run?.completedAt).toBeTruthy();
+    expect(run?.sides[0]?.settledAt).toBeTruthy();
+    expect(run?.error).toBeTruthy();
+    expect(events.map((e) => e.type)).toContain("fusion.side_completed");
+    expect(events.map((e) => e.type)).toContain("fusion.completed");
+    const completed = events.find((e) => e.type === "fusion.completed");
+    if (completed?.type === "fusion.completed") {
+      expect(completed.payload.error).toBeTruthy();
+    }
   });
 
   it("reconcileMissingCastRoles continues after a failed respawn", () => {

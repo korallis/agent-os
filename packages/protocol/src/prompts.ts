@@ -87,6 +87,13 @@ export const fusionRunSchema = z.strictObject({
    * Optional for records written before this field existed.
    */
   completedAt: isoTimestampSchema.nullable().optional(),
+  /**
+   * Accumulated failure reasons (stop / lost / spawn abort / deliver abort).
+   * Latched across side settles so a clean last settle cannot erase an earlier
+   * failure. Null/absent when the run completed cleanly. Durable so REST detail
+   * and post-restart inspection can distinguish failure from empty model output.
+   */
+  error: z.string().nullable().optional(),
 });
 export type FusionRun = z.infer<typeof fusionRunSchema>;
 

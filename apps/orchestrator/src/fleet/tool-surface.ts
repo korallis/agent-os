@@ -1281,10 +1281,17 @@ export class ToolSurface {
     // Finalize any in-flight fusion side before dropping ownership so a stop
     // cannot leave the run stranded on fusion.dispatched. Pass reason so the
     // last side's stop is not reported as a clean fusion.completed success.
-    this.completeFusionSide(input.sessionId, input.reason);
-    this.deps.tmux.killWindow(session.tmuxWindow);
-    void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
-    this.releaseWorktreeLeases({ sessionId: input.sessionId });
+    // Suppress releaseSettled's session.stopped — this method owns the single
+    // terminal lifecycle event with the caller reason.
+    this.completeFusionSide(input.sessionId, input.reason, {
+      suppressStopEvent: true,
+    });
+    const afterFusion = this.sessions.get(input.sessionId) ?? session;
+    if (afterFusion.status !== "stopped" && afterFusion.status !== "lost") {
+      this.deps.tmux.killWindow(session.tmuxWindow);
+      void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
+      this.releaseWorktreeLeases({ sessionId: input.sessionId });
+    }
     this.clearFusionSession(input.sessionId);
     const now = new Date().toISOString();
     // Re-read after release so cleared worktreePath refs are not re-stamped.
@@ -1468,6 +1475,7 @@ export class ToolSurface {
       contractOk,
       createdAt: new Date().toISOString(),
       completedAt: null,
+      error: null,
     };
     this.deps.fusionRuns.create(run);
     this.deps.fusionRuns.writeInstruction(task.id, runId, instruction);
@@ -1645,10 +1653,31 @@ export class ToolSurface {
     this.deps.fusionRuns.save({ ...latest, sides });
 
     this.clearFusionRunSessionState(runId, sides.map((s) => s.sessionId));
-    const finalRun = this.deps.fusionRuns.get(taskId, runId);
+    const finalRun = this.latchFusionError(taskId, runId, errorMessage);
     if (finalRun !== null) {
-      this.emitFusionCompleted(finalRun, errorMessage);
+      this.emitFusionCompleted(finalRun);
     }
+  }
+
+  /**
+   * Latch a non-empty failure reason onto the durable FusionRun. Reasons
+   * accumulate (semicolon-separated, de-duplicated) so a clean last settle
+   * cannot erase an earlier side stop/lost/abort.
+   */
+  private latchFusionError(
+    taskId: string,
+    runId: string,
+    error?: string | null,
+  ): FusionRun | null {
+    const run = this.deps.fusionRuns.get(taskId, runId);
+    if (run === null) return null;
+    if (error == null || error.length === 0) return run;
+    const existing = run.error ?? null;
+    const next = mergeFusionErrors(existing, error);
+    if (next === existing) return run;
+    const updated: FusionRun = { ...run, error: next };
+    this.deps.fusionRuns.save(updated);
+    return updated;
   }
 
   /**
@@ -1658,9 +1687,16 @@ export class ToolSurface {
    * does not hold a pool slot. fusionBySessionId stays until the run
    * completes so late usage frames after agent_settled still attribute.
    */
-  private completeFusionSide(sessionId: string, error?: string | null): void {
+  private completeFusionSide(
+    sessionId: string,
+    error?: string | null,
+    options: { suppressStopEvent?: boolean } = {},
+  ): void {
     const ref = this.fusionBySessionId.get(sessionId);
     if (ref === undefined) return;
+
+    // Latch immediately so a later clean settle cannot drop this reason.
+    this.latchFusionError(ref.taskId, ref.runId, error);
 
     const run = this.deps.fusionRuns.get(ref.taskId, ref.runId);
     if (run === null) {
@@ -1675,8 +1711,8 @@ export class ToolSurface {
     }
     if (side.settledAt != null || side.artifactPath !== null) {
       // Already recorded (e.g. double settle from agent_settled + session_end).
-      this.tryCompleteFusionRun(ref.taskId, ref.runId, error);
-      this.releaseSettledFusionCrewmate(sessionId);
+      this.tryCompleteFusionRun(ref.taskId, ref.runId);
+      this.releaseSettledFusionCrewmate(sessionId, options);
       return;
     }
 
@@ -1718,15 +1754,20 @@ export class ToolSurface {
       },
     });
 
-    this.tryCompleteFusionRun(ref.taskId, ref.runId, error);
-    this.releaseSettledFusionCrewmate(sessionId);
+    this.tryCompleteFusionRun(ref.taskId, ref.runId);
+    this.releaseSettledFusionCrewmate(sessionId, options);
   }
 
   /**
    * Stop a settled fusion side's pane and free its worktree lease without
    * dropping fusion ownership (that stays until the whole run completes).
+   * When `suppressStopEvent` is set, the caller owns the single terminal
+   * lifecycle event (stop_crewmate / markSessionLost).
    */
-  private releaseSettledFusionCrewmate(sessionId: string): void {
+  private releaseSettledFusionCrewmate(
+    sessionId: string,
+    options: { suppressStopEvent?: boolean } = {},
+  ): void {
     const session = this.sessions.get(sessionId);
     if (session === undefined) {
       // Artifact already captured; free the dir map even if the session row is gone.
@@ -1765,14 +1806,16 @@ export class ToolSurface {
         });
       }
     }
-    this.sink({
-      type: "session.stopped",
-      payload: {
-        sessionId,
-        taskId: session.taskId,
-        reason: "fusion side settled",
-      },
-    });
+    if (options.suppressStopEvent !== true) {
+      this.sink({
+        type: "session.stopped",
+        payload: {
+          sessionId,
+          taskId: session.taskId,
+          reason: "fusion side settled",
+        },
+      });
+    }
   }
 
   /**
@@ -1800,7 +1843,9 @@ export class ToolSurface {
     runId: string,
     error?: string | null,
   ): void {
-    const run = this.deps.fusionRuns.get(taskId, runId);
+    // Latch any late reason before the all-sides check so order of settle
+    // cannot drop a prior failure when the last side is clean.
+    const run = this.latchFusionError(taskId, runId, error);
     if (run === null) return;
     if (run.completedAt != null) return;
     // A side is done when it has settled (possibly without an artifact) or,
@@ -1816,11 +1861,12 @@ export class ToolSurface {
       run.sides.map((s) => s.sessionId),
     );
 
-    this.emitFusionCompleted(run, error);
+    this.emitFusionCompleted(run);
 
+    const latchedError = this.deps.fusionRuns.get(taskId, runId)?.error ?? run.error;
     if (
       run.kind === "plan-fusion" &&
-      (error == null || error.length === 0)
+      (latchedError == null || latchedError.length === 0)
     ) {
       const task = this.tasks.get(taskId);
       if (task !== undefined && task.phase === "PLANNING") {
@@ -1830,10 +1876,19 @@ export class ToolSurface {
   }
 
   private emitFusionCompleted(run: FusionRun, error?: string | null): void {
-    const latest = this.deps.fusionRuns.get(run.taskId, run.runId) ?? run;
+    const latest =
+      this.latchFusionError(run.taskId, run.runId, error) ??
+      this.deps.fusionRuns.get(run.taskId, run.runId) ??
+      run;
     if (latest.completedAt != null) return;
     const completedAt = new Date().toISOString();
-    this.deps.fusionRuns.save({ ...latest, completedAt });
+    const durableError =
+      latest.error != null && latest.error.length > 0 ? latest.error : null;
+    this.deps.fusionRuns.save({
+      ...latest,
+      completedAt,
+      error: durableError,
+    });
     this.sink({
       type: "fusion.completed",
       payload: {
@@ -1843,7 +1898,7 @@ export class ToolSurface {
         promptsIdentical: latest.promptsIdentical,
         aggregatorFamily: latest.aggregatorFamily,
         contractOk: latest.contractOk,
-        ...(error != null && error.length > 0 ? { error } : {}),
+        ...(durableError != null ? { error: durableError } : {}),
       },
     });
   }
@@ -2308,12 +2363,22 @@ export class ToolSurface {
    * Settle every in-flight fusion side for a task via the shared
    * completeFusionSide helper (artifact capture, side_completed, and
    * fusion.completed when the last side settles). When `error` is set
-   * (cancel / FAILED / DONE abort), it is attached to fusion.completed.
+   * (cancel / FAILED / deliver abort), it is latched onto the durable run
+   * and reported on fusion.completed regardless of settle order.
    */
   private finalizeFusionSidesForTask(
     taskId: string,
     error?: string | null,
   ): void {
+    // Latch the abort reason once per open run before settling sides so a
+    // clean mid-loop settle cannot erase it.
+    if (error != null && error.length > 0) {
+      for (const run of this.deps.fusionRuns.listForTask(taskId)) {
+        if (run.completedAt != null) continue;
+        this.latchFusionError(taskId, run.runId, error);
+      }
+    }
+
     const ownedSessionIds = [
       ...new Set(
         [...this.fusionBySessionId.entries()]
@@ -2396,7 +2461,10 @@ export class ToolSurface {
     // After halt begins, abort must reclaim leases only for sessions already
     // stopped/lost. Never release a tree a live Pi still has as cwd (partial
     // halt failure); reconcile reclaims those once panes are gone.
+    // Success finalizes fusion via DONE → haltAndReleaseTask; abort paths
+    // finalize in finally so runs cannot sit on fusion.dispatched.
     let deliveryComplete = false;
+    let deliverAbortReason: string | null = null;
     try {
       this.haltTaskSessions(task.id, "deliver_task halt");
       task = this.requireTask(task.id);
@@ -2496,8 +2564,22 @@ export class ToolSurface {
       this.saveTask(task);
       deliveryComplete = true;
       return task;
+    } catch (error) {
+      deliverAbortReason =
+        error instanceof ToolSurfaceError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      throw error;
     } finally {
       if (!deliveryComplete) {
+        // Dirty tree / status failure / deliveryBlocked / partial halt: finalize
+        // any in-flight fusion via the shared helper before reclaiming leases.
+        this.finalizeFusionSidesForTask(
+          input.taskId,
+          deliverAbortReason ?? "deliver_task aborted",
+        );
         this.releaseWorktreeLeases({
           taskId: input.taskId,
           onlyHaltedSessions: true,
@@ -2844,7 +2926,9 @@ export class ToolSurface {
     // Finalize any in-flight fusion side before dropping ownership so a
     // pane-lost side cannot leave the run stranded on fusion.dispatched.
     // Pass reason so a lost last side is not reported as a clean success.
-    this.completeFusionSide(sessionId, reason);
+    // Suppress releaseSettled's session.stopped — session.lost is the single
+    // terminal lifecycle event for this path.
+    this.completeFusionSide(sessionId, reason, { suppressStopEvent: true });
     // Kill a still-live pane so reconcile/respawn cannot share
     // AGENTOS_SESSION_DIR/outputs with an orphan process.
     const afterFusion = this.sessions.get(sessionId) ?? session;
@@ -2966,6 +3050,21 @@ function hashConfig(config: AgentOsConfig): string {
 
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+/**
+ * Accumulate distinct fusion failure reasons. A later clean settle must not
+ * erase an earlier stop/lost/abort; duplicate strings are not repeated.
+ */
+function mergeFusionErrors(
+  existing: string | null | undefined,
+  next: string,
+): string {
+  const trimmed = next.trim();
+  if (trimmed.length === 0) return existing ?? "";
+  if (existing == null || existing.length === 0) return trimmed;
+  if (existing === trimmed || existing.includes(trimmed)) return existing;
+  return `${existing}; ${trimmed}`;
 }
 
 /** Repo-relative listing of everything durable under a run directory. */
