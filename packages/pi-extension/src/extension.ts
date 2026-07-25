@@ -431,10 +431,50 @@ function messageFromEvent(event: unknown): unknown {
   return event;
 }
 
+/**
+ * Expand ~ / $HOME / ${HOME} / $AGENTOS_GATE_WORKSPACE then resolve against cwd.
+ * Used so bash tokens cannot walk into the gate tree via relative or home paths.
+ */
+export function resolveToolPath(
+  candidate: string,
+  cwd: string,
+  home: string = process.env.HOME ?? "",
+  gateWorkspace: string = process.env.AGENTOS_GATE_WORKSPACE ?? "",
+): string {
+  let token = candidate.trim();
+  if (
+    (token.startsWith('"') && token.endsWith('"')) ||
+    (token.startsWith("'") && token.endsWith("'"))
+  ) {
+    token = token.slice(1, -1);
+  }
+  if (token === "~") {
+    token = home;
+  } else if (token.startsWith("~/")) {
+    token = `${home}${token.slice(1)}`;
+  } else if (token.startsWith("${HOME}")) {
+    token = `${home}${token.slice("${HOME}".length)}`;
+  } else if (token.startsWith("$HOME")) {
+    token = `${home}${token.slice("$HOME".length)}`;
+  } else if (gateWorkspace.length > 0) {
+    if (token.startsWith("${AGENTOS_GATE_WORKSPACE}")) {
+      token = `${gateWorkspace}${token.slice("${AGENTOS_GATE_WORKSPACE}".length)}`;
+    } else if (token.startsWith("$AGENTOS_GATE_WORKSPACE")) {
+      token = `${gateWorkspace}${token.slice("$AGENTOS_GATE_WORKSPACE".length)}`;
+    }
+  }
+  return resolve(cwd, token);
+}
+
 /** True when `candidate` resolves inside `gateRoot` (../ cannot walk in). */
-export function pathIsInsideGate(candidate: string, gateRoot: string, cwd: string): boolean {
+export function pathIsInsideGate(
+  candidate: string,
+  gateRoot: string,
+  cwd: string,
+  home: string = process.env.HOME ?? "",
+): boolean {
   if (candidate.length === 0) return false;
-  const resolved = resolve(cwd, candidate);
+  const resolved = resolveToolPath(candidate, cwd, home, gateRoot);
   const gate = resolve(gateRoot);
   const rel = relative(gate, resolved);
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
@@ -473,8 +513,10 @@ export function collectToolPathCandidates(
   if (toolName === "bash" || toolName === "shell") {
     const command = typeof input.command === "string" ? input.command : "";
     if (command.length > 0) {
-      // Absolute path tokens in the command line (../ already resolved by resolve()).
-      for (const match of command.matchAll(/(?:^|[\s"'=])(\/[^\s"'\\;|&]+)/g)) {
+      // Path-like tokens: absolute, ~/..., $HOME/..., ${HOME}/..., relative with /.
+      const tokenRe =
+        /(?:^|[\s"'=])((?:~|\$\{?HOME\}?|\$\{?AGENTOS_GATE_WORKSPACE\}?)(?:\/[^\s"'\\;|&<>]*)?|(?:\.{1,2}\/)?(?:[^\s"'\\;|&<>]*\/)+[^\s"'\\;|&<>]*)/g;
+      for (const match of command.matchAll(tokenRe)) {
         const token = match[1];
         if (token !== undefined) push(token);
       }
@@ -486,25 +528,21 @@ export function collectToolPathCandidates(
 
 /**
  * If any resolved path falls inside the gate workspace, return a block reason.
- * Otherwise null.
+ * Otherwise null. Paths are expanded (~, $HOME) and resolved against cwd so
+ * relative and home-relative bash argv cannot bypass the fence.
  */
 export function gateWorkspaceBlockReason(
   toolName: string,
   input: Record<string, unknown>,
   gateWorkspace: string,
   cwd: string = process.cwd(),
+  home: string = process.env.HOME ?? "",
 ): string | null {
   const gate = resolve(gateWorkspace);
   for (const candidate of collectToolPathCandidates(toolName, input)) {
-    if (pathIsInsideGate(candidate, gate, cwd)) {
-      return `builder is tool/fs-blocked from the gate workspace (${gate}): refused path ${resolve(cwd, candidate)}`;
-    }
-  }
-  // Bash may reference the gate dir by absolute path substring without a clean token.
-  if (toolName === "bash" || toolName === "shell") {
-    const command = typeof input.command === "string" ? input.command : "";
-    if (command.includes(gate)) {
-      return `builder is tool/fs-blocked from the gate workspace (${gate}): refused command reference`;
+    if (pathIsInsideGate(candidate, gate, cwd, home)) {
+      const resolved = resolveToolPath(candidate, cwd, home, gate);
+      return `builder is tool/fs-blocked from the gate workspace (${gate}): refused path ${resolved}`;
     }
   }
   return null;
@@ -573,11 +611,20 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
 
   // Builder gate-dir fence: deny tool calls whose resolved paths fall inside
   // the task gate workspace. Report via ext.tool_blocked for audit.
+  // Fail closed: any unexpected error still blocks the tool call.
   const gateWorkspace = process.env.AGENTOS_GATE_WORKSPACE;
   if (role === "builder" && gateWorkspace !== undefined && gateWorkspace.length > 0) {
     pi.on?.("tool_call", (event: unknown) => {
       try {
-        if (event === null || typeof event !== "object") return undefined;
+        if (event === null || typeof event !== "object") {
+          const reason = "builder gate-dir fence: malformed tool_call event";
+          try {
+            host.toolBlocked("unknown", reason);
+          } catch {
+            // still block
+          }
+          return { block: true, reason };
+        }
         const toolName =
           typeof (event as { toolName?: unknown }).toolName === "string"
             ? (event as { toolName: string }).toolName
@@ -591,8 +638,17 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
         if (reason === null) return undefined;
         host.toolBlocked(toolName.length > 0 ? toolName : "unknown", reason);
         return { block: true, reason };
-      } catch {
-        return undefined;
+      } catch (err) {
+        const reason =
+          err instanceof Error
+            ? `builder gate-dir fence error: ${err.message}`
+            : "builder gate-dir fence error: unexpected failure";
+        try {
+          host.toolBlocked("unknown", reason);
+        } catch {
+          // still block even if audit emit fails
+        }
+        return { block: true, reason };
       }
     });
   }

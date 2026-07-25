@@ -7,6 +7,8 @@ import { familyFromModel } from "../src/substrate/family.js";
 import {
   canTransition,
   assertTransition,
+  canRunGate,
+  canSpawnBuilder,
   canSpawnScout,
   IllegalTransitionError,
 } from "../src/substrate/task-machine.js";
@@ -50,6 +52,23 @@ describe("task state machine", () => {
     expect(canSpawnScout("QUEUED")).toBe(false);
     expect(canSpawnScout("DISPATCH_RESOLVED")).toBe(true);
     expect(canSpawnScout("BUILDING")).toBe(true);
+  });
+
+  it("allows baseline re-prove from BUILDING and VALIDATING", () => {
+    expect(canRunGate("BUILDING", "baseline")).toBe(true);
+    expect(canRunGate("VALIDATING", "baseline")).toBe(true);
+    expect(canRunGate("GATE_AUTHORING", "baseline")).toBe(true);
+    expect(canRunGate("QUEUED", "baseline")).toBe(false);
+  });
+
+  it("restores skip-to-BUILDING edges only when red-baseline is off", () => {
+    expect(canTransition("DISPATCH_RESOLVED", "BUILDING")).toBe(false);
+    expect(canTransition("DISPATCH_RESOLVED", "BUILDING", { redBaselineRequired: false })).toBe(
+      true,
+    );
+    expect(canTransition("PLAN_FUSED", "BUILDING", { redBaselineRequired: false })).toBe(true);
+    expect(canSpawnBuilder("DISPATCH_RESOLVED", { redBaselineRequired: true })).toBe(false);
+    expect(canSpawnBuilder("DISPATCH_RESOLVED", { redBaselineRequired: false })).toBe(true);
   });
 });
 

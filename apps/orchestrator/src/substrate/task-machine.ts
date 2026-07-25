@@ -69,11 +69,18 @@ export function assertTransition(
 
 /**
  * Phases in which `run_gate` is legal.
- * Baseline RED proof is required before BUILDING when red-baseline policy is on.
+ * Baseline may re-run from BUILDING/VALIDATING so a mid-build gate revision can
+ * re-prove RED; candidate still requires a current proof for this source hash.
  */
 export function canRunGate(phase: TaskPhase, target: "baseline" | "candidate"): boolean {
   if (target === "baseline") {
-    return phase === "GATE_AUTHORING" || phase === "GATE_RED_VERIFIED" || phase === "PLAN_FUSED";
+    return (
+      phase === "GATE_AUTHORING" ||
+      phase === "GATE_RED_VERIFIED" ||
+      phase === "PLAN_FUSED" ||
+      phase === "BUILDING" ||
+      phase === "VALIDATING"
+    );
   }
   return phase === "VALIDATING" || phase === "BUILDING" || phase === "GATE_RED_VERIFIED";
 }

@@ -80,6 +80,16 @@ export class GateRunner {
     return dir;
   }
 
+  /**
+   * Daemon-owned evidence directory outside the validator write-jail.
+   * RED proofs and FAIL ledgers live here so a spawned seat cannot forge them.
+   */
+  validationDir(taskId: string): string {
+    const dir = join(this.home, "runs", taskId, "validation");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  }
+
   writeGateSource(taskId: string, source: string, language: "py" | "ts" = this.config.gateLanguage): string {
     const dir = this.gateWorkspace(taskId);
     const file = language === "py" ? join(dir, "gate.py") : join(dir, "gate.ts");
@@ -96,12 +106,13 @@ export class GateRunner {
   }
 
   private redProofPath(taskId: string): string {
-    return join(this.gateWorkspace(taskId), "red-proof.json");
+    return join(this.validationDir(taskId), "red-proof.json");
   }
 
   /**
    * Record that a specific gate revision was proven semantically RED at
    * baseline. Keyed by source hash so an edited gate loses its proof.
+   * Written only by the daemon into validation/ — never into the validator jail.
    */
   recordRedProof(taskId: string, proof: RedProof): void {
     writeFileSync(this.redProofPath(taskId), `${JSON.stringify(proof, null, 2)}\n`, {
@@ -121,8 +132,9 @@ export class GateRunner {
 
   /**
    * A candidate run is only meaningful when THIS gate revision has been proven
-   * red at baseline. Editing the gate invalidates the proof — otherwise a
-   * validator could weaken the gate after the fact and call the build green.
+   * red at baseline. The daemon hashes the gate file it is about to judge and
+   * compares against the daemon-owned proof — never an on-disk proof the
+   * validator could have written inside its jail.
    */
   hasRedProofForCurrentSource(
     taskId: string,
@@ -135,7 +147,7 @@ export class GateRunner {
 
   /** Persist the exact FAIL bytes plus their hash for verbatim re-injection. */
   private writeFailLedger(taskId: string, failLines: string[]): void {
-    const dir = this.gateWorkspace(taskId);
+    const dir = this.validationDir(taskId);
     const text = failLines.join("\n") + (failLines.length > 0 ? "\n" : "");
     writeFileSync(join(dir, "last-fail.txt"), text, { mode: 0o600 });
     writeFileSync(join(dir, "last-fail.sha256"), `${hash(text)}\n`, { mode: 0o600 });
@@ -147,9 +159,13 @@ export class GateRunner {
    * gate's exact words rather than a Brain paraphrase.
    */
   lastFailHash(taskId: string): string | null {
-    const path = join(this.gateWorkspace(taskId), "last-fail.sha256");
+    const path = join(this.validationDir(taskId), "last-fail.sha256");
     if (!existsSync(path)) return null;
-    return readFileSync(path, "utf8").trim();
+    try {
+      return readFileSync(path, "utf8").trim();
+    } catch {
+      return null;
+    }
   }
 
   static hashText(text: string): string {
@@ -278,12 +294,16 @@ export class GateRunner {
   }
 
   readLastFailLines(taskId: string): string[] {
-    const path = join(this.gateWorkspace(taskId), "last-fail.txt");
+    const path = join(this.validationDir(taskId), "last-fail.txt");
     if (!existsSync(path)) return [];
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
+    try {
+      return readFileSync(path, "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+    } catch {
+      return [];
+    }
   }
 }
 

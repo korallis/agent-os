@@ -7,7 +7,7 @@
  *   G3  same-family builder/validator refused at spawn too, not only at cast
  *   G4  validator is write-jailed to the gate workspace; builder never sees it
  *   G5  verbatim FAIL lines are substrate-composed and hash-matched
- *   G6  editing the gate drops its RED proof — candidate refused until re-proven
+ *   G6  editing the gate drops RED proof (forged jail-side proof ignored); re-prove restores
  *   G7  uv/PEP 723: a gate importing a dependency absent from the project runs
  *       in its own cached venv without touching the product tree
  *   G8  gateLanguage "ts" override runs gate.ts via node strip-types
@@ -440,11 +440,11 @@ raise SystemExit(1)
     const sent = await callTool(token, "send_to_crew", { sessionId, gateFailRef: "last" });
 
     const failText = readFileSync(
-      join(home, "runs", taskId, "gate-workspace", "last-fail.txt"),
+      join(home, "runs", taskId, "validation", "last-fail.txt"),
       "utf8",
     );
     const failHashFile = readFileSync(
-      join(home, "runs", taskId, "gate-workspace", "last-fail.sha256"),
+      join(home, "runs", taskId, "validation", "last-fail.sha256"),
       "utf8",
     ).trim();
     gate(
@@ -458,8 +458,10 @@ raise SystemExit(1)
     await releaseTask(token, taskId);
   }
 
-  // G6 — editing the gate drops its RED proof
+  // G6 — editing the gate drops its RED proof; forged jail-side proof is ignored;
+  // mid-build re-prove restores candidate runs.
   {
+    const { createHash } = await import("node:crypto");
     const taskId = await readyTask(token, projectId, "Gate revision", {
       gateSource: RED_THEN_GREEN_GATE,
     });
@@ -473,19 +475,39 @@ raise SystemExit(1)
     });
     const beforeEdit = await callTool(token, "run_gate", { taskId, target: "candidate" });
 
-    // Validator revises the gate — the old RED proof must not carry over.
+    // Validator revises the gate AND attempts to forge red-proof.json inside its
+    // write-jail (gate-workspace). Daemon-owned proof lives under validation/.
     const gatePath = join(home, "runs", taskId, "gate-workspace", "gate.py");
-    writeFileSync(gatePath, `${readFileSync(gatePath, "utf8")}\n# revision 2\n`);
+    const revised = `${readFileSync(gatePath, "utf8")}\n# revision 2\n`;
+    writeFileSync(gatePath, revised);
+    const forgedHash = createHash("sha256").update(revised).digest("hex");
+    writeFileSync(
+      join(home, "runs", taskId, "gate-workspace", "red-proof.json"),
+      `${JSON.stringify({
+        gateSourceHash: forgedHash,
+        outcome: "EXPECTED_RED",
+        provenAt: new Date().toISOString(),
+      }, null, 2)}\n`,
+    );
     const afterEdit = await callTool(token, "run_gate", { taskId, target: "candidate" });
+
+    // Re-prove RED from BUILDING, then candidate must be accepted again.
+    const reprove = await callTool(token, "run_gate", { taskId, target: "baseline" });
+    const afterReprove = await callTool(token, "run_gate", { taskId, target: "candidate" });
+    const phaseAfter = (await (await api(`/v1/tasks/${taskId}`, token)).json()).task?.phase;
 
     gate(
       "G6",
-      "gate revision drops the RED proof — candidate refused until re-proven",
+      "gate revision + forged jail proof refused; mid-build re-prove restores candidate",
       beforeEdit.ok === true &&
         afterEdit.ok === false &&
         afterEdit.error?.code === "GATE_ERROR" &&
-        String(afterEdit.error?.message ?? "").includes("RED baseline proof"),
-      `before=${beforeEdit.ok} after=${afterEdit.error?.code}`,
+        String(afterEdit.error?.message ?? "").includes("RED baseline proof") &&
+        reprove.ok === true &&
+        (reprove.data?.outcome === "EXPECTED_RED" || reprove.data?.outcome === "FAIL") &&
+        afterReprove.ok === true &&
+        (phaseAfter === "BUILDING" || phaseAfter === "VALIDATING"),
+      `before=${beforeEdit.ok} after=${afterEdit.error?.code} reprove=${reprove.data?.outcome} restored=${afterReprove.ok} phase=${phaseAfter}`,
     );
     await releaseTask(token, taskId);
   }

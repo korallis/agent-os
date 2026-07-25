@@ -2088,7 +2088,12 @@ export class ToolSurface {
 
     if (input.target === "baseline") {
       if (result.outcome === "EXPECTED_RED" || result.outcome === "FAIL") {
-        task = this.transition(task, "GATE_RED_VERIFIED", "baseline red proven");
+        // Mid-build re-prove stays in BUILDING/VALIDATING so the rebuild loop
+        // can continue after the daemon records a fresh RED proof. First-time
+        // proof advances into GATE_RED_VERIFIED.
+        if (task.phase !== "BUILDING" && task.phase !== "VALIDATING") {
+          task = this.transition(task, "GATE_RED_VERIFIED", "baseline red proven");
+        }
       } else if (result.outcome === "PASS") {
         throw new ToolSurfaceError(
           "GATE_ERROR",
@@ -3023,14 +3028,12 @@ export class ToolSurface {
     if (to === "DONE") {
       this.assertDoneInvariant(current);
     }
-    assertTransition(
-      task.id,
-      from,
-      to,
-      options.redBaselineRequired === undefined
-        ? {}
-        : { redBaselineRequired: options.redBaselineRequired },
-    );
+    // Derive red-baseline policy from config + task overrides when the caller
+    // omits it, so every path (including advance_phase) honours the same edges.
+    const redBaselineRequired =
+      options.redBaselineRequired ??
+      (this.cfg().policies.redBaselineGateRequired && !this.hasRedBaselineOverride(current));
+    assertTransition(task.id, from, to, { redBaselineRequired });
     // Terminal exit choke point: halt every live session, then release leases
     // (stamp deliveryBlocked on dirty quarantine). No-op when deliver_task
     // already halted/released for DONE.

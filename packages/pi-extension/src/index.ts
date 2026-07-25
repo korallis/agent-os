@@ -5,6 +5,7 @@ export {
   extractAssistantText,
   gateWorkspaceBlockReason,
   pathIsInsideGate,
+  resolveToolPath,
   usageFromAssistantMessage,
   type ExtensionHostOptions,
   type PiExtensionApi,

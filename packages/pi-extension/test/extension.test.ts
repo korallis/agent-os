@@ -315,6 +315,57 @@ describe("builder gate-workspace tool fence", () => {
     ).toBeNull();
   });
 
+  it("blocks bash relative, ~, and $HOME paths that resolve into the gate tree", () => {
+    const home = "/Users/captain";
+    const gate = `${home}/.agentos/runs/task1/gate-workspace`;
+    const cwd = `${home}/.agentos/worktrees/builder-1`;
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: `cat ${gate}/gate.py` },
+        gate,
+        cwd,
+        home,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "cat ~/.agentos/runs/task1/gate-workspace/gate.py" },
+        gate,
+        cwd,
+        home,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "cat $HOME/.agentos/runs/task1/gate-workspace/gate.py" },
+        gate,
+        cwd,
+        home,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "cat ../../runs/task1/gate-workspace/secret" },
+        gate,
+        cwd,
+        home,
+      ),
+    ).toMatch(/tool\/fs-blocked/);
+    expect(
+      gateWorkspaceBlockReason(
+        "bash",
+        { command: "echo hello > ./src/ok.ts" },
+        gate,
+        cwd,
+        home,
+      ),
+    ).toBeNull();
+  });
+
   it("blocks builder tool_call into gate workspace and emits ext.tool_blocked", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agentos-ext-gate-fence-"));
     dirs.push(dir);
@@ -386,5 +437,63 @@ describe("builder gate-workspace tool fence", () => {
       expect(parsed.toolName).toBe("read");
       expect(parsed.reason).toMatch(/gate workspace/);
     }
+  });
+
+  it("fails closed on fence errors (block: true, never undefined)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-fence-fail-"));
+    dirs.push(dir);
+    const gateDir = join(dir, "gate-workspace");
+    const socketPath = join(dir, "hub.sock");
+    const sessionId = "01ARZ3NDEKTSV4RRFFQ69G5FE1";
+    process.env.AGENTOS_SOCKET = socketPath;
+    process.env.AGENTOS_SESSION_ID = sessionId;
+    process.env.AGENTOS_ROLE = "builder";
+    process.env.AGENTOS_GATE_WORKSPACE = gateDir;
+
+    let toolCallHandler: ((...args: unknown[]) => unknown) | undefined;
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer(() => {
+        // accept connection; no need to parse frames for this assertion
+      });
+      server.on("error", reject);
+      server.listen(socketPath, () => {
+        const pi: PiExtensionApi = {
+          version: "0.82.0",
+          on: (event, handler) => {
+            if (event === "tool_call") toolCallHandler = handler;
+          },
+        };
+        const host = agentOsPiExtension(pi);
+        expect(host).toBeDefined();
+        void host!.connect().then(() => {
+          // Proxy input that throws when enumerated paths are read — forces catch.
+          const hostile = new Proxy(
+            {},
+            {
+              get() {
+                throw new Error("boom");
+              },
+              ownKeys() {
+                throw new Error("boom");
+              },
+              getOwnPropertyDescriptor() {
+                throw new Error("boom");
+              },
+            },
+          );
+          const result = toolCallHandler?.({
+            toolName: "bash",
+            toolCallId: "tc-fail",
+            input: hostile,
+          }) as { block?: boolean; reason?: string } | undefined;
+          expect(result).toBeDefined();
+          expect(result?.block).toBe(true);
+          expect(result?.reason ?? "").toMatch(/fence/i);
+          host?.close();
+          server.close();
+          resolve();
+        });
+      });
+    });
   });
 });
