@@ -217,6 +217,27 @@ try {
   // Fake-pi spawn classifies a PROGRESS wake absorbed by the zero-token watcher.
   const absorbedSummary = `progress on ${taskATitle}`;
 
+  // Seed a real quota sample so G7 cannot pass against the empty-state copy.
+  const quotaConnection = (
+    await post("/v1/connections/api-key", {
+      provider: "openrouter",
+      apiKey: "gate-p6-quota-fixture-key-not-a-secret",
+      label: "p6-quota-fixture",
+    })
+  ).connection;
+  const quotaRefresh = await (
+    await fetch(`${BASE}/v1/connections/${quotaConnection.id}/quota/refresh`, {
+      method: "POST",
+      headers: auth,
+    })
+  ).json();
+  const seededQuotaSample = quotaRefresh.sample;
+  const seededQuotaMetric = seededQuotaSample?.metrics?.[0];
+  const seededQuotaProvider = seededQuotaSample?.provider ?? "openrouter";
+  const seededQuotaTier = seededQuotaMetric?.tier ?? "estimate";
+  // UI renders `${tier} · ${source}` under the provider label.
+  const seededQuotaTierLabel = `${seededQuotaTier} ·`;
+
   consoleServer = spawn(
     join(ROOT, "apps", "console", "node_modules", ".bin", "next"),
     ["start", "-p", String(CONSOLE_PORT), "-H", "127.0.0.1"],
@@ -384,17 +405,32 @@ try {
     );
   }
 
-  // G7 — quota strip states its honesty tier
+  // G7 — quota strip renders a seeded sample with provider + honesty tier
   {
+    const quotaList = await (await fetch(`${BASE}/v1/quota`, { headers: auth })).json();
+    const daemonSeeded = (quotaList.samples ?? []).some(
+      (s) =>
+        s.provider === seededQuotaProvider &&
+        (s.metrics ?? []).some((m) => m.tier === seededQuotaTier),
+    );
     await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
     await sleep(600);
     const text = (await page.textContent("body")) ?? "";
-    const hasTier = /LIVE|BEST-EFFORT|ESTIMATE/i.test(text);
+    // Require the concrete provider next to its tier label — never pass on the
+    // empty-state sentence (which previously matched /LIVE/i via "Live quota…").
+    const providerPresent = text.includes(seededQuotaProvider);
+    const tierAdjacent = text.includes(seededQuotaTierLabel);
+    const emptyCopy = text.includes("Quota probes will appear here once providers are connected");
     gate(
       "G7",
-      "quota surface labels every metric with its honesty tier",
-      hasTier,
-      `tierLabelPresent=${hasTier}`,
+      "quota surface renders a seeded sample with provider and honesty tier",
+      daemonSeeded &&
+        providerPresent &&
+        tierAdjacent &&
+        !emptyCopy &&
+        seededQuotaSample !== undefined &&
+        seededQuotaMetric !== undefined,
+      `provider=${seededQuotaProvider} tier=${seededQuotaTier} daemon=${daemonSeeded} uiProvider=${providerPresent} uiTier=${tierAdjacent}`,
     );
   }
 

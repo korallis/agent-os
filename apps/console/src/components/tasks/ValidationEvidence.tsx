@@ -13,6 +13,9 @@ import { fetchTaskEvents } from "@/lib/fetchTaskEvents";
  * verdict, and it does not consume a validation attempt. Rendering those two
  * states identically would hide the difference between "the code is wrong" and
  * "the gate never ran".
+ *
+ * Empty, truncated, and unavailable history are distinct — a failed fetch
+ * never looks like "nothing happened".
  */
 
 interface GateResult {
@@ -53,9 +56,12 @@ export function ValidationEvidence({
     lastEvent !== null && lastEvent.event.type === "gate.result" ? lastEvent.id : "init";
   const [results, setResults] = useState<GateResult[]>([]);
   const [truncated, setTruncated] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
+    setLoaded(false);
     fetchTaskEvents(taskId, GATE_TYPES)
       .then((result) => {
         if (cancelled) return;
@@ -72,14 +78,23 @@ export function ValidationEvidence({
         }
         setResults(mine);
         setTruncated(result.truncated);
+        setUnavailable(result.unavailable);
+        setLoaded(true);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (cancelled) return;
+        setResults([]);
+        setTruncated(false);
+        setUnavailable(true);
+        setLoaded(true);
+      });
     return () => {
       cancelled = true;
     };
   }, [taskId, refreshKey]);
 
-  if (results.length === 0 && !truncated) return null;
+  if (!loaded) return null;
+  if (!unavailable && results.length === 0 && !truncated) return null;
 
   const exhausted = validationAttempt >= maxValidations;
 
@@ -95,10 +110,17 @@ export function ValidationEvidence({
         >
           attempt {validationAttempt} / {maxValidations}
           {exhausted && " — halted at cap"}
-          {truncated && " · history truncated"}
+          {unavailable && " · history unavailable"}
+          {!unavailable && truncated && " · history truncated"}
         </span>
       </div>
-      {results.length === 0 ? (
+      {unavailable ? (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            History unavailable — the event log could not be loaded for this task.
+          </p>
+        </div>
+      ) : results.length === 0 ? (
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
           <p className="text-[12px] text-fg-3">
             Event history was truncated before this task&apos;s gate results were reached.

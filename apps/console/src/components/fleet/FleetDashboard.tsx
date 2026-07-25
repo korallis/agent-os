@@ -86,15 +86,17 @@ function SwarmActivityCard({
   analytics: AnalyticsSnapshot | null;
   lastEventAt: string | null;
 }) {
+  const ready = analytics !== null;
   const daily = analytics?.daily ?? [];
   const completed = daily.map((d) => d.tasksCompleted);
-  const totalCompleted = completed.reduce((a, b) => a + b, 0);
+  const totalCompleted = ready ? completed.reduce((a, b) => a + b, 0) : null;
   // Compare the most recent half of the window with the previous half — a real
   // trend over real data, null when there is not enough history to claim one.
   const half = Math.floor(daily.length / 2);
   const prior = completed.slice(0, half).reduce((a, b) => a + b, 0);
   const recent = completed.slice(half).reduce((a, b) => a + b, 0);
-  const deltaPct = prior === 0 ? null : Number((((recent - prior) / prior) * 100).toFixed(1));
+  const deltaPct =
+    !ready || prior === 0 ? null : Number((((recent - prior) / prior) * 100).toFixed(1));
   const axis = [0, Math.floor(daily.length / 3), Math.floor((daily.length * 2) / 3), daily.length - 1]
     .map((i) => daily[i])
     .filter((d): d is NonNullable<typeof d> => d !== undefined);
@@ -114,18 +116,24 @@ function SwarmActivityCard({
         </div>
         <div className="flex items-start justify-between">
           <span className="text-[13px] text-fg-2">Tasks completed</span>
-          <span className="text-[13px] text-fg-2">last {analytics?.windowDays ?? 14} days</span>
+          <span className="text-[13px] text-fg-2">
+            {ready ? `last ${analytics.windowDays} days` : "unavailable"}
+          </span>
         </div>
         <div className="flex items-start justify-between">
           <span className="text-xs text-fg-3">Total</span>
-          <span className="text-sm font-bold text-fg-1">{totalCompleted}</span>
+          <span className="text-sm font-bold text-fg-1">
+            {totalCompleted === null ? "—" : totalCompleted}
+          </span>
         </div>
       </div>
       <div className="relative h-[161px] w-full overflow-hidden">
-        <Sparkline points={completed} />
+        <Sparkline points={ready ? completed : []} />
       </div>
       <div className="flex items-start justify-between text-[11px] text-fg-3">
-        {axis.length > 0 ? (
+        {!ready ? (
+          <span>Usage snapshot unavailable</span>
+        ) : axis.length > 0 ? (
           axis.map((d, i) => <span key={`${d.day}-${i}`}>{d.day.slice(5)}</span>)
         ) : (
           <span>No activity recorded yet</span>
@@ -150,7 +158,9 @@ function SwarmActivityCard({
 
 function TokenConsumptionCard({ analytics }: { analytics: AnalyticsSnapshot | null }) {
   const totals = analytics?.totals;
-  const tokens = (totals?.inputTokens ?? 0) + (totals?.outputTokens ?? 0);
+  const ready = analytics !== null;
+  const tokens =
+    totals === undefined ? null : totals.inputTokens + totals.outputTokens;
   const cost = totals?.costUsd ?? null;
   const topModels = (analytics?.models ?? []).slice(0, 4);
   const modelMax = Math.max(...topModels.map((m) => m.inputTokens + m.outputTokens), 1);
@@ -163,23 +173,36 @@ function TokenConsumptionCard({ analytics }: { analytics: AnalyticsSnapshot | nu
           <p className="text-[13px] text-fg-2">The sum of all token usage</p>
         </div>
         <span className="flex items-center gap-2 h-9 rounded-lg bg-panel-2 px-3 text-xs font-medium text-fg-2">
-          {analytics?.windowDays ?? 14}d
+          {analytics?.windowDays ?? "—"}
+          {analytics !== null ? "d" : ""}
         </span>
       </div>
-      <p className="mt-4 text-4xl font-medium text-fg-1">{compactNumber(tokens)}</p>
+      <p className="mt-4 text-4xl font-medium text-fg-1">
+        {tokens === null ? "—" : compactNumber(tokens)}
+      </p>
       <p className="mt-4 text-[11px] text-fg-3">
-        {totals?.costCoverage === "partial"
-          ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost ($${cost?.toFixed(2) ?? "0.00"})`
-          : cost !== null
-            ? `$${cost.toFixed(2)} reported by providers`
-            : "Cost not reported by any connected provider"}
+        {!ready
+          ? "Usage snapshot unavailable"
+          : totals?.costCoverage === "partial"
+            ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost ($${cost?.toFixed(2) ?? "0.00"})`
+            : cost !== null
+              ? `$${cost.toFixed(2)} reported by providers`
+              : "Cost not reported by any connected provider"}
       </p>
       <p className="mt-2 text-xs text-fg-3">
-        {totals?.requests ?? 0} requests · in {compactNumber(totals?.inputTokens ?? 0)} / out{" "}
-        {compactNumber(totals?.outputTokens ?? 0)}
+        {!ready
+          ? "—"
+          : `${totals?.requests ?? 0} requests · in ${compactNumber(totals?.inputTokens ?? 0)} / out ${compactNumber(totals?.outputTokens ?? 0)}`}
       </p>
       <div className="mt-3 flex-1 rounded-2xl bg-panel-2 p-4 flex flex-col gap-3">
-        {topModels.length === 0 ? (
+        {!ready ? (
+          <EmptyState
+            kind="no-data"
+            title="Usage unavailable"
+            body="Token consumption appears once the analytics snapshot loads."
+            className="border-0 bg-transparent my-auto py-6"
+          />
+        ) : topModels.length === 0 ? (
           <EmptyState
             kind="no-data"
             title="No model usage yet"

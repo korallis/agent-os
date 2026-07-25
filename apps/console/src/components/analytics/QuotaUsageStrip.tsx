@@ -33,7 +33,7 @@ export function QuotaUsageStrip() {
   if (samples.length === 0) {
     return (
       <p className="mb-4 text-[12px] text-fg-3">
-        Live quota probes will appear here once providers are connected (Phase 2).
+        Quota probes will appear here once providers are connected.
       </p>
     );
   }

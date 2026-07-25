@@ -84,7 +84,8 @@ export function AnalyticsView() {
   }, [refreshKey]);
 
   const totals = snapshot?.totals;
-  const tokensUsed = (totals?.inputTokens ?? 0) + (totals?.outputTokens ?? 0);
+  const tokensUsed =
+    totals === undefined ? null : totals.inputTokens + totals.outputTokens;
   const cost = totals?.costUsd ?? null;
   const daily = snapshot?.daily ?? [];
   const maxDaily = Math.max(...daily.map((d) => d.inputTokens + d.outputTokens), 1);
@@ -96,40 +97,53 @@ export function AnalyticsView() {
   );
   const anyModelCost = models.some((m) => m.costUsd !== null);
   const windowDays = snapshot?.windowDays ?? 14;
+  const snapshotReady = snapshot !== null;
 
   const stats = [
     {
       label: "Total Spend",
-      value: cost === null ? "—" : `$${cost.toFixed(2)}`,
-      note: costNote(totals, windowDays),
+      value: !snapshotReady ? "—" : cost === null ? "—" : `$${cost.toFixed(2)}`,
+      note: !snapshotReady ? "unavailable" : costNote(totals, windowDays),
       noteClass: totals?.costCoverage === "partial" ? "text-warn" : "text-fg-3",
     },
     {
       label: "Tokens Used",
-      value: compact(tokensUsed),
-      note: `${totals?.requests ?? 0} requests · last ${windowDays}d`,
+      value: tokensUsed === null ? "—" : compact(tokensUsed),
+      note: !snapshotReady
+        ? "unavailable"
+        : `${totals?.requests ?? 0} requests · last ${windowDays}d`,
       noteClass: "text-fg-3",
     },
     {
       label: "Tasks Done",
-      value: String(totals?.tasksDone ?? 0),
-      note: `${totals?.tasksTotal ?? 0} created · last ${windowDays}d`,
+      value: !snapshotReady ? "—" : String(totals?.tasksDone ?? 0),
+      note: !snapshotReady
+        ? "unavailable"
+        : `${totals?.tasksTotal ?? 0} created · last ${windowDays}d`,
       noteClass: "text-fg-3",
     },
     {
       label: "Success Rate",
-      value: totals?.successRatePct === null || totals?.successRatePct === undefined
-        ? "—"
-        : `${totals.successRatePct}%`,
-      note: totals?.successRatePct === null ? "no terminal tasks yet" : `${totals?.tasksFailed ?? 0} failed`,
+      value:
+        !snapshotReady || totals?.successRatePct === null || totals?.successRatePct === undefined
+          ? "—"
+          : `${totals.successRatePct}%`,
+      note: !snapshotReady
+        ? "unavailable"
+        : totals?.successRatePct === null
+          ? "no terminal tasks yet"
+          : `${totals?.tasksFailed ?? 0} failed`,
       noteClass: totals?.tasksFailed ? "text-danger" : "text-fg-3",
     },
   ];
 
   // Only a genuine fleet-wide ceiling may drive the bar — never per-task.
-  const fleetCeiling = budgets?.gatewayHardUsd ?? 0;
+  // Three distinct states: budgets not loaded, loaded with zero ceiling, configured.
+  const fleetCeiling = budgets === null ? null : budgets.gatewayHardUsd;
   const budgetPct =
-    cost !== null && fleetCeiling > 0 ? Math.min(100, (cost / fleetCeiling) * 100) : null;
+    cost !== null && fleetCeiling !== null && fleetCeiling > 0
+      ? Math.min(100, (cost / fleetCeiling) * 100)
+      : null;
 
   return (
     <main className="flex-1 flex flex-col gap-5 p-8">
@@ -178,7 +192,14 @@ export function AnalyticsView() {
               <h3 className="text-[15px] font-semibold text-fg-1">Daily Token Consumption</h3>
               <span className="text-[11px] text-fg-3">input + output</span>
             </div>
-            {daily.every((d) => d.inputTokens + d.outputTokens === 0) ? (
+            {!snapshotReady ? (
+              <EmptyState
+                kind="no-data"
+                title="Usage unavailable"
+                body="Daily token consumption appears once the analytics snapshot loads."
+                className="border-0 bg-transparent py-10"
+              />
+            ) : daily.every((d) => d.inputTokens + d.outputTokens === 0) ? (
               <EmptyState
                 kind="no-data"
                 title="No usage recorded yet"
@@ -209,7 +230,14 @@ export function AnalyticsView() {
 
           <Card className="p-6 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Usage by Agent</h3>
-            {agents.length === 0 ? (
+            {!snapshotReady ? (
+              <EmptyState
+                kind="no-data"
+                title="Usage unavailable"
+                body="Per-role usage appears once the analytics snapshot loads."
+                className="border-0 bg-transparent py-6"
+              />
+            ) : agents.length === 0 ? (
               <EmptyState
                 kind="no-data"
                 title="No agent telemetry yet"
@@ -253,7 +281,14 @@ export function AnalyticsView() {
         <div className="flex flex-col gap-4">
           <Card className="p-5 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Cost by Model</h3>
-            {models.length === 0 ? (
+            {!snapshotReady ? (
+              <EmptyState
+                kind="no-data"
+                title="Usage unavailable"
+                body="Per-model cost and tokens appear once the analytics snapshot loads."
+                className="border-0 bg-transparent py-6"
+              />
+            ) : models.length === 0 ? (
               <EmptyState
                 kind="no-data"
                 title="No model usage yet"
@@ -304,9 +339,11 @@ export function AnalyticsView() {
 
           <Card className="p-5 flex flex-col gap-4">
             <h3 className="text-[15px] font-semibold text-fg-1">Budget &amp; Limits</h3>
-            {budgetPct === null ? (
+            {budgets === null ? (
+              <p className="text-[11px] text-fg-3">Budget configuration unavailable</p>
+            ) : budgetPct === null ? (
               <p className="text-[11px] text-fg-3">
-                {fleetCeiling === 0
+                {fleetCeiling === null || fleetCeiling <= 0
                   ? "No fleet spend ceiling configured — set gatewayHardUsd in Policies ▸ Budgets."
                   : totals?.costCoverage === "partial"
                     ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost; spend against budget cannot be shown as complete.`
@@ -317,7 +354,7 @@ export function AnalyticsView() {
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="text-fg-3">Spend vs fleet ceiling</span>
                   <span className="text-fg-1">
-                    ${(cost ?? 0).toFixed(2)} / ${fleetCeiling.toFixed(2)}
+                    ${(cost ?? 0).toFixed(2)} / ${(fleetCeiling ?? 0).toFixed(2)}
                   </span>
                 </div>
                 <div className="h-1.5 rounded bg-line-2 overflow-hidden">

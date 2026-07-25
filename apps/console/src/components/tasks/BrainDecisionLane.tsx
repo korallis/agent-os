@@ -13,6 +13,9 @@ import { fetchTaskEvents } from "@/lib/fetchTaskEvents";
  * successes: a `POLICY_VIOLATION` or `ILLEGAL_TRANSITION` is the substrate
  * correcting the Brain, and that record is the evidence the substrate — not the
  * model — is what enforces the rules.
+ *
+ * Empty, truncated, and unavailable history are rendered as distinct states —
+ * a failed fetch never looks like "nothing happened".
  */
 
 interface Invocation {
@@ -31,9 +34,12 @@ export function BrainDecisionLane({ taskId }: { taskId: string }) {
     lastEvent !== null && lastEvent.event.type === "tool.invoked" ? lastEvent.id : "init";
   const [calls, setCalls] = useState<Invocation[]>([]);
   const [truncated, setTruncated] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
+    setLoaded(false);
     fetchTaskEvents(taskId, TOOL_TYPES)
       .then((result) => {
         if (cancelled) return;
@@ -50,29 +56,50 @@ export function BrainDecisionLane({ taskId }: { taskId: string }) {
         }
         setCalls(mine);
         setTruncated(result.truncated);
+        setUnavailable(result.unavailable);
+        setLoaded(true);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (cancelled) return;
+        setCalls([]);
+        setTruncated(false);
+        setUnavailable(true);
+        setLoaded(true);
+      });
     return () => {
       cancelled = true;
     };
   }, [taskId, refreshKey]);
 
-  if (calls.length === 0 && !truncated) return null;
+  if (!loaded) return null;
+  if (!unavailable && calls.length === 0 && !truncated) return null;
+
   const refused = calls.filter((c) => !c.ok).length;
+
+  let statusLabel: string;
+  if (unavailable) {
+    statusLabel = "history unavailable";
+  } else if (calls.length === 0) {
+    statusLabel = "history truncated";
+  } else {
+    statusLabel = `${calls.length} tool call${calls.length === 1 ? "" : "s"}${
+      refused > 0 ? ` · ${refused} refused by the substrate` : ""
+    }${truncated ? " · history truncated" : ""}`;
+  }
 
   return (
     <section>
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold text-fg-1">Brain decisions</h3>
-        <span className="text-[11px] text-fg-3">
-          {calls.length === 0
-            ? "history truncated"
-            : `${calls.length} tool call${calls.length === 1 ? "" : "s"}${
-                refused > 0 ? ` · ${refused} refused by the substrate` : ""
-              }${truncated ? " · history truncated" : ""}`}
-        </span>
+        <span className="text-[11px] text-fg-3">{statusLabel}</span>
       </div>
-      {calls.length === 0 ? (
+      {unavailable ? (
+        <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
+          <p className="text-[12px] text-fg-3">
+            History unavailable — the event log could not be loaded for this task.
+          </p>
+        </div>
+      ) : calls.length === 0 ? (
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3">
           <p className="text-[12px] text-fg-3">
             Event history was truncated before this task&apos;s tool calls were reached.
