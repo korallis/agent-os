@@ -587,6 +587,8 @@ export const secondmateRoutedEventSchema = z.strictObject({
     domain: z.string(),
     accepted: z.boolean(),
     reason: z.string().nullable(),
+    /** Task id on the secondmate after a successful POST /v1/tasks handover. */
+    remoteTaskId: ulidSchema.nullable().optional(),
   }),
 });
 

@@ -205,11 +205,17 @@ export type NotifyCaptainInput = z.infer<typeof notifyCaptainInputSchema>;
 export const routeToSecondmateInputSchema = z.strictObject({
   name: z.string().min(1).max(64),
   taskId: ulidSchema,
+  /**
+   * Domain being handed over. Must be in the target secondmate's charter.domains
+   * (enforced via SecondmateFleet.routeFor).
+   */
+  domain: z.string().min(1).max(64),
 });
 export type RouteToSecondmateInput = z.infer<typeof routeToSecondmateInputSchema>;
 
 export const readSecondmateBearingsInputSchema = z.strictObject({
-  name: z.string().min(1).max(64),
+  /** When omitted, probe every secondmate. */
+  name: z.string().min(1).max(64).optional(),
 });
 export type ReadSecondmateBearingsInput = z.infer<typeof readSecondmateBearingsInputSchema>;
 

@@ -113,45 +113,6 @@ export const fleetSessionSchema = z.strictObject({
 });
 export type FleetSession = z.infer<typeof fleetSessionSchema>;
 
-export const fleetStateSnapshotSchema = z.strictObject({
-  brain: brainSnapshotSchema,
-  tasks: z.array(taskSnapshotSchema),
-  sessions: z.array(fleetSessionSchema),
-  worktrees: z.array(worktreeLeaseSchema),
-  wakeQueue: z.array(wakeDigestSchema),
-  projects: z.array(projectRecordSchema),
-  brainDown: z.boolean(),
-  generatedAt: isoTimestampSchema,
-});
-export type FleetStateSnapshot = z.infer<typeof fleetStateSnapshotSchema>;
-
-export const fleetSummarySchema = z.strictObject({
-  active: z.number().int().min(0),
-  queued: z.number().int().min(0),
-  needsCaptain: z.number().int().min(0),
-  doneToday: z.number().int().min(0),
-  failed: z.number().int().min(0),
-  brain: brainSnapshotSchema,
-  brainDown: z.boolean(),
-});
-export type FleetSummary = z.infer<typeof fleetSummarySchema>;
-
-/** Compact row for console task boards. */
-export const taskListItemSchema = z.strictObject({
-  id: ulidSchema,
-  shape: taskShapeSchema,
-  title: z.string(),
-  phase: taskPhaseSchema,
-  projectId: ulidSchema,
-  projectName: z.string().nullable(),
-  mode: projectModeSchema,
-  model: piModelRefSchema.nullable(),
-  agent: agentRoleSchema.nullable(),
-  updatedAt: isoTimestampSchema,
-  createdAt: isoTimestampSchema,
-});
-export type TaskListItem = z.infer<typeof taskListItemSchema>;
-
 /**
  * `/afk` autonomy posture (master plan §11 Phase 8). The FAQ is the entire
  * mandate: AFK answers what the Captain pre-decided and escalates everything
@@ -220,3 +181,44 @@ export const secondmateBearingsSchema = z.strictObject({
   brainStatus: z.string().nullable(),
 });
 export type SecondmateBearings = z.infer<typeof secondmateBearingsSchema>;
+
+export const fleetStateSnapshotSchema = z.strictObject({
+  brain: brainSnapshotSchema,
+  tasks: z.array(taskSnapshotSchema),
+  sessions: z.array(fleetSessionSchema),
+  worktrees: z.array(worktreeLeaseSchema),
+  wakeQueue: z.array(wakeDigestSchema),
+  projects: z.array(projectRecordSchema),
+  brainDown: z.boolean(),
+  generatedAt: isoTimestampSchema,
+  /** Most recent secondmate bearings probe results (from read_secondmate_bearings). */
+  secondmateBearings: z.array(secondmateBearingsSchema).optional(),
+});
+export type FleetStateSnapshot = z.infer<typeof fleetStateSnapshotSchema>;
+
+export const fleetSummarySchema = z.strictObject({
+  active: z.number().int().min(0),
+  queued: z.number().int().min(0),
+  needsCaptain: z.number().int().min(0),
+  doneToday: z.number().int().min(0),
+  failed: z.number().int().min(0),
+  brain: brainSnapshotSchema,
+  brainDown: z.boolean(),
+});
+export type FleetSummary = z.infer<typeof fleetSummarySchema>;
+
+/** Compact row for console task boards. */
+export const taskListItemSchema = z.strictObject({
+  id: ulidSchema,
+  shape: taskShapeSchema,
+  title: z.string(),
+  phase: taskPhaseSchema,
+  projectId: ulidSchema,
+  projectName: z.string().nullable(),
+  mode: projectModeSchema,
+  model: piModelRefSchema.nullable(),
+  agent: agentRoleSchema.nullable(),
+  updatedAt: isoTimestampSchema,
+  createdAt: isoTimestampSchema,
+});
+export type TaskListItem = z.infer<typeof taskListItemSchema>;

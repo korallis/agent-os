@@ -70,7 +70,8 @@ import type { WakeWatcher } from "./watcher.js";
 import { GateRunner } from "./gate-runner.js";
 import type { FusionRunStore } from "./fusion-runs.js";
 import type { SecondmateRegistry } from "./secondmates.js";
-import type { SecondmateFleet } from "./secondmate-fleet.js";
+import { SecondmateHandoverError, type SecondmateFleet } from "./secondmate-fleet.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
 
@@ -147,6 +148,8 @@ export interface ToolSurfaceDeps {
   prompts?: PromptService;
   /** Phase 7 secondmate fleet: registry + routing/bearings operations. */
   secondmates?: { registry: SecondmateRegistry; fleet: SecondmateFleet };
+  /** Shared Pi auth broker — every spawn grant goes through this choke point. */
+  authBroker?: PiAuthBroker;
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
@@ -291,40 +294,71 @@ export class ToolSurface {
     tool: string,
     input: Record<string, unknown>,
   ): ToolCallResult {
+    const gate = this.authorizeSessionTool(sessionId, tool);
+    if (!gate.ok) return gate.result;
+    return this.invoke(gate.name, input);
+  }
+
+  /** Async session entry — required for route_to_secondmate / read_secondmate_bearings. */
+  async invokeFromSessionAsync(
+    sessionId: string,
+    tool: string,
+    input: Record<string, unknown>,
+  ): Promise<ToolCallResult> {
+    const gate = this.authorizeSessionTool(sessionId, tool);
+    if (!gate.ok) return gate.result;
+    return this.invokeAsync(gate.name, input);
+  }
+
+  private authorizeSessionTool(
+    sessionId: string,
+    tool: string,
+  ):
+    | { ok: true; name: BrainToolName }
+    | { ok: false; result: ToolCallResult } {
     const parsed = brainToolNameSchema.safeParse(tool);
     if (!parsed.success) {
       return {
-        invocationId: nextUlid(),
         ok: false,
-        error: err("VALIDATION_ERROR", `unknown tool: ${tool}`),
-        durationMs: 0,
+        result: {
+          invocationId: nextUlid(),
+          ok: false,
+          error: err("VALIDATION_ERROR", `unknown tool: ${tool}`),
+          durationMs: 0,
+        },
       };
     }
     const name = parsed.data;
     if (CAPTAIN_ONLY_TOOLS.has(name)) {
       return {
-        invocationId: nextUlid(),
         ok: false,
-        error: err(
-          "UNAUTHORIZED_TOOL",
-          `${name} is Captain-only — not available over a session socket`,
-        ),
-        durationMs: 0,
+        result: {
+          invocationId: nextUlid(),
+          ok: false,
+          error: err(
+            "UNAUTHORIZED_TOOL",
+            `${name} is Captain-only — not available over a session socket`,
+          ),
+          durationMs: 0,
+        },
       };
     }
     const isBrain = this.brainSessionId !== null && sessionId === this.brainSessionId;
     if (!isBrain && !CREW_ALLOWED_TOOLS.has(name)) {
       return {
-        invocationId: nextUlid(),
         ok: false,
-        error: err(
-          "UNAUTHORIZED_TOOL",
-          `session ${sessionId} is not the Brain — ${name} is not available to crewmates`,
-        ),
-        durationMs: 0,
+        result: {
+          invocationId: nextUlid(),
+          ok: false,
+          error: err(
+            "UNAUTHORIZED_TOOL",
+            `session ${sessionId} is not the Brain — ${name} is not available to crewmates`,
+          ),
+          durationMs: 0,
+        },
       };
     }
-    return this.invoke(name, input);
+    return { ok: true, name };
   }
 
   isBrainDown(): boolean {
@@ -356,6 +390,7 @@ export class ToolSurface {
       projects: this.deps.projects.list(),
       brainDown: this.brainDown,
       generatedAt: new Date().toISOString(),
+      secondmateBearings: this.latestBearings,
     };
   }
 
@@ -579,6 +614,48 @@ export class ToolSurface {
     rawInput: Record<string, unknown>,
     options: { idempotencyKey?: string } = {},
   ): ToolCallResult {
+    if (tool === "route_to_secondmate" || tool === "read_secondmate_bearings") {
+      const started = Date.now();
+      const invocationId = nextUlid();
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err(
+          "INTERNAL",
+          `${tool} requires invokeAsync (I/O probe / remote handover)`,
+        ),
+      });
+    }
+    return this.finishInvoke(tool, rawInput, options, () => this.dispatch(tool, rawInput));
+  }
+
+  /**
+   * Async tool entry for secondmate I/O (handover POST, bearings probe).
+   * Sync tools are delegated to the same finish path.
+   */
+  async invokeAsync(
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    options: { idempotencyKey?: string } = {},
+  ): Promise<ToolCallResult> {
+    if (tool === "route_to_secondmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.routeToSecondmate(rawInput),
+      );
+    }
+    if (tool === "read_secondmate_bearings") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.readSecondmateBearings(rawInput),
+      );
+    }
+    return this.invoke(tool, rawInput, options);
+  }
+
+  private finishInvoke(
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    options: { idempotencyKey?: string },
+    run: () => unknown,
+  ): ToolCallResult {
     const started = Date.now();
     const invocationId = nextUlid();
 
@@ -587,16 +664,15 @@ export class ToolSurface {
       if (cached !== undefined) return cached;
     }
 
-    // Orchestration tools blocked in BRAIN_DOWN except read_* and Captain REST.
     if (
       this.brainDown &&
       tool !== "read_fleet_state" &&
       tool !== "read_task" &&
       tool !== "read_policy" &&
       tool !== "read_run_artifacts" &&
-      tool !== "notify_captain"
+      tool !== "notify_captain" &&
+      tool !== "read_secondmate_bearings"
     ) {
-      // Captain REST may still create_task / resolve_delivery_block.
       if (tool !== "create_task" && tool !== "resolve_delivery_block") {
         return this.finish(invocationId, tool, null, started, {
           ok: false,
@@ -606,7 +682,7 @@ export class ToolSurface {
     }
 
     try {
-      const data = this.dispatch(tool, rawInput);
+      const data = run();
       const result = this.finish(invocationId, tool, extractTaskId(rawInput), started, {
         ok: true,
         data,
@@ -616,40 +692,100 @@ export class ToolSurface {
       }
       return result;
     } catch (error) {
-      if (error instanceof IllegalTransitionError) {
-        return this.finish(invocationId, tool, error.taskId, started, {
+      return this.mapInvokeError(invocationId, tool, rawInput, started, error);
+    }
+  }
+
+  private async finishInvokeAsync(
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    options: { idempotencyKey?: string },
+    run: () => Promise<unknown>,
+  ): Promise<ToolCallResult> {
+    const started = Date.now();
+    const invocationId = nextUlid();
+
+    if (options.idempotencyKey !== undefined) {
+      const cached = this.toolIdempotency.get(`${tool}:${options.idempotencyKey}`);
+      if (cached !== undefined) return cached;
+    }
+
+    if (
+      this.brainDown &&
+      tool !== "read_fleet_state" &&
+      tool !== "read_task" &&
+      tool !== "read_policy" &&
+      tool !== "read_run_artifacts" &&
+      tool !== "notify_captain" &&
+      tool !== "read_secondmate_bearings"
+    ) {
+      if (tool !== "create_task" && tool !== "resolve_delivery_block") {
+        return this.finish(invocationId, tool, null, started, {
           ok: false,
-          error: err("ILLEGAL_TRANSITION", error.message, {
-            from: error.from,
-            to: error.to,
-          }),
+          error: err("BRAIN_DOWN", "brain is down — orchestration tools are blocked"),
         });
       }
-      if (error instanceof ToolSurfaceError) {
-        return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
-          ok: false,
-          error: err(error.code, error.message, error.details),
-        });
+    }
+
+    try {
+      const data = await run();
+      const result = this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: true,
+        data,
+      });
+      if (options.idempotencyKey !== undefined) {
+        this.toolIdempotency.set(`${tool}:${options.idempotencyKey}`, result);
       }
-      // Bad tool input is the caller's error, not an internal fault — the Brain
-      // needs a path-precise VALIDATION_ERROR it can act on.
-      if (error instanceof ZodError) {
-        return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
-          ok: false,
-          error: err("VALIDATION_ERROR", `invalid input for ${tool}`, {
-            issues: error.issues.map((i) => ({
-              path: i.path.join("."),
-              message: i.message,
-            })),
-          }),
-        });
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+      return result;
+    } catch (error) {
+      return this.mapInvokeError(invocationId, tool, rawInput, started, error);
+    }
+  }
+
+  private mapInvokeError(
+    invocationId: string,
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    started: number,
+    error: unknown,
+  ): ToolCallResult {
+    if (error instanceof IllegalTransitionError) {
+      return this.finish(invocationId, tool, error.taskId, started, {
         ok: false,
-        error: err("INTERNAL", message),
+        error: err("ILLEGAL_TRANSITION", error.message, {
+          from: error.from,
+          to: error.to,
+        }),
       });
     }
+    if (error instanceof ToolSurfaceError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err(error.code, error.message, error.details),
+      });
+    }
+    if (error instanceof SecondmateHandoverError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err("CONFLICT", error.message, error.details),
+      });
+    }
+    if (error instanceof ZodError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err("VALIDATION_ERROR", `invalid input for ${tool}`, {
+          issues: error.issues.map((i) => ({
+            path: i.path.join("."),
+            message: i.message,
+          })),
+        }),
+      });
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+      ok: false,
+      error: err("INTERNAL", message),
+    });
   }
 
   private finish(
@@ -718,9 +854,11 @@ export class ToolSurface {
       case "notify_captain":
         return this.notify(raw);
       case "route_to_secondmate":
-        return this.routeToSecondmate(raw);
       case "read_secondmate_bearings":
-        return this.readSecondmateBearings(raw);
+        throw new ToolSurfaceError(
+          "INTERNAL",
+          `${tool} must be invoked via invokeAsync`,
+        );
       case "stow_knowledge":
         return this.stowKnowledge(raw);
       case "read_policy":
@@ -1315,11 +1453,6 @@ export class ToolSurface {
         const prompt =
           input.prompt ??
           `Agent OS role=${input.role}. Task: ${task.title}\n\n${task.intent}`;
-        const grant = resolveProviderKeyGrant(
-          this.deps.home,
-          input.model,
-          this.deps.connections,
-        );
         // Narrowed by preflight above; TypeScript cannot see the throw path.
         if (piDetection == null || extensionPath === undefined) {
           throw new ToolSurfaceError(
@@ -1334,29 +1467,41 @@ export class ToolSurface {
         // Seat allowlist root: builder = leased worktree; validator = gate workspace.
         const seatWorkspace =
           input.role === "builder" || input.role === "validator" ? cwd : undefined;
-        const spec = buildPiSpawnSpec({
-          agentosHome: this.deps.home,
-          detection: piDetection,
-          args: ["--mode", "json", "-p", prompt, "--model", input.model],
-          cwd,
-          sessionId,
-          role: input.role,
-          socketPath,
-          extensionPath,
-          sessionDir,
-          thinking: input.thinking,
-          cleanRoom: input.cleanRoom,
-          grantProviderKey: grant,
-          ...(gateWorkspace !== undefined ? { gateWorkspace } : {}),
-          ...(seatWorkspace !== undefined ? { seatWorkspace } : {}),
-        });
-        const win = this.deps.tmux.newWindow({
-          windowName,
-          argv: [spec.binary, ...spec.args],
-          env: spec.env,
-          cwd,
-        });
-        tmuxWindow = win.target;
+        const runSpawn = (): string => {
+          const grant = resolveProviderKeyGrant(
+            this.deps.home,
+            input.model,
+            this.deps.connections,
+          );
+          const spec = buildPiSpawnSpec({
+            agentosHome: this.deps.home,
+            detection: piDetection,
+            args: ["--mode", "json", "-p", prompt, "--model", input.model],
+            cwd,
+            sessionId,
+            role: input.role,
+            socketPath,
+            extensionPath,
+            sessionDir,
+            thinking: input.thinking,
+            cleanRoom: input.cleanRoom,
+            grantProviderKey: grant,
+            ...(gateWorkspace !== undefined ? { gateWorkspace } : {}),
+            ...(seatWorkspace !== undefined ? { seatWorkspace } : {}),
+          });
+          const win = this.deps.tmux.newWindow({
+            windowName,
+            argv: [spec.binary, ...spec.args],
+            env: spec.env,
+            cwd,
+          });
+          return win.target;
+        };
+        // Auth-store touch goes through the single PiAuthBroker choke point.
+        tmuxWindow =
+          this.deps.authBroker !== undefined
+            ? this.deps.authBroker.withSpawnGrantSync(runSpawn)
+            : runSpawn();
       }
 
       const now = new Date().toISOString();
@@ -3090,17 +3235,18 @@ export class ToolSurface {
   }
 
   /**
-   * Hand a task to a secondmate. The task LEAVES this fleet — it is cancelled
-   * here with a routed reason rather than left running in both places, because
-   * two Brains owning one task is how duplicate work and conflicting deliveries
-   * happen. Refuses when no secondmate accepts the domain: inventing a
-   * destination would strand the task.
+   * Hand a task to a secondmate. POST the task to the secondmate first; only
+   * after acceptance is it released on the primary. A failed POST leaves the
+   * task on the primary with a typed error — dropping work is worse than
+   * refusing to route. Domain must match the target charter via routeFor.
    */
-  private routeToSecondmate(raw: Record<string, unknown>): {
+  private async routeToSecondmate(raw: Record<string, unknown>): Promise<{
     name: string;
     taskId: string;
+    remoteTaskId: string;
     accepted: boolean;
-  } {
+    domain: string;
+  }> {
     const input = routeToSecondmateInputSchema.parse(raw);
     if (this.deps.secondmates === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
@@ -3109,12 +3255,30 @@ export class ToolSurface {
     if (isTerminalPhase(task.phase)) {
       throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
     }
-    const record = this.deps.secondmates.registry
-      .list()
-      .find((s) => s.name === input.name);
-    if (record === undefined) {
-      throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
+
+    const byDomain = this.deps.secondmates.fleet.routeFor(input.domain);
+    if (byDomain === null || byDomain.name !== input.name) {
+      this.sink({
+        type: "secondmate.routed",
+        payload: {
+          name: input.name,
+          taskId: task.id,
+          domain: input.domain,
+          accepted: false,
+          reason: byDomain === null
+            ? `no secondmate accepts domain ${input.domain}`
+            : `domain ${input.domain} routes to ${byDomain.name}, not ${input.name}`,
+          remoteTaskId: null,
+        },
+      });
+      throw new ToolSurfaceError(
+        "POLICY_VIOLATION",
+        byDomain === null
+          ? `no secondmate accepts domain ${input.domain}`
+          : `secondmate ${input.name} does not accept domain ${input.domain}`,
+      );
     }
+    const record = byDomain;
     const { charter } = this.deps.secondmates.fleet.readCharter(record);
     if (!charter.acceptsRouting) {
       this.sink({
@@ -3122,9 +3286,10 @@ export class ToolSurface {
         payload: {
           name: record.name,
           taskId: task.id,
-          domain: charter.domains[0] ?? "",
+          domain: input.domain,
           accepted: false,
           reason: "charter declines routing",
+          remoteTaskId: null,
         },
       });
       throw new ToolSurfaceError(
@@ -3133,43 +3298,91 @@ export class ToolSurface {
       );
     }
 
-    // Halt anything running here before handing ownership over, so the task
-    // cannot be live on two daemons at once.
+    const project = this.deps.projects.get(task.projectId);
+    if (project === null) {
+      throw new ToolSurfaceError("NOT_FOUND", `project not found: ${task.projectId}`);
+    }
+
+    let remoteTaskId: string;
+    try {
+      const handed = await this.deps.secondmates.fleet.handoverTask({
+        record,
+        task,
+        project: {
+          name: project.name,
+          path: project.path,
+          mode: project.mode,
+          trusted: project.trusted,
+          yolo: project.yolo,
+        },
+        domain: input.domain,
+      });
+      remoteTaskId = handed.remoteTaskId;
+    } catch (error) {
+      const message =
+        error instanceof SecondmateHandoverError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : "handover failed";
+      this.sink({
+        type: "secondmate.routed",
+        payload: {
+          name: record.name,
+          taskId: task.id,
+          domain: input.domain,
+          accepted: false,
+          reason: message,
+          remoteTaskId: null,
+        },
+      });
+      if (error instanceof SecondmateHandoverError) throw error;
+      throw new SecondmateHandoverError(message);
+    }
+
+    // Accepted on the secondmate — only now release ownership on the primary.
     this.haltAndReleaseTask(task.id, `routed to secondmate ${record.name}`);
-    this.transition(this.requireTask(task.id), "CANCELLED", `routed to secondmate ${record.name}`);
+    this.transition(
+      this.requireTask(task.id),
+      "CANCELLED",
+      `routed to secondmate ${record.name} as ${remoteTaskId}`,
+    );
     this.sink({
       type: "secondmate.routed",
       payload: {
         name: record.name,
         taskId: task.id,
-        domain: charter.domains[0] ?? "",
+        domain: input.domain,
         accepted: true,
         reason: null,
+        remoteTaskId,
       },
     });
-    return { name: record.name, taskId: task.id, accepted: true };
+    return {
+      name: record.name,
+      taskId: task.id,
+      remoteTaskId,
+      accepted: true,
+      domain: input.domain,
+    };
   }
 
-  /** Live status of every secondmate; unreachable is reported as a fact. */
-  private readSecondmateBearings(raw: Record<string, unknown>): {
-    pending: true;
-    name: string | null;
-  } {
+  /** Live status of secondmates; awaits the probe and surfaces unreachable as fact. */
+  private async readSecondmateBearings(raw: Record<string, unknown>): Promise<{
+    bearings: SecondmateBearings[];
+  }> {
     const input = readSecondmateBearingsInputSchema.parse(raw);
     if (this.deps.secondmates === undefined) {
       throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
     }
-    // The tool surface is synchronous; bearings are an I/O probe, so the REST
-    // surface owns the await and the Brain reads the result from fleet state.
-    void this.deps.secondmates.fleet
-      .bearings()
-      .then((all) => {
-        this.latestBearings = input.name === undefined
-          ? all
-          : all.filter((b) => b.name === input.name);
-      })
-      .catch(() => undefined);
-    return { pending: true, name: input.name ?? null };
+    const all = await this.deps.secondmates.fleet.bearings();
+    const bearings =
+      input.name === undefined ? all : all.filter((b) => b.name === input.name);
+    if (input.name !== undefined && bearings.length === 0) {
+      throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
+    }
+    this.latestBearings = bearings;
+    return { bearings };
   }
 
   /** Most recent bearings probe result, for fleet state and REST. */

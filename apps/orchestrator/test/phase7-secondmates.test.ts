@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CrossProcessAuthBroker } from "../src/pi/cross-process-broker.js";
+import { PiAuthBroker } from "../src/pi/auth-broker.js";
 import { SecondmateRegistry } from "../src/fleet/secondmates.js";
 import { SecondmateFleet } from "../src/fleet/secondmate-fleet.js";
 
@@ -61,6 +62,27 @@ describe("cross-process auth broker", () => {
     expect(existsSync(lockPath)).toBe(true);
   });
 
+  it("refuses to release an unreadable/corrupt lock", () => {
+    const dir = temp("agentos-p7-corrupt-");
+    mkdirSync(dir, { recursive: true });
+    const lockPath = join(dir, "auth-broker.lock");
+    writeFileSync(lockPath, "not-json-at-all");
+    const broker = new CrossProcessAuthBroker(dir);
+    broker.release();
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  it("writes lock metadata through the exclusive fd (no empty file window)", () => {
+    const dir = temp("agentos-p7-fd-");
+    const broker = new CrossProcessAuthBroker(dir);
+    expect(broker.tryAcquire("login")).toBe(true);
+    const info = broker.holder();
+    expect(info).not.toBeNull();
+    expect(info?.pid).toBe(process.pid);
+    expect(info?.purpose).toBe("login");
+    broker.release();
+  });
+
   it("reclaims a lock whose holder process is gone", () => {
     const dir = temp("agentos-p7-stale-");
     const lockPath = join(dir, "auth-broker.lock");
@@ -98,6 +120,26 @@ describe("cross-process auth broker", () => {
   });
 });
 
+describe("PiAuthBroker choke point", () => {
+  it("withSpawnGrantSync acquires the cross-process lock", () => {
+    const dir = temp("agentos-p7-choke-");
+    const piHome = join(dir, "pi");
+    mkdirSync(join(piHome, "agent"), { recursive: true });
+    const broker = PiAuthBroker.forManagedHome(piHome);
+    const peer = new CrossProcessAuthBroker(join(piHome, "agent"));
+
+    let ran = false;
+    broker.withSpawnGrantSync(() => {
+      ran = true;
+      // While held, a peer process cannot acquire.
+      expect(peer.tryAcquire("peer")).toBe(false);
+    });
+    expect(ran).toBe(true);
+    expect(peer.tryAcquire("peer")).toBe(true);
+    peer.release();
+  });
+});
+
 describe("secondmate homes", () => {
   it("provisions an isolated home carrying no auth material", () => {
     const home = temp("agentos-p7-home-");
@@ -128,6 +170,20 @@ describe("secondmate homes", () => {
     const audit = registry.auditNoAuthMaterial();
     expect(audit.ok).toBe(false);
     expect(audit.offenders.join(" ")).toContain("daemon.token");
+  });
+
+  it("keeps runtime tokens outside the audited secondmate home", () => {
+    const home = temp("agentos-p7-token-out-");
+    const registry = new SecondmateRegistry(home);
+    const record = registry.provision({ name: "infra", domain: "infra" });
+    const tokenPath = registry.runtimeTokenPath(record.name);
+    expect(tokenPath.startsWith(record.home)).toBe(false);
+    expect(tokenPath).toContain(join("runtime", "secondmates", "infra"));
+    mkdirSync(join(tokenPath, ".."), { recursive: true });
+    writeFileSync(tokenPath, "runtime-token\n", { mode: 0o600 });
+    // Token outside the home must not fail the home audit.
+    expect(registry.auditNoAuthMaterial().ok).toBe(true);
+    expect(registry.readRuntimeToken("infra")).toBe("runtime-token");
   });
 });
 

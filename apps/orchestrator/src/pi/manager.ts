@@ -27,6 +27,9 @@ export interface PiDetection {
 }
 
 export function managedPiHome(agentosHome: string): string {
+  // Secondmates share the primary's Pi auth store via AGENTOS_PI_HOME.
+  const override = process.env.AGENTOS_PI_HOME;
+  if (override !== undefined && override.length > 0) return override;
   return join(agentosHome, "pi");
 }
 

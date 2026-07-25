@@ -14,6 +14,7 @@ import { ConfigService } from "./config/service.js";
 import { buildServer, type AgentosdServer } from "./server/app.js";
 import { AGENTOSD_VERSION, DEFAULT_PORT, LOOPBACK_HOST } from "./version.js";
 import { ConnectionRegistry } from "./pi/connections.js";
+import { PiAuthBroker } from "./pi/auth-broker.js";
 import { detectPi } from "./pi/manager.js";
 import { SocketHub } from "./pi/socket-hub.js";
 import { OnboardingService } from "./onboarding/state.js";
@@ -159,6 +160,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const startedAt = new Date().toISOString();
 
     const pi = detectPi(home);
+    const authBroker = PiAuthBroker.forManagedHome(pi.managedHome);
     const connections = new ConnectionRegistry(home);
     connections.onEvent((event) => {
       eventStore.append(event);
@@ -201,12 +203,15 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     });
     prompts.installDefaults();
 
+    const agentosdBin = resolveAgentosdBin();
     const fleet = new FleetService({
       home,
       config,
       connections,
       prompts,
       pi,
+      authBroker,
+      agentosdBin,
       ...(extensionPath !== undefined ? { extensionPath } : {}),
       sockets: socketHub,
       fakeTmux: process.env.AGENTOS_FAKE_TMUX === "1",
@@ -292,6 +297,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       connections,
       onboarding,
       pi,
+      authBroker,
       quotaSamples,
       fleet,
       prompts,
@@ -421,4 +427,16 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       lock.release();
     }
   }
+}
+
+/** Resolve the on-disk agentosd entrypoint for secondmate child processes. */
+function resolveAgentosdBin(): string {
+  // Prefer the running process path when launched as agentosd.js.
+  const argv1 = process.argv[1];
+  if (typeof argv1 === "string" && argv1.length > 0 && existsSync(argv1)) {
+    return argv1;
+  }
+  const candidate = join(here, "bin", "agentosd.js");
+  if (existsSync(candidate)) return candidate;
+  return join(here, "bin", "agentosd.js");
 }

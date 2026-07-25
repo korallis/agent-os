@@ -1,7 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import JSON5 from "json5";
-import type { OrchestratorEvent, SecondmateBearings, SecondmateCharter } from "@agent-os/protocol";
+import type {
+  OrchestratorEvent,
+  ProjectMode,
+  SecondmateBearings,
+  SecondmateCharter,
+  TaskSnapshot,
+} from "@agent-os/protocol";
 import { secondmateCharterSchema } from "@agent-os/protocol";
 import type { SecondmateRecord, SecondmateRegistry } from "./secondmates.js";
 
@@ -25,6 +31,20 @@ export type SecondmateEventSink = (event: OrchestratorEvent) => void;
 
 /** How long a bearings probe waits before calling a secondmate unreachable. */
 const BEARINGS_TIMEOUT_MS = 5_000;
+/** How long a task handover POST waits before failing closed (task stays on primary). */
+const HANDOVER_TIMEOUT_MS = 10_000;
+
+export class SecondmateHandoverError extends Error {
+  readonly code = "SECONDMATE_HANDOVER_FAILED" as const;
+
+  constructor(
+    message: string,
+    readonly details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "SecondmateHandoverError";
+  }
+}
 
 export class SecondmateFleet {
   private sink: SecondmateEventSink = () => undefined;
@@ -33,6 +53,112 @@ export class SecondmateFleet {
 
   onEvent(sink: SecondmateEventSink): void {
     this.sink = sink;
+  }
+
+  /**
+   * Hand a task to a running secondmate: ensure the project exists remotely,
+   * POST the task spec, and return the remote task id. Does not mutate the
+   * primary — the caller releases only after acceptance.
+   */
+  async handoverTask(input: {
+    record: SecondmateRecord;
+    task: TaskSnapshot;
+    project: { name: string; path: string; mode: ProjectMode; trusted: boolean; yolo: boolean };
+    domain: string;
+  }): Promise<{ remoteTaskId: string }> {
+    const token = this.registry.readRuntimeToken(input.record.name);
+    if (token === null) {
+      throw new SecondmateHandoverError(
+        `secondmate ${input.record.name} has no runtime token — start it first`,
+      );
+    }
+    const baseUrl = `http://127.0.0.1:${input.record.port}`;
+    const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+    const remoteProjectId = await this.ensureRemoteProject(baseUrl, auth, input.project);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HANDOVER_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${baseUrl}/v1/tasks`, {
+        method: "POST",
+        headers: auth,
+        signal: controller.signal,
+        body: JSON.stringify({
+          spec: {
+            shape: input.task.shape,
+            title: input.task.title,
+            intent: input.task.intent,
+            projectId: remoteProjectId,
+            mode: input.task.mode,
+            ...(input.task.shape === "SHIP" ? { yolo: input.task.yolo } : {}),
+          },
+          idempotencyKey: `routed-from-primary:${input.task.id}`,
+        }),
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new SecondmateHandoverError(
+          `secondmate ${input.record.name} refused task (HTTP ${response.status})`,
+          { status: response.status, body: text.slice(0, 500) },
+        );
+      }
+      const body = (await response.json()) as { task?: { id?: string } };
+      const remoteTaskId = body.task?.id;
+      if (typeof remoteTaskId !== "string" || remoteTaskId.length === 0) {
+        throw new SecondmateHandoverError(
+          `secondmate ${input.record.name} accepted without a task id`,
+        );
+      }
+      return { remoteTaskId };
+    } catch (error) {
+      if (error instanceof SecondmateHandoverError) throw error;
+      throw new SecondmateHandoverError(
+        error instanceof Error ? error.message : "handover failed",
+        { domain: input.domain },
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async ensureRemoteProject(
+    baseUrl: string,
+    auth: Record<string, string>,
+    project: { name: string; path: string; mode: ProjectMode; trusted: boolean; yolo: boolean },
+  ): Promise<string> {
+    const listRes = await fetch(`${baseUrl}/v1/projects`, { headers: auth });
+    if (listRes.ok) {
+      const listBody = (await listRes.json()) as {
+        projects?: Array<{ id: string; path: string }>;
+      };
+      const match = (listBody.projects ?? []).find((p) => p.path === project.path);
+      if (match !== undefined) return match.id;
+    }
+    const createRes = await fetch(`${baseUrl}/v1/projects`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        name: project.name,
+        path: project.path,
+        mode: project.mode,
+        trusted: project.trusted,
+        yolo: project.yolo,
+      }),
+    });
+    if (!createRes.ok) {
+      const text = await createRes.text().catch(() => "");
+      throw new SecondmateHandoverError(
+        `could not register project on secondmate (HTTP ${createRes.status})`,
+        { body: text.slice(0, 500) },
+      );
+    }
+    const created = (await createRes.json()) as { project?: { id?: string } };
+    const id = created.project?.id;
+    if (typeof id !== "string" || id.length === 0) {
+      throw new SecondmateHandoverError("secondmate project create returned no id");
+    }
+    return id;
   }
 
   private charterPath(record: SecondmateRecord): string {
@@ -141,14 +267,13 @@ export class SecondmateFleet {
         brainStatus: null,
       };
     }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), BEARINGS_TIMEOUT_MS);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), BEARINGS_TIMEOUT_MS);
       const response = await fetch(`http://127.0.0.1:${record.port}/v1/fleet`, {
         headers: { authorization: `Bearer ${token}` },
         signal: controller.signal,
       });
-      clearTimeout(timer);
       if (!response.ok) {
         return {
           ...base,
@@ -179,17 +304,16 @@ export class SecondmateFleet {
         queued: null,
         brainStatus: null,
       };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
+  /**
+   * Read the secondmate daemon token from the primary-side runtime tree
+   * (outside the audited secondmate home).
+   */
   private readToken(record: SecondmateRecord): string | null {
-    const path = join(record.home, "daemon.token");
-    if (!existsSync(path)) return null;
-    try {
-      const token = readFileSync(path, "utf8").trim();
-      return token.length > 0 ? token : null;
-    } catch {
-      return null;
-    }
+    return this.registry.readRuntimeToken(record.name);
   }
 }

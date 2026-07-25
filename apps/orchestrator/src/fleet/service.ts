@@ -31,6 +31,7 @@ import {
   worstWindowPctFromSample,
   type HandoffCandidate,
 } from "./brain-handoff.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 
 export type FleetEventSink = (event: OrchestratorEvent) => void;
 
@@ -39,6 +40,7 @@ export interface FleetServiceOptions {
   config: ConfigService;
   connections?: ConnectionRegistry;
   pi?: PiDetection;
+  authBroker?: PiAuthBroker;
   extensionPath?: string;
   sockets?: SessionChannel;
   prompts?: PromptService;
@@ -47,6 +49,8 @@ export interface FleetServiceOptions {
   fakeBrain?: boolean;
   /** Latest quota samples, read live so handoff decisions use current numbers. */
   quotaSamples?: () => QuotaSample[];
+  /** Absolute path to agentosd.js for spawning secondmate processes. */
+  agentosdBin?: string;
 }
 
 /**
@@ -140,6 +144,7 @@ export class FleetService {
       secondmates: { registry: this.secondmates, fleet: this.secondmateFleet },
       ...(options.prompts !== undefined ? { prompts: options.prompts } : {}),
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
+      ...(options.authBroker !== undefined ? { authBroker: options.authBroker } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
@@ -154,6 +159,7 @@ export class FleetService {
       sessionKeys: this.sessionKeys,
       config: cfg.brain,
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
+      ...(options.authBroker !== undefined ? { authBroker: options.authBroker } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
@@ -307,7 +313,17 @@ export class FleetService {
   private onToolCall(
     frame: Extract<ExtensionToDaemonFrame, { type: "ext.tool_call" }>,
   ): void {
-    const result = this.tools.invokeFromSession(frame.sessionId, frame.tool, frame.input);
+    void this.onToolCallAsync(frame);
+  }
+
+  private async onToolCallAsync(
+    frame: Extract<ExtensionToDaemonFrame, { type: "ext.tool_call" }>,
+  ): Promise<void> {
+    const result = await this.tools.invokeFromSessionAsync(
+      frame.sessionId,
+      frame.tool,
+      frame.input,
+    );
     const reason = result.ok ? null : (result.error?.message ?? null);
     const controlFrame: Extract<DaemonControlFrame, { type: "ctl.tool_result" }> = {
       type: "ctl.tool_result",
@@ -375,7 +391,44 @@ export class FleetService {
     }
   }
 
+  /**
+   * Start a provisioned secondmate as a live agentosd process.
+   * Token lives under primary runtime/; shared Pi home is the primary managed pi.
+   */
+  startSecondmate(name: string): {
+    name: string;
+    pid: number;
+    port: number;
+    tokenPath: string;
+    startedAt: string;
+  } {
+    const agentosdBin = this.options.agentosdBin;
+    if (agentosdBin === undefined) {
+      throw new Error("agentosd binary path not configured — cannot start secondmate");
+    }
+    const sharedPiHome =
+      this.options.pi?.managedHome ??
+      `${this.options.home}/pi`;
+    return this.secondmates.start(name, {
+      agentosdBin,
+      sharedPiHome,
+      env: {
+        AGENTOS_FAKE_PI: process.env.AGENTOS_FAKE_PI,
+        AGENTOS_FAKE_BRAIN: process.env.AGENTOS_FAKE_BRAIN,
+        AGENTOS_FAKE_GATE: process.env.AGENTOS_FAKE_GATE,
+        AGENTOS_FAKE_GIT: process.env.AGENTOS_FAKE_GIT,
+        AGENTOS_FAKE_TMUX: process.env.AGENTOS_FAKE_TMUX,
+        AGENTOS_TMUX_SOCKET: process.env.AGENTOS_TMUX_SOCKET,
+      },
+    });
+  }
+
+  stopSecondmate(name: string): { stopped: boolean; name: string } {
+    return this.secondmates.stop(name);
+  }
+
   stop(): void {
+    this.secondmates.stopAll();
     // leave tmux windows alive — they survive daemon restarts
     this.stopReconcileTick();
   }

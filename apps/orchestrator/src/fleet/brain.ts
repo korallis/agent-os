@@ -10,6 +10,7 @@ import type {
 } from "@agent-os/protocol";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import { resolveProviderKeyGrant } from "../pi/connections.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 import type { PiDetection } from "../pi/manager.js";
 import { buildPiSpawnSpec } from "../pi/manager.js";
 import { familyFromModel } from "../substrate/family.js";
@@ -57,6 +58,7 @@ export interface BrainManagerDeps {
   watcher: WakeWatcher;
   sessionKeys: SessionKeyStore;
   connections?: ConnectionRegistry;
+  authBroker?: PiAuthBroker;
   pi?: PiDetection;
   extensionPath?: string;
   sockets?: SessionChannel;
@@ -195,36 +197,48 @@ export class BrainManager {
       this.deps.tools.setBrainSessionId(sessionId);
 
       try {
-        const grant = resolveProviderKeyGrant(
-          this.deps.home,
-          model,
-          this.deps.connections,
-        );
         const sessionDir = this.deps.sessionKeys.ensure({
           projectId: BRAIN_SESSION_PROJECT_ID,
           role: "brain",
           model,
         }).dir;
-        const spec = buildPiSpawnSpec({
-          agentosHome: this.deps.home,
-          detection: this.deps.pi,
-          args: ["--mode", "json", "-p", BRAIN_SYSTEM_PROMPT, "--model", model],
-          cwd: this.deps.home,
-          sessionId,
-          role: "brain",
-          socketPath,
-          extensionPath: this.deps.extensionPath,
-          sessionDir,
-          thinking,
-          cleanRoom: false,
-          grantProviderKey: grant,
-        });
-        const win = this.deps.tmux.newWindow({
-          windowName,
-          argv: [spec.binary, ...spec.args],
-          env: spec.env,
-        });
-        this.snapshot = { ...this.snapshot, tmuxWindow: win.target };
+        const pi = this.deps.pi;
+        const extensionPath = this.deps.extensionPath;
+        if (pi === undefined || extensionPath === undefined) {
+          throw new Error("Pi detection or extension path missing");
+        }
+        const runSpawn = (): string => {
+          const grant = resolveProviderKeyGrant(
+            this.deps.home,
+            model,
+            this.deps.connections,
+          );
+          const spec = buildPiSpawnSpec({
+            agentosHome: this.deps.home,
+            detection: pi,
+            args: ["--mode", "json", "-p", BRAIN_SYSTEM_PROMPT, "--model", model],
+            cwd: this.deps.home,
+            sessionId,
+            role: "brain",
+            socketPath,
+            extensionPath,
+            sessionDir,
+            thinking,
+            cleanRoom: false,
+            grantProviderKey: grant,
+          });
+          const win = this.deps.tmux.newWindow({
+            windowName,
+            argv: [spec.binary, ...spec.args],
+            env: spec.env,
+          });
+          return win.target;
+        };
+        const tmuxWindow =
+          this.deps.authBroker !== undefined
+            ? this.deps.authBroker.withSpawnGrantSync(runSpawn)
+            : runSpawn();
+        this.snapshot = { ...this.snapshot, tmuxWindow };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.deps.tools.setBrainSessionId(null);

@@ -1,12 +1,13 @@
 import {
   closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
   rmSync,
   statSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -103,8 +104,9 @@ export class CrossProcessAuthBroker {
   release(): void {
     const info = this.holder();
     // Only the holder may release — a stray release from another process would
-    // hand the store to a third while the real holder is mid-write.
-    if (info !== null && info.pid !== process.pid) return;
+    // hand the store to a third while the real holder is mid-write. An
+    // unreadable/corrupt lock is treated as "not mine" and must not be removed.
+    if (info === null || info.pid !== process.pid) return;
     try {
       rmSync(this.lockPath, { force: true });
     } catch {
@@ -126,17 +128,25 @@ export class CrossProcessAuthBroker {
     }
   }
 
-  /** Exclusive create — the atomic primitive this whole broker rests on. */
+  /** Exclusive create — write metadata through the exclusive fd (no empty window). */
   private writeLock(purpose: string): boolean {
     try {
       const fd = openSync(this.lockPath, "wx", 0o600);
-      const info: BrokerLockInfo = {
-        pid: process.pid,
-        acquiredAt: Date.now(),
-        purpose,
-      };
-      writeFileSync(this.lockPath, `${JSON.stringify(info)}\n`, { mode: 0o600 });
-      closeSync(fd);
+      try {
+        const info: BrokerLockInfo = {
+          pid: process.pid,
+          acquiredAt: Date.now(),
+          purpose,
+        };
+        writeSync(fd, `${JSON.stringify(info)}\n`);
+        try {
+          fsyncSync(fd);
+        } catch {
+          // some platforms/tmpfs ignore fsync
+        }
+      } finally {
+        closeSync(fd);
+      }
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;

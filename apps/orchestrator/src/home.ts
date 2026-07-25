@@ -38,12 +38,19 @@ export interface HomePaths {
 }
 
 export function homePaths(home: string): HomePaths {
+  // Secondmates (and tests) may place the token outside AGENTOS_HOME so the
+  // audited secondmate tree stays free of auth material while bearings still auth.
+  const tokenOverride = process.env.AGENTOS_TOKEN_PATH;
+  const tokenPath =
+    tokenOverride !== undefined && tokenOverride.length > 0
+      ? tokenOverride
+      : join(home, "daemon.token");
   return {
     home,
     configDir: join(home, "config"),
     eventsDir: join(home, "events"),
     logsDir: join(home, "logs"),
-    tokenPath: join(home, "daemon.token"),
+    tokenPath,
     lockPath: join(home, "daemon.lock"),
     logFile: join(home, "logs", "agentosd.ndjson"),
   };
@@ -274,6 +281,7 @@ export function ensureHome(home: string): HomePaths {
  */
 export function ensureDaemonToken(home: string): string {
   const { tokenPath } = homePaths(home);
+  mkdirSync(join(tokenPath, ".."), { recursive: true, mode: 0o700 });
 
   if (!existsSync(tokenPath)) {
     const token = randomBytes(32).toString("hex");

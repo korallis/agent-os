@@ -45,6 +45,7 @@ import type { ConnectionRegistry } from "../pi/connections.js";
 import { writeApiKeyFile } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
 import { listDetectedProviders } from "../pi/manager.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 import type { OnboardingService } from "../onboarding/state.js";
 import { OnboardingBlockedError } from "../onboarding/state.js";
 import { enableQuotaProviders } from "../quota-probes/enable.js";
@@ -73,6 +74,8 @@ export interface ServerDeps {
   connections?: ConnectionRegistry;
   onboarding?: OnboardingService;
   pi?: PiDetection;
+  /** Shared Pi auth broker (login/spawn choke point). */
+  authBroker?: PiAuthBroker;
   /** In-memory latest quota samples (connectionId → sample). */
   quotaSamples?: Map<string, QuotaSample>;
   /** Phase 3 fleet substrate. */
@@ -508,6 +511,39 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     return deps.fleet.secondmates.auditNoAuthMaterial();
   });
 
+  app.post<{ Params: { name: string } }>(
+    "/v1/secondmates/:name/start",
+    async (request, reply) => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return;
+      }
+      try {
+        const runtime = deps.fleet.startSecondmate(request.params.name);
+        return { runtime };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "start failed";
+        sendError(reply, 400, "BAD_REQUEST", message);
+      }
+    },
+  );
+
+  app.post<{ Params: { name: string } }>(
+    "/v1/secondmates/:name/stop",
+    async (request, reply) => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return;
+      }
+      try {
+        return deps.fleet.stopSecondmate(request.params.name);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "stop failed";
+        sendError(reply, 400, "BAD_REQUEST", message);
+      }
+    },
+  );
+
   // ── Analytics (master plan §7 Token Usage / §8.2) ───────────────────────
   app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {
     if (deps.analytics === undefined) {
@@ -690,12 +726,12 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     }
     const result =
       body.data.sessionId !== undefined
-        ? deps.fleet.tools.invokeFromSession(
+        ? await deps.fleet.tools.invokeFromSessionAsync(
             body.data.sessionId,
             toolParsed.data,
             body.data.input,
           )
-        : deps.fleet.tools.invoke(
+        : await deps.fleet.tools.invokeAsync(
             toolParsed.data,
             body.data.input,
             body.data.idempotencyKey !== undefined
@@ -751,28 +787,35 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 400, "BAD_REQUEST", "invalid oauth start body");
       return;
     }
-    const connection = deps.connections.upsertConnection({
-      provider: body.data.provider,
-      kind: "pi-oauth",
-      billingMode: body.data.billingMode ?? null,
-    });
-    // Visible tmux login is driven by the host; we record the attach contract.
-    // Inject PI_CONFIG_DIR (managed isolation) so login lands in the same store spawns use.
-    const session = "agentos";
-    const window = `login-${body.data.provider}`;
-    const attachCommand = buildOAuthAttachCommand({
-      session,
-      window,
-      provider: body.data.provider,
-      pi: deps.pi,
-      home: deps.home,
-    });
-    return {
-      connectionId: connection.id,
-      tmuxSession: session,
-      tmuxWindow: window,
-      attachCommand,
+    const run = async () => {
+      const connection = deps.connections!.upsertConnection({
+        provider: body.data.provider,
+        kind: "pi-oauth",
+        billingMode: body.data.billingMode ?? null,
+      });
+      // Visible tmux login is driven by the host; we record the attach contract.
+      // Inject PI_CONFIG_DIR (managed isolation) so login lands in the same store spawns use.
+      const session = "agentos";
+      const window = `login-${body.data.provider}`;
+      const attachCommand = buildOAuthAttachCommand({
+        session,
+        window,
+        provider: body.data.provider,
+        pi: deps.pi,
+        home: deps.home,
+      });
+      return {
+        connectionId: connection.id,
+        tmuxSession: session,
+        tmuxWindow: window,
+        attachCommand,
+      };
     };
+    // Login flows serialise on the cross-process auth lock (single choke point).
+    if (deps.authBroker !== undefined) {
+      return deps.authBroker.withLoginLock(run);
+    }
+    return run();
   });
 
   app.post("/v1/connections/api-key", async (request, reply) => {
