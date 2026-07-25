@@ -897,6 +897,115 @@ describe("/opinion live path", () => {
     expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 
+  it("forces clean-room argv for /opinion even when cast.cleanRoom is false", () => {
+    const home = temp("agentos-p4-cleanroom-force-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const extensionPath = join(home, "extension.js");
+    writeFileSync(extensionPath, "export default {};\n");
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const promptService = new PromptService(SHIPPED_PROMPTS_DIR, join(home, "prompts"));
+    promptService.installDefaults();
+
+    const capturedArgvs: string[][] = [];
+    const service = new FleetService({
+      home,
+      config,
+      prompts: promptService,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: false,
+      pi: {
+        binary: "/usr/bin/true",
+        version: PI_PINNED_VERSION,
+        pinnedVersion: PI_PINNED_VERSION,
+        versionMatchesPin: true,
+        managedHome: join(home, "pi"),
+        configDirEnv: "PI_CONFIG_DIR",
+        isolationMode: "managed",
+      },
+      extensionPath,
+      sockets: {
+        sessionSocketPath: (sessionId) => join(home, "sockets", `${sessionId}.sock`),
+        openSession: (sessionId) => {
+          mkdirSync(join(home, "sockets"), { recursive: true });
+          return join(home, "sockets", `${sessionId}.sock`);
+        },
+        closeSession: async () => undefined,
+        sendControl: () => false,
+      },
+    });
+    service.start();
+
+    const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+    service.tmux.newWindow = ((input: Parameters<typeof originalNewWindow>[0]) => {
+      capturedArgvs.push([...input.argv]);
+      return originalNewWindow(input);
+    }) as typeof service.tmux.newWindow;
+
+    const { taskId } = seedShipTask(service);
+    const result = service.tools.invoke("dispatch_fusion", {
+      taskId,
+      kind: "opinion",
+      casts: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          thinking: "high",
+          family: "anthropic",
+          cleanRoom: false,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          thinking: "low",
+          family: "openai",
+          cleanRoom: false,
+        },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    expect((result.data as { spawned: boolean }).spawned).toBe(true);
+
+    const plannerArgvs = capturedArgvs.filter((argv) =>
+      argv.some((a) => a.includes("claude-fable-5") || a.includes("gpt-5.6-sol")),
+    );
+    expect(plannerArgvs.length).toBeGreaterThanOrEqual(2);
+    for (const argv of plannerArgvs) {
+      expect(argv).toContain("--no-skills");
+      expect(argv).toContain("--no-extensions");
+      expect(argv).toContain("--no-context-files");
+      expect(argv).toContain("-e");
+      expect(argv).toContain(extensionPath);
+    }
+  });
+
+  it("refuses crew session read_run_artifacts (no clean-room cross-reads)", () => {
+    const { service } = fleet();
+    const { taskId } = seedShipTask(service);
+
+    const spawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      vars: {},
+    });
+    expect(spawned.ok).toBe(true);
+    const sessionId = (spawned.data as { session: { sessionId: string } }).session.sessionId;
+
+    // Captain / Brain path may still read artifacts.
+    const asCaptain = service.tools.invoke("read_run_artifacts", { taskId });
+    expect(asCaptain.ok).toBe(true);
+
+    service.tools.setBrainSessionId("01JBR4N0000000000000000000");
+    const asCrew = service.tools.invokeFromSession(sessionId, "read_run_artifacts", {
+      taskId,
+    });
+    expect(asCrew.ok).toBe(false);
+    expect(asCrew.error?.code).toBe("UNAUTHORIZED_TOOL");
+  });
+
   it("refuses same-family /opinion even when cast.family labels disagree", () => {
     const { service } = fleet();
     const { taskId } = seedShipTask(service);

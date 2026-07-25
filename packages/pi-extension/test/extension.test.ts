@@ -238,3 +238,51 @@ describe("assistant output capture", () => {
     expect(existsSync(join(sessionDir, "output.md"))).toBe(false);
   });
 });
+
+describe("clean-room model-visible tool surface", () => {
+  it("registers no agent-os tools for a clean-room planner (opinion side)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-crew-tools-"));
+    dirs.push(dir);
+    process.env.AGENTOS_SOCKET = join(dir, "hub.sock");
+    process.env.AGENTOS_SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FC0";
+    process.env.AGENTOS_ROLE = "planner";
+
+    const registered: string[] = [];
+    const pi: PiExtensionApi = {
+      version: "0.82.0",
+      registerTool: (definition) => {
+        registered.push(definition.name);
+      },
+    };
+
+    const host = agentOsPiExtension(pi);
+    expect(host).toBeDefined();
+    host?.close();
+    expect(registered).toEqual([]);
+  });
+
+  it("registers the Brain tool bridge only when AGENTOS_ROLE=brain", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentos-ext-brain-tools-"));
+    dirs.push(dir);
+    process.env.AGENTOS_SOCKET = join(dir, "hub.sock");
+    process.env.AGENTOS_SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FD0";
+    process.env.AGENTOS_ROLE = "brain";
+
+    const registered: string[] = [];
+    const pi: PiExtensionApi = {
+      version: "0.82.0",
+      registerTool: (definition) => {
+        registered.push(definition.name);
+      },
+    };
+
+    const host = agentOsPiExtension(pi);
+    expect(host).toBeDefined();
+    host?.close();
+    expect(registered).toContain("dispatch_fusion");
+    expect(registered).toContain("spawn_crewmate");
+    expect(registered).toContain("read_run_artifacts");
+    expect(registered).toContain("agent_os_ask");
+    expect(registered.length).toBeGreaterThan(10);
+  });
+});

@@ -93,14 +93,15 @@ export interface SessionChannel {
 }
 
 /**
- * Tools a non-Brain session may call over its own socket. Strictly read-only
- * plus report-upward (`notify_captain`); everything that writes or moves the
- * fleet is Brain-only (or Captain REST).
+ * Tools a non-Brain session may call over its own socket. Strictly self-scoped:
+ * read own task/policy and report upward. Never `read_run_artifacts` — that
+ * would let an /opinion side cross-read peer artifacts and break clean-room
+ * independence. Everything that writes, moves the fleet, or reads run trees
+ * is Brain-only (or Captain REST).
  */
 const CREW_ALLOWED_TOOLS = new Set<BrainToolName>([
   "read_task",
   "read_policy",
-  "read_run_artifacts",
   "notify_captain",
 ]);
 
@@ -1549,7 +1550,11 @@ export class ToolSurface {
             role: side.role,
             model: side.model,
             thinking: cast.thinking,
-            cleanRoom: cast.cleanRoom,
+            // §6.3: /opinion and plan-fusion are always clean-room — ignore cast.
+            cleanRoom:
+              input.kind === "opinion" || input.kind === "plan-fusion"
+                ? true
+                : cast.cleanRoom,
             vars: {},
             prompt: instruction,
           });

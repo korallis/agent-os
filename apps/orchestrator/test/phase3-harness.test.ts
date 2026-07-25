@@ -371,6 +371,15 @@ describe("tool bridge authorization", () => {
     );
     expect(allowed.error?.code).toBe("NOT_FOUND");
 
+    // Run-tree reads are Brain-only: a crew side must not cross-read peers.
+    const artifacts = service.tools.invokeFromSession(
+      "01JCREW0000000000000000000",
+      "read_run_artifacts",
+      { taskId: "01JTASK0000000000000000000" },
+    );
+    expect(artifacts.ok).toBe(false);
+    expect(artifacts.error?.code).toBe("UNAUTHORIZED_TOOL");
+
     const unknown = service.tools.invokeFromSession(
       "01JBR4N0000000000000000000",
       "definitely_not_a_tool",

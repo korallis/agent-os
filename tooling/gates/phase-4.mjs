@@ -12,6 +12,7 @@
  *   G8  `{{VAR}}` with an undefined variable → typed VALIDATION_ERROR
  *   G9  project prompt override wins over global
  *   G10 customized-template detection + three-way diff data served
+ *   G11 clean-room: no model-visible tools on crew sides; no cross-reads
  *
  * Runs against a real daemon; only the model is simulated.
  * Usage: node tooling/gates/phase-4.mjs
@@ -29,7 +30,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
@@ -459,6 +460,82 @@ try {
       `pristine=${pristine?.customized} customized=${customized?.customized}`,
     );
     writeFileSync(templatePath, before);
+  }
+
+  // G11 — clean-room: extension injects nothing model-visible for crew roles;
+  // crew session cannot read_run_artifacts (no peer cross-reads).
+  {
+    const extPath = join(ROOT, "packages", "pi-extension", "dist", "extension.js");
+    const extMod = await import(pathToFileURL(extPath).href);
+    const agentOsPiExtension = extMod.default;
+
+    const registeredPlanner = [];
+    process.env.AGENTOS_SOCKET = join(home, "g11-planner.sock");
+    process.env.AGENTOS_SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FG1";
+    process.env.AGENTOS_ROLE = "planner";
+    const plannerHost = agentOsPiExtension({
+      version: "0.82.0",
+      registerTool: (def) => registeredPlanner.push(def.name),
+    });
+    plannerHost?.close?.();
+
+    const registeredBrain = [];
+    process.env.AGENTOS_SOCKET = join(home, "g11-brain.sock");
+    process.env.AGENTOS_SESSION_ID = "01ARZ3NDEKTSV4RRFFQ69G5FG2";
+    process.env.AGENTOS_ROLE = "brain";
+    const brainHost = agentOsPiExtension({
+      version: "0.82.0",
+      registerTool: (def) => registeredBrain.push(def.name),
+    });
+    brainHost?.close?.();
+    delete process.env.AGENTOS_SOCKET;
+    delete process.env.AGENTOS_SESSION_ID;
+    delete process.env.AGENTOS_ROLE;
+
+    const taskId = await newTask("Clean-room no cross-read");
+    await callTool(token, "resolve_cast", {
+      taskId,
+      roles: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          thinking: "high",
+          cleanRoom: true,
+        },
+      ],
+      familyCheckOverride: false,
+    });
+    const spawn = await callTool(token, "spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      cleanRoom: true,
+    });
+    const crewSessionId = spawn.data?.session?.sessionId;
+    const denied = await (await api("/v1/tools/call", token, {
+      method: "POST",
+      body: JSON.stringify({
+        tool: "read_run_artifacts",
+        input: { taskId },
+        sessionId: crewSessionId,
+      }),
+    })).json();
+    const captainOk = await callTool(token, "read_run_artifacts", { taskId });
+
+    gate(
+      "G11",
+      "clean-room: no model-visible tools on crew; crew read_run_artifacts → UNAUTHORIZED_TOOL",
+      registeredPlanner.length === 0 &&
+        registeredBrain.includes("dispatch_fusion") &&
+        registeredBrain.includes("read_run_artifacts") &&
+        spawn.ok === true &&
+        typeof crewSessionId === "string" &&
+        denied.ok === false &&
+        denied.error?.code === "UNAUTHORIZED_TOOL" &&
+        captainOk.ok === true,
+      `plannerTools=${registeredPlanner.length} brainTools=${registeredBrain.length} denied=${denied.error?.code}`,
+    );
   }
 
   const failed = results.filter((r) => !r.ok);

@@ -16,9 +16,10 @@ import {
  *
  * Injected into every spawned Pi via `-e`. Streams lifecycle telemetry to
  * agentosd over a per-session Unix socket, receives control injections, and
- * carries the Brain's tool bridge (`ext.tool_call` → `ctl.tool_result`).
- * Registers the typed agent-os tool surface as Pi-visible tools that proxy
- * over the socket; the daemon authorizes by session.
+ * captures assistant output for fusion side artifacts. The Brain seat alone
+ * also gets the tool bridge (`ext.tool_call` → `ctl.tool_result`) registered
+ * as model-visible Pi tools; clean-room crewmates load this extension for
+ * telemetry and output capture only — nothing model-visible is injected.
  */
 
 export const EXTENSION_VERSION = "0.2.0";
@@ -430,8 +431,9 @@ function messageFromEvent(event: unknown): unknown {
 /**
  * Pi extension entry — Pi loads this when passed with `-e`.
  * Uses AGENTOS_SOCKET / AGENTOS_SESSION_ID / AGENTOS_ROLE / AGENTOS_SESSION_DIR
- * from the scrubbed spawn env. Registers the agent-os tool surface when
- * `pi.registerTool` exists. Persists assistant text to
+ * from the scrubbed spawn env. Registers the agent-os tool surface only for
+ * the Brain seat (`AGENTOS_ROLE=brain`); clean-room sides get lifecycle
+ * telemetry and output capture only. Persists assistant text to
  * `$AGENTOS_SESSION_DIR/outputs/$AGENTOS_SESSION_ID.md` for fusion side
  * artifacts (per-session file so sequential runs never share a path).
  */
@@ -462,10 +464,11 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
   };
 
   const parsedRole = agentRoleSchema.safeParse(process.env.AGENTOS_ROLE);
+  const role: AgentRole = parsedRole.success ? parsedRole.data : "builder";
   const host = new AgentOsExtensionHost({
     socketPath,
     sessionId,
-    role: parsedRole.success ? parsedRole.data : "builder",
+    role,
     piVersion: pi.version ?? "unknown",
   });
 
@@ -480,7 +483,11 @@ export default function agentOsPiExtension(pi: PiExtensionApi): AgentOsExtension
     );
   };
 
-  registerAgentOsTools(pi, host);
+  // Clean-room invariant: crewmates (including /opinion sides) must not see
+  // orchestration tools in the model-visible catalogue. Brain only.
+  if (role === "brain") {
+    registerAgentOsTools(pi, host);
+  }
 
   pi.on?.("agent_start", () => host.lifecycle("session_start"));
   pi.on?.("turn_start", () => host.lifecycle("turn_start"));
