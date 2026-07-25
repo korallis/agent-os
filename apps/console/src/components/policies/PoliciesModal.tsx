@@ -8,6 +8,8 @@ import {
   type EffectiveConfigResponse,
 } from "@agent-os/protocol";
 import { SettingsModal, Divider, type SettingsTab } from "@/components/settings/SettingsModal";
+import { SafetyToggles } from "./SafetyToggles";
+import { PromptDiff } from "./PromptDiff";
 
 function leafEntries(
   value: Record<string, unknown>,
@@ -34,14 +36,20 @@ const LAYER_PILL: Record<ConfigLayer, string> = {
 
 /**
  * Policies (§7.5) — the effective Policy Pack chain rendered in the Figma
- * Settings-modal language. Live from `/v1/config/effective`: every key
- * shows its value and the layer that supplied it. The layered editor and
- * three-way prompt diffs land in Phase 6; files are the truth today.
+ * Settings-modal language. Live from `/v1/config/effective`: every key shows
+ * its value and the layer that supplied it.
+ *
+ * The ◆ diff-from-default mark is computed by comparing the effective value
+ * against the SHIPPED value, not by asking whether some layer mentions the key.
+ * A global file that happens to restate a default is not a deviation, and
+ * marking it as one would train the Captain to ignore the mark.
  */
 export function PoliciesModal() {
   const [data, setData] = useState<EffectiveConfigResponse | null>(null);
   const [failed, setFailed] = useState(false);
   const [activeDomain, setActiveDomain] = useState<string | null>(null);
+  /** domain → flattened shipped defaults, for the ◆ comparison. */
+  const [shipped, setShipped] = useState<Record<string, Record<string, string>>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -61,13 +69,51 @@ export function PoliciesModal() {
     };
   }, []);
 
+  // Shipped defaults per domain — fetched once the domain list is known so the
+  // ◆ mark compares values rather than inferring deviation from the layer name.
+  const domainList = data !== null ? Object.keys(data.config) : [];
+  const domainKey = domainList.join(",");
+  useEffect(() => {
+    if (domainList.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      const next: Record<string, Record<string, string>> = {};
+      await Promise.all(
+        domainList.map(async (name) => {
+          try {
+            const res = await fetch(`/api/agentos/config/shipped/${name}`, { cache: "no-store" });
+            if (!res.ok) return;
+            const body = (await res.json()) as { value?: unknown };
+            if (body.value === null || typeof body.value !== "object") return;
+            next[name] = Object.fromEntries(
+              leafEntries(body.value as Record<string, unknown>, "").map((row) => [
+                row.path,
+                row.display,
+              ]),
+            );
+          } catch {
+            // A missing shipped view means we cannot claim a deviation; the ◆
+            // simply does not render, which is the honest fallback.
+          }
+        }),
+      );
+      if (!cancelled) setShipped(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [domainKey]);
+
   const domains = data !== null ? Object.keys(data.config) : [];
   const domain = activeDomain ?? domains[0] ?? null;
 
-  const tabs: SettingsTab[] = domains.map((name) => ({
-    label: name,
-    icon: "st-workspace.svg",
-  }));
+  const SAFETY_TAB = "safety";
+  const PROMPTS_TAB = "prompts";
+  const tabs: SettingsTab[] = [
+    ...domains.map((name) => ({ label: name, icon: "st-workspace.svg" })),
+    { label: SAFETY_TAB, icon: "st-workspace.svg" },
+    { label: PROMPTS_TAB, icon: "st-workspace.svg" },
+  ];
 
   const footer = (
     <>
@@ -115,6 +161,26 @@ export function PoliciesModal() {
     );
   }
 
+  if (domain === "safety" || domain === "prompts") {
+    return (
+      <SettingsModal
+        heading="Policies"
+        tabs={tabs}
+        activeTab={domain}
+        title={domain === "safety" ? "Safety policies" : "Prompt templates"}
+        subtitle={
+          domain === "safety"
+            ? "The invariants that keep the fleet honest — overridable, never by accident."
+            : "Three-way diff between what shipped at install, what ships now, and your copy."
+        }
+        footer={footer}
+        onTabSelect={setActiveDomain}
+      >
+        {domain === "safety" ? <SafetyToggles /> : <PromptDiff />}
+      </SettingsModal>
+    );
+  }
+
   const domainEntries = Object.entries(data.config) as [string, Record<string, unknown>][];
   const value = domainEntries.find(([name]) => name === domain)?.[1] ?? {};
   const rows = leafEntries(value, "");
@@ -131,12 +197,26 @@ export function PoliciesModal() {
     >
         {rows.map((row, index) => {
           const layer = data.sources[`${domain}.${row.path}`] ?? "shipped";
+          const shippedValue = shipped[domain]?.[row.path];
+          // Only claim a deviation when the shipped value is known AND differs.
+          const differsFromDefault = shippedValue !== undefined && shippedValue !== row.display;
           return (
             <div key={row.path} className="flex flex-col gap-4">
               {index > 0 && <Divider />}
               <div className="flex flex-col gap-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-[13px] font-medium text-fg-2">{row.path}</span>
+                  <span className="flex items-center gap-1.5 text-[13px] font-medium text-fg-2">
+                    {differsFromDefault && (
+                      <span
+                        aria-label="differs from shipped default"
+                        title={`Shipped default: ${shippedValue}`}
+                        className="text-teal-brand"
+                      >
+                        ◆
+                      </span>
+                    )}
+                    {row.path}
+                  </span>
                   <span
                     className={cn(
                       "flex items-center gap-1.5 rounded-[20px] px-2.5 py-1 text-[11px] font-semibold",
@@ -157,6 +237,9 @@ export function PoliciesModal() {
                 </div>
                 <span className="text-xs text-fg-3">
                   Supplied by the {layer} layer{layer === "shipped" ? " (default)" : ""}.
+                  {differsFromDefault && (
+                    <> ◆ differs from shipped default (<span className="font-mono">{shippedValue}</span>).</>
+                  )}
                 </span>
               </div>
             </div>
