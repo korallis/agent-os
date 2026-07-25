@@ -21,7 +21,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -714,6 +714,111 @@ try {
         badgeShown &&
         diffShown,
       `diamond=${marksDeviation} unconfirmed=${unconfirmed.status} confirmed=${confirmed.status} badge=${badgeShown} threeWay=${diffShown}`,
+    );
+  }
+
+  // G14 — quota UI [R5]: all four card archetypes render, LIMIT REACHED states
+  // its exclusion reason, and the usage strip reflects a quota.updated within 1s.
+  {
+    // One connection per archetype, each driven by the explicit quota fixture
+    // seam so the states are deterministic rather than dependent on live plans.
+    const archetypes = [
+      {
+        provider: "anthropic",
+        label: "weekly-window",
+        metrics: [
+          { kind: "weekly-window-pct", value: 42, unit: "percent", tier: "live", source: "OAUTH", syncedAt: new Date().toISOString(), reason: null, resetsAt: new Date(Date.now() + 3 * 86_400_000).toISOString(), limitReached: false },
+        ],
+      },
+      {
+        provider: "openai",
+        label: "limit-reached",
+        metrics: [
+          { kind: "weekly-window-pct", value: 100, unit: "percent", tier: "live", source: "OAUTH", syncedAt: new Date().toISOString(), reason: "weekly plan window exhausted", resetsAt: null, limitReached: true },
+        ],
+      },
+      {
+        provider: "xai",
+        label: "best-effort",
+        metrics: [
+          { kind: "weekly-window-pct", value: 61, unit: "percent", tier: "best-effort", source: "TELEMETRY", syncedAt: new Date().toISOString(), reason: "derived from local telemetry", resetsAt: null, limitReached: false },
+        ],
+      },
+      {
+        provider: "openrouter",
+        label: "balance-split",
+        metrics: [
+          { kind: "sdk-credit-pool", value: 12.5, unit: "usd", tier: "live", source: "API KEY", syncedAt: new Date().toISOString(), reason: null, resetsAt: null, limitReached: false },
+        ],
+      },
+    ];
+
+    mkdirSync(join(home, "fake-quota"), { recursive: true });
+    const seeded = [];
+    for (const archetype of archetypes) {
+      writeFileSync(
+        join(home, "fake-quota", `${archetype.provider}.json`),
+        JSON.stringify(archetype.metrics),
+      );
+      const connection = (
+        await post("/v1/connections/api-key", {
+          provider: archetype.provider,
+          apiKey: `p6-quota-${archetype.label}-not-a-secret`,
+          label: `${archetype.label} fixture`,
+        })
+      ).connection;
+      await post(`/v1/connections/${connection.id}/quota/refresh`, {});
+      seeded.push({ ...archetype, connectionId: connection.id });
+    }
+    await sleep(900);
+
+    await page.goto(`${CONSOLE}/providers`, { waitUntil: "networkidle" });
+    await sleep(1200);
+    const providersText = (await page.textContent("body")) ?? "";
+
+    // Each archetype must be individually visible — not one generic card shape.
+    const weeklyShown = providersText.includes("weekly-window fixture") && /42%/.test(providersText);
+    const limitShown =
+      providersText.includes("LIMIT REACHED") &&
+      providersText.includes("Excluded from casts") &&
+      providersText.includes("weekly plan window exhausted");
+    const bestEffortShown =
+      providersText.includes("best-effort fixture") && /best-effort/i.test(providersText);
+    const balanceShown = providersText.includes("balance-split fixture");
+
+    // The usage strip must reflect a NEW quota.updated within 1s over SSE.
+    await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
+    await sleep(900);
+    const bumped = seeded[0];
+    const distinctPct = 77;
+    writeFileSync(
+      join(home, "fake-quota", `${bumped.provider}.json`),
+      JSON.stringify([{ ...bumped.metrics[0], value: distinctPct }]),
+    );
+    const startedAt = Date.now();
+    await post(`/v1/connections/${bumped.connectionId}/quota/refresh`, {});
+    let reflected = false;
+    while (Date.now() - startedAt < 3000) {
+      const text = (await page.textContent("body")) ?? "";
+      // Assert the label+value pair, not a bare "77" that could appear anywhere.
+      if (text.includes(`${distinctPct}%`)) {
+        reflected = true;
+        break;
+      }
+      await sleep(100);
+    }
+    const elapsed = Date.now() - startedAt;
+
+    gate(
+      "G14",
+      "all four quota card archetypes render, LIMIT REACHED states its reason, strip updates ≤1 s",
+      weeklyShown &&
+        limitShown &&
+        bestEffortShown &&
+        balanceShown &&
+        reflected &&
+        elapsed <= 1000,
+      `weekly=${weeklyShown} limitReached=${limitShown} bestEffort=${bestEffortShown} balance=${balanceShown} stripUpdate=${reflected} in ${elapsed}ms`,
     );
   }
 
