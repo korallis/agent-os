@@ -167,6 +167,43 @@ export const observabilityConfigSchema = z.strictObject({
 });
 export type ObservabilityConfig = z.infer<typeof observabilityConfigSchema>;
 
+/**
+ * `balancer.json5` — config surface #12 (§11 Phase 10, [R7]).
+ *
+ * The auto-balancer spreads work across the Captain's models. Two rules the
+ * design study made non-negotiable:
+ *
+ *  - the roster must span at least two model families, or cross-family
+ *    builder/validator and `/opinion` could never be cast legally. That is
+ *    refused at WRITE time rather than failing every task later;
+ *  - ranking is on quota-window HEADROOM. There is no price table in this
+ *    product, and `costUsd` is null exactly on subscription connections, so
+ *    ranking on observed dollars would rate plan-quota models as free.
+ */
+export const balancerConfigSchema = z.strictObject({
+  enabled: z.boolean(),
+  roster: z.array(
+    z.strictObject({
+      model: z.string().min(3),
+      /** Eligible to host the Brain seat, not just crew roles. */
+      brainCapable: z.boolean(),
+    }),
+  ),
+  /**
+   * Stop preferring a connection once its worst window passes this. Sits BELOW
+   * the Brain handoff threshold so crew work steers away first and the Brain
+   * only moves when steering was not enough — one pressure ladder, not two
+   * controllers fighting over the same signal.
+   */
+  steerAwayPct: z.number().int().min(1).max(100),
+  /**
+   * Use reported dollar cost as a tiebreak when coverage allows. Ignored when
+   * no provider reports cost, which is the common case on subscriptions.
+   */
+  useReportedCost: z.boolean(),
+});
+export type BalancerConfig = z.infer<typeof balancerConfigSchema>;
+
 /** Domain registry — one schema per on-disk config file. */
 export const configDomainSchemas = {
   supervision: supervisionConfigSchema,
@@ -180,6 +217,7 @@ export const configDomainSchemas = {
   validation: validationConfigSchema,
   budgets: budgetsConfigSchema,
   observability: observabilityConfigSchema,
+  balancer: balancerConfigSchema,
 } as const;
 
 export const configDomainSchema = z.enum([
@@ -194,6 +232,7 @@ export const configDomainSchema = z.enum([
   "validation",
   "budgets",
   "observability",
+  "balancer",
 ]);
 export type ConfigDomain = z.infer<typeof configDomainSchema>;
 
@@ -209,6 +248,7 @@ export const CONFIG_DOMAINS: readonly ConfigDomain[] = [
   "validation",
   "budgets",
   "observability",
+  "balancer",
 ];
 
 /** The fully-resolved effective config across all domains. */
@@ -224,6 +264,7 @@ export const agentOsConfigSchema = z.strictObject({
   validation: validationConfigSchema,
   budgets: budgetsConfigSchema,
   observability: observabilityConfigSchema,
+  balancer: balancerConfigSchema,
 });
 export type AgentOsConfig = z.infer<typeof agentOsConfigSchema>;
 

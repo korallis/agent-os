@@ -1312,7 +1312,7 @@ Gates:
 - [x] Visibility profiles: three shipped profiles (quiet / working / firehose) demonstrably change what reaches the Console and the wake queue, hot-reloaded without a restart.
 - [x] No unbounded growth: a long run's step log is windowed in the Console with truncation stated, not silently dropped.
 
-**Phase 10 — Auto-balancer (v1.1, 2 wk)** **[R7 — Captain-requested]**
+**Phase 10 — Auto-balancer (v1.1, 2 wk)** **[R7 — Captain-requested]** — shipped (`tooling/gates/phase-10.mjs` G1–G7; 7/7 + 14 vitest)
 
 A toggle that spreads work across the Captain's configured models — cost-effective while staying powerful — with the participating set configurable, fusion intact, and the cross-family rule never weakened.
 
@@ -1325,15 +1325,15 @@ A toggle that spreads work across the Captain's configured models — cost-effec
 - **Cast order is load-bearing.** `aggregatorFamily` is the first planner's family. Sorting fusion sides by any cost metric would silently flip which family writes the fused artifact — so the balancer must never reorder fusion casts.
 
 Gates:
-- [ ] Toggle off ⇒ **byte-identical** cast behaviour to today (no advisory injected, no event emitted) — proving the feature is genuinely opt-in.
-- [ ] A single-family roster is **refused at config-write time** with a path-precise reason, not accepted and then failing at cast.
-- [ ] With the toggle on and two healthy families, successive SHIP tasks distribute across the roster instead of pinning one model — measured over N tasks, with the distribution asserted.
-- [ ] Cross-family survives balancing: no balanced cast ever produces a same-family builder/validator, and the balancer **never** sets `familyCheckOverride` to make its own suggestion legal.
-- [ ] `/opinion` and plan-fusion casts keep ≥2 distinct families under balancing; fusion side **order is preserved**, and `aggregatorFamily` is unchanged versus the unbalanced cast.
-- [ ] Headroom-driven, not dollar-driven: with `costCoverage: "absent"` the balancer still balances (on window headroom) and states that cost was not a factor; it never renders an unmeasured saving.
-- [ ] A connection at `LIMIT REACHED` is never suggested, and one **near** its threshold is de-preferred before it trips.
-- [ ] Balancer and Brain handoff do not fight: a fixture with two over-threshold providers converges instead of oscillating, and the Brain seat is moved by the handoff path only — the balancer never calls `brain.handoff()` and never clears `handoffFrom`/`handoffReason`.
-- [ ] Every balancing decision is recorded with its reason and inputs (roster, headroom per candidate, whether cost was usable), so a Captain can ask "why this model?" and get an answer from the log rather than an inference.
+- [x] Toggle off ⇒ **byte-identical** cast behaviour to today (no advisory injected, no event emitted) — proving the feature is genuinely opt-in.
+- [x] A single-family roster is **refused at config-write time** with a path-precise reason, not accepted and then failing at cast.
+- [x] With the toggle on and two healthy families, successive SHIP tasks distribute across the roster instead of pinning one model — measured over N tasks, with the distribution asserted.
+- [x] Cross-family survives balancing: no balanced cast ever produces a same-family builder/validator, and the balancer **never** sets `familyCheckOverride` to make its own suggestion legal.
+- [x] `/opinion` and plan-fusion casts keep ≥2 distinct families under balancing; fusion side **order is preserved**, and `aggregatorFamily` is unchanged versus the unbalanced cast.
+- [x] Headroom-driven, not dollar-driven: with `costCoverage: "absent"` the balancer still balances (on window headroom) and states that cost was not a factor; it never renders an unmeasured saving.
+- [x] A connection at `LIMIT REACHED` is never suggested, and one **near** its threshold is de-preferred before it trips.
+- [x] Balancer and Brain handoff do not fight: a fixture with two over-threshold providers converges instead of oscillating, and the Brain seat is moved by the handoff path only — the balancer never calls `brain.handoff()` and never clears `handoffFrom`/`handoffReason`.
+- [x] Every balancing decision is recorded with its reason and inputs (roster, headroom per candidate, whether cost was usable), so a Captain can ask "why this model?" and get an answer from the log rather than an inference.
 
 **[R7] Revision note (Captain, 2026-07-25).** Two product-shaping requests, planned before any implementation:
 1. *Live visibility into the `no-mistakes` gate* — "when things enter no-mistakes our app has a live view of it rather than just polling". Grounded in an investigation of `no-mistakes v1.40.0`'s actual surfaces rather than assumed capability; the honest finding is that a true push channel exists (socket `subscribe`) but is undocumented and apparently unused even by its own TUI, so the design pushes-first and falls back to a tailed log + read-only SQLite, **stating which mode is live**.

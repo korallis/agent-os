@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import JSON5 from "json5";
 import type { ServerResponse } from "node:http";
 import Fastify, {
   LogController,
@@ -14,6 +15,7 @@ import {
   apiKeyConnectRequestSchema,
   brainToolNameSchema,
   afkRequestSchema,
+  balancerConfigSchema,
   configDomainSchema,
   configLayerSchema,
   oauthStartRequestSchema,
@@ -54,6 +56,7 @@ import type { PromptService } from "../prompts/service.js";
 import type { AnalyticsService } from "../analytics/service.js";
 import type { PtyTicketStore } from "../pty/tickets.js";
 import { runConfigDoctor } from "../prompts/doctor.js";
+import { validateRoster } from "../fleet/balancer.js";
 import type { PipelineWatcher } from "../pipeline/watcher.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
@@ -1239,6 +1242,33 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
           `safety-policy writes require the ${SAFETY_CONFIRM_HEADER}: true header (Captain-only, §2.6 #12)`,
         );
         return undefined;
+      }
+    }
+
+    // Balancer rosters are validated BEFORE the write lands. A roster that
+    // collapses to one family would make cross-family builder/validator and
+    // /opinion impossible to cast — refusing here, with a path-precise reason,
+    // is far kinder than accepting it and failing every task afterwards.
+    if (domain === "balancer") {
+      let candidate: unknown;
+      try {
+        candidate = typeof body === "string" ? JSON5.parse(body) : body;
+      } catch {
+        candidate = null;
+      }
+      const parsed = balancerConfigSchema.safeParse(candidate);
+      if (parsed.success) {
+        const verdict = validateRoster(parsed.data);
+        if (!verdict.ok) {
+          sendError(
+            reply,
+            400,
+            "CONFIG_INVALID",
+            "balancer roster is not castable — nothing applied",
+            verdict.issues,
+          );
+          return undefined;
+        }
       }
     }
 
