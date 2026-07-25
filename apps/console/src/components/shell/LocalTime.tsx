@@ -14,18 +14,24 @@ import { useEffect, useState } from "react";
  * first client render agree and the value is never blank.
  */
 export function LocalTime({ iso, mode = "time" }: { iso: string; mode?: "time" | "datetime" }) {
-  const [formatted, setFormatted] = useState<string | null>(null);
+  // Only the MOUNTED flag lives in state; the text is derived during render.
+  // Copying the formatted string into state would duplicate a value that is
+  // already a pure function of the props.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
 
-  useEffect(() => {
-    const date = new Date(iso);
-    if (Number.isNaN(date.getTime())) {
-      setFormatted(iso);
-      return;
-    }
-    setFormatted(mode === "time" ? date.toLocaleTimeString() : date.toLocaleString());
-  }, [iso, mode]);
+  // SSR + first client paint both render the locale-independent ISO slice, so
+  // they agree; the viewer's own clock takes over once mounted.
+  const date = new Date(iso);
+  const valid = !Number.isNaN(date.getTime());
+  const text =
+    mounted && valid
+      ? mode === "time"
+        ? date.toLocaleTimeString()
+        : date.toLocaleString()
+      : mode === "time"
+        ? iso.slice(11, 19)
+        : iso.replace("T", " ").slice(0, 19);
 
-  // SSR + first paint: the ISO slice is locale-independent, so both agree.
-  const fallback = mode === "time" ? iso.slice(11, 19) : iso.replace("T", " ").slice(0, 19);
-  return <time dateTime={iso}>{formatted ?? fallback}</time>;
+  return <time dateTime={iso}>{text}</time>;
 }

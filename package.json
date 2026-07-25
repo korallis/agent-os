@@ -16,7 +16,8 @@
     "verify:no-deprecated": "node scripts/verify-no-deprecated.mjs",
     "verify:gate-cleanup": "node scripts/verify-gate-cleanup.mjs",
     "verify:gate-ports": "node scripts/verify-gate-ports.mjs",
-    "gates": "node tooling/gates/phase-1.mjs && node tooling/gates/phase-2.mjs && node tooling/gates/phase-2b.mjs && node tooling/gates/phase-3.mjs && node tooling/gates/phase-4.mjs && node tooling/gates/phase-5.mjs && node tooling/gates/phase-6.mjs && node tooling/gates/phase-6-fidelity.mjs && node tooling/gates/phase-6-wizard.mjs && node tooling/gates/phase-6-terminal.mjs && node tooling/gates/phase-7.mjs && node tooling/gates/phase-8.mjs",
+    "gates": "node tooling/gates/phase-1.mjs && node tooling/gates/phase-2.mjs && node tooling/gates/phase-2b.mjs && node tooling/gates/phase-3.mjs && node tooling/gates/phase-4.mjs && node tooling/gates/phase-5.mjs && node tooling/gates/phase-6.mjs && node tooling/gates/phase-6-fidelity.mjs && node tooling/gates/phase-6-wizard.mjs && node tooling/gates/phase-6-terminal.mjs && node tooling/gates/phase-7.mjs && node tooling/gates/phase-8.mjs && node tooling/gates/phase-9.mjs",
+
     "screenshots": "pnpm run build && node tooling/screenshots/capture-console.mjs"
   },
   "devDependencies": {
