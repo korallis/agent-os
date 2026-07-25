@@ -170,6 +170,19 @@ export class EventStore {
   }
 
   /**
+   * Newest-first page of one or more event types. Truncation is about matching
+   * frames only (not mixed global log windows), so empty means no matches.
+   */
+  eventsOfTypes(
+    types: readonly string[],
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const events = this.projection.eventsOfTypes(types, limit + 1);
+    const truncated = events.length > limit;
+    return { events: truncated ? events.slice(0, limit) : events, truncated };
+  }
+
+  /**
    * Task-scoped history for evidence surfaces.
    * `truncated` means this task has more matching events than `limit` —
    * independent of global log size. Returns chronological order (oldest first).

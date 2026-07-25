@@ -130,7 +130,10 @@ export function AlertsView() {
   useEffect(() => {
     let cancelled = false;
     const load = async (): Promise<void> => {
-      const result = await fetchEventsReplay({ limit: 5000 });
+      const result = await fetchEventsReplay({
+        limit: 5000,
+        types: [...ALERT_TYPES],
+      });
       if (cancelled) return;
       if (result.unavailable) {
         setState((prev) => (prev === "ready" ? "ready" : "unavailable"));
@@ -156,6 +159,15 @@ export function AlertsView() {
     return <p className="py-10 text-center text-[13px] text-fg-3">Loading…</p>;
   }
   if (alerts.length === 0) {
+    if (truncated) {
+      return (
+        <EmptyState
+          kind="no-data"
+          title="Alert history incomplete"
+          body="No alerts in the newest matching page, but history was truncated at a read bound — older alerts may exist and are not shown."
+        />
+      );
+    }
     return (
       <EmptyState
         kind="no-data"

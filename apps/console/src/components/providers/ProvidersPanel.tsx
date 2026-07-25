@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { ProviderConnection, QuotaMetric, QuotaSample } from "@agent-os/protocol";
+import { selectPrimaryQuotaMetric } from "@/lib/selectPrimaryQuotaMetric";
 import { Icon } from "@/components/shell/Icon";
 
 function ProviderLogo({ letter, className }: { letter: string; className?: string }) {
@@ -308,8 +309,7 @@ export function ProvidersPanel() {
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {connections.map((c) => {
             const sample = sampleFor(c.id);
-            const primary = sample?.metrics[0];
-            const subMetrics = sample?.metrics.slice(1) ?? [];
+            const { primary, subMetrics } = selectPrimaryQuotaMetric(sample?.metrics ?? []);
             return (
               <div
                 key={c.id}

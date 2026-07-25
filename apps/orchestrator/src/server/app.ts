@@ -797,6 +797,12 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
      */
     order: z.enum(["asc", "desc"]).default("asc"),
     limit: z.coerce.number().int().min(1).max(10_000).default(1000),
+    /**
+     * Comma-separated event types. When set, pages matching frames only
+     * (newest-first) so sparse surfaces like alerts never misread a mixed
+     * window as empty history.
+     */
+    types: z.string().optional(),
   });
 
   app.get("/v1/events/replay", (request, reply): EventsReplayResponse | undefined => {
@@ -804,6 +810,19 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     if (!query.success) {
       sendError(reply, 400, "BAD_REQUEST", "invalid replay query");
       return undefined;
+    }
+    const typeFilter =
+      query.data.types !== undefined && query.data.types.length > 0
+        ? query.data.types
+            .split(",")
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0)
+        : null;
+    if (typeFilter !== null) {
+      // Type-filtered pages are always newest-first matching frames; `after` /
+      // `before` cursors apply only to the unfiltered log paths below.
+      const { events, truncated } = deps.store.eventsOfTypes(typeFilter, query.data.limit);
+      return { events, truncated };
     }
     if (query.data.order === "desc") {
       const { events, truncated } = deps.store.eventsBeforeId(

@@ -32,6 +32,12 @@ export type FetchEventsReplayOptions = {
    * Default is `desc` (newest-first evidence path).
    */
   order?: "asc" | "desc";
+  /**
+   * When set, server returns only these event types (newest-first matching
+   * frames). Prefer this for sparse evidence UIs so an empty page means no
+   * matches rather than "no matches in a mixed newest window".
+   */
+  types?: readonly string[];
 };
 
 export async function fetchEventsReplay(
@@ -45,6 +51,9 @@ export async function fetchEventsReplay(
   });
   if (options.before !== undefined && options.before.length > 0) {
     params.set("before", options.before);
+  }
+  if (options.types !== undefined && options.types.length > 0) {
+    params.set("types", options.types.join(","));
   }
   try {
     const res = await fetch(`/api/agentos/events/replay?${params.toString()}`, {

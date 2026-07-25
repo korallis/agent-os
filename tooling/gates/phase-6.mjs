@@ -536,11 +536,12 @@ try {
       return path.length > 0 ? path : null;
     };
 
-    /** Static shell + settings pages that may carry links to PAGES routes. */
-    const crawlSeeds = ["/fleet", "/settings", "/providers", "/runs", "/analytics", "/notifications"];
+    // Seed ONLY the shell entry. Pre-seeding PAGES routes would prove nothing —
+    // those are the routes this gate must discover by following rendered links.
+    const shellEntry = "/fleet";
     const pagesSet = new Set(PAGES);
-    const discovered = new Set();
-    const toVisit = [...crawlSeeds];
+    const discovered = new Set([shellEntry]);
+    const toVisit = [shellEntry];
     const visited = new Set();
 
     while (toVisit.length > 0) {
@@ -556,25 +557,22 @@ try {
         const target = normalizeHref(raw);
         if (target === null) continue;
         discovered.add(target);
-        if (
-          (pagesSet.has(target) || crawlSeeds.includes(target)) &&
-          !visited.has(target) &&
-          !toVisit.includes(target)
-        ) {
+        // Follow any in-app link that might reveal more PAGES routes (nested
+        // subnavs, settings rail). Cap crawl to same-origin paths already
+        // normalized; only enqueue unvisited targets still worth expanding.
+        if (!visited.has(target) && !toVisit.includes(target) && pagesSet.has(target)) {
           toVisit.push(target);
         }
       }
     }
 
-    // Shell home is the entry; treat it as reachable even without a self-link.
-    discovered.add("/fleet");
     const orphaned = PAGES.filter((p) => !discovered.has(p));
     gate(
       "G10",
       "every PAGES route is reachable by following links from the console shell",
       orphaned.length === 0,
       orphaned.length === 0
-        ? `reachable=${PAGES.length}`
+        ? `reachable=${PAGES.length} from=${shellEntry}`
         : `orphaned=${orphaned.join(",")}`,
     );
   }
