@@ -517,8 +517,8 @@ export class PipelineWatcher {
         // would bury the transitions that matter under its own noise.
         const fingerprint = JSON.stringify(snapshot);
         if (this.lastFingerprint.get(run.id) !== fingerprint) {
-          this.lastFingerprint.set(run.id, fingerprint);
           this.sink({ type: "pipeline.run_updated", payload: snapshot });
+          this.lastFingerprint.set(run.id, fingerprint);
         }
 
         // Always advance log offsets on the active step; streamPipelineLogs

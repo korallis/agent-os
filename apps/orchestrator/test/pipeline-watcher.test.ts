@@ -260,6 +260,49 @@ describe("PipelineWatcher", () => {
     watcher.stop();
   });
 
+  it("retries run_updated after a throwing sink instead of permanently suppressing", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-fp-sink-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', NULL, 'round 1', ?, NULL, NULL)`,
+    ).run(now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    let failNextRunUpdated = true;
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => {
+        if (failNextRunUpdated && e.type === "pipeline.run_updated") {
+          failNextRunUpdated = false;
+          throw new Error("simulated append failure");
+        }
+        events.push(e);
+      },
+    });
+    // start() ticks once; sink throws so the frame must not be fingerprinted.
+    watcher.start();
+    expect(events.filter((e) => e.type === "pipeline.run_updated")).toHaveLength(0);
+
+    // Same structured state — without the fix this would stay silent forever.
+    watcher.tick();
+    const runs = events.filter((e) => e.type === "pipeline.run_updated");
+    expect(runs).toHaveLength(1);
+    if (runs[0]?.type === "pipeline.run_updated") {
+      expect(runs[0].payload.runId).toBe("run1");
+    }
+    watcher.stop();
+  });
+
   it("marks compatibility failed when a selected column is missing", () => {
     const gateHome = mkdtempSync(join(tmpdir(), "p9-schema-"));
     homes.push(gateHome);

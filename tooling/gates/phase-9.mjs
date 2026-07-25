@@ -75,12 +75,13 @@ function buildFixtureGate(dir) {
   return db;
 }
 
-function seedRun(db, runId, branch, steps) {
-  const now = Date.now();
+/** Real no-mistakes stores unix epoch seconds in INTEGER timestamp columns. */
+function seedRun(db, runId, branch, steps, status = "running") {
+  const now = Math.floor(Date.now() / 1000);
   db.prepare(
     `INSERT OR REPLACE INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
-     VALUES (?, 'repo1', ?, 'abc1234def', 'base', 'running', ?, ?, 'fixture intent')`,
-  ).run(runId, branch, now, now);
+     VALUES (?, 'repo1', ?, 'abc1234def', 'base', ?, ?, ?, 'fixture intent')`,
+  ).run(runId, branch, status, now, now);
   steps.forEach((step, index) => {
     db.prepare(
       `INSERT OR REPLACE INTO step_results
@@ -95,10 +96,10 @@ function seedRun(db, runId, branch, steps) {
       step.findings ?? null,
       step.logPath ?? null,
       step.lastActivity ?? null,
-      step.lastActivity != null ? Date.now() : null,
+      step.lastActivity != null ? now : null,
     );
   });
-  db.prepare("UPDATE runs SET updated_at = ? WHERE id = ?").run(Date.now(), runId);
+  db.prepare("UPDATE runs SET updated_at = ? WHERE id = ?").run(now, runId);
 }
 
 function walk(dir) {
@@ -221,6 +222,40 @@ try {
       "a pipeline state change is visible within 1 s",
       seen && elapsed <= 1000,
       `seen=${seen} in ${elapsed}ms`,
+    );
+  }
+
+  // ── G1b — recently completed runs surface via the recency branch ──────
+  {
+    const completedId = "01RUNFIXTURE0000000000004";
+    seedRun(
+      fixtureDb,
+      completedId,
+      "phase-x/completed",
+      [
+        { name: "intent", status: "completed" },
+        { name: "review", status: "completed", lastActivity: "shipped" },
+      ],
+      "completed",
+    );
+    const started = Date.now();
+    let seen = false;
+    let status = null;
+    while (Date.now() - started < 3000) {
+      const runs = (await get("/v1/pipeline/runs")).runs ?? [];
+      const hit = runs.find((r) => r.runId === completedId);
+      if (hit) {
+        seen = true;
+        status = hit.status;
+        break;
+      }
+      await sleep(50);
+    }
+    gate(
+      "G1b",
+      "a recently completed run surfaces via the recency branch",
+      seen && status === "completed",
+      `seen=${seen} status=${status} in ${Date.now() - started}ms`,
     );
   }
 
