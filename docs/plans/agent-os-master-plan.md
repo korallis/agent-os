@@ -110,15 +110,15 @@ v1 is shipped when all of the following are true (each restated as an executable
 | **Configuration** | **Layered Policy Packs** (§2.6): shipped defaults → `~/.agentos/config/` → per-project `.agentos/` → per-task; **JSON5** files + prompt-template `.md` packs; zod-validated; Console-editable; hot-reload where safe | **[R3]** — JSON5 chosen over TOML: zod schemas map 1:1 onto JSON structures, deep nesting and arrays of rule objects (dispatch profiles, casts) are natural, comments/trailing commas keep it human-editable, and one parser serves daemon + console. TOML's array-of-tables syntax is hostile to exactly the nested rule shapes this system is made of. |
 | Worker harness | **Pi coding agent, pinned exact version**; headless children via `pi --mode json -p`; live channel via the `agent-os` extension | **[R2]**; vendor CLIs rejected (§13.4). |
 | Model I/O | **All model calls go through Pi**; no AI SDK dependency | **[R2]**. |
-| HTTP server | **Fastify 5.x** + `@fastify/websocket` | **[CONSENSUS]** |
-| Semantic events transport | **SSE** (ULID ids, `Last-Event-ID` replay); **WebSocket only for PTY bytes** | [B]. |
+| HTTP server | **Fastify 5.x**; PTY WebSocket via `ws` on the same HTTP server's upgrade path (loopback + exact-origin) | **[CONSENSUS]** + **[Phase 6 as-built]** |
+| Semantic events transport | **SSE** (ULID ids, `Last-Event-ID` replay); **WebSocket only for the terminal attach channel** | [B]. |
 | Daemon ⇄ worker channel | **Per-session Unix domain sockets**, zod-validated NDJSON frames; the Brain's tool surface rides the same channel | **[R2]+[R3]**. |
-| Console↔daemon auth | **Next Route Handlers as loopback BFF**; PTY via single-use ≤60 s tickets | [B]. |
+| Console↔daemon auth | **Next Route Handlers as loopback BFF**; PTY via single-use **30 s** tickets (minted over REST; spent on WS upgrade) | [B]; TTL tightened as-built. |
 | Schema/validation | **zod 4.x** in `packages/protocol` — REST, SSE, socket frames, tool surface, **config schemas** | **[CONSENSUS]**; tool + config schemas added [R3]. |
 | State | **SQLite (WAL) via `better-sqlite3`** projection + **append-only NDJSON event logs** as truth | **[CONSENSUS]** |
 | ORM/migrations | **drizzle-orm** [A] + forward-only checksummed SQL migrations with pre-migration backup [B] | Fused. |
 | Session backend | **tmux (hard dependency)**, socket `-L agentos`; Pi processes (incl. the Brain) are children of tmux, **not** the daemon | **[CONSENSUS]** |
-| node-pty | Only for browser terminal attach | **[CONSENSUS]** |
+| Browser terminal attach | **Read-only WS** (`ws` on HTTP upgrade): mint `POST /v1/sessions/:id/attach-ticket`, redeem once on `WS /v1/pty?ticket=`; pane content polled via `tmux capture-pane` (send-on-change). **Not** node-pty; client keystrokes get an explicit read-only notice. Take-over = Captain runs the display-only attach command in their own terminal | **[Phase 6 fourth slice]** — deliberate trade vs node-pty / pipe-pane (no native addon, no write path) |
 | Process spawning | **`execa` 9.x**, `shell: false`, allowlist-built env (§4.8) | [A]+[B]. |
 | Secrets | **`@napi-rs/keyring` against the macOS Keychain only** for API keys + daemon token; Pi's auth store vendor-owned and opaque | [A]+[R2]; **[R4]** drops the libsodium encrypted-file fallback (a headless-Linux accommodation) to the post-v1 backlog with Linux itself. |
 | Gate runtime | **`uv` (hard v1 dependency)** — gates run as `gate.py` via `uv run` with PEP 723 inline metadata; `gate.ts` per-project override | **[R4]** — flips Rev-1 D5 to [B] on new evidence (§6.4). |
@@ -128,7 +128,7 @@ v1 is shipped when all of the following are true (each restated as an executable
 | Logging | **pino** with redaction + regex token scrubbing | **[CONSENSUS]** |
 | IDs | **ULID** | **[CONSENSUS]** |
 | Monorepo tooling | **pnpm 10 workspaces + Turborepo 2.x** | [A]. |
-| Terminal UI | `@xterm/xterm` + fit addon | **[CONSENSUS]** |
+| Terminal UI | Session Detail: monospace read-only pane surface (capture text); `@xterm/xterm` remains the planned surface for a future interactive attach if one ships | **[Phase 6 fourth slice as-built]**; xterm deferred with interactivity |
 | Tests | Vitest + Playwright | **[CONSENSUS]** |
 
 **Dependency policy [B, retained]:** exact pins (including Pi), zero-deprecated gates, audit-clean, strict TS flags, `no-explicit-any: error`. **Pi upgrade policy [R2]:** pinned + weekly canary CI with report; deliberate upgrades only.
@@ -148,12 +148,12 @@ flowchart TB
     end
 
     UI -- "fetch + SSE" --> BFF
-    UI -- "WS (single-use PTY ticket)" --> TTY
+    UI -- "WS (single-use attach ticket)" --> TTY
 
     subgraph Daemon["agentosd :4700 — deterministic substrate + policy enforcer"]
         API["Fastify 5 REST /v1/*\n(incl. /v1/config/*)"]
         SSE["SSE hub /v1/events"]
-        TTY["PTY bridge (node-pty → tmux attach)"]
+        TTY["Read-only PTY WS\n(capture-pane poll → single-use ticket)"]
         HUB["Extension Socket Hub\n~/.agentos/sockets/<sessionId>.sock"]
         TOOLS["Brain Tool Surface\ntyped tools: spawn_crewmate · dispatch_fusion ·\nrun_gate · send_to_crew · read_fleet_state ·\nescalate_to_captain · deliver_task …"]
         POLICY["Policy Engine\nlayered config resolution (JSON5 + prompt packs)\nmechanical enforcement · override stamping"]
@@ -348,7 +348,7 @@ Rules retained: full-daemon isolation per secondmate [A]; no credential copies �
 launchd (user scope)                                # macOS-only v1 [R4]
 └── agentosd (node 24, :4700, AGENTOS_HOME=~/.agentos, daemon.lock)
     ├── fastify http listener (127.0.0.1:4700) — REST (+ /v1/config/*) + SSE
-    ├── pty bridge (node-pty → tmux attach; single-use tickets)
+    ├── pty WS upgrade (/v1/pty; single-use tickets; capture-pane poll; read-only)
     ├── extension socket hub — ~/.agentos/sockets/<sessionId>.sock per spawn
     ├── policy engine — layered config resolution + mechanical enforcement
     ├── brain tool surface — typed tools, transition-validated, policy-checked
@@ -425,7 +425,7 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 
 pnpm workspaces + Turborepo (§2.1). Marketing lives at `apps/marketing` (verbatim migration from the former root `src/`); shared design-system primitives live in `packages/ui`. [A]
 
-**Phase 6 as-built** (Console completion partial). **First slice:** `GET /v1/analytics` derives usage/cost/throughput from the append-only event log (no second accounting store); Fleet Dashboard + Analytics bind to that snapshot with honesty rules (underivable → null/`—` with reason; cost coverage distinguishes absent vs zero); Notifications is live on the wake queue (including ABSORBED); Task Detail ships fusion side-by-side (`promptsIdentical` + shared hash), validation evidence (FAIL vs GATE_ERROR), and a Brain decision lane; shared empty/error/`not-found` treatments. **Second slice:** Session Detail at `/sessions/[id]` (Figma Agent Detail `41:2` + Agent Logs `41:456`) — seat spawn facts, live status, measured usage, worktree, every extension-reported frame, and a **display-only** attach command (copy affordance; daemon never attaches on the Captain's behalf); Task Detail session cards link through; Run History at `/runs/history` (Pipeline Runs `41:5136` + Workflow Run History `41:7213`) reconstructs each task's gate/fusion journey from the durable log with FAIL and GATE_ERROR counted separately; event-store projects an indexed `session_id` column (mirroring `task_id`) with session-scoped queries whose `truncated` flag is **session-scoped only**; REST `GET /v1/sessions/:id`, `GET /v1/sessions/:id/events`, `GET /v1/runs/history`. **Third slice:** Providers quota cards complete §7.3 card anatomy (primary metric + sub-rows for session windows / model caps / extra-usage / credit splits, each with bar, `RESETS IN` from `resetsAt`, and a per-metric honesty badge when the tier differs); percent metrics render "N% used" with "N% left" so bar and numeral never disagree about direction; currency amounts are verbatim as the vendor reported them (no FX, §13.1 R21). Recent Alerts at `/alerts` (Figma `41:5674`) — actionable frames only (`quota.threshold`, Captain escalations, billing mismatches, SCOUT write violations, brain-down, session loss, rejected config); backed by type-filtered `GET /v1/events/replay?types=` (matching-frames-only newest-first so sparse alert types never misread a mixed window as empty). Model Performance at `/analytics/models` (Figma `41:4355`) — measured provider telemetry only (requests, tokens, avg output, cost where reported); **not** a quality leaderboard. Settings Billing at `/settings/billing` (Figma `41:6309`) — per-connection billing surface, probe amounts, measured spend with `costCoverage` honesty, and Policies ▸ Budgets ceilings; **no** invoice, plan tiers, payment method, or upgrade path (this product has no billing relationship with the user). Executable browser gates `tooling/gates/phase-6.mjs` G1–G10 (G3: Figma placeholders absent; G9: session detail label+value pairs; G10: every `PAGES` route reachable via in-app links from the shell). Phase 5 auto-validate substrate and Phase 4 fleet/fusion substrate remain. **Still deferred:** Network I/O Detail, Providers four-archetype Playwright gate + `LIMIT REACHED` exclusion linkage, ticketed terminal attach, Policies three-way-diff UI, provider wizard E2E. Authoritative route inventory: §7. Executable gates: `tooling/gates/phase-{1,2,3,4,5,6}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
+**Phase 6 as-built** (Console completion partial). **First slice:** `GET /v1/analytics` derives usage/cost/throughput from the append-only event log (no second accounting store); Fleet Dashboard + Analytics bind to that snapshot with honesty rules (underivable → null/`—` with reason; cost coverage distinguishes absent vs zero); Notifications is live on the wake queue (including ABSORBED); Task Detail ships fusion side-by-side (`promptsIdentical` + shared hash), validation evidence (FAIL vs GATE_ERROR), and a Brain decision lane; shared empty/error/`not-found` treatments. **Second slice:** Session Detail at `/sessions/[id]` (Figma Agent Detail `41:2` + Agent Logs `41:456`) — seat spawn facts, live status, measured usage, worktree, every extension-reported frame, and a **display-only** attach command (copy affordance; daemon never attaches on the Captain's behalf); Task Detail session cards link through; Run History at `/runs/history` (Pipeline Runs `41:5136` + Workflow Run History `41:7213`) reconstructs each task's gate/fusion journey from the durable log with FAIL and GATE_ERROR counted separately; event-store projects an indexed `session_id` column (mirroring `task_id`) with session-scoped queries whose `truncated` flag is **session-scoped only**; REST `GET /v1/sessions/:id`, `GET /v1/sessions/:id/events`, `GET /v1/runs/history`. **Third slice:** Providers quota cards complete §7.3 card anatomy (primary metric + sub-rows for session windows / model caps / extra-usage / credit splits, each with bar, `RESETS IN` from `resetsAt`, and a per-metric honesty badge when the tier differs); percent metrics render "N% used" with "N% left" so bar and numeral never disagree about direction; currency amounts are verbatim as the vendor reported them (no FX, §13.1 R21). Recent Alerts at `/alerts` (Figma `41:5674`) — actionable frames only (`quota.threshold`, Captain escalations, billing mismatches, SCOUT write violations, brain-down, session loss, rejected config); backed by type-filtered `GET /v1/events/replay?types=` (matching-frames-only newest-first so sparse alert types never misread a mixed window as empty). Model Performance at `/analytics/models` (Figma `41:4355`) — measured provider telemetry only (requests, tokens, avg output, cost where reported); **not** a quality leaderboard. Settings Billing at `/settings/billing` (Figma `41:6309`) — per-connection billing surface, probe amounts, measured spend with `costCoverage` honesty, and Policies ▸ Budgets ceilings; **no** invoice, plan tiers, payment method, or upgrade path (this product has no billing relationship with the user). **Fourth slice:** ticketed **read-only** terminal attach on Session Detail — authenticated `POST /v1/sessions/:id/attach-ticket` mints a single-use 30 s ticket + loopback `wsUrl`; browser opens `WS /v1/pty?ticket=` **directly on the daemon** (BFF cannot proxy WS upgrades; the daemon bearer never enters a query string); upgrade enforces the same loopback-only + exact-origin rules as REST; stream polls `tmux capture-pane` and sends only on change; client writes receive an explicit read-only notice (take-over remains the human attach command beside the view). Schema: `attachTicketResponseSchema` in `packages/protocol`. Implementation: `apps/orchestrator/src/pty/{tickets,server}.ts`, Console `TerminalAttach`. Executable browser gates `tooling/gates/phase-6.mjs` G1–G11 (G3: Figma placeholders absent; G9: session detail label+value pairs; G10: every `PAGES` route reachable via in-app links from the shell; G11: real WS upgrade redeems a ticket once and refuses the replay). Phase 5 auto-validate substrate and Phase 4 fleet/fusion substrate remain. **Still deferred:** Network I/O Detail, Providers four-archetype Playwright gate + `LIMIT REACHED` exclusion linkage, Task Detail embedded terminal + 10‑min no-drop-frame soak, Policies three-way-diff UI, provider wizard E2E. Authoritative route inventory: §7–§8. Executable gates: `tooling/gates/phase-{1,2,3,4,5,6}.mjs`. Console PR evidence: `docs/screenshots/` via `pnpm screenshots`.
 
 ```
 agent-os/
@@ -476,7 +476,8 @@ agent-os/
 │           ├── config/               # resolver + service (layered Policy Packs)
 │           ├── prompts/              # layered prompt packs + three-way diff data [Phase 4]
 │           ├── analytics/            # [Phase 6] log-derived usage/cost snapshot (no second store)
-│           ├── server/               # fastify: health, config, events SSE, fleet/tasks/projects/tools/fusion/prompts/analytics
+│           ├── server/               # fastify: health, config, events SSE, fleet/tasks/projects/tools/fusion/prompts/analytics/attach-ticket
+│           ├── pty/                  # [Phase 6] single-use tickets + read-only capture-pane WS (/v1/pty)
 │           ├── substrate/            # task-machine.ts, family.ts
 │           ├── fleet/                # service, brain, tool-surface, fusion-runs, sessions,
 │           │                         # worktree-pool, tmux, watcher, gate-runner, projects, secondmates
@@ -499,7 +500,7 @@ agent-os/
     └── screenshots/capture-console.mjs  # Playwright PR evidence (pnpm screenshots)
 ```
 
-**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); Phase 4 ships `dispatch_fusion` executors for opinion / fusion / plan-fusion plus `fleet/fusion-runs.ts`, `fleet/sessions.ts`, and `prompts/service.ts`. **Phase 5** ships lifecycle auto-validate (`gate-runner` + tool-surface RED proofs / FAIL ledgers / seat fences; `tooling/gates/phase-5.mjs` G1–G9). **Phase 6 first slice** ships Console fusion side-by-side columns, auto-validate evidence UI, Fleet/Analytics log-derived panels, Notifications, and empty/error treatments; **second slice** ships Session Detail + Agent Logs, Run History, session-scoped event projection, and `tooling/gates/phase-6.mjs` G1–G9; **third slice** ships §7.3 quota card sub-rows, Recent Alerts, Model Performance, Settings Billing, type-filtered event replay, and G10 in-app link reachability. Policies three-way-diff UI, Network I/O Detail, and ticketed terminal attach stay deferred.
+**[R3] change notes:** `core/` → `substrate/` (decision logic removed; state-machine validation remains); the Brain **tool surface** lives under `fleet/tool-surface.ts` (not a separate `substrate/tool-surface`); shipped defaults live in `apps/orchestrator/defaults/` and are installed to `~/.agentos/config/` templates on init. **Colocation note:** CLI lives under `apps/orchestrator` (`agentos` + `agentosd` bins), not a separate `apps/cli`; event persistence is `packages/event-store` (not an in-daemon `store/`); Brain reconcile + boot recovery live in `fleet/brain.ts` + `fleet/service.ts` (no separate `recovery/` package); Phase 4 ships `dispatch_fusion` executors for opinion / fusion / plan-fusion plus `fleet/fusion-runs.ts`, `fleet/sessions.ts`, and `prompts/service.ts`. **Phase 5** ships lifecycle auto-validate (`gate-runner` + tool-surface RED proofs / FAIL ledgers / seat fences; `tooling/gates/phase-5.mjs` G1–G9). **Phase 6 first slice** ships Console fusion side-by-side columns, auto-validate evidence UI, Fleet/Analytics log-derived panels, Notifications, and empty/error treatments; **second slice** ships Session Detail + Agent Logs, Run History, session-scoped event projection, and `tooling/gates/phase-6.mjs` G1–G9; **third slice** ships §7.3 quota card sub-rows, Recent Alerts, Model Performance, Settings Billing, type-filtered event replay, and G10 in-app link reachability; **fourth slice** ships ticketed read-only terminal attach on Session Detail (`POST …/attach-ticket` + `WS /v1/pty`, capture-pane poll, G11 single-use ticket proof). Policies three-way-diff UI, Network I/O Detail, and Task Detail embedded terminal / 10‑min soak stay deferred.
 ---
 
 ## 4. Provider Connection Subsystem
@@ -702,7 +703,7 @@ Unchanged from Rev 2 ([A] mechanics + [B] transaction/caution): daemon-owned clo
 
 ### 5.5 Session backend contract (tmux)
 
-Unchanged from Rev 2: typed wrapper; `pipe-pane` human-fallback log; `pane-died` hooks as fallback liveness; humans can always attach; Console terminal read-only tail by default with ticketed take-over. **[CONSENSUS + R2]**
+Unchanged from Rev 2: typed wrapper; `pipe-pane` human-fallback log; `pane-died` hooks as fallback liveness; humans can always attach. **[Phase 6 fourth slice]** Console Session Detail streams a **read-only** live view (ticketed WS + `capture-pane` poll); take-over is not browser keystrokes — the Captain runs the display-only attach command in their own terminal. **[CONSENSUS + R2]**
 
 ### 5.6 Wake watcher — zero-token classification, Brain decisions **[R3 reframing]**
 
@@ -841,13 +842,13 @@ Unchanged from Rev 2 in discipline (write-once phases, SHA-256, redaction), with
 | Landing Page · "Orchestrate AI Agents At Scale" | `8:11470` | `apps/marketing` home | Phase 0 (visual refresh at Captain's option) |
 | Dashboard · Home Dashboard | `10:11978` | `/fleet` | **Phase 6 first slice live** — summary + Swarm Activity / Top Agents / Recent Tasks / budget bar from daemon + `/v1/analytics` (no Figma sample figures; pure-fiction upsell/tips panels removed) |
 | Dashboard · All Agents | `17:4` | `/tasks` (board) | **Phase 3 live** (`/v1/tasks` + SSE) |
-| Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | **Phase 6 first slice live** — fusion columns (`promptsIdentical` + hash), validation evidence (FAIL ≠ GATE_ERROR), Brain decision lane; ticketed terminal attach still deferred |
+| Dashboard · Task Detail | `37:1845` | `/tasks/[id]` | **Phase 6 first slice live** — fusion columns (`promptsIdentical` + hash), validation evidence (FAIL ≠ GATE_ERROR), Brain decision lane; embedded Task Detail terminal + 10‑min soak still deferred (read-only attach lives on Session Detail, fourth slice) |
 | Dashboard · Swarm Activity | `37:2871` | `/fleet` activity + `/runs` overview | **Phase 6 first slice live** on `/fleet` (sparkline over task throughput); history chrome → `/runs/history` **second slice** |
 | Dashboard · Notifications | `17:940` | `/notifications` (wake queue / needs-you) | **Phase 6 first slice live** (`/v1/fleet/wakes`, incl. ABSORBED) |
 | Dashboard · Token Usage | `37:2265` | `/analytics` | **Phase 6 first slice live** (`GET /v1/analytics`; null/`—` honesty + cost coverage); Model Performance subnav → `/analytics/models` **third slice**; Network I/O Detail still deferred |
 | Dashboard · Onboarding Guide | `37:1300` | `/onboarding` (§4.10 wizard) | Phase 2 |
 | Dashboard · User Profile | `37:1553` | `/settings` (profile section) | Phase 6 (remaining) |
-| Agent Detail · Agent Detail / Agent Logs / Create New Agent / Edit Agent | `41:2` / `41:456` / `41:1226` / `41:1605` | crewmate/session detail · terminal log view · new-task dispatch · task/config edit | **Phase 6 second slice live** on `/sessions/[id]` for Detail + Logs (`41:2`/`41:456`; attach command display-only); Create/Edit remain task/dispatch chrome on `/tasks` |
+| Agent Detail · Agent Detail / Agent Logs / Create New Agent / Edit Agent | `41:2` / `41:456` / `41:1226` / `41:1605` | crewmate/session detail · terminal log view · new-task dispatch · task/config edit | **Phase 6 second slice live** on `/sessions/[id]` for Detail + Logs (`41:2`/`41:456`; attach command display-only); **fourth slice** adds ticketed read-only live pane (`TerminalAttach`); Create/Edit remain task/dispatch chrome on `/tasks` |
 | Inference Jobs · Inference Jobs | `41:2412` | `/tasks` | **Phase 3 live** |
 | Inference Jobs · Pipeline Runs | `41:5136` | `/runs/history` | **Phase 6 second slice live** (`GET /v1/runs/history`; FAIL ≠ GATE_ERROR) |
 | Inference Jobs · Live Log Stream | `41:3973` | `/runs` | **Phase 1 live** (daemon SSE; filters/pause/search/detail) |
@@ -864,7 +865,7 @@ Unchanged from Rev 2 in discipline (write-once phases, SHA-256, redaction), with
 | Other · Delete Agent / KB Upload / Test Agent modals | `41:1519` / `41:3790` / `41:6787` | modals on their owning screens | with owners |
 | **SKIPPED (R6.3-Q1 — Captain: "skip"):** Login (Sign In/Up/Forgot, `37:3447/37:3607/37:3689`); Pricing & Upgrade/Checkout/Payment Success (`37:3849/37:4074/37:4230`); Settings · Team Members (`37:4297/41:6442`); Knowledge Base (`41:2767/41:3226/41:3505`) — **not implemented**; only frames mapping to the local single-user product are built. Retained here as future/marketing candidates | | not built | — |
 
-**Future-phase / no-mocks [R6.3 + Phase 6 honesty]:** visual treatment (tokens, spacing, typography) stays frame-faithful. **Values must bind to daemon state** — underivable figures are `null` and render as an em dash with a stated reason, never a plausible stand-in. **Panels whose content is pure fiction with no local derivable source** (e.g. SaaS upsell, invented dollar savings tips, invoice/payment chrome on Settings Billing) are **removed** rather than re-skinned. Figma sample strings must not reappear (`tooling/gates/phase-6.mjs` G3). As of Phase 6 third slice: Fleet/Analytics/Notifications/Task Detail evidence, Session Detail/Logs, Run History, Providers §7.3 quota card anatomy, Recent Alerts, Model Performance, and Settings Billing are live; remaining inventory rows marked **Phase 6 remaining** or later stay deferred — never filled with mock numbers.
+**Future-phase / no-mocks [R6.3 + Phase 6 honesty]:** visual treatment (tokens, spacing, typography) stays frame-faithful. **Values must bind to daemon state** — underivable figures are `null` and render as an em dash with a stated reason, never a plausible stand-in. **Panels whose content is pure fiction with no local derivable source** (e.g. SaaS upsell, invented dollar savings tips, invoice/payment chrome on Settings Billing) are **removed** rather than re-skinned. Figma sample strings must not reappear (`tooling/gates/phase-6.mjs` G3). As of Phase 6 fourth slice: Fleet/Analytics/Notifications/Task Detail evidence, Session Detail/Logs + read-only ticketed terminal, Run History, Providers §7.3 quota card anatomy, Recent Alerts, Model Performance, and Settings Billing are live; remaining inventory rows marked **Phase 6 remaining** or later stay deferred — never filled with mock numbers.
 
 Carried forward unchanged: nav destinations (now the Figma icon rail + top bar); ⌘K **Brain chat** drawer [R3]; one SSE stream; on-demand ticketed terminal; red for security/auth/hard failures incl. the `LIMIT REACHED` pill [R5]; unknown quota renders `?`; extension-fed live columns [R2]; safety-override amber badge [R3]; per-metric honesty tier + source + synced-at [R5].
 
@@ -899,7 +900,7 @@ If the Brain is down: the header chip goes red and a full-width banner section s
 
 ### 7.2 Task Detail with live fusion columns (`/tasks/[id]`)
 
-**Phase 6 first slice:** fusion side-by-side columns headed by clean-room proof (`promptsIdentical` + shared prompt hash; red when sides diverge); validation evidence that distinguishes **GATE_ERROR** (infrastructure, consumes no attempt) from **FAIL** (real rejection); **Brain decisions** lane (refusals as prominent as successes, e.g. `POLICY_VIOLATION`). Evidence is fed from task-scoped events (`GET /v1/tasks/:id/events`) plus fusion REST — not placeholders. **Second slice:** each session card links to `/sessions/[id]` (Agent Detail + Logs). Still deferred: ticketed terminal attach / take-over, 10‑min no-drop-frame soak, full extension-fed cost/context meters per column. [R3] delta retained: effective config chips open Policies scoped to the task. **[R6.2] framing** (IA only): stacked article about the task — hero, plan columns, validation section, terminal section — not tabs-and-panes chrome.
+**Phase 6 first slice:** fusion side-by-side columns headed by clean-room proof (`promptsIdentical` + shared prompt hash; red when sides diverge); validation evidence that distinguishes **GATE_ERROR** (infrastructure, consumes no attempt) from **FAIL** (real rejection); **Brain decisions** lane (refusals as prominent as successes, e.g. `POLICY_VIOLATION`). Evidence is fed from task-scoped events (`GET /v1/tasks/:id/events`) plus fusion REST — not placeholders. **Second slice:** each session card links to `/sessions/[id]` (Agent Detail + Logs). **Fourth slice:** ticketed **read-only** terminal attach ships on Session Detail (not as browser take-over of the pane). Still deferred on Task Detail: embedded terminal section, 10‑min no-drop-frame soak, full extension-fed cost/context meters per column. [R3] delta retained: effective config chips open Policies scoped to the task. **[R6.2] framing** (IA only): stacked article about the task — hero, plan columns, validation section, terminal section — not tabs-and-panes chrome.
 
 ### 7.3 Provider Connections & Usage (`/providers`) **[R5 — quota cards added]**
 
@@ -1040,7 +1041,7 @@ Step 0 (doctor) shows the same pattern for Pi/tmux/uv installs (pinned copy-past
 
 ### 8.1 Console ↔ daemon transport & auth
 
-Unchanged from Rev 2 ([B]): loopback-only; BFF-held bearer; single-use PTY tickets; `Idempotency-Key` on mutations; typed errors; zod everywhere; CLI uses the bearer directly.
+Unchanged from Rev 2 ([B]): loopback-only; BFF-held bearer; single-use PTY tickets; `Idempotency-Key` on mutations; typed errors; zod everywhere; CLI uses the bearer directly. **[Phase 6 fourth slice]** Attach tickets are minted only over authenticated REST, bound to one session id, redeemable once, valid **30 s**; the browser opens the loopback `wsUrl` directly because the BFF cannot proxy a WebSocket upgrade — the daemon bearer never rides a query string. WS upgrade enforces the same loopback-only and exact-origin guards as REST.
 
 ### 8.2 REST routes
 
@@ -1048,7 +1049,7 @@ Rev-2 table retained; [R3] additions:
 
 | Method | Path | Body → Response | Notes |
 |---|---|---|---|
-| *(all Rev-2 routes retained: status, providers + login/logout flows + probe, projects, tasks + actions + artifacts, runs, fusion, dispatch-profiles, fleet state, secondmates, analytics, sessions ticket, events SSE, terminal WS)* | | | |
+| *(all Rev-2 routes retained: status, providers + login/logout flows + probe, projects, tasks + actions + artifacts, runs, fusion, dispatch-profiles, fleet state, secondmates, analytics, events SSE)* | | | |
 | GET | `/v1/config/effective?project=&task=` | → resolved config + per-key source layer | **[R3]** powers the Policies chain view |
 | GET/PUT | `/v1/config/:layer/:domain` | JSON5 body → validated write | **[R3]** layer ∈ {global, project, task}; typed path-precise validation errors; safety-policy writes require Captain confirmation and emit `policy.changed` |
 | GET | `/v1/prompts` | → `{ templates: PromptTemplateInfo[] }` | **[Phase 4]** layered pack list (ref, layer, contentHash, customized, upstreamChanged) |
@@ -1063,6 +1064,8 @@ Rev-2 table retained; [R3] additions:
 | GET | `/v1/tasks/:id/events?types=&limit=` | → `{ taskId, events, truncated }` | **[Phase 6]** task-scoped evidence frames; `truncated` is per-task, not global log size |
 | GET | `/v1/sessions/:id` | → `SessionDetailResponse` (`session`, `taskTitle`, `attachCommand`) | **[Phase 6]** Agent Detail; `attachCommand` is display-only (Captain runs it; daemon never attaches) |
 | GET | `/v1/sessions/:id/events?types=&limit=` | → `{ sessionId, events, truncated }` | **[Phase 6]** Agent Logs; `truncated` is per-session, not global log size |
+| POST | `/v1/sessions/:id/attach-ticket` | → `AttachTicketResponse` (`sessionId`, `ticket`, `expiresAt`, `wsUrl`) | **[Phase 6 fourth slice]** single-use 30 s ticket for the read-only PTY WS; `wsUrl` is absolute loopback (`ws://127.0.0.1:<port>/v1/pty?ticket=…`) |
+| WS | `/v1/pty?ticket=` | frames: `{type:"pane",content}`, `{type:"closed",reason}`, `{type:"notice",reason}` | **[Phase 6 fourth slice]** redeem ticket once; capture-pane poll (read-only); client messages → notice, not keystrokes; loopback + exact-origin on upgrade |
 | GET | `/v1/runs/history` | → `{ runs: RunHistoryRow[] }` | **[Phase 6]** daemon-side per-task gate/fusion aggregates; `gateFailures` (FAIL) ≠ `gateErrors` (GATE_ERROR) |
 | GET | `/v1/fleet/wakes` (alias `/v1/wakes`) | → `{ wakes: WakeDigest[] }` | **[Phase 6]** Console Notifications; includes ABSORBED wakes |
 | GET | `/v1/events/replay?types=&limit=` | → `{ events, truncated }` | **[Phase 6]** when `types` is set, newest-first **matching frames only** (empty = no matches); powers Recent Alerts sparse type filter |
@@ -1164,7 +1167,7 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 1. **Secrets at rest:** keychain for API keys + daemon token; Pi auth store vendor-owned/opaque, never written; mtime/hash watch. [A]+[R2] **[R5] — one narrow read exception:** the quota-probe module may read stored OAuth bearer tokens exclusively to call **read-only usage/balance GET endpoints** from a **code-baked allowlist** (never config — a config-supplied URL receiving a bearer token would be an exfiltration vector); tokens are never used for inference, never persisted elsewhere, never logged (redaction covers probe I/O); probe failures never invalidate the connection. Everything else about the opacity boundary stands.
 2. **Secrets in flight:** allowlist env, ≤1 cast-matching provider key, redacted env manifests, `shell: false`, absolute `pi` path recorded. **[CONSENSUS + R2]**
 3. **Log redaction:** pino + regex scrubbers; `/login` terminals live-only. **[CONSENSUS]** Config-locked (§2.6 #13).
-4. **Network surface:** loopback-only (config-locked), BFF-held bearer, exact-origin, single-use PTY tickets, 0600 Unix sockets, guard policies from disk not socket. [A]+[B]+[R2]
+4. **Network surface:** loopback-only (config-locked), BFF-held bearer, exact-origin, single-use PTY tickets (30 s; WS upgrade path matches REST loopback + origin guards), 0600 Unix sockets, guard policies from disk not socket. [A]+[B]+[R2]
 5. **Role tool policies:** guard extension blocks forbidden `tool_call`s pre-execution (scout all-writes; validator outside artifact dir; builder outside worktree; fusion tools-off) + fs path-jail; violations → `SECURITY`, terminate, quarantine. [B]+[R2]
 6. **The Brain is powerful but bounded [R3]:** it acts only through the typed tool surface; every call is policy-checked, transition-validated, evidence-logged; it cannot write config (`read_policy` only), cannot alter gate output, cannot exceed budgets, cannot weaken safety policies. Only the Captain changes policy — via Console (authenticated) or config files (OS-user-writable only). Weakening overrides are stamped into `summary.json` and badged in the Console.
 7. **Guarded writes:** SCOUT triple enforcement; `ao/*` pushes only; force-push/hard-reset/clean/merge/branch-deletion denial (safety policy #12, default ON); FF-only secondmate sync; artifact path-jail; verified-reset precondition. **[CONSENSUS]**
@@ -1243,7 +1246,7 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] **`uv` gate-runtime gates [R4]:** a `gate.py` with PEP 723 inline deps runs in an isolated cached venv — a gate importing a library absent from the target repo executes without touching the product's `node_modules`/venv (isolation fixture); missing `uv` fails `doctor` at setup, and is reported as an infrastructure error, never as a gate `RED`; a project with `validation.gateLanguage: "ts"` runs `gate.ts` via `node --experimental-strip-types` (override honored). (G7, G8)
 - [x] E2E: unresolved fixture halts exactly at the configured cap (and at a *reconfigured* cap — config honored [R3]). (G9; `BUILDING → VALIDATION_EXHAUSTED` edge so the cap is reachable when FAIL lands from BUILDING)
 
-**Phase 6 — Console completion (2 wk)** — first + second + third slices shipped (`tooling/gates/phase-6.mjs` G1–G10; CI Playwright chromium); remainder open:
+**Phase 6 — Console completion (2 wk)** — first + second + third + fourth slices shipped (`tooling/gates/phase-6.mjs` G1–G11; CI Playwright chromium); remainder open:
 - [x] **Browser shell gates (G1, G2, G8):** Console pages render against a seeded daemon (incl. `/notifications`, `/runs/history`, `/alerts`, `/analytics/models`, `/settings/billing`); Fleet reflects a new task ≤1 s over SSE; unknown route → shared Not Found. [A]
 - [x] **No-mocks gate (G3):** Figma sample placeholder strings (e.g. `23,094`, invented agent roster, `Upgrade to Pro`, `AI Optimization Tips`) are **absent** from every rendered page. [R6.3 honesty]
 - [x] **Analytics honesty (G4):** `/analytics` renders the daemon's own `GET /v1/analytics` figures; cost absence stated when coverage is not complete. Schema + service: `packages/protocol/src/analytics.ts`, `apps/orchestrator/src/analytics/`.
@@ -1257,11 +1260,12 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] **Recent Alerts:** `/alerts` (Figma `41:5674`) filters to actionable frames only via type-filtered event replay.
 - [x] **Model Performance:** `/analytics/models` (Figma `41:4355`) reports measured telemetry only — not a quality leaderboard.
 - [x] **Settings Billing:** `/settings/billing` (Figma `41:6309`) shows connection billing surfaces, probe amounts, measured spend + coverage, and budget ceilings — no invoice/plan/payment/upgrade fiction.
-- [ ] Task Detail: full extension-fed per-column cost/context meters + ticketed terminal, 10 min, no dropped frames (seq assertions). [A]+[R2]+[R3]
+- [x] **Ticketed read-only terminal attach (G11, fourth slice):** mint real attach ticket → WS upgrade succeeds once → identical ticket replay refused; Session Detail streams capture-pane content; client writes get an explicit read-only notice; take-over remains the human attach command. [A]+[B]+[R2]
+- [ ] Task Detail: full extension-fed per-column cost/context meters + embedded terminal section, 10 min, no dropped frames (seq assertions). Session Detail read-only attach shipped in fourth slice above. [A]+[R2]+[R3]
 - [ ] Provider wizard E2E (`pi-api-key` + fixture `pi-oauth`); extra-usage labeling assertions across card/wizard/task/analytics. [A]+[R2]
 - [ ] **Policies page gates [R3]:** layered chain view shows correct per-key source; diff-from-default marks (◆) accurate; safety-policy toggle requires confirmation, stamps overrides, and raises the persistent badge; prompt three-way diff renders for a customized template with a shipped update.
 - [ ] **Usage & quota UI gates [R5] (remaining):** Fleet usage strip updates on `quota.updated` within 1 s; Providers quota card grid renders all four card archetypes (weekly-window, limit-reached, best-effort, balance-split) with fixture coverage; the `LIMIT REACHED` pill renders red and links to the exclusion reason (Playwright). Card anatomy (sub-rows) shipped in third slice above.
-- [ ] Terminal reconnect resumes the same tmux window. [B]
+- [ ] Terminal reconnect resumes the same tmux window (seq continuity under reconnect). [B]
 - [ ] Remaining §7 frames: Network I/O Detail (`41:4815`).
 - [ ] **Figma-fidelity gate [R6.3, replaces R6.2's brand-parity gate]:** every shipped screen has a **Figma-frame-vs-implementation side-by-side** in the evidence pack (per breakpoint where the frame specifies); implementation was built from `get_design_context` per screen (figma-design-to-code skill), not eyeballed screenshots; visual diffs reviewed against the canonical frames in the §7 inventory. **Kept from R6.2:** marketing renders identically after component promotion (no-regression parity on marketing routes).
 
@@ -1383,7 +1387,7 @@ Rev 1/2 specified a deterministic, LLM-free Orchestrator Core making dispatch an
 
 1. **Product shape:** single-user, local-first, loopback-only; standalone daemon + Next.js 16 console as a pure client.
 2. **Subscription/API boundary:** subscription credentials feed harness processes only; no token extraction; hosted mode api-key-only. (R2: harness = Pi; Agent OS calls no model APIs itself.)
-3. **tmux as the durability substrate;** node-pty only for terminal attach.
+3. **tmux as the durability substrate;** browser terminal is a ticketed **read-only** attach (as-built: `capture-pane` poll over WS — not node-pty; take-over is human `tmux attach`).
 4. **Event-log-is-truth:** NDJSON first, SQLite projection; boot replay; `kill -9` recovery as an acceptance test.
 5. **Zero-token supervision** — surviving in R3 as zero-token *classification* with absorb rules; judgment on actionable wakes moved to the Brain by directive.
 6. **Cross-family discipline:** builder ≠ validator family, ≥2 planner families, per-{project, role, model} sessions, no cross-model replay. (R3: enforced as default-ON policy by the substrate.)
@@ -1410,7 +1414,7 @@ Rev 1/2 specified a deterministic, LLM-free Orchestrator Core making dispatch an
 | D11 | Orchestrator architecture | Distinct chat-only Liaison atop a deterministic, LLM-free decision Core | Orchestrator *is* the (LLM) liaison | **[A] won in Rev 1** (testability) | **Dissolved by R3 — [B]'s instinct ultimately prevails by Captain's directive:** the Orchestrator IS an LLM (the Brain); [A]'s determinism survives as the substrate/enforcement layer, not as the decision-maker (§13.5) |
 | D12 | Stale supervision | Flat 10 min | Per-role, never-silent-kill | **[B]** thresholds + fused ladder | Sources upgraded by R2; ladder became the Brain's playbook + config #5 [R3] |
 | D13 | Naming/ports | `agentosd` :4700 | `agent-osd` :4777 | **[A]** + [B] secondmate placement | Unchanged |
-| D14 | Terminal interactivity | Read-only tail | Ticketed attach | **Fused** | Unchanged |
+| D14 | Terminal interactivity | Read-only tail | Ticketed attach | **Fused** | **Phase 6 fourth slice as-built:** ticketed read-only live view on Session Detail; no browser write path; human attach command for take-over |
 
 ### (c) Open questions for the Captain
 
