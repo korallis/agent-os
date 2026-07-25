@@ -39,8 +39,9 @@ export function Icon({ src, className, tint, alt = "" }: IconProps) {
       />
     );
   }
-  // eslint-disable-next-line @next/next/no-img-element -- exact Figma asset bytes
   return (
+    // Exact Figma asset bytes — do not route through next/image.
+    // eslint-disable-next-line @next/next/no-img-element
     <img
       src={url}
       alt={alt}

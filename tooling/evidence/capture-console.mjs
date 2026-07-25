@@ -204,7 +204,11 @@ try {
   ];
   await tool("resolve_cast", {
     taskId: taskB,
-    roles: fusionCasts.map(({ family, ...rest }) => rest),
+    roles: fusionCasts.map((cast) => {
+      const { family, ...rest } = cast;
+      void family;
+      return rest;
+    }),
     familyCheckOverride: false,
   });
   const fusion = await tool("dispatch_fusion", {
