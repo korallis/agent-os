@@ -450,11 +450,13 @@ export class ToolSurface {
 
   /** Hydrate from durable task store (daemon boot). Rebuilds in-memory session rows. */
   hydrateTask(task: TaskSnapshot): void {
+    const wedgeRespawnsByRole = task.wedgeRespawnsByRole ?? {};
     const normalized: TaskSnapshot = {
       ...task,
       deliveryBlocked: task.deliveryBlocked ?? null,
       redProof: task.redProof ?? null,
       lastFailLedger: task.lastFailLedger ?? null,
+      wedgeRespawnsByRole,
     };
     this.tasks.set(normalized.id, normalized);
     if (normalized.idempotencyKey !== null) {
@@ -466,6 +468,11 @@ export class ToolSurface {
     }
     if (normalized.lastFailLedger !== null) {
       this.deps.gates.installFailLedger(normalized.id, normalized.lastFailLedger);
+    }
+    for (const [role, count] of Object.entries(wedgeRespawnsByRole)) {
+      if (typeof count === "number" && Number.isFinite(count) && count >= 0) {
+        this.wedgeRespawns.set(`${normalized.id}:${role}`, count);
+      }
     }
     task = normalized;
     for (const s of task.sessions) {
@@ -633,53 +640,115 @@ export class ToolSurface {
       const idleMinutes = idleMs / 60_000;
       if (idleMinutes < thresholdMinutes) continue;
 
-      const ledgerKey = `${session.taskId ?? "none"}:${session.role}`;
-      const used = this.wedgeRespawns.get(ledgerKey) ?? 0;
-      const action = used < respawnCap ? "respawned" : "escalated";
+      const used = this.getWedgeRespawns(session.taskId, session.role);
+      const canRespawn = used < respawnCap;
+      this.persistSessionWedged(session);
 
-      this.sessions.set(session.sessionId, { ...session, status: "wedged" });
-      this.sink({
-        type: "session.wedged",
-        payload: {
-          sessionId: session.sessionId,
-          taskId: session.taskId,
-          role: session.role,
-          idleMinutes: Number(idleMinutes.toFixed(2)),
-          thresholdMinutes,
-          respawnsUsed: used,
-          respawnCap,
-          action,
-        },
-      });
-
-      if (action === "respawned") {
-        this.wedgeRespawns.set(ledgerKey, used + 1);
+      let action: "respawned" | "escalated";
+      let escalateSummary: string | null = null;
+      if (canRespawn) {
         try {
           this.respawnCrewmate({
             sessionId: session.sessionId,
             reason: `structural WEDGED — no activity for ${Math.round(idleMinutes)}m (threshold ${thresholdMinutes}m)`,
           });
+          this.setWedgeRespawns(session.taskId, session.role, used + 1);
+          action = "respawned";
         } catch {
-          // A failed respawn must not swallow the signal; escalate instead of
-          // leaving a wedged seat silently unattended.
-          this.escalate({
-            taskId: session.taskId ?? undefined,
-            summary: `Seat ${session.role} wedged and could not be respawned — no activity for ${Math.round(idleMinutes)}m`,
-            severity: "critical",
-          });
+          action = "escalated";
+          escalateSummary = `Seat ${session.role} wedged and could not be respawned — no activity for ${Math.round(idleMinutes)}m`;
         }
       } else {
         // Cap consumed: the Captain decides, because a second wedge on the same
         // role is far more likely to be the task than the seat.
+        action = "escalated";
+        escalateSummary = `Seat ${session.role} wedged again after ${used} respawn${used === 1 ? "" : "s"} — no activity for ${Math.round(idleMinutes)}m. The task, not the model, is the likely cause.`;
+      }
+
+      this.emitSessionWedged(session, {
+        idleMinutes,
+        thresholdMinutes,
+        respawnsUsed: used,
+        respawnCap,
+        action,
+      });
+      if (escalateSummary !== null) {
         this.escalate({
           taskId: session.taskId ?? undefined,
-          summary: `Seat ${session.role} wedged again after ${used} respawn${used === 1 ? "" : "s"} — no activity for ${Math.round(idleMinutes)}m. The task, not the model, is the likely cause.`,
+          summary: escalateSummary,
           severity: "critical",
         });
       }
       acted.push({ sessionId: session.sessionId, action });
     }
     return acted;
+  }
+
+  private getWedgeRespawns(taskId: string | null, role: string): number {
+    const key = `${taskId ?? "none"}:${role}`;
+    if (taskId !== null) {
+      const task = this.tasks.get(taskId);
+      if (task !== undefined) {
+        const durable = task.wedgeRespawnsByRole?.[role];
+        if (typeof durable === "number" && Number.isFinite(durable) && durable >= 0) {
+          return durable;
+        }
+      }
+    }
+    return this.wedgeRespawns.get(key) ?? 0;
+  }
+
+  private setWedgeRespawns(taskId: string | null, role: string, count: number): void {
+    const key = `${taskId ?? "none"}:${role}`;
+    this.wedgeRespawns.set(key, count);
+    if (taskId === null) return;
+    const task = this.tasks.get(taskId);
+    if (task === undefined) return;
+    this.saveTask({
+      ...task,
+      wedgeRespawnsByRole: { ...(task.wedgeRespawnsByRole ?? {}), [role]: count },
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  private persistSessionWedged(session: FleetSession): void {
+    this.sessions.set(session.sessionId, { ...session, status: "wedged" });
+    if (session.taskId === null) return;
+    const task = this.tasks.get(session.taskId);
+    if (task === undefined) return;
+    const now = new Date().toISOString();
+    this.saveTask({
+      ...task,
+      sessions: task.sessions.map((s) =>
+        s.sessionId === session.sessionId ? { ...s, status: "wedged", lastEventAt: now } : s,
+      ),
+      updatedAt: now,
+    });
+  }
+
+  private emitSessionWedged(
+    session: FleetSession,
+    detail: {
+      idleMinutes: number;
+      thresholdMinutes: number;
+      respawnsUsed: number;
+      respawnCap: number;
+      action: "respawned" | "escalated";
+    },
+  ): void {
+    this.sink({
+      type: "session.wedged",
+      payload: {
+        sessionId: session.sessionId,
+        taskId: session.taskId,
+        role: session.role,
+        idleMinutes: Number(detail.idleMinutes.toFixed(2)),
+        thresholdMinutes: detail.thresholdMinutes,
+        respawnsUsed: detail.respawnsUsed,
+        respawnCap: detail.respawnCap,
+        action: detail.action,
+      },
+    });
   }
 
   /**
@@ -1262,6 +1331,7 @@ export class ToolSurface {
       deliveryBlocked: null,
       redProof: null,
       lastFailLedger: null,
+      wedgeRespawnsByRole: {},
       idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
       updatedAt: now,
@@ -3666,7 +3736,15 @@ export class ToolSurface {
     if (input.taskId !== undefined) {
       const task = this.requireTask(input.taskId);
       if (!isTerminalPhase(task.phase)) {
-        this.transition(task, "NEEDS_CAPTAIN", input.summary);
+        if (task.phase === "NEEDS_CAPTAIN") {
+          this.saveTask({
+            ...task,
+            needsCaptainSummary: input.summary,
+            updatedAt: new Date().toISOString(),
+          });
+        } else {
+          this.transition(task, "NEEDS_CAPTAIN", input.summary);
+        }
       }
     }
     this.sink({
@@ -4257,9 +4335,11 @@ export class ToolSurface {
   markSessionStatus(sessionId: string, status: FleetSession["status"]): void {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
-    // Terminal is terminal: late agent_settled / running frames after stop or
-    // lost must not resurrect the session (and must not inflate healthyLeft).
-    if (session.status === "stopped" || session.status === "lost") return;
+    // Terminal is terminal: late agent_settled / running frames after stop,
+    // lost, or wedged must not resurrect the session (and must not inflate healthyLeft).
+    if (session.status === "stopped" || session.status === "lost" || session.status === "wedged") {
+      return;
+    }
     this.sessions.set(sessionId, {
       ...session,
       status,
@@ -4283,6 +4363,35 @@ export class ToolSurface {
     if (status === "settled") {
       this.completeFusionSide(sessionId);
     }
+  }
+
+  /**
+   * Stamp lastActivityAt from an observable frame (lifecycle progress, usage,
+   * crewmate tool call) without changing status. null lastActivityAt means the
+   * seat has produced nothing since spawn — only real frames clear that.
+   */
+  touchSessionActivity(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) return;
+    if (
+      session.status === "stopped" ||
+      session.status === "lost" ||
+      session.status === "wedged"
+    ) {
+      return;
+    }
+    const now = new Date().toISOString();
+    this.sessions.set(sessionId, { ...session, lastActivityAt: now });
+    if (session.taskId === null) return;
+    const task = this.tasks.get(session.taskId);
+    if (task === undefined) return;
+    this.saveTask({
+      ...task,
+      sessions: task.sessions.map((s) =>
+        s.sessionId === sessionId ? { ...s, lastEventAt: now } : s,
+      ),
+      updatedAt: now,
+    });
   }
 
   /** Mark a session lost (pane-died / reconcile). */

@@ -169,6 +169,11 @@ export const taskSnapshotSchema = z.strictObject({
   redProof: taskRedProofSchema.nullable().default(null),
   /** Daemon-authoritative last FAIL lines for verbatim inject. */
   lastFailLedger: taskFailLedgerSchema.nullable().default(null),
+  /**
+   * Per-role structural-WEDGED respawns already spent on this task.
+   * Survives daemon restart so the respawn-once spend bound cannot reset on bounce.
+   */
+  wedgeRespawnsByRole: z.record(z.string(), z.number().int().min(0)).default({}),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
