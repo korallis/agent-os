@@ -867,4 +867,189 @@ describe("/opinion live path", () => {
     ).toHaveLength(0);
     expect(types).toContain("session.stopped");
   });
+
+  it("cancel_task finalizes in-flight fusion sides instead of stranding them", () => {
+    const { service, events } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    const spawnA = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      vars: {},
+    });
+    expect(spawnA.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session
+      .sessionId;
+
+    const spawnB = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawnB.ok).toBe(true);
+    const sessionB = (spawnB.data as { session: { sessionId: string } }).session
+      .sessionId;
+
+    const runId = "01JCANCELFUSION000000000001";
+    service.fusionRuns.create({
+      runId,
+      taskId,
+      kind: "opinion",
+      templateRef: null,
+      templateLayer: null,
+      templateHash: null,
+      renderedHash: "cancel-hash",
+      promptsIdentical: true,
+      sides: [
+        {
+          role: "planner",
+          model: "anthropic/claude-fable-5",
+          family: "anthropic",
+          sessionId: sessionA,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+        {
+          role: "planner",
+          model: "openai/gpt-5.6-sol",
+          family: "openai",
+          sessionId: sessionB,
+          promptHash: "same",
+          artifactPath: null,
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+        },
+      ],
+      aggregatorFamily: null,
+      contractOk: null,
+      createdAt: new Date().toISOString(),
+    });
+
+    const dirA = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    }).dir;
+    mkdirSync(join(dirA, "outputs"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dirA, "outputs", `${sessionA}.md`), "cancel side a\n", {
+      mode: 0o600,
+    });
+
+    service.tools.hydrateFusionOwnership();
+    events.length = 0;
+
+    const cancelled = service.tools.invoke("cancel_task", {
+      taskId,
+      reason: "captain cancelled mid-opinion",
+    });
+    expect(cancelled.ok).toBe(true);
+    expect((cancelled.data as { phase: string }).phase).toBe("CANCELLED");
+
+    const types = events.map((e) => e.type);
+    expect(types.filter((t) => t === "fusion.side_completed")).toHaveLength(2);
+    expect(types).toContain("fusion.completed");
+
+    const run = service.fusionRuns.get(taskId, runId);
+    expect(run).not.toBeNull();
+    expect(run!.sides.every((s) => s.settledAt != null)).toBe(true);
+    expect(run!.sides[0]?.artifactPath).not.toBeNull();
+
+    // Hydrate must not re-arm a finished run after cancel.
+    service.tools.hydrateFusionOwnership();
+    events.length = 0;
+    service.tools.markSessionStatus(sessionA, "settled");
+    expect(events.map((e) => e.type)).not.toContain("fusion.side_completed");
+    expect(events.map((e) => e.type)).not.toContain("fusion.completed");
+  });
+
+  it("reconcileMissingCastRoles continues after a failed respawn", () => {
+    const { service, events } = fleet();
+    const { taskId, projectId } = seedShipTask(service);
+
+    const spawnA = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      vars: {},
+    });
+    expect(spawnA.ok).toBe(true);
+    const sessionA = (spawnA.data as { session: { sessionId: string } }).session
+      .sessionId;
+
+    const spawnB = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+      thinking: "low",
+      vars: {},
+    });
+    expect(spawnB.ok).toBe(true);
+
+    const dirA = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+    }).dir;
+    const dirB = service.sessionKeys.ensure({
+      projectId,
+      role: "planner",
+      model: "openai/gpt-5.6-sol",
+    }).dir;
+    rmSync(dirA, { recursive: true, force: true });
+    rmSync(dirB, { recursive: true, force: true });
+
+    const originalLease = service.worktrees.lease.bind(service.worktrees);
+    let leaseCalls = 0;
+    service.worktrees.lease = ((input: Parameters<typeof originalLease>[0]) => {
+      leaseCalls += 1;
+      if (leaseCalls === 1) {
+        throw new Error("worktree pool exhausted");
+      }
+      return originalLease(input);
+    }) as typeof service.worktrees.lease;
+
+    events.length = 0;
+    const respawned = service.tools.reconcileMissingCastRoles();
+
+    // First slot fails; second still respawns. Reconcile must not throw.
+    expect(respawned).toEqual([
+      {
+        taskId,
+        role: "planner",
+        model: "openai/gpt-5.6-sol",
+      },
+    ]);
+    expect(
+      events.some(
+        (e) =>
+          e.type === "captain.escalation" &&
+          e.payload.summary.includes("session-key reconcile failed") &&
+          e.payload.summary.includes("anthropic/claude-fable-5"),
+      ),
+    ).toBe(true);
+    expect(
+      service.tools.listSessions().some(
+        (s) =>
+          s.model === "openai/gpt-5.6-sol" &&
+          s.sessionId !==
+            (spawnB.data as { session: { sessionId: string } }).session.sessionId &&
+          (s.status === "running" || s.status === "starting" || s.status === "settled"),
+      ),
+    ).toBe(true);
+    // Surviving failure path still marked the wiped first session lost.
+    expect(
+      service.tools.listSessions().some(
+        (s) => s.sessionId === sessionA && s.status === "lost",
+      ),
+    ).toBe(true);
+  });
 });

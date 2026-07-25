@@ -437,28 +437,43 @@ export class ToolSurface {
           (c) => c.role === slot.role && c.model === slot.model,
         );
         if (castEntry === undefined) continue;
-        for (const s of [...this.sessions.values()]) {
-          if (
-            s.taskId === task.id &&
-            s.role === slot.role &&
-            s.model === slot.model &&
-            (s.status === "starting" || s.status === "running" || s.status === "settled")
-          ) {
-            this.markSessionLost(
-              s.sessionId,
-              "session-key directory missing (reconcile)",
-            );
+        try {
+          for (const s of [...this.sessions.values()]) {
+            if (
+              s.taskId === task.id &&
+              s.role === slot.role &&
+              s.model === slot.model &&
+              (s.status === "starting" || s.status === "running" || s.status === "settled")
+            ) {
+              this.markSessionLost(
+                s.sessionId,
+                "session-key directory missing (reconcile)",
+              );
+            }
           }
+          this.spawnCrewmate({
+            taskId: task.id,
+            role: castEntry.role,
+            model: castEntry.model,
+            thinking: castEntry.thinking,
+            cleanRoom: castEntry.cleanRoom,
+            vars: {},
+          });
+          respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
+        } catch (error) {
+          // A failed respawn must not abort boot-time rehydrate or sibling slots.
+          const message = error instanceof Error ? error.message : String(error);
+          const summary = `session-key reconcile failed to respawn ${slot.role}/${slot.model} for task ${task.id}: ${message}`;
+          this.sink({
+            type: "captain.escalation",
+            payload: {
+              taskId: task.id,
+              summary,
+              severity: "warn",
+            },
+          });
+          process.stderr.write(`[agentos] ${summary}\n`);
         }
-        this.spawnCrewmate({
-          taskId: task.id,
-          role: castEntry.role,
-          model: castEntry.model,
-          thinking: castEntry.thinking,
-          cleanRoom: castEntry.cleanRoom,
-          vars: {},
-        });
-        respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
       }
     }
     return respawned;
@@ -2206,14 +2221,76 @@ export class ToolSurface {
   }
 
   /**
-   * Single choke point when a task leaves the live set: halt every session,
-   * then release every task-linked lease (clean → verified-reset, dirty →
-   * quarantine + deliveryBlocked stamp). Used by cancel/FAILED terminal paths
-   * and as the deliver abort reclaim.
+   * Single choke point when a task leaves the live set: finalize in-flight
+   * fusion sides, halt every session, then release every task-linked lease
+   * (clean → verified-reset, dirty → quarantine + deliveryBlocked stamp).
+   * Used by cancel/FAILED terminal paths and as the deliver abort reclaim.
    */
   private haltAndReleaseTask(taskId: string, reason: string): void {
+    // Same completeFusionSide path as stop_crewmate / markSessionLost so
+    // cancel_task / FAILED / DONE cannot strand runs on fusion.dispatched.
+    this.finalizeFusionSidesForTask(taskId);
     this.haltTaskSessions(taskId, reason);
     this.releaseWorktreeLeases({ taskId });
+  }
+
+  /**
+   * Settle every in-flight fusion side for a task via the shared
+   * completeFusionSide helper (artifact capture, side_completed, and
+   * fusion.completed when the last side settles).
+   */
+  private finalizeFusionSidesForTask(taskId: string): void {
+    const ownedSessionIds = [
+      ...new Set(
+        [...this.fusionBySessionId.entries()]
+          .filter(([, ref]) => ref.taskId === taskId)
+          .map(([sessionId]) => sessionId),
+      ),
+    ];
+    for (const sessionId of ownedSessionIds) {
+      this.completeFusionSide(sessionId);
+    }
+
+    // Durable runs may still have unsettled sides that lost map ownership
+    // (e.g. a prior halt path). Re-arm and settle so hydrate cannot re-arm
+    // a run with no live settle path on the next boot.
+    for (const run of this.deps.fusionRuns.listForTask(taskId)) {
+      const sideCount = run.sides.length;
+      for (let sideIndex = 0; sideIndex < sideCount; sideIndex++) {
+        const latest = this.deps.fusionRuns.get(taskId, run.runId);
+        if (latest === null) break;
+        const side = latest.sides[sideIndex];
+        if (side === undefined) continue;
+        if (side.settledAt != null || side.artifactPath !== null) continue;
+        if (side.sessionId === null) {
+          const settledAt = new Date().toISOString();
+          const sides = latest.sides.map((s, i) =>
+            i === sideIndex ? { ...s, settledAt } : s,
+          );
+          this.deps.fusionRuns.save({ ...latest, sides });
+          this.sink({
+            type: "fusion.side_completed",
+            payload: {
+              taskId,
+              runId: latest.runId,
+              role: side.role,
+              model: side.model,
+              family: side.family,
+              promptHash: side.promptHash,
+              artifactPath: null,
+            },
+          });
+          this.tryCompleteFusionRun(taskId, latest.runId);
+          continue;
+        }
+        this.fusionBySessionId.set(side.sessionId, {
+          taskId,
+          runId: latest.runId,
+          sideIndex,
+        });
+        this.completeFusionSide(side.sessionId);
+      }
+    }
   }
 
   private deliverTask(raw: Record<string, unknown>): TaskSnapshot {
