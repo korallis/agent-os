@@ -28,11 +28,13 @@ export const BRAIN_SESSION_PROJECT_ID = "orchestrator";
 /** Budget handoff target under AGENTOS_HOME — survives daemon restart. */
 const HANDOFF_STATE_FILE = "handoff.json";
 
-interface DurableHandoff {
+export interface DurableHandoff {
   toModel: string;
   fromModel: string | null;
   reason: string;
   at: string;
+  /** Whether the post-handoff Brain seat reached running. */
+  landed: boolean;
 }
 
 /**
@@ -267,38 +269,61 @@ export class BrainManager {
       return this.getSnapshot();
     }
     this.handoffModel = toModel;
+    // start() tears down the prior pane, mints a fresh session id, and resolves
+    // a session dir keyed to the new model — the no-replay guarantee is
+    // structural rather than a rule the caller has to remember.
+    const next = this.start(`brain handoff: ${reason}`);
+    const landed = next.status === "running";
     this.persistHandoff({
       toModel,
       fromModel,
       reason,
       at: new Date().toISOString(),
+      landed,
     });
-    // start() tears down the prior pane, mints a fresh session id, and resolves
-    // a session dir keyed to the new model — the no-replay guarantee is
-    // structural rather than a rule the caller has to remember.
-    const next = this.start(`brain handoff: ${reason}`);
     this.snapshot = {
       ...this.snapshot,
       handoffFrom: fromModel,
       handoffReason: reason,
     };
     this.deps.tools.setBrainSnapshot(this.snapshot);
-    this.sink({
-      type: "brain.handoff_completed",
-      payload: {
-        fromModel,
-        toModel,
-        fromSessionId,
-        toSessionId: this.snapshot.sessionId,
-        reason,
-      },
-    });
-    return { ...next, handoffFrom: fromModel, handoffReason: reason };
+    // handoff_completed means the new seat is live — never record a BRAIN_DOWN
+    // land as success. start() already emits brain.down for the spawn path;
+    // emit a handoff-scoped down so the Captain can see the attempt failed.
+    if (landed) {
+      this.sink({
+        type: "brain.handoff_completed",
+        payload: {
+          fromModel,
+          toModel,
+          fromSessionId,
+          toSessionId: this.snapshot.sessionId,
+          reason,
+        },
+      });
+    } else {
+      this.sink({
+        type: "brain.down",
+        payload: {
+          wakeQueueDepth: this.deps.watcher.queueDepth(),
+          reason: `handoff to ${toModel} did not land: ${reason}`,
+        },
+      });
+    }
+    return { ...this.getSnapshot(), handoffFrom: fromModel, handoffReason: reason };
   }
 
   /** The model a handoff moved the Brain to, or null when none has happened. */
   handoffTarget(): string | null {
     return this.handoffModel;
+  }
+
+  /**
+   * Durable handoff record (handoff.json) — single source of truth for the
+   * last attempt's target, time, and whether the seat landed running.
+   */
+  durableHandoff(): DurableHandoff | null {
+    return this.loadHandoff();
   }
 
   private loadHandoff(): DurableHandoff | null {
@@ -319,6 +344,9 @@ export class BrainManager {
         fromModel: typeof record.fromModel === "string" ? record.fromModel : null,
         reason: typeof record.reason === "string" ? record.reason : "restored handoff",
         at: typeof record.at === "string" ? record.at : new Date(0).toISOString(),
+        // Pre-landed-field records were written only after intended moves; treat
+        // as landed so a restart mid-cooldown still suppresses thrash.
+        landed: typeof record.landed === "boolean" ? record.landed : true,
       };
     } catch {
       return null;

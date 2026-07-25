@@ -122,7 +122,7 @@ describe("Brain budget handoff", () => {
       config,
       budgets,
       samples: [sample(42)],
-      candidates: ["anthropic/claude-sonnet-4-5"],
+      candidates: [{ model: "anthropic/claude-sonnet-4-5", worstWindowPct: null }],
     });
     expect(decision.shouldHandoff).toBe(false);
     expect(decision.observedPct).toBe(42);
@@ -135,7 +135,10 @@ describe("Brain budget handoff", () => {
       config,
       budgets,
       samples: [sample(80)],
-      candidates: ["openai/gpt-5.6-sol", "anthropic/claude-sonnet-4-5"],
+      candidates: [
+        { model: "openai/gpt-5.6-sol", worstWindowPct: null },
+        { model: "anthropic/claude-sonnet-4-5", worstWindowPct: null },
+      ],
     });
     expect(decision.shouldHandoff).toBe(true);
     expect(decision.toModel).toBe("anthropic/claude-sonnet-4-5");
@@ -153,10 +156,46 @@ describe("Brain budget handoff", () => {
       config,
       budgets,
       samples: [sample(93)],
-      candidates: ["openrouter/anthropic/claude-sonnet-4-5"],
+      candidates: [
+        { model: "openrouter/anthropic/claude-sonnet-4-5", worstWindowPct: null },
+      ],
     });
     expect(decision.shouldHandoff).toBe(true);
     expect(decision.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+  });
+
+  it("prefers an under-threshold refuge over an over-threshold same-family one", () => {
+    const decision = decideHandoff({
+      brainModel: "anthropic/claude-sonnet-4-5",
+      brainConnectionId: "01JCONN00000000000000000AA",
+      config,
+      budgets,
+      samples: [sample(93)],
+      candidates: [
+        { model: "openrouter/anthropic/claude-sonnet-4-5", worstWindowPct: 91 },
+        { model: "xai/grok-3", worstWindowPct: 10 },
+      ],
+    });
+    expect(decision.shouldHandoff).toBe(true);
+    expect(decision.toModel).toBe("xai/grok-3");
+    expect(decision.reason).not.toContain("only over-threshold refuge");
+  });
+
+  it("falls back to an over-threshold refuge only as a last resort", () => {
+    const decision = decideHandoff({
+      brainModel: "anthropic/claude-sonnet-4-5",
+      brainConnectionId: "01JCONN00000000000000000AA",
+      config,
+      budgets,
+      samples: [sample(93)],
+      candidates: [
+        { model: "openrouter/anthropic/claude-sonnet-4-5", worstWindowPct: 91 },
+        { model: "xai/grok-3", worstWindowPct: 88 },
+      ],
+    });
+    expect(decision.shouldHandoff).toBe(true);
+    expect(decision.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+    expect(decision.reason).toContain("only over-threshold refuge available");
   });
 
   function fleetConnections(now: string): {
@@ -240,12 +279,12 @@ describe("Brain budget handoff", () => {
     const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
     const registry = { list: () => connections } as ConnectionRegistry;
 
-    // Both Anthropic and OpenRouter report over threshold so a thrash loop
-    // would otherwise bounce the Brain every reconcile tick.
+    // Every connected provider is over threshold so same-family openrouter is
+    // the last-resort refuge — without cooldown the next tick would bounce again.
     const samples = [
       windowSample(anthropicId, "anthropic", 93, now),
       windowSample(openrouterId, "openrouter", 91, now),
-      windowSample(xaiId, "xai", 10, now),
+      windowSample(xaiId, "xai", 88, now),
     ];
 
     const service = new FleetService({
@@ -263,7 +302,9 @@ describe("Brain budget handoff", () => {
     const first = service.evaluateBrainHandoff();
     expect(first?.shouldHandoff).toBe(true);
     expect(first?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+    expect(first?.reason).toContain("only over-threshold refuge available");
     expect(service.lastBrainHandoff()?.toModel).toBe("openrouter/anthropic/claude-sonnet-4-5");
+    expect(service.lastBrainHandoff()?.landed).toBe(true);
 
     const second = service.evaluateBrainHandoff();
     expect(second?.shouldHandoff).toBe(false);
@@ -308,8 +349,113 @@ describe("Brain budget handoff", () => {
     restarted.stop();
   });
 
-  it("does not latch cooldown when the post-handoff seat is down", () => {
+  it("does not emit handoff_completed or thrash when the post-handoff seat is down", () => {
     const home = temp("agentos-p8-handoff-down-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    configService.installDefaults();
+
+    const now = new Date().toISOString();
+    const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+    const registry = { list: () => connections } as ConnectionRegistry;
+    // All over threshold so a failed land still sits on a connection that would
+    // re-trigger handoff every tick without the short retry backoff.
+    const samples = [
+      windowSample(anthropicId, "anthropic", 93, now),
+      windowSample(openrouterId, "openrouter", 91, now),
+      windowSample(xaiId, "xai", 88, now),
+    ];
+
+    const events: Array<{ type: string }> = [];
+    // No fakeBrain and no Pi → start() enters BRAIN_DOWN after handoff.
+    const service = new FleetService({
+      home,
+      config: configService,
+      connections: registry,
+      quotaSamples: () => samples,
+      fakeTmux: true,
+      fakeBrain: false,
+    });
+    service.onEvent((event) => {
+      events.push(event);
+    });
+    service.start();
+    service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+    expect(service.brain.getSnapshot().status).toBe("down");
+    events.length = 0;
+
+    const first = service.evaluateBrainHandoff();
+    expect(first?.shouldHandoff).toBe(true);
+    expect(service.brain.getSnapshot().status).toBe("down");
+    expect(service.lastBrainHandoff()?.landed).toBe(false);
+    expect(events.some((e) => e.type === "brain.handoff_completed")).toBe(false);
+    expect(events.some((e) => e.type === "brain.handoff_triggered")).toBe(true);
+    expect(events.some((e) => e.type === "brain.down")).toBe(true);
+
+    // Short retry backoff — not the success cooldown, but enough to stop thrash.
+    const second = service.evaluateBrainHandoff();
+    expect(second?.shouldHandoff).toBe(false);
+    expect(second?.reason ?? "").toContain("retry backoff");
+    expect(service.lastBrainHandoff()?.landed).toBe(false);
+
+    service.stop();
+  });
+
+  it("restores success cooldown from durable handoff across restart", () => {
+    const home = temp("agentos-p8-handoff-cd-restore-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    configService.installDefaults();
+
+    const now = new Date().toISOString();
+    const { connections, anthropicId, openrouterId, xaiId } = fleetConnections(now);
+    const registry = { list: () => connections } as ConnectionRegistry;
+    // All over threshold so the refuge remains over threshold after the move —
+    // without a restored cooldown the restart would immediately hand off again.
+    const samples = [
+      windowSample(anthropicId, "anthropic", 93, now),
+      windowSample(openrouterId, "openrouter", 91, now),
+      windowSample(xaiId, "xai", 88, now),
+    ];
+
+    const first = new FleetService({
+      home,
+      config: configService,
+      connections: registry,
+      quotaSamples: () => samples,
+      fakeTmux: true,
+      fakeBrain: true,
+    });
+    first.start();
+    first.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
+    const decision = first.evaluateBrainHandoff();
+    expect(decision?.shouldHandoff).toBe(true);
+    expect(first.lastBrainHandoff()?.landed).toBe(true);
+    const durable = first.brain.durableHandoff();
+    expect(durable?.landed).toBe(true);
+    expect(durable?.toModel).toBe(first.lastBrainHandoff()?.toModel);
+    first.stop();
+
+    // Daemon bounce mid-cooldown must not immediately re-handoff.
+    const restarted = new FleetService({
+      home,
+      config: configService,
+      connections: registry,
+      quotaSamples: () => samples,
+      fakeTmux: true,
+      fakeBrain: true,
+    });
+    restarted.start();
+    expect(restarted.lastBrainHandoff()?.toModel).toBe(durable?.toModel);
+    expect(restarted.lastBrainHandoff()?.landed).toBe(true);
+    const suppressed = restarted.evaluateBrainHandoff();
+    expect(suppressed?.shouldHandoff).toBe(false);
+    expect(suppressed?.reason ?? "").toContain("handoff cooldown");
+    restarted.stop();
+  });
+
+  it("fleet path prefers under-threshold xai over exhausted same-family openrouter", () => {
+    const home = temp("agentos-p8-handoff-healthy-");
     mkdirSync(join(home, "config"), { recursive: true });
     const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
     configService.installDefaults();
@@ -323,27 +469,22 @@ describe("Brain budget handoff", () => {
       windowSample(xaiId, "xai", 10, now),
     ];
 
-    // No fakeBrain and no Pi → start() enters BRAIN_DOWN after handoff.
     const service = new FleetService({
       home,
       config: configService,
       connections: registry,
       quotaSamples: () => samples,
       fakeTmux: true,
-      fakeBrain: false,
+      fakeBrain: true,
     });
     service.start();
     service.brain.handoff("anthropic/claude-sonnet-4-5", "test setup");
-    expect(service.brain.getSnapshot().status).toBe("down");
 
-    const first = service.evaluateBrainHandoff();
-    expect(first?.shouldHandoff).toBe(true);
-    expect(service.brain.getSnapshot().status).toBe("down");
-    expect(service.lastBrainHandoff()).toBeNull();
-
-    const second = service.evaluateBrainHandoff();
-    expect(second?.reason ?? "").not.toContain("cooldown");
-    expect(service.lastBrainHandoff()).toBeNull();
+    const decision = service.evaluateBrainHandoff();
+    expect(decision?.shouldHandoff).toBe(true);
+    // Same-family openrouter is over threshold; healthy xai must win.
+    expect(decision?.toModel).toBe("xai/grok-3");
+    expect(decision?.reason).not.toContain("only over-threshold refuge");
 
     service.stop();
   });
@@ -369,7 +510,7 @@ describe("Brain budget handoff", () => {
       config,
       budgets,
       samples: [sample(88, "estimate")],
-      candidates: ["anthropic/claude-sonnet-4-5"],
+      candidates: [{ model: "anthropic/claude-sonnet-4-5", worstWindowPct: null }],
     });
     expect(decision.shouldHandoff).toBe(true);
     expect(decision.basis).toBe("estimate");

@@ -24,7 +24,11 @@ import { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
 import { AfkService } from "./afk.js";
-import { decideHandoff } from "./brain-handoff.js";
+import {
+  decideHandoff,
+  worstWindowPctFromSample,
+  type HandoffCandidate,
+} from "./brain-handoff.js";
 
 export type FleetEventSink = (event: OrchestratorEvent) => void;
 
@@ -62,8 +66,10 @@ const DEFAULT_BRAIN_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = {
   "vercel-ai-gateway": "vercel-ai-gateway/anthropic/claude-sonnet-4-5",
 };
 
-/** Min interval between Brain handoffs — stops thrashing every heartbeat. */
+/** Min interval between successful Brain handoffs — stops thrashing every heartbeat. */
 const BRAIN_HANDOFF_COOLDOWN_MS = 5 * 60 * 1000;
+/** After a failed land, wait this long before reminting a session. */
+const BRAIN_HANDOFF_RETRY_BACKOFF_MS = 30 * 1000;
 
 /** Routing provider id = first segment of a `provider/…` model ref. */
 function modelRoutingProvider(model: string): string {
@@ -96,8 +102,12 @@ export class FleetService {
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   /** ctl.tool_result frames that failed sendControl; retried on session re-hello. */
   private readonly pendingToolResults = new Map<string, PendingToolResult[]>();
-  /** Last budget handoff — used to suppress thrash between over-threshold providers. */
-  private lastHandoff: { atMs: number; toModel: string } | null = null;
+  /**
+   * Last budget handoff attempt — seeded from durable handoff.json on boot so a
+   * restart cannot bypass the cooldown. `landed` selects success cooldown vs
+   * short retry backoff.
+   */
+  private lastHandoff: { atMs: number; toModel: string; landed: boolean } | null = null;
 
   constructor(private readonly options: FleetServiceOptions) {
     const cfg = options.config.effective().config;
@@ -146,6 +156,23 @@ export class FleetService {
     this.hydrateTasks();
     this.hydrateRedProofsFromEventLog();
     this.rehydrateRuntime();
+    this.seedHandoffCooldownFromDurable();
+  }
+
+  /**
+   * Seed the in-memory cooldown from the durable handoff record so a daemon
+   * bounce cannot immediately re-handoff while two providers stay over threshold.
+   */
+  private seedHandoffCooldownFromDurable(): void {
+    const durable = this.brain.durableHandoff();
+    if (durable === null) return;
+    const atMs = Date.parse(durable.at);
+    if (!Number.isFinite(atMs)) return;
+    this.lastHandoff = {
+      atMs,
+      toModel: durable.toModel,
+      landed: durable.landed,
+    };
   }
 
   onEvent(sink: FleetEventSink): void {
@@ -535,17 +562,21 @@ export class FleetService {
       return decision;
     }
 
-    // Suppress thrash: two over-threshold providers must not bounce the Brain
-    // into a new session on every reconcile tick.
+    // Suppress thrash: success uses a long cooldown; a failed land uses a short
+    // retry backoff so a broken spawn path cannot remint every reconcile tick.
     if (this.lastHandoff !== null) {
       const elapsed = Date.now() - this.lastHandoff.atMs;
-      if (elapsed < BRAIN_HANDOFF_COOLDOWN_MS) {
-        const remainingSec = Math.ceil((BRAIN_HANDOFF_COOLDOWN_MS - elapsed) / 1000);
+      const windowMs = this.lastHandoff.landed
+        ? BRAIN_HANDOFF_COOLDOWN_MS
+        : BRAIN_HANDOFF_RETRY_BACKOFF_MS;
+      if (elapsed < windowMs) {
+        const remainingSec = Math.ceil((windowMs - elapsed) / 1000);
+        const kind = this.lastHandoff.landed ? "handoff cooldown" : "handoff retry backoff";
         return {
           ...decision,
           shouldHandoff: false,
           toModel: null,
-          reason: `${decision.metric} at ${decision.observedPct}% crossed ${decision.thresholdPct}% but handoff cooldown has ${remainingSec}s remaining after move to ${this.lastHandoff.toModel}`,
+          reason: `${decision.metric} at ${decision.observedPct}% crossed ${decision.thresholdPct}% but ${kind} has ${remainingSec}s remaining after move to ${this.lastHandoff.toModel}`,
         };
       }
     }
@@ -561,37 +592,43 @@ export class FleetService {
       },
     });
     const after = this.brain.handoff(decision.toModel, decision.reason);
-    // Only latch cooldown when the refuge seat actually came up. A BRAIN_DOWN
-    // land must not block another try — fail toward retry, never stay down quietly.
-    if (after.status === "running") {
-      this.lastHandoff = { atMs: Date.now(), toModel: decision.toModel };
-    } else {
-      this.lastHandoff = null;
-    }
+    // Keep one inspectable record (also durable via BrainManager): success
+    // latches the long cooldown; failure latches only the short retry backoff.
+    this.lastHandoff = {
+      atMs: Date.now(),
+      toModel: decision.toModel,
+      landed: after.status === "running",
+    };
     return decision;
   }
 
-  /** Last budget handoff time/target, for inspectability and tests. */
-  lastBrainHandoff(): { atMs: number; toModel: string } | null {
+  /** Last budget handoff time/target/landed, for inspectability and tests. */
+  lastBrainHandoff(): { atMs: number; toModel: string; landed: boolean } | null {
     return this.lastHandoff;
   }
 
   /**
    * Models the Brain could be moved to: one per healthy, not-limit-reached
    * connection other than the one it is spending down. A connection at its own
-   * limit is not a refuge.
+   * limit is not a refuge. Includes worst-window metrics so decideHandoff can
+   * prefer under-threshold refuges.
    */
-  private handoffCandidates(currentModel: string): string[] {
+  private handoffCandidates(currentModel: string): HandoffCandidate[] {
     const connections = this.options.connections?.list() ?? [];
+    const samples = this.options.quotaSamples?.() ?? [];
     const currentProvider = modelRoutingProvider(currentModel);
-    const candidates: string[] = [];
+    const candidates: HandoffCandidate[] = [];
     for (const connection of connections) {
       if (connection.limitReached) continue;
       if (connection.health === "unhealthy") continue;
       if (connection.provider.toLowerCase() === currentProvider) continue;
       const model = DEFAULT_BRAIN_MODEL_BY_PROVIDER[connection.provider];
       if (model === undefined) continue;
-      candidates.push(model);
+      const sample = samples.find((s) => s.connectionId === connection.id);
+      candidates.push({
+        model,
+        worstWindowPct: worstWindowPctFromSample(sample),
+      });
     }
     return candidates;
   }

@@ -16,6 +16,9 @@ import { familyFromModel } from "../substrate/family.js";
  *   - the decision is made from PROBED windows where they are live, not from an
  *     estimate. An estimate may trigger a handoff, but it is labelled as such
  *     so the Captain can see why the Brain moved.
+ *
+ * A refuge that is itself past the threshold is not preferred: when samples are
+ * available, under-threshold candidates win; over-threshold ones are last resort.
  */
 
 export interface HandoffDecision {
@@ -30,6 +33,16 @@ export interface HandoffDecision {
   reason: string;
 }
 
+/** A replacement model plus its connection's worst window, when known. */
+export interface HandoffCandidate {
+  model: string;
+  /**
+   * Worst window percent for the candidate connection, or null when no sample
+   * is available (not proven over-threshold — still eligible as a refuge).
+   */
+  worstWindowPct: number | null;
+}
+
 /** Metric kinds that describe a plan window the Brain is spending down. */
 const WINDOW_KINDS = new Set([
   "session-window-pct",
@@ -39,14 +52,26 @@ const WINDOW_KINDS = new Set([
   "sdk-credit-pool",
 ]);
 
+/** Worst percent window metric on a sample, or null when none apply. */
+export function worstWindowPctFromSample(sample: QuotaSample | undefined): number | null {
+  if (sample === undefined) return null;
+  let worst: number | null = null;
+  for (const metric of sample.metrics) {
+    if (!WINDOW_KINDS.has(metric.kind)) continue;
+    if (metric.unit !== "percent") continue;
+    if (worst === null || metric.value > worst) worst = metric.value;
+  }
+  return worst;
+}
+
 export function decideHandoff(input: {
   brainModel: string | null;
   brainConnectionId: string | null;
   config: BrainConfig;
   budgets: BudgetsConfig;
   samples: QuotaSample[];
-  /** Candidate replacement models, already filtered to healthy connections. */
-  candidates: string[];
+  /** Candidate replacements, already filtered to healthy connections. */
+  candidates: HandoffCandidate[];
 }): HandoffDecision {
   const threshold = input.config.handoff.thresholdPct;
   const from = input.brainModel ?? "unknown";
@@ -88,8 +113,13 @@ export function decideHandoff(input: {
     };
   }
 
-  const target = pickTarget(input.config.handoff.target, input.brainModel, input.candidates);
-  if (target === null) {
+  const picked = pickTarget(
+    input.config.handoff.target,
+    input.brainModel,
+    input.candidates,
+    threshold,
+  );
+  if (picked === null) {
     return {
       shouldHandoff: false,
       fromModel: from,
@@ -103,33 +133,70 @@ export function decideHandoff(input: {
     };
   }
 
+  const baseReason = `${worst.kind} at ${worst.pct}% crossed the ${threshold}% threshold (${worst.tier})`;
   return {
     shouldHandoff: true,
     fromModel: from,
-    toModel: target,
+    toModel: picked.model,
     metric: worst.kind,
     observedPct: worst.pct,
     thresholdPct: threshold,
     basis: worst.tier,
-    reason: `${worst.kind} at ${worst.pct}% crossed the ${threshold}% threshold (${worst.tier})`,
+    reason: picked.usedOverThresholdRefuge
+      ? `${baseReason}; only over-threshold refuge available`
+      : baseReason,
   };
 }
 
 function pickTarget(
   strategy: BrainConfig["handoff"]["target"],
   currentModel: string,
-  candidates: string[],
-): string | null {
-  const currentFamily = familyFromModel(currentModel);
-  const usable = candidates.filter((c) => c !== currentModel);
+  candidates: HandoffCandidate[],
+  threshold: number,
+): { model: string; usedOverThresholdRefuge: boolean } | null {
+  const usable = candidates.filter((c) => c.model !== currentModel);
   if (usable.length === 0) return null;
+
+  // Prefer refuges not already past the threshold. Unknown samples count as
+  // eligible — only a measured over-threshold connection is demoted.
+  const underOrUnknown = usable.filter(
+    (c) => c.worstWindowPct === null || c.worstWindowPct < threshold,
+  );
+  const overThreshold = usable.filter(
+    (c) => c.worstWindowPct !== null && c.worstWindowPct >= threshold,
+  );
+
+  const fromPool = (pool: HandoffCandidate[]): string | null => {
+    if (pool.length === 0) return null;
+    const models = pool.map((c) => c.model);
+    return pickByFamily(strategy, currentModel, models);
+  };
+
+  const healthy = fromPool(underOrUnknown);
+  if (healthy !== null) {
+    return { model: healthy, usedOverThresholdRefuge: false };
+  }
+  const exhausted = fromPool(overThreshold);
+  if (exhausted !== null) {
+    return { model: exhausted, usedOverThresholdRefuge: true };
+  }
+  return null;
+}
+
+function pickByFamily(
+  strategy: BrainConfig["handoff"]["target"],
+  currentModel: string,
+  models: string[],
+): string | null {
+  if (models.length === 0) return null;
+  const currentFamily = familyFromModel(currentModel);
 
   if (strategy === "same-family-api-key") {
     // Prefer the same family so the Brain's behaviour stays comparable; fall
     // back to any other family rather than leaving the fleet without a Brain.
-    const sameFamily = usable.find((c) => familyFromModel(c) === currentFamily);
-    return sameFamily ?? usable[0] ?? null;
+    const sameFamily = models.find((c) => familyFromModel(c) === currentFamily);
+    return sameFamily ?? models[0] ?? null;
   }
-  const otherFamily = usable.find((c) => familyFromModel(c) !== currentFamily);
-  return otherFamily ?? usable[0] ?? null;
+  const otherFamily = models.find((c) => familyFromModel(c) !== currentFamily);
+  return otherFamily ?? models[0] ?? null;
 }
