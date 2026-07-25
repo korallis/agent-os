@@ -152,6 +152,8 @@ function SwarmActivityCard({
           <span>Usage snapshot unavailable</span>
         ) : axis.length > 0 ? (
           axis.map((d, i) => <span key={`${d.day}-${i}`}>{d.day.slice(5)}</span>)
+        ) : ready && analytics.truncated === true ? (
+          <span>Activity history incomplete — older frames may be outside the read bound</span>
         ) : (
           <span>No activity recorded yet</span>
         )}
@@ -208,7 +210,9 @@ function TokenConsumptionCard({
           : status === "unavailable"
             ? "Usage snapshot unavailable"
             : totals?.costCoverage === "partial"
-              ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost ($${cost?.toFixed(2) ?? "0.00"})`
+              ? cost !== null
+                ? `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost ($${cost.toFixed(2)})`
+                : `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost`
               : cost !== null
                 ? `$${cost.toFixed(2)} reported by providers`
                 : "Cost not reported by any connected provider"}
@@ -229,12 +233,21 @@ function TokenConsumptionCard({
             className="border-0 bg-transparent my-auto py-6"
           />
         ) : topModels.length === 0 ? (
-          <EmptyState
-            kind="no-data"
-            title="No model usage yet"
-            body="Spawn a crewmate to see consumption here."
-            className="border-0 bg-transparent my-auto py-6"
-          />
+          ready && analytics.truncated === true ? (
+            <EmptyState
+              kind="no-data"
+              title="Model history incomplete"
+              body="No model usage in the newest frames, but history was truncated at a read bound — older in-window usage may exist."
+              className="border-0 bg-transparent my-auto py-6"
+            />
+          ) : (
+            <EmptyState
+              kind="no-data"
+              title="No model usage yet"
+              body="Spawn a crewmate to see consumption here."
+              className="border-0 bg-transparent my-auto py-6"
+            />
+          )
         ) : (
           topModels.map((m) => {
             const total = m.inputTokens + m.outputTokens;
@@ -332,12 +345,21 @@ function TopAgentsCard({
             className="border-0 bg-transparent py-6"
           />
         ) : agents.length === 0 ? (
-          <EmptyState
-            kind="no-data"
-            title="No agent telemetry yet"
-            body="Per-role usage appears as crewmates report tokens."
-            className="border-0 bg-transparent py-6"
-          />
+          ready && analytics.truncated === true ? (
+            <EmptyState
+              kind="no-data"
+              title="Agent history incomplete"
+              body="No agent telemetry in the newest frames, but history was truncated at a read bound — older in-window usage may exist."
+              className="border-0 bg-transparent py-6"
+            />
+          ) : (
+            <EmptyState
+              kind="no-data"
+              title="No agent telemetry yet"
+              body="Per-role usage appears as crewmates report tokens."
+              className="border-0 bg-transparent py-6"
+            />
+          )
         ) : null}
         {ready &&
           agents.map((agent) => (

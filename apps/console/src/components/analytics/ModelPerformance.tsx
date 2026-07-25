@@ -75,7 +75,18 @@ export function ModelPerformance() {
   }
 
   const models = snapshot?.models ?? [];
+  const truncated = snapshot?.truncated === true;
+
   if (models.length === 0) {
+    if (truncated) {
+      return (
+        <EmptyState
+          kind="no-data"
+          title="Model history incomplete"
+          body="No model telemetry in the newest frames, but history was truncated at a read bound — older in-window usage may exist and is not shown."
+        />
+      );
+    }
     return (
       <EmptyState
         kind="no-data"
@@ -90,7 +101,7 @@ export function ModelPerformance() {
 
   return (
     <div className="flex flex-col gap-4">
-      {snapshot?.truncated === true && (
+      {truncated && (
         <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-2 text-[11px] text-warn">
           Window truncated — figures cover the most recent frames only.
         </div>

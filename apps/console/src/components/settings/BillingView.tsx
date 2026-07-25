@@ -67,6 +67,15 @@ function spendNote(
   return { text: "no provider reported cost", tone: "text-fg-3" };
 }
 
+/** 0 means the ceiling is unset — never render that as a $0.00 stop. */
+function formatUsdCap(value: number): string {
+  return value > 0 ? `$${value.toFixed(2)}` : "none";
+}
+
+function formatTokenCap(value: number): string {
+  return value > 0 ? value.toLocaleString() : "none";
+}
+
 export function BillingView() {
   const { events } = useEventStream();
   const refreshKey = useStickyRefreshKey(
@@ -137,22 +146,22 @@ export function BillingView() {
   const totals = analyticsReady ? analytics.totals : undefined;
   const coverage = totals?.costCoverage;
   const spend = spendNote(analyticsStatus, coverage, totals);
-  const windowDays = analytics?.windowDays ?? 14;
+  const windowDays = analyticsReady ? analytics.windowDays : null;
 
   return (
     <div className="flex flex-col gap-5">
       {analyticsReady && analytics.truncated === true && (
         <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
           Analytics history was truncated at a read bound — reported spend keeps the
-          newest frames and may omit older in-window usage inside the {windowDays}-day
-          range.
+          newest frames and may omit older in-window usage
+          {windowDays !== null ? ` inside the ${windowDays}-day range` : ""}.
         </div>
       )}
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1">
           <span className="text-[11px] uppercase tracking-wide text-fg-3">
-            Reported spend ({windowDays}d)
+            {windowDays !== null ? `Reported spend (${windowDays}d)` : "Reported spend"}
           </span>
           <span className="text-2xl font-semibold text-fg-1">
             {!analyticsReady || totals?.costUsd == null ? "—" : `$${totals.costUsd.toFixed(2)}`}
@@ -162,11 +171,7 @@ export function BillingView() {
         <div className="rounded-2xl border border-line-2 bg-panel px-4 py-3 flex flex-col gap-1">
           <span className="text-[11px] uppercase tracking-wide text-fg-3">Fleet ceiling</span>
           <span className="text-2xl font-semibold text-fg-1">
-            {budgets === null
-              ? "—"
-              : budgets.gatewayHardUsd > 0
-                ? `$${budgets.gatewayHardUsd.toFixed(2)}`
-                : "none"}
+            {budgets === null ? "—" : formatUsdCap(budgets.gatewayHardUsd)}
           </span>
           <Link href="/policies" className="text-[11px] text-teal-brand">
             Edit in Policies ▸ Budgets →
@@ -251,10 +256,13 @@ export function BillingView() {
         <section className="rounded-2xl border border-line-2 bg-panel p-5 flex flex-col gap-2">
           <h3 className="text-[15px] font-semibold text-fg-1">Configured ceilings</h3>
           {[
-            { label: "Per-task", value: `$${budgets.perTaskUsd.toFixed(2)}` },
-            { label: "Claude extra-usage daily", value: `$${budgets.claudeExtraUsageDailyUsd.toFixed(2)}` },
-            { label: "Gateway hard cap (fleet)", value: `$${budgets.gatewayHardUsd.toFixed(2)}` },
-            { label: "Brain tokens per day", value: budgets.brainTokensPerDay.toLocaleString() },
+            { label: "Per-task", value: formatUsdCap(budgets.perTaskUsd) },
+            {
+              label: "Claude extra-usage daily",
+              value: formatUsdCap(budgets.claudeExtraUsageDailyUsd),
+            },
+            { label: "Gateway hard cap (fleet)", value: formatUsdCap(budgets.gatewayHardUsd) },
+            { label: "Brain tokens per day", value: formatTokenCap(budgets.brainTokensPerDay) },
           ].map((row) => (
             <div key={row.label} className="flex items-center justify-between text-[12px]">
               <span className="text-fg-3">{row.label}</span>

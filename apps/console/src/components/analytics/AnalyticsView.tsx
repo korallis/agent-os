@@ -45,13 +45,27 @@ function formatRowCost(
   return `$${costUsd.toFixed(2)}`;
 }
 
-function costNote(totals: AnalyticsSnapshot["totals"] | undefined, windowDays: number): string {
-  if (totals === undefined) return `over ${windowDays}d`;
+function costNote(
+  totals: AnalyticsSnapshot["totals"] | undefined,
+  windowDays: number | null,
+): string {
+  if (totals === undefined) {
+    return windowDays === null ? "window unknown" : `over ${windowDays}d`;
+  }
   if (totals.costCoverage === "absent") return "not reported by providers";
   if (totals.costCoverage === "partial") {
     return `partial — ${totals.costReportedRequests} of ${totals.requests} requests reported cost`;
   }
-  return `over ${windowDays}d`;
+  return windowDays === null ? "reported cost" : `over ${windowDays}d`;
+}
+
+/** 0 means the ceiling is unset — never render that as a configured $0.00 stop. */
+function formatUsdCap(value: number): string {
+  return value > 0 ? `$${value.toFixed(2)}` : "none";
+}
+
+function formatTokenCap(value: number): string {
+  return value > 0 ? value.toLocaleString() : "none";
 }
 
 function Card({ className, children }: { className?: string; children: React.ReactNode }) {
@@ -114,7 +128,10 @@ export function AnalyticsView() {
   const anyModelCost = models.some((m) => m.costUsd !== null);
   const useModelCostDonut =
     totals?.costCoverage === "complete" && anyModelCost && modelCostTotal > 0;
-  const windowDays = snapshot?.windowDays ?? 14;
+  const windowDays = snapshotReady ? snapshot.windowDays : null;
+  const truncated = snapshotReady && snapshot.truncated === true;
+  const windowNote =
+    windowDays === null ? "" : ` · last ${windowDays}d`;
 
   const pendingNote = snapshotStatus === "loading" ? "loading…" : "unavailable";
 
@@ -130,7 +147,7 @@ export function AnalyticsView() {
       value: tokensUsed === null ? "—" : compact(tokensUsed),
       note: !snapshotReady
         ? pendingNote
-        : `${totals?.requests ?? 0} requests · last ${windowDays}d`,
+        : `${totals?.requests ?? 0} requests${windowNote}`,
       noteClass: "text-fg-3",
     },
     {
@@ -138,7 +155,7 @@ export function AnalyticsView() {
       value: !snapshotReady ? "—" : String(totals?.tasksDone ?? 0),
       note: !snapshotReady
         ? pendingNote
-        : `${totals?.tasksTotal ?? 0} created · last ${windowDays}d`,
+        : `${totals?.tasksTotal ?? 0} created${windowNote}`,
       noteClass: "text-fg-3",
     },
     {
@@ -183,16 +200,16 @@ export function AnalyticsView() {
           <AnalyticsSubnav />
           <span className="flex items-center gap-2 h-9 rounded-lg bg-panel border border-line-1 px-3.5 text-[13px] font-medium text-fg-1">
             <Icon src="calendar.svg" className="size-4" />
-            Last {windowDays} days
+            {windowDays === null ? "Window —" : `Last ${windowDays} days`}
           </span>
         </div>
       </div>
 
-      {snapshot?.truncated === true && (
+      {truncated && (
         <div className="rounded-xl border border-warn/30 bg-warn/[0.06] px-4 py-3 text-[12px] text-warn">
           Analytics history was truncated at a read bound — figures keep the newest
           frames and may omit older in-window usage or pre-window session attribution
-          inside the {windowDays}-day range.
+          {windowDays !== null ? ` inside the ${windowDays}-day range` : ""}.
         </div>
       )}
 
@@ -227,12 +244,21 @@ export function AnalyticsView() {
                 className="border-0 bg-transparent py-10"
               />
             ) : daily.every((d) => d.inputTokens + d.outputTokens === 0) ? (
-              <EmptyState
-                kind="no-data"
-                title="No usage recorded yet"
-                body="Token consumption appears here as providers report usage frames."
-                className="border-0 bg-transparent py-10"
-              />
+              truncated ? (
+                <EmptyState
+                  kind="no-data"
+                  title="Usage history incomplete"
+                  body="No token consumption in the newest frames, but history was truncated at a read bound — older in-window usage may exist."
+                  className="border-0 bg-transparent py-10"
+                />
+              ) : (
+                <EmptyState
+                  kind="no-data"
+                  title="No usage recorded yet"
+                  body="Token consumption appears here as providers report usage frames."
+                  className="border-0 bg-transparent py-10"
+                />
+              )
             ) : (
               <div className="flex items-end gap-3 h-[180px]">
                 {daily.map((d) => {
@@ -267,12 +293,21 @@ export function AnalyticsView() {
                 className="border-0 bg-transparent py-6"
               />
             ) : agents.length === 0 ? (
-              <EmptyState
-                kind="no-data"
-                title="No agent telemetry yet"
-                body="Per-role usage appears after crewmates report ext.usage frames."
-                className="border-0 bg-transparent py-6"
-              />
+              truncated ? (
+                <EmptyState
+                  kind="no-data"
+                  title="Agent history incomplete"
+                  body="No agent telemetry in the newest frames, but history was truncated at a read bound — older in-window usage may exist."
+                  className="border-0 bg-transparent py-6"
+                />
+              ) : (
+                <EmptyState
+                  kind="no-data"
+                  title="No agent telemetry yet"
+                  body="Per-role usage appears after crewmates report ext.usage frames."
+                  className="border-0 bg-transparent py-6"
+                />
+              )
             ) : (
               <>
                 <div className="flex items-center h-8 text-[11px] text-fg-3 border-b border-line-1">
@@ -320,12 +355,21 @@ export function AnalyticsView() {
                 className="border-0 bg-transparent py-6"
               />
             ) : models.length === 0 ? (
-              <EmptyState
-                kind="no-data"
-                title="No model usage yet"
-                body="Per-model cost and tokens appear once providers report usage."
-                className="border-0 bg-transparent py-6"
-              />
+              truncated ? (
+                <EmptyState
+                  kind="no-data"
+                  title="Model history incomplete"
+                  body="No model usage in the newest frames, but history was truncated at a read bound — older in-window usage may exist."
+                  className="border-0 bg-transparent py-6"
+                />
+              ) : (
+                <EmptyState
+                  kind="no-data"
+                  title="No model usage yet"
+                  body="Per-model cost and tokens appear once providers report usage."
+                  className="border-0 bg-transparent py-6"
+                />
+              )
             ) : (
               <>
                 <div className="flex items-center justify-center py-2">
@@ -416,9 +460,13 @@ export function AnalyticsView() {
             )}
             {budgets !== null && (
               <div className="flex flex-col gap-1 text-[11px] text-fg-3">
-                <span>Per-task cap: ${budgets.perTaskUsd.toFixed(2)} (not a fleet ceiling)</span>
-                <span>Brain tokens/day cap: {budgets.brainTokensPerDay.toLocaleString()}</span>
-                <span>Claude extra-usage daily: ${budgets.claudeExtraUsageDailyUsd.toFixed(2)}</span>
+                <span>
+                  Per-task cap: {formatUsdCap(budgets.perTaskUsd)} (not a fleet ceiling)
+                </span>
+                <span>Brain tokens/day cap: {formatTokenCap(budgets.brainTokensPerDay)}</span>
+                <span>
+                  Claude extra-usage daily: {formatUsdCap(budgets.claudeExtraUsageDailyUsd)}
+                </span>
               </div>
             )}
           </Card>
