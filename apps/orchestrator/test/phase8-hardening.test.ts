@@ -230,3 +230,92 @@ describe("signed self-update", () => {
     expect(rolled.reason).toContain("no retained previous version");
   });
 });
+
+describe("analytics breakdowns reconcile with the totals", () => {
+  const spawnedAt = new Date().toISOString();
+
+  function usageEvent(sessionId: string, provider: string, input: number, output: number) {
+    return {
+      id: `01JEVT${sessionId}${input}`,
+      seq: 1,
+      ts: spawnedAt,
+      event: {
+        type: "ext.usage" as const,
+        payload: {
+          sessionId,
+          provider,
+          model: "m1",
+          inputTokens: input,
+          outputTokens: output,
+          costUsd: null,
+          requestId: null,
+        },
+      },
+    };
+  }
+
+  it("splits by billing surface and Brain lane without losing a single token", async () => {
+    const { AnalyticsService } = await import("../src/analytics/service.js");
+    const service = new AnalyticsService(
+      () => ({
+        events: [
+          usageEvent("SBRAIN", "anthropic", 100, 50),
+          usageEvent("SCREW1", "anthropic", 200, 30),
+          usageEvent("SCREW2", "openai", 40, 10),
+        ] as never,
+        truncated: false,
+      }),
+      () => [],
+      () => ({
+        facts: [
+          { sessionId: "SBRAIN", role: "brain", model: "anthropic/x", taskId: null },
+          { sessionId: "SCREW1", role: "builder", model: "anthropic/x", taskId: "t1" },
+          { sessionId: "SCREW2", role: "validator", model: "openai/y", taskId: "t1" },
+        ],
+        truncated: false,
+      }),
+      () => [
+        { provider: "anthropic", billingSurface: "plan-quota" },
+        { provider: "openai", billingSurface: "api-metered" },
+      ],
+    );
+
+    const snapshot = service.snapshot({ days: 1 });
+    expect(snapshot.totals.inputTokens).toBe(340);
+    expect(snapshot.totals.outputTokens).toBe(90);
+
+    // The whole point of the reconcile: every breakdown sums back exactly.
+    expect(snapshot.reconcile.exact).toBe(true);
+    expect(snapshot.reconcile.billingSurfacesMatchTotals).toBe(true);
+    expect(snapshot.reconcile.brainPlusCrewMatchTotals).toBe(true);
+
+    expect(snapshot.brain.brainInputTokens).toBe(100);
+    expect(snapshot.brain.crewInputTokens).toBe(240);
+
+    const surfaces = Object.fromEntries(
+      snapshot.billingSurfaces.map((s) => [s.surface, s.inputTokens]),
+    );
+    expect(surfaces["plan-quota"]).toBe(300);
+    expect(surfaces["api-metered"]).toBe(40);
+  });
+
+  it("buckets a provider with conflicting billing surfaces as unattributed, not a guess", async () => {
+    const { AnalyticsService } = await import("../src/analytics/service.js");
+    const service = new AnalyticsService(
+      () => ({ events: [usageEvent("S1", "anthropic", 10, 5)] as never, truncated: false }),
+      () => [],
+      () => ({ facts: [], truncated: false }),
+      // Two connections on the same provider billing differently: a usage frame
+      // naming only the provider genuinely cannot be attributed to either.
+      () => [
+        { provider: "anthropic", billingSurface: "plan-quota" },
+        { provider: "anthropic", billingSurface: "api-metered" },
+      ],
+    );
+
+    const snapshot = service.snapshot({ days: 1 });
+    expect(snapshot.billingSurfaces).toHaveLength(1);
+    expect(snapshot.billingSurfaces[0]?.surface).toBe("unattributed");
+    expect(snapshot.reconcile.exact).toBe(true);
+  });
+});

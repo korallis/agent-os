@@ -18,11 +18,14 @@ interface IconProps {
  */
 export function Icon({ src, className, tint, alt = "" }: IconProps) {
   const url = `/figma/${src}`;
+  // An icon with no alt text is decorative — almost always inside a link or
+  // button that already names itself. Announcing it as an image with an empty
+  // name adds a nameless stop for screen-reader users, so hide it instead.
+  const decorative = alt.length === 0;
   if (tint) {
     return (
       <span
-        role="img"
-        aria-label={alt}
+        {...(decorative ? { "aria-hidden": true } : { role: "img", "aria-label": alt })}
         className={cn("inline-block shrink-0", className)}
         style={{
           backgroundColor: tint,
@@ -37,5 +40,12 @@ export function Icon({ src, className, tint, alt = "" }: IconProps) {
     );
   }
   // eslint-disable-next-line @next/next/no-img-element -- exact Figma asset bytes
-  return <img src={url} alt={alt} className={cn("block shrink-0", className)} />;
+  return (
+    <img
+      src={url}
+      alt={alt}
+      {...(decorative ? { "aria-hidden": true } : {})}
+      className={cn("block shrink-0", className)}
+    />
+  );
 }

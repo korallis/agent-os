@@ -1,16 +1,16 @@
 {
   "capturedAgainst": {
-    "daemonPort": 5348,
-    "consolePort": 3618
+    "daemonPort": 5309,
+    "consolePort": 3630
   },
   "seeded": {
-    "projectId": "01KYDC0Q5V4FVEGCVEMKBB17J7",
-    "taskA": "01KYDC0Q64QYF995BF6CMTK8CK",
-    "taskB": "01KYDC0QA3KHQKZ3G9Q2TZE90G",
-    "taskC": "01KYDC0QEJV8025ZQFDX8NYYRR",
-    "sessionId": "01KYDC0Q7Z5DTGWF94095FZ476",
-    "fusionRunId": "01KYDC0QAW4JFD56EK811A1XCQ",
-    "connectionId": "01KYDC0QHQQ4Y9W5X59KPHJG7Z"
+    "projectId": "01KYDDB09NKDZGMR1G1R7N883C",
+    "taskA": "01KYDDB09Y7X2DKNXPCD0C47MM",
+    "taskB": "01KYDDB0DXWCN0QPR4A2511DWX",
+    "taskC": "01KYDDB0J8VBHAJFRZ0ASQJTHZ",
+    "sessionId": "01KYDDB0BSCR4MJM86M6VX4GCY",
+    "fusionRunId": "01KYDDB0EQPZ4E3RG0J31NRZZQ",
+    "connectionId": "01KYDDB0NJRSB42Y26KY3FG4G2"
   },
   "shots": [
     {
@@ -27,13 +27,13 @@
     },
     {
       "name": "task-detail-validation",
-      "path": "/tasks/01KYDC0Q64QYF995BF6CMTK8CK",
+      "path": "/tasks/01KYDDB09Y7X2DKNXPCD0C47MM",
       "note": "Brain decision lane + FAIL vs GATE_ERROR evidence",
       "status": 200
     },
     {
       "name": "task-detail-fusion",
-      "path": "/tasks/01KYDC0QA3KHQKZ3G9Q2TZE90G",
+      "path": "/tasks/01KYDDB0DXWCN0QPR4A2511DWX",
       "note": "Clean-room /fusion columns with byte-identical prompt proof",
       "status": 200
     },
@@ -111,13 +111,13 @@
     },
     {
       "name": "session-detail",
-      "path": "/sessions/01KYDC0Q7Z5DTGWF94095FZ476",
+      "path": "/sessions/01KYDDB0BSCR4MJM86M6VX4GCY",
       "note": "Seat model, tmux pane, attach command, agent log",
       "status": 200
     },
     {
       "name": "terminal-attach",
-      "path": "/sessions/01KYDC1J4DEHX524CDDP75PBS9",
+      "path": "/sessions/01KYDDBWC2ZWWWFW1WN0VQR05A",
       "note": "Read-only ticketed terminal streaming a live tmux pane",
       "status": 200
     },

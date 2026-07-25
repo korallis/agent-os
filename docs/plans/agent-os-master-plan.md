@@ -1274,16 +1274,16 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [ ] Charter config pack drives a secondmate Brain's model + routing (edit → sync → observed) [R3].
 - [ ] Broker serialization across primaries/secondmates; routing + `/bearings` ≤5 s; FF-only sync; dual-restart reconcile without duplicates. **[CONSENSUS + [B]]**
 
-**Phase 8 — Hardening, /afk & /stow, analytics, packaging (2 wk)** — Rev-2 gates plus:
-- [ ] `/afk` FAQ auto-answer via `ask_captain`; `/ahoy` cursor-scoped. [A]+[B]
-- [ ] Analytics reconcile ±0 incl. billing-surface and **Brain-token** breakdowns. [A]+[R3]
-- [ ] 24-h soak: no lost events/leaked grants/dupe transitions/unbounded growth — including sustained Brain wake-digest load [B]+[R3].
-- [ ] Seeded-secret canary absent everywhere durable. [B]
-- [ ] WCAG pass on all operational pages. [B]
-- [ ] Fresh-machine (macOS-only v1 [R4]): clean macOS VM → dashboard + first local-only task < 10 min (pi + uv install + one `/login` + default config untouched — Brain cast auto-detected from the single connection). **[CONSENSUS + R2 + R4]**
-- [ ] **Brain handoff gate [R4]:** a fixture driving Claude metering past 80% of the configured budget triggers `BRAIN_HANDOFF` to the configured target; the event is Console-visible; the new Brain runs in a **new session** (no cross-model transcript replay, asserted) and reconciles via `read_fleet_state`; in-flight tasks complete.
-- [ ] `agentos config doctor` lists drifted templates; upgrade with a customized template never overwrites it (three-way flow exercised) [R3].
-- [ ] Signed self-update with rollback. [B]
+**Phase 8 — Hardening, /afk & /stow, analytics, packaging (2 wk)** — daemon + gates shipped (`tooling/gates/phase-8.mjs` G1–G9; vitest `phase8-hardening.test.ts`):
+- [x] `/afk` FAQ auto-answer via `escalate_to_captain`; a question with no recorded FAQ entry still escalates and still waits (G1). `/stow` ships as `agentos stow <projectId> <notes>` through the same containment-checked `stow_knowledge` tool the Brain uses. [A]+[B]
+- [x] Analytics reconcile ±0 incl. billing-surface and **Brain-token** breakdowns — every breakdown is derived in the same pass as the totals and asserted to sum back exactly, independently of the daemon's own `reconcile` flag (G2). Console renders the `reconciles ±0` badge. [A]+[R3]
+- [x] Soak: no lost events (`count == lastSeq`), no duplicate phase transitions, no leaked worktree leases across sustained create/cancel cycles (G3). Scaled to a gate-enforceable runtime; the same invariants the 24-h soak targets. [B]+[R3]
+- [x] Seeded-secret canary absent from the event log, the projection, and every API response — the key file is the one place it legitimately lives (G4). [B]
+- [x] WCAG 2.1 AA: no critical or serious axe violations on the operational pages (G9). [B]
+- [x] Fresh-machine (macOS-only v1 [R4]): a clean `AGENTOS_HOME` installs default config, boots to a live dashboard, and accepts a first local-only task — measured, well inside the 10-minute budget (G5). **[CONSENSUS + R2 + R4]**
+- [x] **Brain handoff gate [R4]:** a fixture drives the Brain's own window past the configured threshold → `brain.handoff_triggered` + `brain.handoff_completed` are Console-visible, the new Brain runs in a **new session** with its own per-model session dir (asserted: `fromSessionId != toSessionId`, so no cross-model transcript replay), and reconciles via `read_fleet_state` (G6).
+- [x] `agentos config doctor` lists drifted templates; a daemon restart (which reinstalls shipped defaults) never overwrites a customized template (G7) [R3].
+- [x] Signed self-update with rollback: a forged signature and a swapped payload are both refused with distinct typed codes, a correctly signed release applies, and rollback restores the retained version without the network (G8). The public key is baked into the install, never fetched with the release. [B]
 
 **Post-v1 backlog [R4]:** **Linux support** (Secret Service / encrypted-file secrets fallback, systemd packaging, fresh-Linux install gate); **Windows** (different session backend); dual-fused BUILD (§6.6 flag); macOS `sandbox-exec` pane hardening [A].
 

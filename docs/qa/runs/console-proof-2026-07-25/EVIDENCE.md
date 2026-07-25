@@ -69,6 +69,20 @@ and a Captain escalation so the wake queue and alerts have real rows.
 
 `fleet-mobile.png`, `notifications-mobile.png` at 390×844.
 
+## Accessibility
+
+Captured after the Phase 8 WCAG pass. Three real defects were found by axe-core and fixed:
+
+- `--color-fg-3` was `#666666` per Figma, measuring **3.2:1** on `--color-panel` — below the AA
+  floor of 4.5:1 for the 11px labels it is used for. Raised to `#8a8a8a`, which clears 4.5:1 on
+  both dark surfaces while staying visibly subordinate to `fg-2`.
+- Decorative icons rendered as `role="img"` with an empty label, adding nameless stops for
+  screen-reader users inside links that already name themselves. They are now `aria-hidden`.
+- The settings scroll region had no focusable content, so a keyboard-only user could not scroll
+  it. It is now focusable.
+
+The operational pages now report **zero critical or serious violations** (`tooling/gates/phase-8.mjs` G9).
+
 ## Honesty note
 
 Several panels render empty states in this capture (for example "No agent telemetry yet"
