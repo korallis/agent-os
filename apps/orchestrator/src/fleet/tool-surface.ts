@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { monotonicFactory } from "ulid";
 import { ZodError } from "zod";
@@ -34,6 +34,9 @@ import {
   type DaemonControlFrame,
   type FleetSession,
   type FleetStateSnapshot,
+  type FusionRun,
+  type FusionSide,
+  type PromptTemplateInfo,
   type OrchestratorEvent,
   type RoleCast,
   type TaskPhase,
@@ -53,6 +56,7 @@ import {
   canRunGate,
   canSpawnBuilder,
   canSpawnScout,
+  canTransition,
   IllegalTransitionError,
   isTerminalPhase,
 } from "../substrate/task-machine.js";
@@ -61,6 +65,16 @@ import type { WorktreePool } from "./worktree-pool.js";
 import type { TmuxController } from "./tmux.js";
 import type { WakeWatcher } from "./watcher.js";
 import type { GateRunner } from "./gate-runner.js";
+import type { FusionRunStore } from "./fusion-runs.js";
+import { SessionKeyStore } from "./sessions.js";
+import type { PromptService } from "../prompts/service.js";
+
+/** Shipped instruction template per fusion kind (overridable per call/project). */
+const DEFAULT_FUSION_TEMPLATES: Record<"opinion" | "fusion" | "plan-fusion", string> = {
+  opinion: "fusion/opinion.md",
+  fusion: "fusion/fusion.md",
+  "plan-fusion": "fusion/fusion.md",
+};
 
 export type ToolEventSink = (event: OrchestratorEvent) => void;
 
@@ -79,14 +93,15 @@ export interface SessionChannel {
 }
 
 /**
- * Tools a non-Brain session may call over its own socket. Strictly read-only
- * plus report-upward (`notify_captain`); everything that writes or moves the
- * fleet is Brain-only (or Captain REST).
+ * Tools a non-Brain session may call over its own socket. Strictly self-scoped:
+ * read own task/policy and report upward. Never `read_run_artifacts` — that
+ * would let an /opinion side cross-read peer artifacts and break clean-room
+ * independence. Everything that writes, moves the fleet, or reads run trees
+ * is Brain-only (or Captain REST).
  */
 const CREW_ALLOWED_TOOLS = new Set<BrainToolName>([
   "read_task",
   "read_policy",
-  "read_run_artifacts",
   "notify_captain",
 ]);
 
@@ -121,6 +136,10 @@ export interface ToolSurfaceDeps {
   tmux: TmuxController;
   watcher: WakeWatcher;
   gates: GateRunner;
+  fusionRuns: FusionRunStore;
+  sessionKeys: SessionKeyStore;
+  /** Layered prompt packs; absent only in fixtures that never dispatch fusion. */
+  prompts?: PromptService;
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
@@ -150,6 +169,18 @@ export class ToolSurface {
   private readonly failLines = new Map<string, string[]>();
   private readonly questions = new Map<string, PendingQuestion>();
   private brainSessionId: string | null = null;
+  /**
+   * sessionId → fusion side ownership for O(1) usage attribution and settle
+   * completion. Lifetime is owned by clearFusionRunSessionState only: entries
+   * stay until the whole run completes so late ext.usage after agent_settled
+   * or session_end still attributes while siblings are in flight.
+   */
+  private readonly fusionBySessionId = new Map<
+    string,
+    { taskId: string; runId: string; sideIndex: number }
+  >();
+  /** sessionId → SessionKeyStore directory for this spawn. */
+  private readonly sessionDirs = new Map<string, string>();
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -175,6 +206,38 @@ export class ToolSurface {
     this.brain = brain;
     this.brainDown = brain.status === "down";
     this.deps.watcher.setBrainDown(this.brainDown);
+  }
+
+  /**
+   * Attribute an `ext.usage` frame to the fusion side that owns its session.
+   * No-op for sessions that are not part of a fusion run.
+   */
+  attributeFusionUsage(
+    sessionId: string,
+    usage: { inputTokens: number | null; outputTokens: number | null; costUsd: number | null },
+  ): void {
+    const ref = this.fusionBySessionId.get(sessionId);
+    if (ref === undefined) return;
+    this.deps.fusionRuns.recordSideUsage(
+      ref.taskId,
+      ref.runId,
+      sessionId,
+      usage,
+      ref.sideIndex,
+    );
+  }
+
+  /** Fusion runs recorded for a task, newest first. */
+  listFusionRuns(taskId: string): FusionRun[] {
+    return this.deps.fusionRuns.listForTask(taskId);
+  }
+
+  /**
+   * Session directory for a {project, role, model} triple. A changed model
+   * yields a different key, so transcripts never cross model families.
+   */
+  ensureSessionKey(input: { projectId: string; role: string; model: string }): string {
+    return this.deps.sessionKeys.ensure(input).dir;
   }
 
   /** The session id whose extension channel is allowed to orchestrate. */
@@ -292,6 +355,64 @@ export class ToolSurface {
   }
 
   /**
+   * Rebuild fusion side ownership from durable run.json after a daemon restart.
+   * Sides with a sessionId that have not yet settled remain in-flight so
+   * settle/session_end can still write artifacts and emit fusion.completed.
+   * Open runs are then reconciled via the shared finalize path so a kill-9
+   * mid-dispatch (null sessionId), halt-without-settle (stopped/settled
+   * without settledAt), missing pane, or all-settled-missing-completedAt
+   * cannot leave a run permanently on fusion.dispatched.
+   */
+  hydrateFusionOwnership(): void {
+    for (const task of this.tasks.values()) {
+      for (const run of this.deps.fusionRuns.listForTask(task.id)) {
+        if (run.completedAt != null) continue;
+        run.sides.forEach((side, sideIndex) => {
+          if (side.sessionId === null) return;
+          if (side.settledAt != null || side.artifactPath !== null) return;
+          this.fusionBySessionId.set(side.sessionId, {
+            taskId: task.id,
+            runId: run.runId,
+            sideIndex,
+          });
+          const key = SessionKeyStore.computeKey({
+            projectId: task.projectId,
+            role: side.role,
+            model: side.model,
+          });
+          const record = this.deps.sessionKeys.get(key);
+          if (record !== null) {
+            this.sessionDirs.set(side.sessionId, record.dir);
+          }
+        });
+      }
+    }
+
+    // Boot counterpart of halt finalize: any side that can no longer make
+    // progress on its own (never spawned, non-live status, missing pane),
+    // plus all-settled-missing-completedAt. One shared helper so boot cannot
+    // diverge from runtime.
+    for (const task of this.tasks.values()) {
+      for (const run of this.deps.fusionRuns.listForTask(task.id)) {
+        if (run.completedAt != null) continue;
+        const hasNeverSpawned = run.sides.some(
+          (s) =>
+            s.sessionId === null &&
+            s.settledAt == null &&
+            s.artifactPath === null,
+        );
+        this.finalizeOpenFusionRun(
+          task.id,
+          run.runId,
+          hasNeverSpawned
+            ? "fusion side never spawned (daemon interrupted mid-dispatch)"
+            : undefined,
+        );
+      }
+    }
+  }
+
+  /**
    * After boot hydrate: re-open per-session listeners for non-terminal live
    * sessions so surviving Pi panes can re-hello.
    */
@@ -322,6 +443,70 @@ export class ToolSurface {
       lost.push(session.sessionId);
     }
     return lost;
+  }
+
+  /**
+   * Boot/restart reconcile for the session-key gate (master plan §6.5 / G6).
+   *
+   * For each non-terminal task that already has crewmate sessions, compare the
+   * resolved cast against SessionKeyStore and respawn ONLY roles whose session
+   * directory is absent — surviving dirs (and their live panes) are left alone.
+   * Live sessions whose key dir vanished are marked lost before respawn so a
+   * wiped directory cannot leave an orphan "running" row blocking the gate.
+   */
+  reconcileMissingCastRoles(): Array<{ taskId: string; role: string; model: string }> {
+    const respawned: Array<{ taskId: string; role: string; model: string }> = [];
+    for (const task of this.listTasks()) {
+      if (isTerminalPhase(task.phase)) continue;
+      if (task.cast.length === 0 || task.sessions.length === 0) continue;
+
+      const expected = task.cast.map((c) => ({ role: c.role, model: c.model }));
+      const missing = this.deps.sessionKeys.missingRoles(task.projectId, expected);
+      for (const slot of missing) {
+        const castEntry = task.cast.find(
+          (c) => c.role === slot.role && c.model === slot.model,
+        );
+        if (castEntry === undefined) continue;
+        try {
+          for (const s of [...this.sessions.values()]) {
+            if (
+              s.taskId === task.id &&
+              s.role === slot.role &&
+              s.model === slot.model &&
+              (s.status === "starting" || s.status === "running" || s.status === "settled")
+            ) {
+              this.markSessionLost(
+                s.sessionId,
+                "session-key directory missing (reconcile)",
+              );
+            }
+          }
+          this.spawnCrewmate({
+            taskId: task.id,
+            role: castEntry.role,
+            model: castEntry.model,
+            thinking: castEntry.thinking,
+            cleanRoom: castEntry.cleanRoom,
+            vars: {},
+          });
+          respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
+        } catch (error) {
+          // A failed respawn must not abort boot-time rehydrate or sibling slots.
+          const message = error instanceof Error ? error.message : String(error);
+          const summary = `session-key reconcile failed to respawn ${slot.role}/${slot.model} for task ${task.id}: ${message}`;
+          this.sink({
+            type: "captain.escalation",
+            payload: {
+              taskId: task.id,
+              summary,
+              severity: "warn",
+            },
+          });
+          process.stderr.write(`[agentos] ${summary}\n`);
+        }
+      }
+    }
+    return respawned;
   }
 
   invoke(
@@ -926,13 +1111,55 @@ export class ToolSurface {
       );
     }
 
+    // Per-model session key: a model change yields a new directory so transcripts
+    // never cross families. buildPiSpawnSpec hands it to Pi via --session-dir +
+    // PI_CODING_AGENT_SESSION_DIR; AGENTOS_SESSION_DIR is extension output only.
+    // Preflight before ensure; remove a newly created key dir on launch failure
+    // so missingRoles does not treat an orphan as "role present".
+    const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
+    const piDetection = this.deps.pi;
+    const extensionPath = this.deps.extensionPath;
+    const sessionKeyInput = {
+      projectId: task.projectId,
+      role: input.role,
+      model: input.model,
+    };
+    let sessionKeyCreated = false;
+
     try {
-      const fake = this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1";
+      if (!fake) {
+        if (piDetection?.binary == null) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
+          );
+        }
+        if (extensionPath === undefined || !existsSync(extensionPath)) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
+          );
+        }
+      }
+
+      const sessionKeyExisted = this.deps.sessionKeys.has(sessionKeyInput);
+      const sessionDir = this.deps.sessionKeys.ensure(sessionKeyInput).dir;
+      sessionKeyCreated = !sessionKeyExisted;
+      this.sessionDirs.set(sessionId, sessionDir);
 
       let tmuxWindow = `agentos:${windowName}`;
       if (fake) {
-        // Stay alive so pane-liveness reconcile does not spuriously SESSION_LOST
-        // the moment a short-lived `echo` exits under real tmux.
+        // Deterministic side output so fusion gates can assert artifacts without
+        // a paid model. Per-session path matches the real extension layout so
+        // sequential runs never share a file. Stay alive so pane-liveness
+        // reconcile does not spuriously SESSION_LOST on short-lived echo.
+        const outputsDir = join(sessionDir, "outputs");
+        mkdirSync(outputsDir, { recursive: true, mode: 0o700 });
+        writeFileSync(
+          join(outputsDir, `${sessionId}.md`),
+          `fake-pi ${input.role} ${input.model} session=${sessionId}\n`,
+          { mode: 0o600 },
+        );
         this.deps.tmux.newWindow({
           windowName,
           argv: [
@@ -943,21 +1170,6 @@ export class ToolSurface {
           cwd,
         });
       } else {
-        if (this.deps.pi?.binary == null) {
-          throw new ToolSurfaceError(
-            "PI_UNAVAILABLE",
-            "Pi is not installed — run onboarding to install the pinned Pi before spawning crewmates",
-          );
-        }
-        if (
-          this.deps.extensionPath === undefined ||
-          !existsSync(this.deps.extensionPath)
-        ) {
-          throw new ToolSurfaceError(
-            "PI_UNAVAILABLE",
-            "agent-os Pi extension is unavailable — refusing to spawn a crewmate without telemetry",
-          );
-        }
         // Control channel is a hard precondition of spawn — never launch Pi with a dead socket.
         let socketPath: string;
         try {
@@ -983,15 +1195,24 @@ export class ToolSurface {
           input.model,
           this.deps.connections,
         );
+        // Narrowed by preflight above; TypeScript cannot see the throw path.
+        if (piDetection == null || extensionPath === undefined) {
+          throw new ToolSurfaceError(
+            "PI_UNAVAILABLE",
+            "Pi detection or extension path missing after preflight",
+          );
+        }
         const spec = buildPiSpawnSpec({
           agentosHome: this.deps.home,
-          detection: this.deps.pi,
+          detection: piDetection,
           args: ["--mode", "json", "-p", prompt, "--model", input.model],
           cwd,
           sessionId,
           role: input.role,
           socketPath,
-          extensionPath: this.deps.extensionPath,
+          extensionPath,
+          sessionDir,
+          thinking: input.thinking,
           cleanRoom: input.cleanRoom,
           grantProviderKey: grant,
         });
@@ -1068,6 +1289,9 @@ export class ToolSurface {
       });
 
       // Fake Pi auto-settles for zero-token idle proofs and local-only SHIP.
+      // Status stays "running" (historical harness contract); the wake is what
+      // the Brain sees. Fusion sides finalize via completeFusionSide after the
+      // dispatch path registers ownership.
       if (fake) {
         this.deps.watcher.classify({
           class: "AGENT_SETTLED",
@@ -1079,6 +1303,10 @@ export class ToolSurface {
 
       return { session: fleetSession, task: this.requireTask(task.id) };
     } catch (error) {
+      this.sessionDirs.delete(sessionId);
+      if (sessionKeyCreated) {
+        this.deps.sessionKeys.remove(sessionKeyInput);
+      }
       if (sessionSocketOpened) {
         void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
       }
@@ -1098,9 +1326,22 @@ export class ToolSurface {
     if (session.role === "scout") {
       this.auditScoutSession(input.sessionId);
     }
-    this.deps.tmux.killWindow(session.tmuxWindow);
-    void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
-    this.releaseWorktreeLeases({ sessionId: input.sessionId });
+    // Finalize any in-flight fusion side so a stop cannot leave the run
+    // stranded on fusion.dispatched. Pass reason so the last side's stop is
+    // not reported as a clean fusion.completed success. Ownership stays until
+    // the whole run completes (clearFusionRunSessionState). Suppress
+    // releaseSettled's session.stopped — this method owns the single terminal
+    // lifecycle event with the caller reason.
+    this.completeFusionSide(input.sessionId, input.reason, {
+      suppressStopEvent: true,
+    });
+    const afterFusion = this.sessions.get(input.sessionId) ?? session;
+    if (afterFusion.status !== "stopped" && afterFusion.status !== "lost") {
+      this.deps.tmux.killWindow(session.tmuxWindow);
+      void this.deps.sockets?.closeSession(input.sessionId).catch(() => undefined);
+      this.releaseWorktreeLeases({ sessionId: input.sessionId });
+    }
+    this.clearFusionSession(input.sessionId);
     const now = new Date().toISOString();
     // Re-read after release so cleared worktreePath refs are not re-stamped.
     const released = this.sessions.get(input.sessionId) ?? session;
@@ -1147,27 +1388,116 @@ export class ToolSurface {
     });
   }
 
-  private dispatchFusion(raw: Record<string, unknown>): { runId: string; contractOk?: boolean } {
+  /**
+   * `/opinion`, `/fusion` and plan-fusion (master plan §6.3).
+   *
+   * The instruction is rendered ONCE from the layered prompt pack and handed to
+   * every side byte-for-byte. That is the clean-room contract: each family
+   * answers the same question in isolation, and `promptsIdentical` on the run
+   * record is the durable proof — not a claim in a comment.
+   */
+  private dispatchFusion(raw: Record<string, unknown>): {
+    runId: string;
+    promptsIdentical: boolean;
+    aggregatorFamily: string | null;
+    contractOk?: boolean;
+    spawned: boolean;
+  } {
     const input = dispatchFusionInputSchema.parse(raw);
     const task = this.requireTask(input.taskId);
-    if (input.kind === "plan-fusion") {
-      const families = new Set(input.casts.map((c) => c.family));
-      if (this.cfg().policies.distinctPlannerFamilies && families.size < 2) {
+    const policies = this.cfg().policies;
+
+    // Family is always derived from model server-side. Client-supplied
+    // cast.family is ignored for policy and durable records so mislabels
+    // cannot bypass cross-family invariants.
+    const casts = input.casts.map((cast) => ({
+      ...cast,
+      family: familyFromModel(cast.model),
+    }));
+
+    // Cross-family invariants: an opinion or a plan-fusion whose sides all
+    // share a family is not a second opinion, it is an echo.
+    const families = new Set(casts.map((c) => c.family));
+    if (input.kind === "plan-fusion" && policies.distinctPlannerFamilies && families.size < 2) {
+      throw new ToolSurfaceError("POLICY_VIOLATION", "plan-fusion requires ≥2 distinct families");
+    }
+    if (input.kind === "opinion" && casts.length >= 2 && families.size < 2) {
+      throw new ToolSurfaceError(
+        "POLICY_VIOLATION",
+        "/opinion requires ≥2 distinct model families — a same-family panel is not an independent opinion",
+        { families: [...families] },
+      );
+    }
+
+    // Default spawn policy by kind (§6.3): opinion / plan-fusion spawn clean-room
+    // sides; fusion with a completed artifact is a contract check only.
+    const spawnSides =
+      input.spawnSides ?? (input.kind === "opinion" || input.kind === "plan-fusion");
+
+    const runId = nextUlid();
+    const project = this.deps.projects.get(task.projectId);
+
+    // Render the instruction from the layered prompt pack when a ref is given.
+    const templateRef =
+      input.instructionTemplateRef ??
+      (input.instruction === undefined ? DEFAULT_FUSION_TEMPLATES[input.kind] : undefined);
+    let instruction = input.instruction ?? "";
+    let templateInfo: PromptTemplateInfo | null = null;
+    let renderedHash: string | null = null;
+
+    if (templateRef !== undefined && this.deps.prompts !== undefined) {
+      const vars: Record<string, string> = {
+        TASK_TITLE: task.title,
+        TASK_INTENT: task.intent,
+        QUESTION: input.vars.QUESTION ?? task.title,
+        CONTEXT: input.vars.CONTEXT ?? task.intent,
+        ...input.vars,
+      };
+      try {
+        const rendered = this.deps.prompts.render(
+          templateRef,
+          vars,
+          project?.trusted === true ? join(project.path, ".agentos", "prompts") : undefined,
+        );
+        instruction = rendered.rendered;
+        templateInfo = rendered.info;
+        renderedHash = rendered.renderedHash;
+      } catch (error) {
+        // An undefined {{VAR}} or a missing ref is the caller's error, stated
+        // precisely — never a half-rendered instruction sent to a model.
         throw new ToolSurfaceError(
-          "POLICY_VIOLATION",
-          "plan-fusion requires ≥2 distinct families",
+          "VALIDATION_ERROR",
+          error instanceof Error ? error.message : String(error),
+          { templateRef },
         );
       }
     }
-    const runId = nextUlid();
-    const dir = join(this.deps.home, "runs", task.id, "fusion", runId);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const instruction =
-      input.instruction ?? `Fusion kind=${input.kind} for ${task.title}\n`;
-    writeFileSync(join(dir, "instruction.md"), instruction, { mode: 0o600 });
+    if (instruction.length === 0) {
+      instruction = `Fusion kind=${input.kind} for ${task.title}\n`;
+    }
+    const instructionHash = sha256(instruction);
 
-    // When a fused artifact is supplied as instruction for kind=fusion, enforce contract.
-    let contractOk: boolean | undefined;
+    // Every side receives the SAME rendered bytes.
+    const sides: FusionSide[] = casts.map((cast) => ({
+      role: cast.role,
+      model: cast.model,
+      family: cast.family,
+      sessionId: null,
+      promptHash: instructionHash,
+      artifactPath: null,
+      inputTokens: null,
+      outputTokens: null,
+      costUsd: null,
+    }));
+    const promptsIdentical = new Set(sides.map((s) => s.promptHash)).size === 1;
+
+    // Aggregator family retention: the fusion agent runs on the ARCHITECT
+    // side's family — the first planner in the cast — and that choice is
+    // recorded on the run rather than silently made.
+    const architect = casts.find((c) => c.role === "planner") ?? casts[0];
+    const aggregatorFamily = architect?.family ?? null;
+
+    let contractOk: boolean | null = null;
     if (input.kind === "fusion" && input.instruction !== undefined) {
       const contract = enforceFusionContract(input.instruction);
       contractOk = contract.ok;
@@ -1178,17 +1508,419 @@ export class ToolSurface {
           { errors: contract.errors },
         );
       }
-      writeFileSync(join(dir, "fused.md"), input.instruction, { mode: 0o600 });
+    }
+
+    const run: FusionRun = {
+      runId,
+      taskId: task.id,
+      kind: input.kind,
+      templateRef: templateInfo?.ref ?? templateRef ?? null,
+      templateLayer: templateInfo?.layer ?? null,
+      templateHash: templateInfo?.contentHash ?? null,
+      renderedHash,
+      promptsIdentical,
+      sides,
+      aggregatorFamily,
+      contractOk,
+      createdAt: new Date().toISOString(),
+      completedAt: null,
+      error: null,
+    };
+    this.deps.fusionRuns.create(run);
+    this.deps.fusionRuns.writeInstruction(task.id, runId, instruction);
+    if (input.kind === "fusion" && input.instruction !== undefined) {
+      this.deps.fusionRuns.writeFused(task.id, runId, input.instruction);
     }
 
     this.sink({
       type: "fusion.dispatched",
       payload: { taskId: task.id, kind: input.kind, runId },
     });
-    if (input.kind === "plan-fusion" && task.phase === "PLANNING") {
-      this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+
+    // Spawn one clean-room Pi per side, each with the identical instruction and
+    // its own per-model session key. side_completed / completed fire on settle.
+    if (spawnSides) {
+      const spawnedSessionIds: Array<string | null> = sides.map(() => null);
+      for (let i = 0; i < sides.length; i++) {
+        const side = sides[i]!;
+        const cast = casts[i]!;
+        try {
+          const result = this.spawnCrewmate({
+            taskId: task.id,
+            role: side.role,
+            model: side.model,
+            thinking: cast.thinking,
+            // §6.3: /opinion and plan-fusion are always clean-room — ignore cast.
+            cleanRoom:
+              input.kind === "opinion" || input.kind === "plan-fusion"
+                ? true
+                : cast.cleanRoom,
+            vars: {},
+            prompt: instruction,
+          });
+          const sessionId = result.session.sessionId;
+          spawnedSessionIds[i] = sessionId;
+          this.fusionBySessionId.set(sessionId, {
+            taskId: task.id,
+            runId,
+            sideIndex: i,
+          });
+          // Persist immediately so kill-9 mid-loop can hydrate ownership and
+          // early ext.usage frames can attribute by sideIndex.
+          const latest = this.deps.fusionRuns.get(task.id, runId) ?? run;
+          const withSession = latest.sides.map((s, j) =>
+            j === i ? { ...s, sessionId: s.sessionId ?? sessionId } : s,
+          );
+          this.deps.fusionRuns.save({ ...latest, sides: withSession });
+          // Fake-Pi writes per-session output during spawn and never sends
+          // agent_settled over the extension channel — finalize as soon as
+          // ownership is registered. Real Pi finalizes via settle / session_end.
+          if (this.deps.fakePi === true || process.env.AGENTOS_FAKE_PI === "1") {
+            this.completeFusionSide(sessionId);
+          }
+        } catch (error) {
+          // Partial spawn must not leave a durable in-flight run: stop any
+          // already-spawned crewmates (pane/socket/lease), finalize sides,
+          // complete the run with error, then rethrow the typed tool error.
+          const message =
+            error instanceof ToolSurfaceError
+              ? error.message
+              : error instanceof Error
+                ? error.message
+                : String(error);
+          this.failRemainingFusionSides(
+            task.id,
+            runId,
+            spawnedSessionIds,
+            i,
+            message,
+          );
+          throw error;
+        }
+      }
+    } else {
+      // Pure contract / bookkeeping dispatch — no sides to wait on.
+      this.emitFusionCompleted(run);
+      if (input.kind === "plan-fusion" && task.phase === "PLANNING") {
+        this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+      }
     }
-    return contractOk === undefined ? { runId } : { runId, contractOk };
+
+    return contractOk === null
+      ? { runId, promptsIdentical, aggregatorFamily, spawned: spawnSides }
+      : { runId, promptsIdentical, aggregatorFamily, contractOk, spawned: spawnSides };
+  }
+
+  /**
+   * After a mid-cast spawn failure: stop already-spawned crewmates (pane,
+   * socket, lease), then settle remaining sides and complete the run through
+   * the shared finalize helper so Console never sits on "dispatched".
+   */
+  private failRemainingFusionSides(
+    taskId: string,
+    runId: string,
+    spawnedSessionIds: Array<string | null>,
+    failedAtIndex: number,
+    errorMessage: string,
+  ): void {
+    const stopReason = `fusion spawn failed at side ${failedAtIndex}: ${errorMessage}`;
+    for (let i = 0; i < failedAtIndex; i++) {
+      const sessionId = spawnedSessionIds[i];
+      if (sessionId == null) continue;
+      const live = this.sessions.get(sessionId);
+      if (
+        live === undefined ||
+        live.status === "stopped" ||
+        live.status === "lost"
+      ) {
+        continue;
+      }
+      try {
+        this.stopCrewmate({
+          sessionId,
+          reason: stopReason,
+        });
+      } catch {
+        // Best-effort teardown; finalize below even if stop races.
+      }
+    }
+
+    // Same lifecycle as halt/boot: never-spawned sides, remaining session
+    // sides, tryComplete with the failure latched.
+    this.finalizeOpenFusionRun(taskId, runId, errorMessage);
+  }
+
+  /**
+   * Latch a non-empty failure reason onto the durable FusionRun. Reasons
+   * accumulate (semicolon-separated, de-duplicated) so a clean last settle
+   * cannot erase an earlier side stop/lost/abort.
+   */
+  private latchFusionError(
+    taskId: string,
+    runId: string,
+    error?: string | null,
+  ): FusionRun | null {
+    const run = this.deps.fusionRuns.get(taskId, runId);
+    if (run === null) return null;
+    if (error == null || error.length === 0) return run;
+    const existing = run.error ?? null;
+    const next = mergeFusionErrors(existing, error);
+    if (next === existing) return run;
+    const updated: FusionRun = { ...run, error: next };
+    this.deps.fusionRuns.save(updated);
+    return updated;
+  }
+
+  /**
+   * Capture a fusion side's output when its session settles, emit
+   * fusion.side_completed, and finish the run when every side is done.
+   * The settled side's pane is killed and its worktree lease released so it
+   * does not hold a pool slot. fusionBySessionId stays until the run
+   * completes so late usage frames after agent_settled still attribute.
+   */
+  private completeFusionSide(
+    sessionId: string,
+    error?: string | null,
+    options: { suppressStopEvent?: boolean } = {},
+  ): void {
+    const ref = this.fusionBySessionId.get(sessionId);
+    if (ref === undefined) return;
+
+    // Latch immediately so a later clean settle cannot drop this reason.
+    this.latchFusionError(ref.taskId, ref.runId, error);
+
+    const run = this.deps.fusionRuns.get(ref.taskId, ref.runId);
+    if (run === null) {
+      this.fusionBySessionId.delete(sessionId);
+      return;
+    }
+
+    const side = run.sides[ref.sideIndex];
+    if (side === undefined) {
+      this.fusionBySessionId.delete(sessionId);
+      return;
+    }
+    if (side.settledAt != null || side.artifactPath !== null) {
+      // Already recorded (e.g. double settle from agent_settled + session_end).
+      this.tryCompleteFusionRun(ref.taskId, ref.runId);
+      this.releaseSettledFusionCrewmate(sessionId, options);
+      return;
+    }
+
+    const content = this.readSideOutput(sessionId);
+    const artifactPath =
+      content === null
+        ? null
+        : this.deps.fusionRuns.writeSideArtifact(
+            ref.taskId,
+            ref.runId,
+            ref.sideIndex,
+            side.model,
+            content,
+          );
+
+    const settledAt = new Date().toISOString();
+    const sides = run.sides.map((s, i) =>
+      i === ref.sideIndex
+        ? {
+            ...s,
+            sessionId: s.sessionId ?? sessionId,
+            artifactPath,
+            settledAt,
+          }
+        : s,
+    );
+    this.deps.fusionRuns.save({ ...run, sides });
+
+    this.sink({
+      type: "fusion.side_completed",
+      payload: {
+        taskId: ref.taskId,
+        runId: ref.runId,
+        role: side.role,
+        model: side.model,
+        family: side.family,
+        promptHash: side.promptHash,
+        artifactPath,
+      },
+    });
+
+    this.tryCompleteFusionRun(ref.taskId, ref.runId);
+    this.releaseSettledFusionCrewmate(sessionId, options);
+  }
+
+  /**
+   * Stop a settled fusion side's pane and free its worktree lease without
+   * dropping fusion ownership (that stays until the whole run completes).
+   * When `suppressStopEvent` is set, the caller owns the single terminal
+   * lifecycle event (stop_crewmate / markSessionLost).
+   */
+  private releaseSettledFusionCrewmate(
+    sessionId: string,
+    options: { suppressStopEvent?: boolean } = {},
+  ): void {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) {
+      // Artifact already captured; free the dir map even if the session row is gone.
+      this.sessionDirs.delete(sessionId);
+      return;
+    }
+    if (session.status === "stopped" || session.status === "lost") {
+      this.sessionDirs.delete(sessionId);
+      return;
+    }
+
+    try {
+      this.deps.tmux.killWindow(session.tmuxWindow);
+    } catch {
+      // Pane may already be gone (real session_end / prior halt).
+    }
+    void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
+    this.releaseWorktreeLeases({ sessionId });
+    const now = new Date().toISOString();
+    const released = this.sessions.get(sessionId) ?? session;
+    this.sessions.set(sessionId, { ...released, status: "stopped" });
+    // Artifact already read; drop the session-dir mapping so happy-path settle
+    // does not retain unbounded sessionId→dir entries (fake-Pi has no session_end).
+    this.sessionDirs.delete(sessionId);
+    if (session.taskId !== null) {
+      const task = this.tasks.get(session.taskId);
+      if (task !== undefined) {
+        this.saveTask({
+          ...task,
+          sessions: task.sessions.map((s) =>
+            s.sessionId === sessionId
+              ? { ...s, status: "stopped", lastEventAt: now }
+              : s,
+          ),
+          updatedAt: now,
+        });
+      }
+    }
+    if (options.suppressStopEvent !== true) {
+      this.sink({
+        type: "session.stopped",
+        payload: {
+          sessionId,
+          taskId: session.taskId,
+          reason: "fusion side settled",
+        },
+      });
+    }
+  }
+
+  /**
+   * Read the extension-written side answer for this session only.
+   * Path is `$SESSION_DIR/outputs/$sessionId.md` so sequential runs that share
+   * a per-model session key never re-attribute a prior run's bytes.
+   * Null / empty / whitespace-only reads are treated as no artifact.
+   */
+  private readSideOutput(sessionId: string): string | null {
+    const sessionDir = this.sessionDirs.get(sessionId);
+    if (sessionDir === undefined) return null;
+    const outputPath = join(sessionDir, "outputs", `${sessionId}.md`);
+    if (!existsSync(outputPath)) return null;
+    try {
+      const content = readFileSync(outputPath, "utf8");
+      if (content.trim().length === 0) return null;
+      return content;
+    } catch {
+      return null;
+    }
+  }
+
+  private tryCompleteFusionRun(
+    taskId: string,
+    runId: string,
+    error?: string | null,
+  ): void {
+    // Latch any late reason before the all-sides check so order of settle
+    // cannot drop a prior failure when the last side is clean.
+    const run = this.latchFusionError(taskId, runId, error);
+    if (run === null) return;
+    if (run.completedAt != null) return;
+    // A side is done when it has settled (possibly without an artifact) or,
+    // for older records, when an artifact path was already written.
+    if (!run.sides.every((s) => s.settledAt != null || s.artifactPath !== null)) {
+      return;
+    }
+
+    // Sole owner of fusionBySessionId lifetime: drop only when every side is done.
+    this.clearFusionRunSessionState(
+      runId,
+      run.sides.map((s) => s.sessionId),
+    );
+
+    this.emitFusionCompleted(run);
+
+    const latchedError = this.deps.fusionRuns.get(taskId, runId)?.error ?? run.error;
+    if (
+      run.kind === "plan-fusion" &&
+      (latchedError == null || latchedError.length === 0)
+    ) {
+      const task = this.tasks.get(taskId);
+      if (task !== undefined && task.phase === "PLANNING") {
+        this.transition(task, "PLAN_FUSED", "plan-fusion complete");
+      }
+    }
+  }
+
+  private emitFusionCompleted(run: FusionRun, error?: string | null): void {
+    const latest =
+      this.latchFusionError(run.taskId, run.runId, error) ??
+      this.deps.fusionRuns.get(run.taskId, run.runId) ??
+      run;
+    if (latest.completedAt != null) return;
+    const completedAt = new Date().toISOString();
+    const durableError =
+      latest.error != null && latest.error.length > 0 ? latest.error : null;
+    this.deps.fusionRuns.save({
+      ...latest,
+      completedAt,
+      error: durableError,
+    });
+    this.sink({
+      type: "fusion.completed",
+      payload: {
+        taskId: latest.taskId,
+        runId: latest.runId,
+        kind: latest.kind,
+        promptsIdentical: latest.promptsIdentical,
+        aggregatorFamily: latest.aggregatorFamily,
+        contractOk: latest.contractOk,
+        ...(durableError != null ? { error: durableError } : {}),
+      },
+    });
+  }
+
+  /**
+   * Drop fusion ownership and session-dir entries for a finished/failed run.
+   * This is the only path that clears fusionBySessionId for a live run —
+   * stop/lost/session_end must not drop ownership while siblings are in flight.
+   */
+  private clearFusionRunSessionState(
+    runId: string,
+    sessionIds: Array<string | null | undefined>,
+  ): void {
+    for (const [sid, ref] of this.fusionBySessionId) {
+      if (ref.runId === runId) {
+        this.fusionBySessionId.delete(sid);
+        this.sessionDirs.delete(sid);
+      }
+    }
+    for (const sessionId of sessionIds) {
+      if (sessionId == null) continue;
+      this.fusionBySessionId.delete(sessionId);
+      this.sessionDirs.delete(sessionId);
+    }
+  }
+
+  /**
+   * Drop the session-dir mapping only. Fusion ownership is intentionally not
+   * cleared here — that is clearFusionRunSessionState's job at run completion.
+   */
+  private clearFusionSession(sessionId: string): void {
+    this.sessionDirs.delete(sessionId);
   }
 
   private authorGate(raw: Record<string, unknown>): { taskId: string; gatePath: string } {
@@ -1610,14 +2342,151 @@ export class ToolSurface {
   }
 
   /**
-   * Single choke point when a task leaves the live set: halt every session,
-   * then release every task-linked lease (clean → verified-reset, dirty →
-   * quarantine + deliveryBlocked stamp). Used by cancel/FAILED terminal paths
-   * and as the deliver abort reclaim.
+   * Single choke point when a task leaves the live set: finalize in-flight
+   * fusion sides, halt every session, then release every task-linked lease
+   * (clean → verified-reset, dirty → quarantine + deliveryBlocked stamp).
+   * Used by cancel/FAILED terminal paths and as the deliver abort reclaim.
    */
   private haltAndReleaseTask(taskId: string, reason: string): void {
+    // Same completeFusionSide path as stop_crewmate / markSessionLost so
+    // cancel_task / FAILED / DONE cannot strand runs on fusion.dispatched.
+    // Pass reason so fusion.completed.error distinguishes abort from success.
+    this.finalizeFusionSidesForTask(taskId, reason);
     this.haltTaskSessions(taskId, reason);
     this.releaseWorktreeLeases({ taskId });
+  }
+
+  /**
+   * Settle every in-flight fusion side for a task via the shared
+   * completeFusionSide helper (artifact capture, side_completed, and
+   * fusion.completed when the last side settles). When `error` is set
+   * (cancel / FAILED / deliver abort), it is latched onto the durable run
+   * and reported on fusion.completed regardless of settle order.
+   */
+  private finalizeFusionSidesForTask(
+    taskId: string,
+    error?: string | null,
+  ): void {
+    // Latch the abort reason once per open run before settling sides so a
+    // clean mid-loop settle cannot erase it.
+    if (error != null && error.length > 0) {
+      for (const run of this.deps.fusionRuns.listForTask(taskId)) {
+        if (run.completedAt != null) continue;
+        this.latchFusionError(taskId, run.runId, error);
+      }
+    }
+
+    const ownedSessionIds = [
+      ...new Set(
+        [...this.fusionBySessionId.entries()]
+          .filter(([, ref]) => ref.taskId === taskId)
+          .map(([sessionId]) => sessionId),
+      ),
+    ];
+    for (const sessionId of ownedSessionIds) {
+      this.completeFusionSide(sessionId, error);
+    }
+
+    // Durable open runs: never-spawned sides, lost ownership, tryComplete.
+    // Same finalizeOpenFusionRun used by boot hydrate — one lifecycle rule.
+    for (const run of this.deps.fusionRuns.listForTask(taskId)) {
+      if (run.completedAt != null) continue;
+      this.finalizeOpenFusionRun(taskId, run.runId, error);
+    }
+  }
+
+  /**
+   * Single durable-run finalize: settle never-spawned (null sessionId) sides,
+   * complete session-owned sides that cannot still make progress (or are
+   * force-finalized on error paths), leave live sides for settle/session_end,
+   * and tryComplete when every side is done (including all-settled runs that
+   * still lack completedAt).
+   * Used by halt/cancel, mid-spawn failure, and boot hydrate so the rule is not forked.
+   */
+  private finalizeOpenFusionRun(
+    taskId: string,
+    runId: string,
+    error?: string | null,
+  ): void {
+    if (error != null && error.length > 0) {
+      this.latchFusionError(taskId, runId, error);
+    }
+
+    const force = error != null && error.length > 0;
+    const initial = this.deps.fusionRuns.get(taskId, runId);
+    if (initial === null || initial.completedAt != null) return;
+
+    const sideCount = initial.sides.length;
+    for (let sideIndex = 0; sideIndex < sideCount; sideIndex++) {
+      const latest = this.deps.fusionRuns.get(taskId, runId);
+      if (latest === null) break;
+      if (latest.completedAt != null) break;
+      const side = latest.sides[sideIndex];
+      if (side === undefined) continue;
+      if (side.settledAt != null || side.artifactPath !== null) continue;
+      if (side.sessionId === null) {
+        const settledAt = new Date().toISOString();
+        const sides = latest.sides.map((s, i) =>
+          i === sideIndex ? { ...s, settledAt } : s,
+        );
+        this.deps.fusionRuns.save({ ...latest, sides });
+        this.sink({
+          type: "fusion.side_completed",
+          payload: {
+            taskId,
+            runId: latest.runId,
+            role: side.role,
+            model: side.model,
+            family: side.family,
+            promptHash: side.promptHash,
+            artifactPath: null,
+          },
+        });
+        this.tryCompleteFusionRun(taskId, latest.runId, error);
+        continue;
+      }
+      this.fusionBySessionId.set(side.sessionId, {
+        taskId,
+        runId: latest.runId,
+        sideIndex,
+      });
+      // Property, not a status enum: can this side still receive lifecycle
+      // events? Only starting/running rows with a live pane can. Anything else
+      // (settled/stopped/lost/wedged/missing row/gone pane/unknown) must be
+      // finalized here — default to finalize when progress is no or unknown.
+      const canStillMakeProgress = this.fusionSideCanStillMakeProgress(
+        side.sessionId,
+      );
+      // Force (halt / mid-spawn fail / never-spawned sibling) completes live
+      // sides; boot hydrate only settles sides that can no longer settle alone.
+      if (force || !canStillMakeProgress) {
+        this.completeFusionSide(side.sessionId, error);
+      }
+    }
+
+    // Crash window: all sides already settled but completedAt still null.
+    this.tryCompleteFusionRun(taskId, runId, error);
+  }
+
+  /**
+   * Whether a fusion side can still emit agent_settled / session_end on its own.
+   * True only for a known session in a live status whose tmux window still
+   * exists. Missing sessions, non-live statuses (including settled-without-
+   * settledAt), gone panes, and unknown rows all return false so boot recovery
+   * finalizes them through completeFusionSide rather than waiting forever.
+   */
+  private fusionSideCanStillMakeProgress(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) return false;
+    if (session.status !== "starting" && session.status !== "running") {
+      return false;
+    }
+    try {
+      return this.deps.tmux.hasWindow(session.tmuxWindow);
+    } catch {
+      // Unknown liveness → cannot assume progress; finalize on boot/halt.
+      return false;
+    }
   }
 
   private deliverTask(raw: Record<string, unknown>): TaskSnapshot {
@@ -1647,7 +2516,10 @@ export class ToolSurface {
     // After halt begins, abort must reclaim leases only for sessions already
     // stopped/lost. Never release a tree a live Pi still has as cwd (partial
     // halt failure); reconcile reclaims those once panes are gone.
+    // Success finalizes fusion via DONE → haltAndReleaseTask; abort paths
+    // finalize in finally so runs cannot sit on fusion.dispatched.
     let deliveryComplete = false;
+    let deliverAbortReason: string | null = null;
     try {
       this.haltTaskSessions(task.id, "deliver_task halt");
       task = this.requireTask(task.id);
@@ -1747,8 +2619,22 @@ export class ToolSurface {
       this.saveTask(task);
       deliveryComplete = true;
       return task;
+    } catch (error) {
+      deliverAbortReason =
+        error instanceof ToolSurfaceError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      throw error;
     } finally {
       if (!deliveryComplete) {
+        // Dirty tree / status failure / deliveryBlocked / partial halt: finalize
+        // any in-flight fusion via the shared helper before reclaiming leases.
+        this.finalizeFusionSidesForTask(
+          input.taskId,
+          deliverAbortReason ?? "deliver_task aborted",
+        );
         this.releaseWorktreeLeases({
           taskId: input.taskId,
           onlyHaltedSessions: true,
@@ -2063,6 +2949,9 @@ export class ToolSurface {
   markSessionStatus(sessionId: string, status: FleetSession["status"]): void {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
+    // Terminal is terminal: late agent_settled / running frames after stop or
+    // lost must not resurrect the session (and must not inflate healthyLeft).
+    if (session.status === "stopped" || session.status === "lost") return;
     this.sessions.set(sessionId, { ...session, status });
     const task = session.taskId !== null ? this.tasks.get(session.taskId) : undefined;
     if (task !== undefined) {
@@ -2079,6 +2968,9 @@ export class ToolSurface {
     if (status === "settled" && session.role === "scout") {
       this.auditScoutSession(sessionId);
     }
+    if (status === "settled") {
+      this.completeFusionSide(sessionId);
+    }
   }
 
   /** Mark a session lost (pane-died / reconcile). */
@@ -2086,10 +2978,27 @@ export class ToolSurface {
     const session = this.sessions.get(sessionId);
     if (session === undefined) return;
     if (session.status === "lost" || session.status === "stopped") return;
+    // Finalize any in-flight fusion side so a pane-lost side cannot leave the
+    // run stranded on fusion.dispatched. Pass reason so a lost last side is
+    // not reported as a clean success. Ownership stays until the whole run
+    // completes. Suppress releaseSettled's session.stopped — session.lost is
+    // the single terminal lifecycle event for this path.
+    this.completeFusionSide(sessionId, reason, { suppressStopEvent: true });
+    // Kill a still-live pane so reconcile/respawn cannot share
+    // AGENTOS_SESSION_DIR/outputs with an orphan process.
+    const afterFusion = this.sessions.get(sessionId) ?? session;
+    if (afterFusion.status !== "stopped" && afterFusion.status !== "lost") {
+      try {
+        this.deps.tmux.killWindow(afterFusion.tmuxWindow);
+      } catch {
+        // Pane may already be gone.
+      }
+    }
     void this.deps.sockets?.closeSession(sessionId).catch(() => undefined);
     this.releaseWorktreeLeases({ sessionId });
     const released = this.sessions.get(sessionId) ?? session;
     this.sessions.set(sessionId, { ...released, status: "lost" });
+    this.clearFusionSession(sessionId);
     this.sink({
       type: "session.lost",
       payload: { sessionId, taskId: session.taskId, reason },
@@ -2107,12 +3016,22 @@ export class ToolSurface {
           updatedAt: new Date().toISOString(),
         };
         this.saveTask(withSession);
-        if (!isTerminalPhase(withSession.phase) && withSession.phase !== "SESSION_LOST") {
-          try {
-            this.transition(withSession, "SESSION_LOST", reason);
-          } catch {
-            // Illegal from this phase — session status already persisted.
-          }
+        // Losing one cast side must not declare the whole task lost while
+        // siblings are still healthy — only promote when nothing healthy remains.
+        const healthyLeft = [...this.sessions.values()].some(
+          (s) =>
+            s.taskId === session.taskId &&
+            (s.status === "starting" ||
+              s.status === "running" ||
+              s.status === "settled"),
+        );
+        if (
+          !healthyLeft &&
+          !isTerminalPhase(withSession.phase) &&
+          withSession.phase !== "SESSION_LOST" &&
+          canTransition(withSession.phase, "SESSION_LOST")
+        ) {
+          this.transition(withSession, "SESSION_LOST", reason);
         }
       }
     }
@@ -2122,8 +3041,13 @@ export class ToolSurface {
    * Clean Pi exit (ext.lifecycle session_end): release the worktree lease so
    * settle-and-exit does not exhaust the pool. Reuses the shared release helper
    * (verified-reset when clean, quarantine + deliveryBlocked when dirty).
+   * Also settles any fusion side still waiting on this session. Ownership stays
+   * until the whole fusion run completes so late ext.usage still attributes.
    */
   releaseSessionOnEnd(sessionId: string): void {
+    // session_end without a prior agent_settled still finalizes fusion sides.
+    this.completeFusionSide(sessionId);
+    this.clearFusionSession(sessionId);
     this.releaseWorktreeLeases({ sessionId });
   }
 
@@ -2178,6 +3102,32 @@ function extractTaskId(raw: Record<string, unknown>): string | null {
 
 function hashConfig(config: AgentOsConfig): string {
   return createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 16);
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/**
+ * Accumulate distinct fusion failure reasons. A later clean settle must not
+ * erase an earlier stop/lost/abort; duplicate segments (exact equality after
+ * splitting on "; ") are not repeated. Substring matches are not de-duped —
+ * "stop" after "test stop" is a distinct reason.
+ */
+function mergeFusionErrors(
+  existing: string | null | undefined,
+  next: string,
+): string {
+  const trimmed = next.trim();
+  if (trimmed.length === 0) return existing ?? "";
+  if (existing == null || existing.length === 0) return trimmed;
+  if (existing === trimmed) return existing;
+  const segments = existing
+    .split("; ")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (segments.includes(trimmed)) return existing;
+  return `${existing}; ${trimmed}`;
 }
 
 /** Repo-relative listing of everything durable under a run directory. */

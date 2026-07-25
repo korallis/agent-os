@@ -44,6 +44,7 @@ import { enableQuotaProviders } from "../quota-probes/enable.js";
 import { probeConnection, isLimitReached } from "../quota-probes/probes.js";
 import { resolveAuthJsonPathsWithFallback } from "../security/auth-store.js";
 import type { FleetService } from "../fleet/service.js";
+import type { PromptService } from "../prompts/service.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -66,6 +67,8 @@ export interface ServerDeps {
   quotaSamples?: Map<string, QuotaSample>;
   /** Phase 3 fleet substrate. */
   fleet?: FleetService;
+  /** Phase 4 layered prompt packs. */
+  prompts?: PromptService;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -305,6 +308,63 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       return;
     }
     return { task };
+  });
+
+  // ── Fusion runs (master plan §7.4) ──────────────────────────────────────
+  app.get<{ Params: { id: string } }>("/v1/tasks/:id/fusion", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { runs: deps.fleet.fusionRuns.listForTask(request.params.id) };
+  });
+
+  app.get<{ Params: { id: string; runId: string } }>(
+    "/v1/tasks/:id/fusion/:runId",
+    async (request, reply) => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return;
+      }
+      const detail = deps.fleet.fusionRuns.detail(request.params.id, request.params.runId);
+      if (detail === null) {
+        sendError(reply, 404, "NOT_FOUND", "fusion run not found");
+        return;
+      }
+      return detail;
+    },
+  );
+
+  // ── Prompt packs (master plan §2.6) ─────────────────────────────────────
+  app.get("/v1/prompts", async (_request, reply) => {
+    if (deps.prompts === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "prompt service unavailable");
+      return;
+    }
+    return { templates: deps.prompts.list() };
+  });
+
+  app.get<{ Querystring: { ref?: string } }>("/v1/prompts/diff", async (request, reply) => {
+    if (deps.prompts === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "prompt service unavailable");
+      return;
+    }
+    const ref = request.query.ref;
+    if (ref === undefined || ref.length === 0) {
+      sendError(reply, 400, "BAD_REQUEST", "ref query parameter is required");
+      return;
+    }
+    try {
+      return deps.prompts.threeWayDiff(ref);
+    } catch (error) {
+      sendError(
+        reply,
+        400,
+        "BAD_REQUEST",
+        error instanceof Error ? error.message : "invalid prompt ref",
+      );
+      return;
+    }
   });
 
   app.post("/v1/tools/call", async (request, reply) => {

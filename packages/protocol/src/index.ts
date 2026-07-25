@@ -15,6 +15,7 @@ export * from "./pi.js";
 export * from "./tasks.js";
 export * from "./tools.js";
 export * from "./fleet.js";
+export * from "./prompts.js";
 
 import { z } from "zod";
 

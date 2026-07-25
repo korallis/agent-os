@@ -24,10 +24,13 @@ import {
 import { enableQuotaProviders } from "./quota-probes/enable.js";
 import type { QuotaSample } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
+import { PromptService } from "./prompts/service.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Shipped Policy Pack defaults — inside the package, never edited (§2.6). */
 export const SHIPPED_DEFAULTS_DIR = join(here, "..", "defaults");
+/** Shipped prompt packs — copied into the editable global layer on boot (§2.6). */
+export const SHIPPED_PROMPTS_DIR = join(here, "..", "defaults", "prompts");
 
 /** Preferred on-disk location of the built Pi extension (operator-facing path). */
 export const EXPECTED_EXTENSION_DIST = join(
@@ -187,10 +190,19 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         "agent-os Pi extension dist not found — Brain and crewmate spawn will fail closed (PI_UNAVAILABLE / BRAIN_DOWN); build packages/pi-extension first",
       );
     }
+    // Prompt packs are files first: shipped templates are materialised into the
+    // global layer so the Captain tunes behaviour by editing files, not code.
+    const prompts = new PromptService(SHIPPED_PROMPTS_DIR, join(home, "prompts"));
+    prompts.onEvent((event) => {
+      eventStore.append(event);
+    });
+    prompts.installDefaults();
+
     const fleet = new FleetService({
       home,
       config,
       connections,
+      prompts,
       pi,
       ...(extensionPath !== undefined ? { extensionPath } : {}),
       sockets: socketHub,
@@ -223,6 +235,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       pi,
       quotaSamples,
       fleet,
+      prompts,
     };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });

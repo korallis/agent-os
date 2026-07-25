@@ -18,6 +18,9 @@ import { WakeWatcher } from "./watcher.js";
 import { GateRunner } from "./gate-runner.js";
 import { ToolSurface, type SessionChannel } from "./tool-surface.js";
 import { BrainManager } from "./brain.js";
+import { FusionRunStore } from "./fusion-runs.js";
+import { SessionKeyStore } from "./sessions.js";
+import type { PromptService } from "../prompts/service.js";
 
 export type FleetEventSink = (event: OrchestratorEvent) => void;
 
@@ -28,6 +31,7 @@ export interface FleetServiceOptions {
   pi?: PiDetection;
   extensionPath?: string;
   sockets?: SessionChannel;
+  prompts?: PromptService;
   fakeTmux?: boolean;
   fakePi?: boolean;
   fakeBrain?: boolean;
@@ -49,6 +53,8 @@ export class FleetService {
   readonly tmux: TmuxController;
   readonly watcher: WakeWatcher;
   readonly gates: GateRunner;
+  readonly fusionRuns: FusionRunStore;
+  readonly sessionKeys: SessionKeyStore;
   readonly tools: ToolSurface;
   readonly brain: BrainManager;
   private sink: FleetEventSink = () => undefined;
@@ -65,6 +71,8 @@ export class FleetService {
     });
     this.watcher = new WakeWatcher(cfg.supervision);
     this.gates = new GateRunner(options.home, cfg.validation);
+    this.fusionRuns = new FusionRunStore(options.home);
+    this.sessionKeys = new SessionKeyStore(options.home);
     this.tools = new ToolSurface({
       home: options.home,
       config: options.config,
@@ -73,6 +81,9 @@ export class FleetService {
       tmux: this.tmux,
       watcher: this.watcher,
       gates: this.gates,
+      fusionRuns: this.fusionRuns,
+      sessionKeys: this.sessionKeys,
+      ...(options.prompts !== undefined ? { prompts: options.prompts } : {}),
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
@@ -84,6 +95,7 @@ export class FleetService {
       tmux: this.tmux,
       tools: this.tools,
       watcher: this.watcher,
+      sessionKeys: this.sessionKeys,
       config: cfg.brain,
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
@@ -128,6 +140,13 @@ export class FleetService {
         this.onLifecycle(frame);
         break;
       case "ext.usage":
+        // Per-side fusion telemetry: attribute the tokens to whichever fusion
+        // run owns this session, so the Console's side-by-side shows real cost.
+        this.tools.attributeFusionUsage(frame.sessionId, {
+          inputTokens: frame.inputTokens,
+          outputTokens: frame.outputTokens,
+          costUsd: frame.costUsd,
+        });
         if (frame.contextUsedPct !== null) {
           this.watcher.classify({
             class: "CONTEXT_PRESSURE",
@@ -382,13 +401,18 @@ export class FleetService {
 
   /**
    * kill -9 restart-proof path: rebind control sockets for surviving sessions,
-   * mark dead panes lost, reclaim orphaned worktree leases stuck in `leased`.
+   * mark dead panes lost, reclaim orphaned worktree leases stuck in `leased`,
+   * and respawn only cast roles whose session-key directory is absent (G6).
    */
   private rehydrateRuntime(): void {
+    // Rebuild in-flight fusion side ownership from durable run.json so a
+    // restart still receives artifacts + fusion.completed for live sides.
+    this.tools.hydrateFusionOwnership();
     this.tools.rebindSessionListeners();
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
     this.reclaimOrphanedWorktreeLeases();
+    this.tools.reconcileMissingCastRoles();
   }
 
   private startReconcileTick(): void {

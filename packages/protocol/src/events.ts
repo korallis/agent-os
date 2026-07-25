@@ -376,6 +376,46 @@ export const fusionDispatchedEventSchema = z.strictObject({
   }),
 });
 
+/** Shipped prompt templates materialised into the editable global layer. */
+export const promptInstalledEventSchema = z.strictObject({
+  type: z.literal("prompt.installed"),
+  payload: z.strictObject({
+    refs: z.array(z.string()),
+  }),
+});
+
+/**
+ * A fusion side produced its artifact. `promptHash` is what proves the
+ * clean-room contract: every side of an `/opinion` saw identical bytes.
+ */
+export const fusionSideCompletedEventSchema = z.strictObject({
+  type: z.literal("fusion.side_completed"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    runId: ulidSchema,
+    role: z.string(),
+    model: z.string(),
+    family: modelFamilySchema,
+    promptHash: z.string(),
+    artifactPath: z.string().nullable(),
+  }),
+});
+
+/** A fusion run finished, with its contract verdict and aggregator family. */
+export const fusionCompletedEventSchema = z.strictObject({
+  type: z.literal("fusion.completed"),
+  payload: z.strictObject({
+    taskId: ulidSchema,
+    runId: ulidSchema,
+    kind: z.enum(["opinion", "fusion", "plan-fusion"]),
+    promptsIdentical: z.boolean(),
+    aggregatorFamily: modelFamilySchema.nullable(),
+    contractOk: z.boolean().nullable(),
+    /** Set when the run finished because a side failed to spawn (or similar). */
+    error: z.string().nullable().optional(),
+  }),
+});
+
 /** A crewmate asked a blocking question; routed to the Brain/Captain. */
 export const crewQuestionEventSchema = z.strictObject({
   type: z.literal("crew.question"),
@@ -480,6 +520,9 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   toolInvokedEventSchema,
   gateResultEventSchema,
   fusionDispatchedEventSchema,
+  promptInstalledEventSchema,
+  fusionSideCompletedEventSchema,
+  fusionCompletedEventSchema,
   crewQuestionEventSchema,
   crewAnsweredEventSchema,
   scoutWriteViolationEventSchema,

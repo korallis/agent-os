@@ -30,7 +30,7 @@ type TaskSnapshot = {
 };
 
 /**
- * Task detail with live cast/session columns (Phase 3 foundation for fusion columns).
+ * Task detail with live cast/session columns (Phase 3 foundation; fusion columns Phase 6).
  */
 export function TaskDetail({ taskId }: { taskId: string }) {
   const [task, setTask] = useState<TaskSnapshot | null>(null);

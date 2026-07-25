@@ -131,6 +131,14 @@ export const dispatchFusionInputSchema = z.strictObject({
   instructionTemplateRef: z.string().min(1).max(200).optional(),
   vars: z.record(z.string(), z.string()).default({}),
   instruction: z.string().min(1).max(100_000).optional(),
+  /**
+   * Whether to spawn clean-room Pi sides.
+   * - Omitted: defaults by kind — `opinion` and `plan-fusion` spawn (master
+   *   plan §6.3 two clean-room `pi -p` spawns); `fusion` does not (contract
+   *   check when a completed artifact is supplied as `instruction`).
+   * - `true` / `false`: explicit opt-in or bookkeeping-only opt-out.
+   */
+  spawnSides: z.boolean().optional(),
 });
 export type DispatchFusionInput = z.infer<typeof dispatchFusionInputSchema>;
 
