@@ -239,6 +239,37 @@ describe("charter-driven routing", () => {
     expect(fleet.routeFor("infra")).toBeNull();
   });
 
+  it("named acceptsDomain checks the target charter, not first-wins routeFor", () => {
+    const home = temp("agentos-p7-named-route-");
+    const registry = new SecondmateRegistry(home);
+    const fleet = new SecondmateFleet(registry);
+
+    // Provision order: alpha first. Both accept "shared".
+    const alpha = registry.provision({ name: "alpha", domain: "shared" });
+    const beta = registry.provision({ name: "beta", domain: "other" });
+    fleet.writeCharter(alpha, {
+      name: "alpha",
+      domains: ["shared"],
+      brainModel: null,
+      maxConcurrentTasks: 2,
+      acceptsRouting: true,
+    });
+    fleet.writeCharter(beta, {
+      name: "beta",
+      domains: ["shared", "other"],
+      brainModel: null,
+      maxConcurrentTasks: 2,
+      acceptsRouting: true,
+    });
+
+    // Auto-pick still first-wins.
+    expect(fleet.routeFor("shared")?.name).toBe("alpha");
+    // Named beta must still accept shared via its own charter.
+    expect(fleet.acceptsDomain(beta, "shared")).toBe(true);
+    expect(fleet.acceptsDomain(alpha, "other")).toBe(false);
+    expect(fleet.acceptsDomain(beta, "other")).toBe(true);
+  });
+
   it("reads a charter edit back — the charter is config, not code", () => {
     const home = temp("agentos-p7-charter-");
     const registry = new SecondmateRegistry(home);
@@ -258,6 +289,46 @@ describe("charter-driven routing", () => {
     expect(charter.brainModel).toBe("openai/gpt-5.6-sol");
     expect(charter.domains).toEqual(["infra", "deploy"]);
     expect(fleet.routeFor("deploy")?.name).toBe("infra");
+  });
+
+  it("partial charter sync merges omitted fields instead of resetting them", async () => {
+    const home = temp("agentos-p7-charter-merge-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+      agentosdBin: process.execPath,
+    });
+    await service.start();
+    const record = service.provisionSecondmate({
+      name: "infra",
+      domain: "infra",
+      brainModel: "openai/gpt-5.6-sol",
+      maxConcurrentTasks: 4,
+    });
+    expect(record.brainModel).toBe("openai/gpt-5.6-sol");
+
+    // Domains-only update must keep brainModel, capacity, and acceptsRouting.
+    const result = await service.syncSecondmateCharter("infra", {
+      domains: ["infra", "deploy"],
+    });
+    expect(result.charter.domains).toEqual(["infra", "deploy"]);
+    expect(result.charter.brainModel).toBe("openai/gpt-5.6-sol");
+    expect(result.charter.maxConcurrentTasks).toBe(4);
+    expect(result.charter.acceptsRouting).toBe(true);
+
+    const { charter } = service.secondmateFleet.readCharter(
+      service.secondmates.get("infra")!,
+    );
+    expect(charter.brainModel).toBe("openai/gpt-5.6-sol");
+    expect(charter.maxConcurrentTasks).toBe(4);
+    expect(charter.acceptsRouting).toBe(true);
+    expect(charter.domains).toEqual(["infra", "deploy"]);
   });
 
   it("falls back to the provision record when a charter is malformed", () => {
@@ -397,6 +468,71 @@ describe("secondmate admission capacity", () => {
     });
     expect(second.ok).toBe(false);
     expect(second.error?.message ?? "").toMatch(/capacity|concurrent/i);
+  });
+
+  it("concurrent create_task calls respect maxConcurrentTasks (exclusive admission)", async () => {
+    const home = temp("agentos-p7-cap-race-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    writeFileSync(
+      join(home, "config", "charter.json5"),
+      JSON.stringify({
+        name: "infra",
+        domains: ["infra"],
+        brainModel: null,
+        maxConcurrentTasks: 2,
+        acceptsRouting: true,
+      }),
+      { mode: 0o600 },
+    );
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    writeFileSync(
+      join(home, "config", "charter.json5"),
+      JSON.stringify({
+        name: "infra",
+        domains: ["infra"],
+        brainModel: null,
+        maxConcurrentTasks: 2,
+        acceptsRouting: true,
+      }),
+      { mode: 0o600 },
+    );
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await service.start();
+    const project = service.projects.register({
+      name: "cap-race",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const make = (title: string) =>
+      service.tools.invoke("create_task", {
+        spec: {
+          shape: "SHIP",
+          title,
+          intent: title,
+          projectId: project.id,
+          mode: "local-only",
+          yolo: true,
+        },
+      });
+    // Concurrent scheduling via microtasks; exclusive admission must cap at 2.
+    const results = await Promise.all([
+      Promise.resolve().then(() => make("a")),
+      Promise.resolve().then(() => make("b")),
+      Promise.resolve().then(() => make("c")),
+      Promise.resolve().then(() => make("d")),
+    ]);
+    const ok = results.filter((r) => r.ok).length;
+    const refused = results.filter((r) => !r.ok).length;
+    expect(ok).toBe(2);
+    expect(refused).toBe(2);
   });
 });
 

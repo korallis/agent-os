@@ -135,27 +135,43 @@ export class CrossProcessAuthBroker {
 
   /** Exclusive create — write metadata through the exclusive fd (no empty window). */
   private writeLock(purpose: string): boolean {
+    let fd: number | null = null;
+    let created = false;
     try {
-      const fd = openSync(this.lockPath, "wx", 0o600);
+      fd = openSync(this.lockPath, "wx", 0o600);
+      created = true;
+      const info: BrokerLockInfo = {
+        pid: process.pid,
+        acquiredAt: Date.now(),
+        purpose,
+      };
+      writeSync(fd, `${JSON.stringify(info)}\n`);
       try {
-        const info: BrokerLockInfo = {
-          pid: process.pid,
-          acquiredAt: Date.now(),
-          purpose,
-        };
-        writeSync(fd, `${JSON.stringify(info)}\n`);
-        try {
-          fsyncSync(fd);
-        } catch {
-          // some platforms/tmpfs ignore fsync
-        }
-      } finally {
-        closeSync(fd);
+        fsyncSync(fd);
+      } catch {
+        // some platforms/tmpfs ignore fsync
       }
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      // Post-create write failure: remove the orphan lock so auth is not wedged
+      // for STALE_AFTER_MS (holder() is null; release would refuse).
+      if (created) {
+        try {
+          rmSync(this.lockPath, { force: true });
+        } catch {
+          // best-effort
+        }
+      }
       throw error;
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync(fd);
+        } catch {
+          // best-effort
+        }
+      }
     }
   }
 

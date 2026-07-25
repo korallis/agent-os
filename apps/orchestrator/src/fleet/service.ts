@@ -471,22 +471,40 @@ export class FleetService {
   /**
    * Write + sync a secondmate charter. When the secondmate is running, pushes
    * brain cast via its REST API and respawns its Brain so the live model moves.
+   * Partial patches merge with the current charter — omitted fields are kept.
    */
   async syncSecondmateCharter(
     name: string,
+    patch: {
+      domains?: string[];
+      brainModel?: string | null;
+      maxConcurrentTasks?: number;
+      acceptsRouting?: boolean;
+    },
+  ): Promise<{
     charter: {
       name: string;
       domains: string[];
       brainModel: string | null;
       maxConcurrentTasks: number;
       acceptsRouting: boolean;
-    },
-  ): Promise<{ charter: typeof charter; brainSynced: boolean; brainModel: string | null }> {
+    };
+    brainSynced: boolean;
+    brainModel: string | null;
+  }> {
     const record = this.secondmates.get(name);
     if (record === null) {
       throw new Error(`no secondmate named ${name}`);
     }
-    return this.secondmateFleet.syncCharter(record, charter);
+    const { charter: current } = this.secondmateFleet.readCharter(record);
+    const merged = {
+      name: record.name,
+      domains: patch.domains ?? current.domains,
+      brainModel: patch.brainModel !== undefined ? patch.brainModel : current.brainModel,
+      maxConcurrentTasks: patch.maxConcurrentTasks ?? current.maxConcurrentTasks,
+      acceptsRouting: patch.acceptsRouting ?? current.acceptsRouting,
+    };
+    return this.secondmateFleet.syncCharter(record, merged);
   }
 
   async stop(): Promise<void> {

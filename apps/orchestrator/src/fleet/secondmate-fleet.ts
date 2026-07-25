@@ -400,17 +400,24 @@ export class SecondmateFleet {
   }
 
   /**
-   * Choose a secondmate for a domain. Returns null when none accepts it — the
-   * caller must then keep the task on the primary rather than inventing a
-   * destination.
+   * Choose a secondmate for a domain (auto-pick / discovery). First charter that
+   * accepts the domain wins. Named routing must not use this — check the named
+   * secondmate's own charter via acceptsDomain instead.
    */
   routeFor(domain: string): SecondmateRecord | null {
     for (const record of this.registry.list()) {
-      const { charter } = this.readCharter(record);
-      if (!charter.acceptsRouting) continue;
-      if (charter.domains.includes(domain)) return record;
+      if (this.acceptsDomain(record, domain)) return record;
     }
     return null;
+  }
+
+  /**
+   * Whether a specific secondmate's charter accepts routing for `domain`.
+   * Used by named route_to_secondmate — not first-wins across the fleet.
+   */
+  acceptsDomain(record: SecondmateRecord, domain: string): boolean {
+    const { charter } = this.readCharter(record);
+    return charter.acceptsRouting && charter.domains.includes(domain);
   }
 
   /**

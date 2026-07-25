@@ -210,6 +210,13 @@ export class ToolSurface {
   >();
   /** sessionId → SessionKeyStore directory for this spawn. */
   private readonly sessionDirs = new Map<string, string>();
+  /**
+   * Serializes create_task admission (capacity check + insert) on this home.
+   * Depth detects re-entrant creates from event handlers during the exclusive
+   * section; concurrent create_task calls cannot interleave mid-section because
+   * the section is synchronous (no await).
+   */
+  private admissionDepth = 0;
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -1106,10 +1113,6 @@ export class ToolSurface {
       throw new ToolSurfaceError("NOT_FOUND", `project not found: ${input.spec.projectId}`);
     }
 
-    // Secondmate admission: enforce maxConcurrentTasks at the only place that
-    // cannot be raced — task creation on this daemon (not a primary-side probe).
-    this.assertLocalAdmissionCapacity();
-
     const now = new Date().toISOString();
     const maxValidations = this.cfg().validation.maxValidations;
     const yolo = input.spec.shape === "SHIP" ? input.spec.yolo : false;
@@ -1142,11 +1145,16 @@ export class ToolSurface {
       policyOverrides: [],
     };
 
-    this.tasks.set(task.id, task);
-    if (task.idempotencyKey !== null) {
-      this.idempotency.set(task.idempotencyKey, task);
-    }
-    this.persistTask(task);
+    // Capacity check + insert share one exclusive section so concurrent creates
+    // on this home cannot both pass the cap (see runAdmissionExclusive).
+    this.runAdmissionExclusive(() => {
+      this.assertLocalAdmissionCapacity();
+      this.tasks.set(task.id, task);
+      if (task.idempotencyKey !== null) {
+        this.idempotency.set(task.idempotencyKey, task);
+      }
+      this.persistTask(task);
+    });
     this.sink({
       type: "task.created",
       payload: {
@@ -1160,6 +1168,27 @@ export class ToolSurface {
       },
     });
     return task;
+  }
+
+  /**
+   * Run capacity check + task insert atomically w.r.t. other creates on this
+   * home. Synchronous: no await inside `fn`, so the event loop cannot interleave
+   * another create mid-section. Re-entrant admission (nested create from a
+   * sink/handler) is refused rather than racing the load count.
+   */
+  private runAdmissionExclusive<T>(fn: () => T): T {
+    if (this.admissionDepth > 0) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        "task admission is already in progress on this home",
+      );
+    }
+    this.admissionDepth += 1;
+    try {
+      return fn();
+    } finally {
+      this.admissionDepth -= 1;
+    }
   }
 
   private updateTask(raw: Record<string, unknown>): TaskSnapshot {
@@ -3548,7 +3577,8 @@ export class ToolSurface {
    * Hand a task to a secondmate. POST the task to the secondmate first; only
    * after acceptance is it released on the primary. A failed POST leaves the
    * task on the primary with a typed error — dropping work is worse than
-   * refusing to route. Domain must match the target charter via routeFor.
+   * refusing to route. Named routing checks the target's own charter (domains +
+   * acceptsRouting); routeFor is for auto-pick/discovery only.
    * Capacity (maxConcurrentTasks) is enforced on the live secondmate.
    */
   private async routeToSecondmate(raw: Record<string, unknown>): Promise<{
@@ -3567,8 +3597,8 @@ export class ToolSurface {
       throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
     }
 
-    const byDomain = this.deps.secondmates.fleet.routeFor(input.domain);
-    if (byDomain === null || byDomain.name !== input.name) {
+    const record = this.deps.secondmates.registry.get(input.name);
+    if (record === null) {
       this.sink({
         type: "secondmate.routed",
         payload: {
@@ -3576,20 +3606,12 @@ export class ToolSurface {
           taskId: task.id,
           domain: input.domain,
           accepted: false,
-          reason: byDomain === null
-            ? `no secondmate accepts domain ${input.domain}`
-            : `domain ${input.domain} routes to ${byDomain.name}, not ${input.name}`,
+          reason: `no secondmate named ${input.name}`,
           remoteTaskId: null,
         },
       });
-      throw new ToolSurfaceError(
-        "POLICY_VIOLATION",
-        byDomain === null
-          ? `no secondmate accepts domain ${input.domain}`
-          : `secondmate ${input.name} does not accept domain ${input.domain}`,
-      );
+      throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
     }
-    const record = byDomain;
     const { charter } = this.deps.secondmates.fleet.readCharter(record);
     if (!charter.acceptsRouting) {
       this.sink({
@@ -3606,6 +3628,24 @@ export class ToolSurface {
       throw new ToolSurfaceError(
         "POLICY_VIOLATION",
         `secondmate ${record.name} declines routing (charter acceptsRouting=false)`,
+      );
+    }
+    // Named target's own charter — not routeFor first-wins across the fleet.
+    if (!this.deps.secondmates.fleet.acceptsDomain(record, input.domain)) {
+      this.sink({
+        type: "secondmate.routed",
+        payload: {
+          name: record.name,
+          taskId: task.id,
+          domain: input.domain,
+          accepted: false,
+          reason: `secondmate ${record.name} does not accept domain ${input.domain}`,
+          remoteTaskId: null,
+        },
+      });
+      throw new ToolSurfaceError(
+        "POLICY_VIOLATION",
+        `secondmate ${record.name} does not accept domain ${input.domain}`,
       );
     }
 

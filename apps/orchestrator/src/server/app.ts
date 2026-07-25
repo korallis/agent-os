@@ -562,35 +562,74 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         maxConcurrentTasks?: unknown;
         acceptsRouting?: unknown;
       } | null;
-      const domains = Array.isArray(body?.domains)
-        ? body.domains.filter((d): d is string => typeof d === "string")
-        : null;
-      if (domains === null || domains.length === 0) {
-        sendError(reply, 400, "BAD_REQUEST", "domains array is required");
+      // Partial updates merge with the current charter — omitted fields keep
+      // their existing values (never silently reset to defaults).
+      const domains =
+        body !== null && "domains" in body
+          ? Array.isArray(body.domains)
+            ? body.domains.filter((d): d is string => typeof d === "string")
+            : null
+          : undefined;
+      if (domains !== undefined && (domains === null || domains.length === 0)) {
+        sendError(reply, 400, "BAD_REQUEST", "domains must be a non-empty string array when provided");
         return;
       }
-      const brainModel =
-        body?.brainModel === null
-          ? null
-          : typeof body?.brainModel === "string"
-            ? body.brainModel
-            : null;
-      const maxConcurrentTasks =
-        typeof body?.maxConcurrentTasks === "number" ? body.maxConcurrentTasks : 2;
-      const acceptsRouting =
-        typeof body?.acceptsRouting === "boolean" ? body.acceptsRouting : true;
+      const hasBrainModel = body !== null && "brainModel" in body;
+      let brainModel: string | null | undefined;
+      if (hasBrainModel) {
+        if (body!.brainModel === null) {
+          brainModel = null;
+        } else if (typeof body!.brainModel === "string") {
+          brainModel = body!.brainModel;
+        } else {
+          sendError(reply, 400, "BAD_REQUEST", "brainModel must be a string or null");
+          return;
+        }
+      }
+      const hasMax = body !== null && "maxConcurrentTasks" in body;
+      let maxConcurrentTasks: number | undefined;
+      if (hasMax) {
+        if (typeof body!.maxConcurrentTasks !== "number") {
+          sendError(reply, 400, "BAD_REQUEST", "maxConcurrentTasks must be a number");
+          return;
+        }
+        maxConcurrentTasks = body!.maxConcurrentTasks;
+      }
+      const hasAccepts = body !== null && "acceptsRouting" in body;
+      let acceptsRouting: boolean | undefined;
+      if (hasAccepts) {
+        if (typeof body!.acceptsRouting !== "boolean") {
+          sendError(reply, 400, "BAD_REQUEST", "acceptsRouting must be a boolean");
+          return;
+        }
+        acceptsRouting = body!.acceptsRouting;
+      }
+      if (
+        domains === undefined &&
+        brainModel === undefined &&
+        maxConcurrentTasks === undefined &&
+        acceptsRouting === undefined
+      ) {
+        sendError(
+          reply,
+          400,
+          "BAD_REQUEST",
+          "charter update requires at least one of domains, brainModel, maxConcurrentTasks, acceptsRouting",
+        );
+        return;
+      }
       try {
         const result = await deps.fleet.syncSecondmateCharter(request.params.name, {
-          name: request.params.name,
-          domains,
-          brainModel,
-          maxConcurrentTasks,
-          acceptsRouting,
+          ...(domains !== undefined ? { domains } : {}),
+          ...(brainModel !== undefined ? { brainModel } : {}),
+          ...(maxConcurrentTasks !== undefined ? { maxConcurrentTasks } : {}),
+          ...(acceptsRouting !== undefined ? { acceptsRouting } : {}),
         });
         return result;
       } catch (error) {
         const message = error instanceof Error ? error.message : "charter sync failed";
-        sendError(reply, 400, "BAD_REQUEST", message);
+        const notFound = /no secondmate named/i.test(message);
+        sendError(reply, notFound ? 404 : 400, notFound ? "NOT_FOUND" : "BAD_REQUEST", message);
       }
     },
   );
