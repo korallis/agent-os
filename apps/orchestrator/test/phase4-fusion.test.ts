@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { PI_PINNED_VERSION } from "@agent-os/protocol";
 import { SHIPPED_DEFAULTS_DIR, SHIPPED_PROMPTS_DIR } from "../src/daemon.js";
 import { ConfigService } from "../src/config/service.js";
+import { BRAIN_SESSION_PROJECT_ID } from "../src/fleet/brain.js";
 import { FleetService } from "../src/fleet/service.js";
 import { FusionRunStore } from "../src/fleet/fusion-runs.js";
 import { SessionKeyStore } from "../src/fleet/sessions.js";
@@ -400,6 +402,161 @@ describe("session keys (G6)", () => {
         { role: "planner", model: "openai/gpt-5.6-sol" },
       ]),
     ).toEqual([]);
+  });
+
+  it("never inherits ambient session-dir sentinels into crewmate or Brain spawn env", () => {
+    const sentinel = "/tmp/ambient-session-dir-CANARY";
+    const prevAgentos = process.env.AGENTOS_SESSION_DIR;
+    const prevPi = process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.AGENTOS_SESSION_DIR = sentinel;
+    process.env.PI_CODING_AGENT_SESSION_DIR = sentinel;
+
+    try {
+      const home = temp("agentos-p4-session-canary-");
+      mkdirSync(join(home, "config"), { recursive: true });
+      const extensionPath = join(home, "extension.js");
+      writeFileSync(extensionPath, "export default {};\n");
+      const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+      config.installDefaults();
+      const promptService = new PromptService(SHIPPED_PROMPTS_DIR, join(home, "prompts"));
+      promptService.installDefaults();
+
+      const capturedEnvs: Array<Record<string, string> | undefined> = [];
+      const service = new FleetService({
+        home,
+        config,
+        prompts: promptService,
+        fakeTmux: true,
+        fakeBrain: false,
+        fakePi: false,
+        pi: {
+          binary: "/usr/bin/true",
+          version: PI_PINNED_VERSION,
+          pinnedVersion: PI_PINNED_VERSION,
+          versionMatchesPin: true,
+          managedHome: join(home, "pi"),
+          configDirEnv: "PI_CONFIG_DIR",
+          isolationMode: "managed",
+        },
+        extensionPath,
+        sockets: {
+          sessionSocketPath: (sessionId) => join(home, "sockets", `${sessionId}.sock`),
+          openSession: (sessionId) => {
+            mkdirSync(join(home, "sockets"), { recursive: true });
+            return join(home, "sockets", `${sessionId}.sock`);
+          },
+          closeSession: async () => undefined,
+          sendControl: () => false,
+        },
+      });
+
+      const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+      service.tmux.newWindow = ((input: Parameters<typeof originalNewWindow>[0]) => {
+        capturedEnvs.push(input.env);
+        return originalNewWindow(input);
+      }) as typeof service.tmux.newWindow;
+
+      const brainSnap = service.brain.start("session-dir-canary");
+      expect(brainSnap.status).toBe("running");
+      expect(brainSnap.model).not.toBeNull();
+      const brainModel = brainSnap.model as string;
+      const brainDir = service.sessionKeys.ensure({
+        projectId: BRAIN_SESSION_PROJECT_ID,
+        role: "brain",
+        model: brainModel,
+      }).dir;
+
+      const project = service.projects.register({
+        name: "p4-canary",
+        path: gitRepo(),
+        mode: "local-only",
+        trusted: true,
+      });
+      const created = service.tools.invoke("create_task", {
+        spec: {
+          shape: "SHIP",
+          title: "session dir canary",
+          intent: "assert ambient session dirs never leak",
+          projectId: project.id,
+          mode: "local-only",
+          yolo: true,
+        },
+      });
+      expect(created.ok).toBe(true);
+      const taskId = (created.data as { id: string }).id;
+      expect(
+        service.tools.invoke("resolve_cast", {
+          taskId,
+          roles: [
+            {
+              role: "planner",
+              model: "openai/gpt-4.1",
+              thinking: "low",
+              cleanRoom: true,
+            },
+          ],
+          familyCheckOverride: false,
+        }).ok,
+      ).toBe(true);
+      const spawned = service.tools.invoke("spawn_crewmate", {
+        taskId,
+        role: "planner",
+        model: "openai/gpt-4.1",
+        thinking: "low",
+        cleanRoom: true,
+        vars: {},
+      });
+      expect(spawned.ok).toBe(true);
+      const crewmateDir = service.sessionKeys.ensure({
+        projectId: project.id,
+        role: "planner",
+        model: "openai/gpt-4.1",
+      }).dir;
+
+      expect(capturedEnvs.length).toBeGreaterThanOrEqual(2);
+      for (const env of capturedEnvs) {
+        expect(env).toBeDefined();
+        const record = env as Record<string, string>;
+        expect(record.AGENTOS_SESSION_DIR).not.toBe(sentinel);
+        expect(record.PI_CODING_AGENT_SESSION_DIR).not.toBe(sentinel);
+        expect(Object.values(record).join("\0")).not.toContain(sentinel);
+      }
+
+      const brainEnv = capturedEnvs.find((env) => env?.AGENTOS_ROLE === "brain");
+      const crewmateEnv = capturedEnvs.find((env) => env?.AGENTOS_ROLE === "planner");
+      expect(brainEnv).toBeDefined();
+      expect(crewmateEnv).toBeDefined();
+      expect(brainEnv?.AGENTOS_SESSION_DIR).toBe(brainDir);
+      expect(brainEnv?.PI_CODING_AGENT_SESSION_DIR).toBe(brainDir);
+      expect(crewmateEnv?.AGENTOS_SESSION_DIR).toBe(crewmateDir);
+      expect(crewmateEnv?.PI_CODING_AGENT_SESSION_DIR).toBe(crewmateDir);
+
+      const noSession = buildPiSpawnSpec({
+        agentosHome: home,
+        detection: {
+          binary: "/usr/bin/true",
+          version: PI_PINNED_VERSION,
+          pinnedVersion: PI_PINNED_VERSION,
+          versionMatchesPin: true,
+          managedHome: join(home, "pi"),
+          configDirEnv: "PI_CONFIG_DIR",
+          isolationMode: "managed",
+        },
+        args: ["-p", "hi"],
+        cwd: home,
+        sessionId: "01JSESSIONCANARY0000000001",
+        role: "builder",
+        socketPath: join(home, "s.sock"),
+        extensionPath,
+      });
+      expect(noSession.env.AGENTOS_SESSION_DIR).toBeUndefined();
+      expect(noSession.env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
+    } finally {
+      if (prevAgentos === undefined) delete process.env.AGENTOS_SESSION_DIR;
+      else process.env.AGENTOS_SESSION_DIR = prevAgentos;
+      if (prevPi === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+      else process.env.PI_CODING_AGENT_SESSION_DIR = prevPi;
+    }
   });
 
   it("removes a newly created session key when spawn fails so resume still sees the role missing", () => {

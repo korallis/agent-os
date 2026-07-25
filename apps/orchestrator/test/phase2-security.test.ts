@@ -40,6 +40,40 @@ describe("env hygiene (§4.8)", () => {
     expect(result.providerKeysPresent).toEqual(["OPENAI_API_KEY"]);
   });
 
+  it("strips ambient session-dir vars unless granted via extraAllow", () => {
+    const ambient = "/tmp/ambient-session-dir-CANARY";
+    const seat = "/tmp/seat-session-dir-explicit";
+    const stripped = scrubEnv(
+      {
+        PATH: "/usr/bin",
+        HOME: "/tmp",
+        AGENTOS_SESSION_DIR: ambient,
+        PI_CODING_AGENT_SESSION_DIR: ambient,
+      },
+      {},
+    );
+    expect(stripped.env.AGENTOS_SESSION_DIR).toBeUndefined();
+    expect(stripped.env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
+
+    const granted = scrubEnv(
+      {
+        PATH: "/usr/bin",
+        HOME: "/tmp",
+        AGENTOS_SESSION_DIR: ambient,
+        PI_CODING_AGENT_SESSION_DIR: ambient,
+      },
+      {
+        extraAllow: {
+          AGENTOS_SESSION_DIR: seat,
+          PI_CODING_AGENT_SESSION_DIR: seat,
+        },
+      },
+    );
+    expect(granted.env.AGENTOS_SESSION_DIR).toBe(seat);
+    expect(granted.env.PI_CODING_AGENT_SESSION_DIR).toBe(seat);
+    expect(granted.env.AGENTOS_SESSION_DIR).not.toBe(ambient);
+  });
+
   it("flags ambient ANTHROPIC_API_KEY for subscription-sdk path", () => {
     expect(() =>
       assertNoAmbientAnthropicKey({ ANTHROPIC_API_KEY: "sk-ant-ambient" }),

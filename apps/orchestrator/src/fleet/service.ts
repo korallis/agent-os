@@ -95,6 +95,7 @@ export class FleetService {
       tmux: this.tmux,
       tools: this.tools,
       watcher: this.watcher,
+      sessionKeys: this.sessionKeys,
       config: cfg.brain,
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),

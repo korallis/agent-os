@@ -13,6 +13,7 @@ import { resolveProviderKeyGrant } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
 import { buildPiSpawnSpec } from "../pi/manager.js";
 import { familyFromModel } from "../substrate/family.js";
+import type { SessionKeyStore } from "./sessions.js";
 import type { TmuxController } from "./tmux.js";
 import type { SessionChannel, ToolSurface } from "./tool-surface.js";
 import type { WakeWatcher } from "./watcher.js";
@@ -20,6 +21,9 @@ import type { WakeWatcher } from "./watcher.js";
 export type BrainEventSink = (event: OrchestratorEvent) => void;
 
 const nextUlid = monotonicFactory();
+
+/** Durable SessionKeyStore project id for the orchestrator Brain seat. */
+export const BRAIN_SESSION_PROJECT_ID = "orchestrator";
 
 /**
  * The Brain is an LLM, not a rule engine — but it acts only through the typed
@@ -39,6 +43,7 @@ export interface BrainManagerDeps {
   tmux: TmuxController;
   tools: ToolSurface;
   watcher: WakeWatcher;
+  sessionKeys: SessionKeyStore;
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
@@ -172,6 +177,11 @@ export class BrainManager {
           model,
           this.deps.connections,
         );
+        const sessionDir = this.deps.sessionKeys.ensure({
+          projectId: BRAIN_SESSION_PROJECT_ID,
+          role: "brain",
+          model,
+        }).dir;
         const spec = buildPiSpawnSpec({
           agentosHome: this.deps.home,
           detection: this.deps.pi,
@@ -181,6 +191,7 @@ export class BrainManager {
           role: "brain",
           socketPath,
           extensionPath: this.deps.extensionPath,
+          sessionDir,
           thinking,
           cleanRoom: false,
           grantProviderKey: grant,
