@@ -1,7 +1,7 @@
 {
   "//": "Route → Figma frame, and the evidence pack holding the side-by-side.",
   "//fileKey": "Ria7UpyEPRd9jNlF9B6xgF (AgentOS — AI Agent Orchestration Dashboard)",
-  "//rule": "Every route the Console serves must appear here with a Figma frame, or be listed in outOfScope with a reason. A screen with no canonical frame cannot be checked for fidelity, and silently omitting it is how drift starts.",
+  "//rule": "Every route the Console serves must appear here with a Figma frame, or be listed in outOfScope with a reason. A screen with no canonical frame cannot be checked for fidelity, and silently omitting it is how drift starts. Exempt (outOfScope) screens are allowed when the product needs them, but they MUST still be built from the Figma design system: shared shell (Topbar + the same page scaffold mapped screens use) and colours/type from packages/ui tokens (bg-shell, bg-panel, text-fg-*, border-line-*, accents) — hard-coded hex colours and ad-hoc style font sizes in the exempt screen's own components fail F4. A prose reason alone is not enough.",
   "fileKey": "Ria7UpyEPRd9jNlF9B6xgF",
   "routes": {
     "/fleet": { "node": "10:11978", "pack": "phase-1-figma-ui-2026-07-24", "slug": "fleet-dashboard" },

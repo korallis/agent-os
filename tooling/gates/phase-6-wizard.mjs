@@ -16,7 +16,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,13 @@ const PORT = 4700 + 1200 + Math.floor(Math.random() * 40);
 const CONSOLE_PORT = 3200 + Math.floor(Math.random() * 60);
 const BASE = `http://127.0.0.1:${PORT}`;
 const CONSOLE = `http://127.0.0.1:${CONSOLE_PORT}`;
+
+/**
+ * Connection-driven honesty labels only — not budget-ceiling copy such as
+ * "Claude extra-usage daily", which always renders when budgets load.
+ */
+const EXTRA_USAGE_LABEL =
+  /EXTRA USAGE\s*[—–-]\s*PER[- ]TOKEN(?:\s+BILLING)?|Extra usage \(per token\)/;
 
 const results = [];
 function gate(id, name, ok, detail) {
@@ -72,6 +79,25 @@ async function waitHealthy(home, timeoutMs = 30_000) {
   throw new Error("daemon did not come up");
 }
 
+function fixtureRepo() {
+  const dir = mkdtempSync(join(tmpdir(), "agentos-p6w-repo-"));
+  cleanups.push(dir);
+  const git = (...args) => spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "p6w@agent-os.local");
+  git("config", "user.name", "phase6w");
+  writeFileSync(join(dir, "README.md"), "# p6w\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "seed");
+  return dir;
+}
+
+function openrouterVerified(state) {
+  const row = (state.providers ?? []).find((p) => p.provider === "openrouter");
+  if (row === undefined) return null;
+  return { selected: row.selected === true, authVerified: row.authVerified === true };
+}
+
 try {
   const home = mkdtempSync(join(tmpdir(), "agentos-p6w-home-"));
   cleanups.push(home);
@@ -79,80 +105,107 @@ try {
   let token = await waitHealthy(home);
 
   const auth = () => ({ authorization: `Bearer ${token}`, "content-type": "application/json" });
-  const get = async (path) => (await fetch(`${BASE}${path}`, { headers: auth() })).json();
-  const post = async (path, body) =>
-    (await fetch(`${BASE}${path}`, { method: "POST", headers: auth(), body: JSON.stringify(body) })).json();
+  const get = async (path) => {
+    const res = await fetch(`${BASE}${path}`, { headers: auth() });
+    const body = await res.json();
+    return { status: res.status, ok: res.ok, body };
+  };
+  const post = async (path, body) => {
+    const res = await fetch(`${BASE}${path}`, {
+      method: "POST",
+      headers: auth(),
+      body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    return { status: res.status, ok: res.ok, body: json };
+  };
 
   // ── W1 — api-key path completes the wizard ────────────────────────────
   {
-    const before = (await get("/v1/onboarding")).state;
-    const connection = (
-      await post("/v1/connections/api-key", {
-        provider: "openrouter",
-        apiKey: "p6w-api-key-fixture-not-a-secret",
-        label: "OpenRouter (api key)",
-      })
-    ).connection;
+    const beforeRes = await get("/v1/onboarding");
+    const before = beforeRes.body.state;
+    const connectionRes = await post("/v1/connections/api-key", {
+      provider: "openrouter",
+      apiKey: "p6w-api-key-fixture-not-a-secret",
+      label: "OpenRouter (api key)",
+    });
+    const connection = connectionRes.body.connection;
     await post(`/v1/connections/${connection.id}/quota/refresh`, {});
     // The wizard advances by ACTION, not by naming a step — driving it the way
-    // the Console does is the whole point of an E2E gate.
-    await post("/v1/onboarding", { action: "refresh-doctor" });
-    await post("/v1/onboarding", { action: "set-providers", providers: ["openrouter"] });
-    await post("/v1/onboarding", { action: "verify-auth", provider: "openrouter" });
-    await post("/v1/onboarding", { action: "enable-probes" });
-    const after = (await get("/v1/onboarding")).state;
+    // the Console does is the whole point of an E2E gate. Each action must
+    // succeed; a 400 on enable-probes must not be papered over by a lucky step.
+    const actions = [
+      { action: "refresh-doctor" },
+      { action: "set-providers", providers: ["openrouter"] },
+      { action: "verify-auth", provider: "openrouter" },
+      { action: "enable-probes" },
+    ];
+    const actionResults = [];
+    for (const payload of actions) {
+      const res = await post("/v1/onboarding", payload);
+      actionResults.push({
+        action: payload.action,
+        status: res.status,
+        step: res.body?.state?.step,
+        error: res.body?.error?.code ?? res.body?.error?.message ?? null,
+      });
+    }
+    const afterRes = await get("/v1/onboarding");
+    const after = afterRes.body.state;
+    const actionsOk = actionResults.every(
+      (r) => r.status < 400 && r.step !== undefined && r.error === null,
+    );
     gate(
       "W1",
       "a pi-api-key connection carries the wizard from doctor through probes",
-      connection.kind === "pi-api-key" &&
+      connection?.kind === "pi-api-key" &&
+        actionsOk &&
         before.step !== after.step &&
         ["probes", "complete"].includes(after.step),
-      `kind=${connection.kind} step ${before.step} → ${after.step}`,
+      `kind=${connection?.kind ?? "none"} step ${before.step} → ${after.step} actions=${actionResults
+        .map((r) => `${r.action}:${r.status}/${r.step ?? r.error ?? "?"}`)
+        .join(",")}`,
     );
   }
 
   // ── W3 — the wizard resumes at the same step after a daemon restart ────
   {
-    const beforeRestart = (await get("/v1/onboarding")).state;
+    const beforeRestartRes = await get("/v1/onboarding");
+    const beforeRestart = beforeRestartRes.body.state;
+    const beforeOr = openrouterVerified(beforeRestart);
     daemon.kill("SIGTERM");
     await sleep(2500);
     daemon = startDaemon(home);
     token = await waitHealthy(home);
-    const afterRestart = (await get("/v1/onboarding")).state;
+    const afterRestartRes = await get("/v1/onboarding");
+    const afterRestart = afterRestartRes.body.state;
+    const afterOr = openrouterVerified(afterRestart);
+    const verificationsIntact =
+      beforeOr !== null &&
+      afterOr !== null &&
+      beforeOr.selected === afterOr.selected &&
+      beforeOr.authVerified === afterOr.authVerified &&
+      afterOr.selected === true &&
+      afterOr.authVerified === true;
     gate(
       "W3",
       "the wizard resumes at the same step after a daemon restart, with prior verifications intact",
-      beforeRestart.step === afterRestart.step,
-      `${beforeRestart.step} → ${afterRestart.step} (restart survived)`,
+      beforeRestart.step === afterRestart.step && verificationsIntact,
+      `${beforeRestart.step} → ${afterRestart.step} openrouter selected/authVerified ${beforeOr?.selected}/${beforeOr?.authVerified} → ${afterOr?.selected}/${afterOr?.authVerified}`,
     );
   }
 
-  // ── W2 — an OAuth-shaped connection takes a different, valid path ──────
+  // Console is needed for the honesty-label checks (both directions of W4).
+  consoleServer = spawn(
+    join(ROOT, "apps", "console", "node_modules", ".bin", "next"),
+    ["start", "-p", String(CONSOLE_PORT), "-H", "127.0.0.1"],
+    {
+      cwd: join(ROOT, "apps", "console"),
+      env: { ...process.env, AGENTOS_HOME: home, AGENTOS_PORT: String(PORT) },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   {
-    // A fixture OAuth connection: no key file, credentials come from the Pi
-    // auth store, so this exercises the branch the api-key path never touches.
-    const started = await post("/v1/connections/oauth/start", { provider: "anthropic" });
-    const connections = (await get("/v1/connections")).connections ?? [];
-    const oauth = connections.find((c) => c.kind === "pi-oauth");
-    gate(
-      "W2",
-      "a fixture pi-oauth connection is created through the attach-command path",
-      started.attachCommand !== undefined && oauth !== undefined,
-      `attachCommand=${started.attachCommand !== undefined} oauthConnection=${oauth !== undefined} kind=${oauth?.kind ?? "none"}`,
-    );
-  }
-
-  // ── W4 — extra-usage labelling is consistent everywhere ───────────────
-  {
-    consoleServer = spawn(
-      join(ROOT, "apps", "console", "node_modules", ".bin", "next"),
-      ["start", "-p", String(CONSOLE_PORT), "-H", "127.0.0.1"],
-      {
-        cwd: join(ROOT, "apps", "console"),
-        env: { ...process.env, AGENTOS_HOME: home, AGENTOS_PORT: String(PORT) },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
     const deadline = Date.now() + 90_000;
     let up = false;
     while (Date.now() < deadline && !up) {
@@ -163,14 +216,13 @@ try {
       }
       if (!up) await sleep(300);
     }
+    if (!up) throw new Error("console did not start");
+  }
 
-    browser = await chromium.launch();
-    const page = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
+  browser = await chromium.launch();
+  const page = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
 
-    // Find whichever connection the daemon classified as extra-usage billing.
-    const connections = (await get("/v1/connections")).connections ?? [];
-    const extraUsage = connections.find((c) => c.billingSurface === "extra-usage-per-token");
-
+  async function labelledSurfaces() {
     const seenOn = [];
     for (const [label, path] of [
       ["providers", "/providers"],
@@ -180,18 +232,106 @@ try {
       await page.goto(`${CONSOLE}${path}`, { waitUntil: "networkidle" });
       await sleep(900);
       const text = (await page.textContent("body")) ?? "";
-      if (/extra.?usage/i.test(text)) seenOn.push(label);
+      if (EXTRA_USAGE_LABEL.test(text)) seenOn.push(label);
+    }
+    return seenOn;
+  }
+
+  // ── W4 (direction A) — labels absent when nothing bills extra-usage ───
+  // Only the openrouter api-key connection exists so far; no surface should
+  // invent connection-driven extra-usage wording (budget ceilings may still
+  // mention "extra-usage" and must not count).
+  const absentBeforeOauth = await labelledSurfaces();
+  const absentOk = absentBeforeOauth.length === 0;
+
+  // ── W2 — an OAuth-shaped connection takes a different, valid path ──────
+  {
+    // A fixture OAuth connection: no key file, credentials come from the Pi
+    // auth store, so this exercises the branch the api-key path never touches.
+    const started = await post("/v1/connections/oauth/start", { provider: "anthropic" });
+    const connectionsRes = await get("/v1/connections");
+    const connections = connectionsRes.body.connections ?? [];
+    const oauth = connections.find((c) => c.kind === "pi-oauth");
+    gate(
+      "W2",
+      "a fixture pi-oauth connection is created through the attach-command path",
+      started.body.attachCommand !== undefined && oauth !== undefined,
+      `attachCommand=${started.body.attachCommand !== undefined} oauthConnection=${oauth !== undefined} kind=${oauth?.kind ?? "none"}`,
+    );
+  }
+
+  // ── W4 (direction B) — labels on all three surfaces when one bills ─────
+  {
+    const connectionsRes = await get("/v1/connections");
+    const connections = connectionsRes.body.connections ?? [];
+    const extraUsage = connections.find((c) => c.billingSurface === "extra-usage-per-token");
+
+    // Analytics only renders surface labels once usage is attributed. Seed a
+    // single fake-pi spawn on anthropic so the connection-driven wording can
+    // appear — without inventing budget-ceiling matches.
+    if (extraUsage !== undefined) {
+      const projectRes = await post("/v1/projects", {
+        name: "p6w",
+        path: fixtureRepo(),
+        mode: "local-only",
+        trusted: true,
+      });
+      const projectId = projectRes.body.project?.id;
+      const taskRes = await post("/v1/tasks", {
+        spec: {
+          shape: "SHIP",
+          title: "W4 extra-usage label fixture",
+          intent: "seed anthropic usage for honesty labels",
+          projectId,
+          mode: "local-only",
+          yolo: true,
+        },
+      });
+      const taskId = taskRes.body.task?.id;
+      if (taskId !== undefined) {
+        await post("/v1/tools/call", {
+          tool: "resolve_cast",
+          input: {
+            taskId,
+            roles: [
+              {
+                role: "builder",
+                model: "anthropic/claude-sonnet-4-5",
+                thinking: "medium",
+                cleanRoom: true,
+              },
+            ],
+            familyCheckOverride: true,
+          },
+        });
+        await post("/v1/tools/call", {
+          tool: "spawn_crewmate",
+          input: {
+            taskId,
+            role: "builder",
+            model: "anthropic/claude-sonnet-4-5",
+            thinking: "medium",
+            vars: {},
+            redBaselineOverride: true,
+          },
+        });
+        await sleep(1500);
+      }
     }
 
-    // When no connection bills that way, the honest outcome is that the label
-    // appears NOWHERE — an assertion that would fail if a screen invented it.
-    const consistent =
-      extraUsage === undefined ? seenOn.length === 0 : seenOn.length >= 2;
+    const seenOn = await labelledSurfaces();
+    const presentOk =
+      extraUsage !== undefined
+        ? seenOn.includes("providers") &&
+          seenOn.includes("billing") &&
+          seenOn.includes("analytics")
+        : seenOn.length === 0;
+
     gate(
       "W4",
       "extra-usage billing is labelled consistently across card, billing and analytics — and nowhere when nothing bills that way",
-      consistent && up,
-      `extraUsageConnection=${extraUsage !== undefined} labelledOn=[${seenOn.join(",")}] consoleUp=${up}`,
+      absentOk && presentOk,
+      `absentBefore=[${absentBeforeOauth.join(",")}] extraUsageConnection=${extraUsage !== undefined} labelledOn=[${seenOn.join(",")}]`,
     );
   }
 
