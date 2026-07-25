@@ -93,6 +93,9 @@ jobs:
       - name: Phase 6 Figma fidelity gate
         run: node tooling/gates/phase-6-fidelity.mjs
 
+      - name: Phase 6 terminal continuity gates
+        run: node tooling/gates/phase-6-terminal.mjs
+
       - name: Phase 7 gates
         run: node tooling/gates/phase-7.mjs
 

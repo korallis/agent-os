@@ -147,13 +147,27 @@ function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
   const endStream = (reason: string): void => {
     if (closed) return;
     stop();
-    safeSend(ws, JSON.stringify({ type: "closed", reason }));
+    safeSend(ws, JSON.stringify({ type: "closed", reason, lastSeq: seq }));
     try {
       ws.close();
     } catch {
       // already closing or closed
     }
   };
+
+  /**
+   * Monotonic frame sequence, per stream.
+   *
+   * Without it a dropped frame is indistinguishable from a pane that simply did
+   * not change — which is exactly the ambiguity the "no dropped frames" soak
+   * has to rule out. The client asserts `seq` increases by one; a gap means a
+   * genuine loss, not a quiet pane.
+   *
+   * It also makes reconnect honest: a resumed stream reports the target it
+   * re-attached to and restarts its own numbering from 1, so continuity is a
+   * claim the client can check rather than one the server just asserts.
+   */
+  let seq = 0;
 
   const tick = (): void => {
     if (closed || inFlight) return;
@@ -171,7 +185,8 @@ function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
         }
         failures = 0;
         if (captured !== last) {
-          if (safeSend(ws, JSON.stringify({ type: "pane", content: captured }))) {
+          seq += 1;
+          if (safeSend(ws, JSON.stringify({ type: "pane", seq, content: captured }))) {
             last = captured;
           } else if (
             ws.readyState === WebSocket.CLOSING ||
