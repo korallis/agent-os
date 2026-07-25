@@ -157,6 +157,8 @@ try {
     return await new Promise((resolve) => {
       const seqs = [];
       let sawContent = false;
+      const startedAt = Date.now();
+      let lastFrameAt = null;
       // The PTY server enforces a loopback Origin; without it the upgrade
       // succeeds and the socket is closed immediately.
       const ws = new WebSocket(ticket.wsUrl, { origin: "http://127.0.0.1" });
@@ -166,13 +168,14 @@ try {
         } catch {
           // already closing
         }
-        resolve({ seqs, sawContent });
+        resolve({ seqs, sawContent, startedAt, lastFrameAt, windowMs: ms });
       };
       ws.on("message", (raw) => {
         try {
           const frame = JSON.parse(String(raw));
           if (frame.type === "pane" && typeof frame.seq === "number") {
             seqs.push(frame.seq);
+            lastFrameAt = Date.now();
             if (typeof frame.content === "string" && frame.content.length > 0) sawContent = true;
           }
         } catch {
@@ -187,51 +190,87 @@ try {
   const contiguous = (seqs) =>
     seqs.length > 1 && seqs.every((value, index) => value === seqs[0] + index);
 
+  // Server poll interval (apps/orchestrator/src/pty/server.ts). Theoretical max
+  // frames when every tick sees a change is windowMs / POLL_MS. Require a high
+  // fraction so an early burst cannot green a long soak, with modest slack for
+  // capture lag and scheduler jitter.
   const POLL_MS = 500;
+  const FLOOR_FRACTION = 0.9;
+  const END_ARRIVAL_FRACTION = 0.1;
+  const theoreticalMax = (windowMs) => Math.floor(windowMs / POLL_MS);
   const minFramesFor = (windowMs) =>
-    paneChanges ? Math.max(2, Math.floor(windowMs / POLL_MS / 3)) : 1;
+    Math.max(2, Math.floor(theoreticalMax(windowMs) * FLOOR_FRACTION));
 
-  const streamOk = (seqs, sawContent, windowMs) => {
+  const arrivedNearEnd = (startedAt, lastFrameAt, windowMs) => {
+    if (typeof lastFrameAt !== "number") return false;
+    const endAt = startedAt + windowMs;
+    const tailMs = Math.max(POLL_MS * 2, Math.floor(windowMs * END_ARRIVAL_FRACTION));
+    return lastFrameAt >= endAt - tailMs;
+  };
+
+  // T1 is the soak claim: multi-frame contiguity for the full window. When the
+  // environment cannot fork a ticking pane, FAIL (do not green) so a pass always
+  // means sustained emission was actually exercised.
+  const soakOk = (stream) => {
+    if (!paneChanges) return false;
+    const floor = minFramesFor(stream.windowMs);
+    return (
+      stream.seqs.length >= floor &&
+      stream.seqs[0] === 1 &&
+      stream.sawContent &&
+      contiguous(stream.seqs) &&
+      arrivedNearEnd(stream.startedAt, stream.lastFrameAt, stream.windowMs)
+    );
+  };
+
+  // T2 proves reconnect renumbers at 1 on the same pane. Multi-frame when the
+  // ticker is live; single-frame only when the pane cannot change (reconnect
+  // numbering still holds).
+  const reconnectOk = (stream) => {
+    const { seqs, sawContent, startedAt, lastFrameAt, windowMs } = stream;
+    if (!(seqs.length >= 1 && seqs[0] === 1 && sawContent)) return false;
+    if (!paneChanges) return seqs.length === 1 || contiguous(seqs);
     const floor = minFramesFor(windowMs);
     return (
-      seqs.length >= 1 &&
-      seqs[0] === 1 &&
-      sawContent &&
-      (paneChanges
-        ? contiguous(seqs) && seqs.length >= floor
-        : seqs.length === 1 || contiguous(seqs))
+      contiguous(seqs) &&
+      seqs.length >= floor &&
+      arrivedNearEnd(startedAt, lastFrameAt, windowMs)
     );
   };
 
   const first = await streamFor(SOAK_MS);
   const firstFloor = minFramesFor(SOAK_MS);
+  const firstNearEnd = arrivedNearEnd(first.startedAt, first.lastFrameAt, SOAK_MS);
+  const firstContiguous = contiguous(first.seqs);
   gate(
     "T1",
-    "frames are sequenced from 1 with real pane content, and every frame received is contiguous",
-    streamOk(first.seqs, first.sawContent, SOAK_MS),
-    `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${paneChanges ? contiguous(first.seqs) : first.seqs.length === 1 ? "n/a (pane did not change)" : contiguous(first.seqs)} content=${first.sawContent} paneTickerStarted=${paneChanges} soakMs=${SOAK_MS} minFrames=${firstFloor} (floor=max(2,floor(soakMs/${POLL_MS}/3)) ≈⅓ of theoretical max at ${POLL_MS}ms poll)`,
+    "sustained multi-frame soak: sequenced from 1, contiguous, floor met, frames still arriving near end",
+    soakOk(first),
+    !paneChanges
+      ? `FAIL: pane ticker did not start (tmux respawn-pane could not fork) — soak criterion not exercised; frames=${first.seqs.length} soakMs=${SOAK_MS}`
+      : `frames=${first.seqs.length} seq[${first.seqs[0]}..${first.seqs.at(-1)}] contiguous=${firstContiguous} content=${first.sawContent} paneTickerStarted=${paneChanges} soakMs=${SOAK_MS} minFrames=${firstFloor} (floor=${FLOOR_FRACTION} of theoretical ${theoreticalMax(SOAK_MS)} at ${POLL_MS}ms poll) lastFrameNearEnd=${firstNearEnd}`,
   );
 
   const reconnectMs = Math.min(4_000, SOAK_MS);
   const second = await streamFor(reconnectMs);
   const secondFloor = minFramesFor(reconnectMs);
+  const secondNearEnd = arrivedNearEnd(second.startedAt, second.lastFrameAt, reconnectMs);
   gate(
     "T2",
     "a reconnect resumes the same pane and restarts its own numbering at 1",
-    streamOk(second.seqs, second.sawContent, reconnectMs),
-    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs)} samePane=${second.sawContent} minFrames=${secondFloor}`,
+    reconnectOk(second),
+    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs)} samePane=${second.sawContent} minFrames=${secondFloor} lastFrameNearEnd=${secondNearEnd}`,
   );
 
   if (!paneChanges) {
-    // Say it out loud rather than letting a green gate imply more than it proved.
     console.log(
-      "\nNOTE: this environment refused to start a ticking pane (tmux respawn-pane could not fork),",
+      "\nNOTE: this environment refused to start a ticking pane (tmux respawn-pane could not fork).",
     );
     console.log(
-      "so each stream carried a single initial frame. Sequencing, content and reconnect numbering are",
+      "T1 FAILS by design — the 10-minute soak claim requires a live ticker so a green run never",
     );
     console.log(
-      "proven; sustained multi-frame no-gap streaming is NOT proven here and the plan reflects that.",
+      "implies multi-frame sustained emission that was not exercised. T2 may still prove renumbering.",
     );
   }
 
