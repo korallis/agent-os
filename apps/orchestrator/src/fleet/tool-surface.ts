@@ -5,6 +5,7 @@ import { monotonicFactory } from "ulid";
 import { ZodError } from "zod";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
+import JSON5 from "json5";
 import { enforceFusionContract } from "@agent-os/fusion-core";
 import {
   answerCrewmateInputSchema,
@@ -30,6 +31,7 @@ import {
   updateTaskInputSchema,
   advancePhaseInputSchema,
   brainToolNameSchema,
+  secondmateCharterSchema,
   type AgentOsConfig,
   type BrainSnapshot,
   type BrainToolName,
@@ -557,9 +559,101 @@ export class ToolSurface {
    * directory is absent — surviving dirs (and their live panes) are left alone.
    * Live sessions whose key dir vanished are marked lost before respawn so a
    * wiped directory cannot leave an orphan "running" row blocking the gate.
+   *
+   * When a PiAuthBroker is configured, use reconcileMissingCastRolesAsync so
+   * every respawn takes the cross-process spawn-grant lock (grant resolution
+   * refuses to run unlocked).
    */
   reconcileMissingCastRoles(): Array<{ taskId: string; role: string; model: string }> {
+    if (this.deps.authBroker !== undefined) {
+      throw new ToolSurfaceError(
+        "INTERNAL",
+        "reconcileMissingCastRoles requires reconcileMissingCastRolesAsync when PiAuthBroker is configured",
+      );
+    }
+    return this.runMissingCastRoleReconcile((raw) => {
+      this.spawnCrewmate(raw);
+    });
+  }
+
+  /**
+   * Same as reconcileMissingCastRoles, but each respawn runs under
+   * PiAuthBroker.withSpawnGrant so boot/restart cannot bypass the choke point.
+   */
+  async reconcileMissingCastRolesAsync(): Promise<
+    Array<{ taskId: string; role: string; model: string }>
+  > {
+    if (this.deps.authBroker === undefined) {
+      return this.reconcileMissingCastRoles();
+    }
+    const broker = this.deps.authBroker;
+    return this.runMissingCastRoleReconcileAsync(async (raw) => {
+      await broker.withSpawnGrant(async () => {
+        this.spawnCrewmate(raw);
+      });
+    });
+  }
+
+  private runMissingCastRoleReconcile(
+    spawn: (raw: Record<string, unknown>) => void,
+  ): Array<{ taskId: string; role: string; model: string }> {
     const respawned: Array<{ taskId: string; role: string; model: string }> = [];
+    for (const slot of this.collectMissingCastSlots()) {
+      try {
+        this.markMissingCastSlotLost(slot);
+        spawn({
+          taskId: slot.taskId,
+          role: slot.role,
+          model: slot.model,
+          thinking: slot.thinking,
+          cleanRoom: slot.cleanRoom,
+          vars: {},
+        });
+        respawned.push({ taskId: slot.taskId, role: slot.role, model: slot.model });
+      } catch (error) {
+        this.reportReconcileSpawnFailure(slot, error);
+      }
+    }
+    return respawned;
+  }
+
+  private async runMissingCastRoleReconcileAsync(
+    spawn: (raw: Record<string, unknown>) => Promise<void>,
+  ): Promise<Array<{ taskId: string; role: string; model: string }>> {
+    const respawned: Array<{ taskId: string; role: string; model: string }> = [];
+    for (const slot of this.collectMissingCastSlots()) {
+      try {
+        this.markMissingCastSlotLost(slot);
+        await spawn({
+          taskId: slot.taskId,
+          role: slot.role,
+          model: slot.model,
+          thinking: slot.thinking,
+          cleanRoom: slot.cleanRoom,
+          vars: {},
+        });
+        respawned.push({ taskId: slot.taskId, role: slot.role, model: slot.model });
+      } catch (error) {
+        this.reportReconcileSpawnFailure(slot, error);
+      }
+    }
+    return respawned;
+  }
+
+  private collectMissingCastSlots(): Array<{
+    taskId: string;
+    role: string;
+    model: string;
+    thinking: RoleCast["thinking"];
+    cleanRoom: boolean;
+  }> {
+    const slots: Array<{
+      taskId: string;
+      role: string;
+      model: string;
+      thinking: RoleCast["thinking"];
+      cleanRoom: boolean;
+    }> = [];
     for (const task of this.listTasks()) {
       if (isTerminalPhase(task.phase)) continue;
       if (task.cast.length === 0 || task.sessions.length === 0) continue;
@@ -571,46 +665,64 @@ export class ToolSurface {
           (c) => c.role === slot.role && c.model === slot.model,
         );
         if (castEntry === undefined) continue;
-        try {
-          for (const s of [...this.sessions.values()]) {
-            if (
-              s.taskId === task.id &&
-              s.role === slot.role &&
-              s.model === slot.model &&
-              (s.status === "starting" || s.status === "running" || s.status === "settled")
-            ) {
-              this.markSessionLost(
-                s.sessionId,
-                "session-key directory missing (reconcile)",
-              );
-            }
-          }
-          this.spawnCrewmate({
-            taskId: task.id,
-            role: castEntry.role,
-            model: castEntry.model,
-            thinking: castEntry.thinking,
-            cleanRoom: castEntry.cleanRoom,
-            vars: {},
-          });
-          respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
-        } catch (error) {
-          // A failed respawn must not abort boot-time rehydrate or sibling slots.
-          const message = error instanceof Error ? error.message : String(error);
-          const summary = `session-key reconcile failed to respawn ${slot.role}/${slot.model} for task ${task.id}: ${message}`;
-          this.sink({
-            type: "captain.escalation",
-            payload: {
-              taskId: task.id,
-              summary,
-              severity: "warn",
-            },
-          });
-          process.stderr.write(`[agentos] ${summary}\n`);
-        }
+        slots.push({
+          taskId: task.id,
+          role: castEntry.role,
+          model: castEntry.model,
+          thinking: castEntry.thinking,
+          cleanRoom: castEntry.cleanRoom,
+        });
       }
     }
-    return respawned;
+    return slots;
+  }
+
+  private markMissingCastSlotLost(slot: {
+    taskId: string;
+    role: string;
+    model: string;
+  }): void {
+    for (const s of [...this.sessions.values()]) {
+      if (
+        s.taskId === slot.taskId &&
+        s.role === slot.role &&
+        s.model === slot.model &&
+        (s.status === "starting" || s.status === "running" || s.status === "settled")
+      ) {
+        this.markSessionLost(s.sessionId, "session-key directory missing (reconcile)");
+      }
+    }
+  }
+
+  private reportReconcileSpawnFailure(
+    slot: { taskId: string; role: string; model: string },
+    error: unknown,
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const summary = `session-key reconcile failed to respawn ${slot.role}/${slot.model} for task ${slot.taskId}: ${message}`;
+    this.sink({
+      type: "captain.escalation",
+      payload: {
+        taskId: slot.taskId,
+        summary,
+        severity: "warn",
+      },
+    });
+    process.stderr.write(`[agentos] ${summary}\n`);
+  }
+
+  /**
+   * Structural choke: when a broker is configured, provider grant resolution
+   * may only run while this process holds the cross-process auth lock.
+   */
+  private assertSpawnGrantHeld(): void {
+    if (this.deps.authBroker === undefined) return;
+    if (!this.deps.authBroker.holdsAuthLock()) {
+      throw new ToolSurfaceError(
+        "INTERNAL",
+        "provider grant resolution requires PiAuthBroker.withSpawnGrant (auth lock not held)",
+      );
+    }
   }
 
   invoke(
@@ -930,6 +1042,58 @@ export class ToolSurface {
     return this.deps.config.effective().config;
   }
 
+  /**
+   * When this home is a secondmate (charter.json5 present), refuse create_task
+   * once active+queued load reaches charter.maxConcurrentTasks. Primary homes
+   * without a secondmate charter are uncapped here.
+   */
+  private assertLocalAdmissionCapacity(): void {
+    const charterPath = join(this.deps.home, "config", "charter.json5");
+    if (!existsSync(charterPath)) return;
+    let cap: number;
+    try {
+      const parsed = secondmateCharterSchema.parse(
+        JSON5.parse(readFileSync(charterPath, "utf8")),
+      );
+      cap = parsed.maxConcurrentTasks;
+    } catch {
+      // Malformed secondmate charter: fail closed on admission.
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        "secondmate charter is unreadable — cannot admit tasks",
+      );
+    }
+    const load = this.admissionLoad();
+    if (load >= cap) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `secondmate is at capacity (${load}/${cap} concurrent tasks)`,
+        { load, cap },
+      );
+    }
+  }
+
+  /** Matches fleet summary active + queued for capacity admission. */
+  private admissionLoad(): number {
+    const activePhases = new Set<TaskPhase>([
+      "BUILDING",
+      "VALIDATING",
+      "PLANNING",
+      "GATE_AUTHORING",
+      "DELIVERING",
+      "PLAN_FUSED",
+      "GATE_RED_VERIFIED",
+      "DISPATCH_RESOLVED",
+    ]);
+    let load = 0;
+    for (const task of this.listTasks()) {
+      if (activePhases.has(task.phase) || task.phase === "QUEUED" || task.phase === "WAITING_WORKTREE") {
+        load += 1;
+      }
+    }
+    return load;
+  }
+
   private createTask(raw: Record<string, unknown>): TaskSnapshot {
     const input = createTaskInputSchema.parse(raw);
     if (input.idempotencyKey !== undefined) {
@@ -941,6 +1105,10 @@ export class ToolSurface {
     if (project === null) {
       throw new ToolSurfaceError("NOT_FOUND", `project not found: ${input.spec.projectId}`);
     }
+
+    // Secondmate admission: enforce maxConcurrentTasks at the only place that
+    // cannot be raced — task creation on this daemon (not a primary-side probe).
+    this.assertLocalAdmissionCapacity();
 
     const now = new Date().toISOString();
     const maxValidations = this.cfg().validation.maxValidations;
@@ -1536,6 +1704,11 @@ export class ToolSurface {
         const seatWorkspace =
           input.role === "builder" || input.role === "validator" ? cwd : undefined;
         const runSpawn = (): string => {
+          // Structural choke: grant resolution is impossible without the lock
+          // when a broker is configured (assertSpawnGrantHeld). Callers must
+          // enter via withSpawnGrant — spawnCrewmateAsync, dispatchFusionAsync,
+          // reconcileMissingCastRolesAsync — not a bare spawnCrewmate.
+          this.assertSpawnGrantHeld();
           const grant = resolveProviderKeyGrant(
             this.deps.home,
             input.model,
@@ -1565,8 +1738,6 @@ export class ToolSurface {
           });
           return win.target;
         };
-        // Grant resolution goes through PiAuthBroker.withSpawnGrant on the
-        // async path (spawnCrewmateAsync). Sync path is tests without a broker.
         tmuxWindow = runSpawn();
       }
 

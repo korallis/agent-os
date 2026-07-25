@@ -206,6 +206,11 @@ export class FleetService {
 
   /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */
   async start(): Promise<void> {
+    // Cast-role respawn under the spawn-grant lock (skipped in rehydrate when
+    // a broker is present — bare spawnCrewmate cannot resolve grants unlocked).
+    if (this.options.authBroker !== undefined) {
+      await this.tools.reconcileMissingCastRolesAsync();
+    }
     await this.brain.start("daemon-boot");
     this.startReconcileTick();
   }
@@ -620,6 +625,8 @@ export class FleetService {
    * kill -9 restart-proof path: rebind control sockets for surviving sessions,
    * mark dead panes lost, reclaim orphaned worktree leases stuck in `leased`,
    * and respawn only cast roles whose session-key directory is absent (G6).
+   * When a PiAuthBroker is configured, cast-role respawn is deferred to start()
+   * so every grant resolution takes the cross-process spawn-grant lock.
    */
   private rehydrateRuntime(): void {
     // Rebuild in-flight fusion side ownership from durable run.json so a
@@ -629,7 +636,9 @@ export class FleetService {
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
     this.reclaimOrphanedWorktreeLeases();
-    this.tools.reconcileMissingCastRoles();
+    if (this.options.authBroker === undefined) {
+      this.tools.reconcileMissingCastRoles();
+    }
   }
 
   /**

@@ -243,8 +243,9 @@ try {
     });
     const blockedWhileHeld = contender.stdout.trim() === "blocked";
 
-    // Production choke point: async withSpawnGrant must also block while held.
-    const chokeScript = `
+    // Production choke point: async withSpawnGrant must block while held, then
+    // proceed after release — not only tryAcquire (which ignores wait/timeout).
+    const chokeWhileHeldScript = `
       import { PiAuthBroker } from '${authBrokerPath}';
       const b = PiAuthBroker.forManagedHome(${JSON.stringify(join(home, "pi"))});
       const p = b.withSpawnGrant(async () => { process.stdout.write('acquired'); });
@@ -257,23 +258,56 @@ try {
         clearTimeout(t);
       }
     `;
-    // While holder still holds, tryAcquire through a second PiAuthBroker must fail immediately.
+    const chokeWhileHeld = spawn(process.execPath, ["--input-type=module", "-e", chokeWhileHeldScript], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const chokeWhileHeldOut = await new Promise((resolve) => {
+      let buf = "";
+      const done = () => resolve(buf.trim());
+      chokeWhileHeld.stdout.on("data", (chunk) => {
+        buf += String(chunk);
+        if (buf.includes("blocked") || buf.includes("acquired") || buf.includes("error")) done();
+      });
+      chokeWhileHeld.on("exit", done);
+      setTimeout(done, 3000);
+    });
+    const chokeBlocked =
+      chokeWhileHeldOut.includes("blocked") && !chokeWhileHeldOut.includes("acquired");
+    try {
+      chokeWhileHeld.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+
+    // Immediate tryAcquire through a second PiAuthBroker must also fail while held.
     const chokeImmediate = `
       import { PiAuthBroker } from '${authBrokerPath}';
       const b = PiAuthBroker.forManagedHome(${JSON.stringify(join(home, "pi"))});
       process.stdout.write(b.crossProcessBroker.tryAcquire('choke') ? 'acquired' : 'blocked');
     `;
-    const choke = spawnSync(process.execPath, ["--input-type=module", "-e", chokeImmediate], {
+    const chokeImm = spawnSync(process.execPath, ["--input-type=module", "-e", chokeImmediate], {
       encoding: "utf8",
     });
-    const chokeBlocked = choke.stdout.trim() === "blocked";
-    void chokeScript;
+    const chokeImmBlocked = chokeImm.stdout.trim() === "blocked";
 
     await new Promise((resolve) => holder.on("exit", resolve));
     const after = spawnSync(process.execPath, ["--input-type=module", "-e", contendScript], {
       encoding: "utf8",
     });
     const freeAfterRelease = after.stdout.trim() === "acquired";
+
+    // After release, withSpawnGrant must actually proceed (not only tryAcquire).
+    const chokeAfterScript = `
+      import { PiAuthBroker } from '${authBrokerPath}';
+      const b = PiAuthBroker.forManagedHome(${JSON.stringify(join(home, "pi"))});
+      await b.withSpawnGrant(async () => { process.stdout.write('acquired'); });
+    `;
+    const chokeAfter = spawnSync(process.execPath, ["--input-type=module", "-e", chokeAfterScript], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    const chokeProceedsAfterRelease = chokeAfter.stdout.trim() === "acquired";
 
     // Corrupt lock must not be releasable by a non-holder (unreadable → refuse).
     const corruptScript = `
@@ -300,8 +334,13 @@ try {
     gate(
       "G4",
       "auth broker serialises across processes via PiAuthBroker choke point",
-      blockedWhileHeld && freeAfterRelease && chokeBlocked && corruptKept,
-      `blockedWhileHeld=${blockedWhileHeld} freeAfterRelease=${freeAfterRelease} chokeBlocked=${chokeBlocked} corruptKept=${corruptKept}`,
+      blockedWhileHeld &&
+        freeAfterRelease &&
+        chokeBlocked &&
+        chokeImmBlocked &&
+        chokeProceedsAfterRelease &&
+        corruptKept,
+      `blockedWhileHeld=${blockedWhileHeld} freeAfterRelease=${freeAfterRelease} chokeBlocked=${chokeBlocked} chokeImmBlocked=${chokeImmBlocked} chokeProceedsAfterRelease=${chokeProceedsAfterRelease} corruptKept=${corruptKept}`,
     );
   }
 

@@ -115,6 +115,15 @@ export class SecondmateFleet {
       );
       if (!response.ok) {
         const text = await response.text().catch(() => "");
+        if (
+          response.status === 409 ||
+          /capacity|concurrent tasks/i.test(text)
+        ) {
+          throw new SecondmateCapacityError(
+            `secondmate ${input.record.name} is at capacity (admission refused)`,
+            { status: response.status, body: text.slice(0, 500) },
+          );
+        }
         throw new SecondmateHandoverError(
           `secondmate ${input.record.name} refused task (HTTP ${response.status})`,
           { status: response.status, body: text.slice(0, 500) },

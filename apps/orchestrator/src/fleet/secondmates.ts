@@ -392,15 +392,55 @@ export class SecondmateRegistry {
     return { stopped: true, name: record.name };
   }
 
-  /** Stop every secondmate child owned by this registry (daemon shutdown). */
+  /**
+   * Stop every secondmate this primary knows about: live children, provisioned
+   * homes, and runtime.json orphans left after a primary crash/restart (those
+   * are not re-adopted into `children` and would otherwise keep homes/ports).
+   */
   async stopAll(): Promise<void> {
-    const names = [...this.children.keys()];
+    const names = new Set<string>();
+    for (const name of this.children.keys()) names.add(name);
+    for (const record of this.list()) names.add(record.name);
+    if (existsSync(this.runtimeRoot)) {
+      for (const entry of readdirSync(this.runtimeRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) names.add(entry.name);
+      }
+    }
     for (const name of names) {
       try {
         await this.stop(name);
       } catch {
-        // best-effort
+        // best-effort — still try to kill a runtime-only orphan
+        try {
+          await this.stopOrphanRuntime(name);
+        } catch {
+          // ignore
+        }
       }
+    }
+  }
+
+  /** Kill a secondmate known only via runtime.json (no charter / children entry). */
+  private async stopOrphanRuntime(name: string): Promise<void> {
+    const runtime = this.readRuntime(name);
+    if (runtime === null || !isProcessAlive(runtime.pid)) {
+      try {
+        rmSync(this.runtimeStatePath(name), { force: true });
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    try {
+      process.kill(runtime.pid, "SIGTERM");
+    } catch {
+      // ignore
+    }
+    await waitForExit(runtime.pid, undefined, STOP_EXIT_TIMEOUT_MS);
+    try {
+      rmSync(this.runtimeStatePath(name), { force: true });
+    } catch {
+      // ignore
     }
   }
 

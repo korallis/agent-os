@@ -210,6 +210,14 @@ export class BrainManager {
           throw new Error("Pi detection or extension path missing");
         }
         const runSpawn = (): string => {
+          if (
+            this.deps.authBroker !== undefined &&
+            !this.deps.authBroker.holdsAuthLock()
+          ) {
+            throw new Error(
+              "provider grant resolution requires PiAuthBroker.withSpawnGrant (auth lock not held)",
+            );
+          }
           const grant = resolveProviderKeyGrant(
             this.deps.home,
             model,

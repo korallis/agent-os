@@ -317,7 +317,9 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     });
     if (!result.ok) {
       const code = mapToolError(result.error?.code);
-      sendError(reply, code === "NOT_FOUND" ? 404 : 400, code, result.error?.message ?? "create failed");
+      const status =
+        code === "NOT_FOUND" ? 404 : code === "CONFLICT" ? 409 : 400;
+      sendError(reply, status, code, result.error?.message ?? "create failed");
       return;
     }
     return { task: result.data };

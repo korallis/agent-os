@@ -30,6 +30,12 @@ import { join } from "node:path";
 /** Default hold for an interactive OAuth login window. */
 const LOGIN_HOLD_TIMEOUT_MS = 5 * 60_000;
 const LOGIN_HOLD_POLL_MS = 250;
+/**
+ * Spawn grants must wait out a full interactive login hold plus skew so a
+ * concurrent OAuth cannot fail them with AUTH_BROKER_TIMEOUT at 30s.
+ * Derived from LOGIN_HOLD_TIMEOUT_MS — do not hard-code a shorter bound.
+ */
+const SPAWN_GRANT_TIMEOUT_MS = LOGIN_HOLD_TIMEOUT_MS + 5_000;
 
 export class PiAuthBroker {
   private mode: PiAuthBrokerMode = "concurrent";
@@ -137,23 +143,39 @@ export class PiAuthBroker {
    * concurrent login/refresh on another process cannot rewrite the store while
    * we resolve a grant. Intra-process: concurrent unless strict-serial / login held.
    *
-   * Async only — never busy-wait on the daemon event loop.
+   * Timeout is SPAWN_GRANT_TIMEOUT_MS (= LOGIN_HOLD_TIMEOUT_MS + skew) so a
+   * spawn during interactive OAuth waits out the exclusive login window rather
+   * than failing early. Async only — never busy-wait on the daemon event loop.
    */
   async withSpawnGrant<T>(fn: () => Promise<T>): Promise<T> {
-    return this.crossProcess.withAuthLock("spawn-grant", async () => {
-      if (this.mode === "strict-serial" || this.loginHeld) {
-        if (this.loginHeld) {
-          await this.acquireLogin();
-          try {
-            return await fn();
-          } finally {
-            this.releaseLogin();
+    return this.crossProcess.withAuthLock(
+      "spawn-grant",
+      async () => {
+        if (this.mode === "strict-serial" || this.loginHeld) {
+          if (this.loginHeld) {
+            await this.acquireLogin();
+            try {
+              return await fn();
+            } finally {
+              this.releaseLogin();
+            }
           }
+          return this.withSerial(fn);
         }
-        return this.withSerial(fn);
-      }
-      return fn();
-    });
+        return fn();
+      },
+      SPAWN_GRANT_TIMEOUT_MS,
+    );
+  }
+
+  /**
+   * True when this process currently holds the cross-process auth lock.
+   * Production grant resolution asserts this so a call site cannot resolve a
+   * provider key outside withSpawnGrant / withLoginLock.
+   */
+  holdsAuthLock(): boolean {
+    const info = this.crossProcess.holder();
+    return info !== null && info.pid === process.pid;
   }
 
   private acquireLogin(): Promise<void> {

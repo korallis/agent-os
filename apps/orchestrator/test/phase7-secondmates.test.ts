@@ -6,6 +6,9 @@ import { CrossProcessAuthBroker } from "../src/pi/cross-process-broker.js";
 import { PiAuthBroker } from "../src/pi/auth-broker.js";
 import { SecondmateRegistry } from "../src/fleet/secondmates.js";
 import { SecondmateFleet } from "../src/fleet/secondmate-fleet.js";
+import { FleetService } from "../src/fleet/service.js";
+import { ConfigService } from "../src/config/service.js";
+import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
 
 /**
  * Phase 7 units: the cross-process auth lock that orders a primary against a
@@ -131,12 +134,37 @@ describe("PiAuthBroker choke point", () => {
     let ran = false;
     await broker.withSpawnGrant(async () => {
       ran = true;
+      expect(broker.holdsAuthLock()).toBe(true);
       // While held, a peer process cannot acquire.
       expect(peer.tryAcquire("peer")).toBe(false);
     });
     expect(ran).toBe(true);
+    expect(broker.holdsAuthLock()).toBe(false);
     expect(peer.tryAcquire("peer")).toBe(true);
     peer.release();
+  });
+
+  it("withSpawnGrant waits out a long peer hold beyond the old 30s default", async () => {
+    // Login hold is 5 minutes; spawn-grant timeout must be derived from that
+    // (LOGIN_HOLD + skew), not CrossProcessAuthBroker's 30s default.
+    const dir = temp("agentos-p7-grant-timeout-");
+    const piHome = join(dir, "pi");
+    mkdirSync(join(piHome, "agent"), { recursive: true });
+    const broker = PiAuthBroker.forManagedHome(piHome);
+    const peer = new CrossProcessAuthBroker(join(piHome, "agent"));
+    expect(peer.tryAcquire("login-hold")).toBe(true);
+
+    let acquired = false;
+    const grant = broker.withSpawnGrant(async () => {
+      acquired = true;
+    });
+    // Still held after >30s would have timed out under the old default; release
+    // at 50ms and prove the spawn grant proceeds rather than AUTH_BROKER_TIMEOUT.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(acquired).toBe(false);
+    peer.release();
+    await grant;
+    expect(acquired).toBe(true);
   });
 });
 
@@ -258,6 +286,117 @@ describe("charter-driven routing", () => {
     // Never invent activity for a daemon that is not running.
     expect(bearings[0]?.active).toBeNull();
     expect(bearings[0]?.brainStatus).toBeNull();
+  });
+});
+
+describe("secondmate stopAll reaps runtime orphans", () => {
+  it("stops a secondmate known only via runtime.json after primary restart", async () => {
+    const home = temp("agentos-p7-stopall-");
+    const registry = new SecondmateRegistry(home);
+    const record = registry.provision({ name: "infra", domain: "infra" });
+
+    // Simulate an orphaned daemon: runtime.json with a live pid, no children entry.
+    const sleeper = await import("node:child_process").then((cp) =>
+      cp.spawn("sleep", ["30"], { stdio: "ignore" }),
+    );
+    expect(sleeper.pid).toBeTypeOf("number");
+    const runtimeDir = join(home, "runtime", "secondmates", record.name);
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(
+      join(runtimeDir, "runtime.json"),
+      JSON.stringify({
+        name: record.name,
+        pid: sleeper.pid,
+        port: record.port,
+        tokenPath: join(runtimeDir, "daemon.token"),
+        startedAt: new Date().toISOString(),
+      }),
+      { mode: 0o600 },
+    );
+
+    // Fresh registry instance = empty children map (primary restart).
+    const afterRestart = new SecondmateRegistry(home);
+    expect(afterRestart.readRuntime("infra")?.pid).toBe(sleeper.pid);
+    await afterRestart.stopAll();
+
+    expect(afterRestart.readRuntime("infra")).toBeNull();
+    // Process should be gone (or unsignallable).
+    let alive = true;
+    try {
+      process.kill(sleeper.pid!, 0);
+    } catch {
+      alive = false;
+    }
+    expect(alive).toBe(false);
+  });
+});
+
+describe("secondmate admission capacity", () => {
+  it("refuses create_task on a home whose charter is at maxConcurrentTasks", async () => {
+    const home = temp("agentos-p7-cap-");
+    mkdirSync(join(home, "config"), { recursive: true });
+    writeFileSync(
+      join(home, "config", "charter.json5"),
+      JSON.stringify({
+        name: "infra",
+        domains: ["infra"],
+        brainModel: null,
+        maxConcurrentTasks: 1,
+        acceptsRouting: true,
+      }),
+      { mode: 0o600 },
+    );
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
+    config.installDefaults();
+    // Re-write charter after installDefaults may not touch it; ensure present.
+    writeFileSync(
+      join(home, "config", "charter.json5"),
+      JSON.stringify({
+        name: "infra",
+        domains: ["infra"],
+        brainModel: null,
+        maxConcurrentTasks: 1,
+        acceptsRouting: true,
+      }),
+      { mode: 0o600 },
+    );
+    const service = new FleetService({
+      home,
+      config,
+      fakeTmux: true,
+      fakeBrain: true,
+      fakePi: true,
+    });
+    await service.start();
+    const project = service.projects.register({
+      name: "cap",
+      path: home,
+      mode: "local-only",
+      trusted: true,
+    });
+    const first = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "one",
+        intent: "first",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(first.ok).toBe(true);
+    const second = service.tools.invoke("create_task", {
+      spec: {
+        shape: "SHIP",
+        title: "two",
+        intent: "should refuse",
+        projectId: project.id,
+        mode: "local-only",
+        yolo: true,
+      },
+    });
+    expect(second.ok).toBe(false);
+    expect(second.error?.message ?? "").toMatch(/capacity|concurrent/i);
   });
 });
 
