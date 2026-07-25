@@ -82,7 +82,7 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
       // Connect DIRECTLY to the loopback daemon: Next route handlers cannot
       // proxy a WS upgrade. The ticket is the credential, which is why it is
       // single-use and short-lived — the daemon token never leaves the server.
-      socketRef.current?.close();
+      // Prior socket already closed/nulled at the top of connect().
       const ws = new WebSocket(body.wsUrl);
       if (gen !== connectGen.current || boundSession.current !== forSession) {
         ws.close();
