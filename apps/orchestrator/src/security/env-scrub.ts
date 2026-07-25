@@ -121,6 +121,12 @@ export function scrubEnv(
     env[grant.name] = grant.value;
   }
 
+  // Same discipline as provider keys: grantSshAgent is the only way in.
+  // extraAllow must not re-inject SSH_AUTH_SOCK behind the flag.
+  if (options.grantSshAgent !== true) {
+    delete env.SSH_AUTH_SOCK;
+  }
+
   const providerKeysPresent = PROVIDER_KEY_ENV_NAMES.filter((name) => env[name] !== undefined);
 
   if (options.assertSingle !== false && providerKeysPresent.length > 1) {

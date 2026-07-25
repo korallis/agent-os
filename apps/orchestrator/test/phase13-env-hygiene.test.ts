@@ -43,6 +43,24 @@ describe("SSH agent forwarding is opt-in and never reaches gate code", () => {
     const { env } = scrubEnv({ PATH: "/usr/bin" }, { grantSshAgent: true });
     expect(env.SSH_AUTH_SOCK).toBeUndefined();
   });
+
+  it("strips SSH_AUTH_SOCK from extraAllow unless grantSshAgent is true", () => {
+    // An invariant with a side door is not an invariant: extraAllow must not
+    // re-inject the agent socket behind the opt-in flag.
+    const { env: denied } = scrubEnv(
+      { PATH: "/usr/bin" },
+      {
+        extraAllow: { SSH_AUTH_SOCK: "/private/tmp/injected.sock" },
+      },
+    );
+    expect(denied.SSH_AUTH_SOCK).toBeUndefined();
+
+    const { env: granted } = scrubEnv(parent, {
+      grantSshAgent: true,
+      extraAllow: { SSH_AUTH_SOCK: "/private/tmp/injected.sock" },
+    });
+    expect(granted.SSH_AUTH_SOCK).toBe("/private/tmp/injected.sock");
+  });
 });
 
 describe("fusion artifact reads are contained", () => {

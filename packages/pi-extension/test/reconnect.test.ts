@@ -90,4 +90,67 @@ describe("extension host reconnect", () => {
     // close() ends the chain rather than leaving timers running forever.
     expect(true).toBe(true);
   });
+
+  it("reports dropped pending frames as a lifecycle detail on reconnect", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "p13-dropped-frames-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "session.sock");
+    const frames: unknown[] = [];
+    let reported: number | null = null;
+
+    const server = await listen(socketPath);
+    server.on("connection", (socket) => {
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (line.length === 0) continue;
+          frames.push(JSON.parse(line));
+        }
+      });
+    });
+
+    const host = new AgentOsExtensionHost({
+      socketPath,
+      sessionId: "01SESSION0000000000000003",
+      role: "builder",
+      piVersion: "0.82.0",
+      retryMs: 0,
+      maxRetries: 0,
+    });
+    host.onDroppedFrames = (count) => {
+      reported = count;
+    };
+
+    // Force overflow while disconnected so the counter is non-zero.
+    for (let i = 0; i < 1005; i += 1) {
+      host.usage({
+        provider: "test",
+        model: "m",
+        inputTokens: i,
+        outputTokens: 0,
+        costUsd: null,
+        contextUsedPct: null,
+      });
+    }
+
+    await host.connect();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(reported).toBeGreaterThan(0);
+    const lifecycle = frames.find(
+      (f) =>
+        typeof f === "object" &&
+        f !== null &&
+        (f as { type?: unknown }).type === "ext.lifecycle" &&
+        typeof (f as { detail?: unknown }).detail === "string" &&
+        String((f as { detail: string }).detail).includes("dropped"),
+    );
+    expect(lifecycle).toBeDefined();
+    expect((lifecycle as { detail: string }).detail).toMatch(/dropped \d+ pending frame/);
+    host.close();
+  });
 });

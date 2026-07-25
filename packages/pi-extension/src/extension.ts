@@ -128,9 +128,16 @@ export class AgentOsExtensionHost {
         this.pending.length = 0;
         if (this.droppedFrames > 0) {
           // Say what was lost. A silently short buffer would make the analytics
-          // downstream look like a quiet seat rather than a dropped one.
-          this.onDroppedFrames?.(this.droppedFrames);
+          // downstream look like a quiet seat rather than a dropped one. Emit a
+          // lifecycle detail so the daemon event log / Console see the loss;
+          // optional host callback remains for tests.
+          const dropped = this.droppedFrames;
           this.droppedFrames = 0;
+          this.lifecycle(
+            "turn_start",
+            `dropped ${dropped} pending frame(s) while disconnected`,
+          );
+          this.onDroppedFrames?.(dropped);
         }
         resolve();
       });
@@ -184,6 +191,8 @@ export class AgentOsExtensionHost {
     const delay = Math.min(retryMs * 2 ** Math.min(this.attempts - 1, 6), 30_000);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      // Stale timer after a later success or close() must not orphan a live socket.
+      if (this.closed || this.socket !== null) return;
       void this.connect().catch(() => undefined);
     }, delay);
     this.reconnectTimer.unref?.();
@@ -352,6 +361,10 @@ export class AgentOsExtensionHost {
 
   close(): void {
     this.closed = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     for (const [id, waiter] of this.inflight) {
       this.inflight.delete(id);
       waiter.resolve({
