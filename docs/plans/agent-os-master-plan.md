@@ -410,7 +410,7 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 | 8 | Project modes & `+yolo` scope | `projects.json5` + per-project | `pipeline`; yolo boundaries per §5.2 | next task |
 | 9 | Budgets & ceilings: per-connection soft/hard USD, per-task ceiling, Claude extra-usage daily cap, Brain token budget | `budgets.json5` | Gateway $25 hard; Claude extra-usage $10/day; task $5; Brain 200k tok/day (open Q) | yes |
 | 10 | Console layout preferences: default page, column density, wake-queue visibility | `console.json5` | as wireframed | yes |
-| 11 | Secondmate charters: domain, routing hints, capacity, Brain model, escalation posture | `secondmates/<name>.json5` | none (created on provision) | on sync |
+| 11 | Secondmate charters: domain, capacity, Brain model, routing acceptance | under secondmate home: `secondmates/<name>/config/charter.json5` (not primary global config) | none (created on provision) | on sync (live Brain model when running) |
 | 12 | **Safety policies (default ON, Captain-only changes, mechanically enforced, overrides evidence-stamped):** cross-family builder≠validator; distinct planner families; RED-baseline gate requirement; scout read-only; verbatim-FAIL delivery; halt-cap-not-overridable-by-yolo; destructive-git denial | `policies.json5` | all ON | policy version bump; applies next task |
 | 13 | **Config-locked (not configurable in v1):** loopback-only bind; secret redaction; **quota-probe endpoint URLs [R5]** (exfiltration vector if configurable) | — | always on | — |
 | 14 | **[R5]** Quota probes: polling cadence, per-provider enable, best-effort feature flags (e.g. Grok consumer endpoint), threshold levels for `quota.threshold`, courtesy limits (min interval, jitter, back-off) | `quota.json5` | 5 min + on-demand + post-task; **probes auto-enabled per detected Pi connections at onboarding [R5.1]** (Grok best-effort ON when a Grok credential is detected); thresholds 80/95% + low-balance | yes |
@@ -482,9 +482,10 @@ agent-os/
 │           ├── pty/                  # [Phase 6] single-use tickets + read-only capture-pane WS (/v1/pty)
 │           ├── substrate/            # task-machine.ts, family.ts
 │           ├── fleet/                # service, brain, brain-handoff, afk, tool-surface, fusion-runs,
-│           │                         # sessions, worktree-pool, tmux, watcher, gate-runner, projects, secondmates
+│           │                         # sessions, worktree-pool, tmux, watcher, gate-runner, projects,
+│           │                         # secondmates, secondmate-fleet [Phase 7]
 │           ├── update/               # [Phase 8] signed self-update + rollback (public key baked into install)
-│           ├── pi/                   # manager, auth-broker, connections, socket-hub
+│           ├── pi/                   # manager, auth-broker, cross-process-broker, connections, socket-hub
 │           ├── onboarding/           # wizard state
 │           ├── quota-probes/         # [R5] allowlist + adapters + scheduler (+ explicit fake-quota seam [Phase 8])
 │           └── security/             # env-scrub, auth-store, secret-canary, …
@@ -501,7 +502,7 @@ agent-os/
 │   ├── verify-no-deprecated.mjs      # zero-deprecated dependency gate (CI)
 │   └── verify-gate-cleanup.mjs       # gates must exit after try/finally (CI; prevents orphaned agentosd)
 └── tooling/
-    ├── gates/phase-{1,2,2b,3,4,5,6,8}.mjs # executable phase gates (2b: Phase 2 fixture completion; phase-6/8: Playwright + real daemon where noted)
+    ├── gates/phase-{1,2,2b,3,4,5,6,7,8}.mjs # executable phase gates (2b: Phase 2 fixture completion; phase-6/8: Playwright + real daemon where noted; phase-7: secondmates)
     ├── evidence/capture-console.mjs    # full Console proof packs (docs/qa/runs/)
     └── screenshots/capture-console.mjs  # Playwright PR evidence (pnpm screenshots)
 ```
@@ -547,7 +548,7 @@ So a Claude connection has **three billing modes** (`billingMode` on the connect
 
 ### 4.5 Auth-store topology — DECIDED, with a verification gate **[R2]**
 
-**One shared managed Pi auth store** (`~/.agentos/pi/` if Pi honors a config-dir env var — Open Question Q1 — else `~/.pi/agent/` with caveats). Broker locks **only**: login/logout flows (exclusive) and the short post-refresh window; steady-state spawns concurrent; `piStrictSerial: true` fallback if races are observed. This dissolved Rev-1's D9. Secondmates never copy auth material; spawn grants only.
+**One shared managed Pi auth store** (`~/.agentos/pi/` if Pi honors a config-dir env var — Open Question Q1 — else `~/.pi/agent/` with caveats). **Cross-process file lock** (`auth-broker.lock` beside the store) serialises Agent-OS-local critical sections across primaries and secondmates: login/logout holds (exclusive until auth-store mtime advances or timeout) and spawn-grant resolution. A lock held by a live pid is never stolen; an abandoned lock (dead pid) is reclaimed; a non-holder cannot release someone else's lock. Intra-process: steady-state grants concurrent unless `piStrictSerial: true` or a login is held. In-process mutexes alone are insufficient — primaries and secondmates are separate OS processes. This dissolved Rev-1's D9. Secondmates never copy auth material; spawn grants only (tokens live under primary `runtime/`, never under secondmate homes — fs-audited).
 
 ### 4.6 Data model (TypeScript, zod-backed, no `any`)
 
@@ -699,7 +700,7 @@ BRAIN_DOWN (fleet-level flag, §5.8) — substrate-only degraded mode [R3]
 | `answer_crewmate` | `(questionId, answer)` | routes `ask_captain` answers |
 | `deliver_task` | `(taskId)` | mode tail (pipeline/direct-pr/local-only); `ao/*` branch rules; git guardrails |
 | `escalate_to_captain` / `notify_captain` | `(taskId?, summary, severity)` | NEEDS_CAPTAIN transition; Console + OS notification |
-| `route_to_secondmate` / `read_secondmate_bearings` | `(name, spec) / (name)` | charter routing; idempotent forward |
+| `route_to_secondmate` / `read_secondmate_bearings` / `provision_secondmate` | `(name, taskId, domain)` / `(name?)` / `(name, domain, …)` | charter routing + handover (task exists once); bearings list or one; provision isolated home — schemas in `packages/protocol` |
 | `stow_knowledge` | `(projectId, notes)` | writes only `docs/notes/`-style paths; never secrets |
 | `read_policy` | `(domain) → effective config` | **read-only — the Brain cannot write config; only the Captain can** |
 
@@ -747,7 +748,7 @@ Substrate boot sequence unchanged from Rev 2 (lock → migrate → replay NDJSON
 
 ### 5.9 Secondmates
 
-Unchanged from Rev 2 (isolation, broker grants, FF-only sync, structured bearings, namespaced events) with **[R3]**: each secondmate runs its own Brain configured by its charter pack (#11); the primary Brain routes via `route_to_secondmate` and reads `read_secondmate_bearings`.
+**[Phase 7 shipped]** isolation, cross-process broker grants, structured bearings, handover routing (task exists once), dual-restart reconcile — gates in `tooling/gates/phase-7.mjs`. **[R3]:** each secondmate runs its own Brain configured by its charter pack under `secondmates/<name>/config/charter.json5`; the primary Brain routes via `route_to_secondmate`, reads `read_secondmate_bearings`, and may `provision_secondmate`. **FF-only version sync** remains open (not gated).
 
 ### 5.10 Brain skills
 
@@ -1123,14 +1124,15 @@ Guard policies still load from disk at extension init, not from the socket — a
 │   │   ├── roles/{planner,builder,validator,fusion,scout}.md
 │   │   ├── fusion/{opinion,fusion,plan-instruction,gate-brief,triage-brief}.md
 │   │   └── supervision/{nudge,restart-preamble,escalation-report}.md
-│   └── secondmates/<name>.json5         # charters
+│   └── …                                # (secondmate charters live under secondmates/<name>/, not here)
 ├── agentos.db                           # SQLite WAL: rebuildable projection
-├── daemon.lock
+├── daemon.lock                          # exclusive home lock (double-start refusal) [Phase 7 same on secondmate homes]
 ├── onboarding.json5                     # wizard step state — resumable/re-runnable [R6]
 ├── wake/                                # fallback wake drop dir + durable BRAIN_DOWN queue [R3]
 ├── sockets/<sessionId>.sock             # per-session extension sockets (0600) [R2]
 ├── extension/agent-os.ts                # built extension bundle, version-stamped [R2]
-├── pi/agent/{auth.json, models.json}    # managed Pi home (vendor-owned) [R2]
+├── pi/agent/{auth.json, models.json, auth-broker.lock}  # managed Pi home + cross-process broker lock [R2+Phase 7]
+├── runtime/secondmates/<name>/{daemon.token, runtime.json}  # [Phase 7] tokens outside audited secondmate homes
 ├── logs/agentosd.ndjson
 ├── projects/<slug>/{project.json, clone/, leases/, quarantine/}
 ├── worktrees/<slug>/pool-{1..N}/
@@ -1138,7 +1140,12 @@ Guard policies still load from disk at extension init, not from the socket — a
 │                                        # task.json now embeds per-task config overrides [R3]
 ├── runs/<taskId>/fusion/<runId>/        # [Phase 4] run.json · instruction.md · side-* · fused.md
 ├── sessions/<key>/                      # [Phase 4] sha256(project|role|model)[:32]; session.json
-└── secondmates/<name>/{config/, state.sqlite3, events.ndjson, session.lock, projects/}
+└── secondmates/<name>/                  # [Phase 7] isolated AGENTOS_HOME per secondmate — no auth material
+    ├── charter.json                     # registry record (name, port, domain, …)
+    ├── config/{charter.json5, brain.json5, …}
+    ├── daemon.lock                      # double-start blocked on this home
+    ├── tasks/  runs/  projects/         # own state; never shares primary clones or credentials
+    └── …
 
 <repo>/.agentos/                         # [R3] PROJECT layer (trust-gated, hash-acknowledged)
 ├── dispatch.json5  validation.json5  …  # any domain may be overridden (safety: no weakening)
@@ -1234,7 +1241,7 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 **Phase 2 — remaining items need the Captain's own live credentials.** The unticked Phase 2 lines below are the ones that cannot be honestly evidenced from a fixture: a real Pi `/login` OAuth round trip, "each **connected** provider shows a live/best-effort metric", the weekly pinned-Pi canary workflow, and the fresh-macOS-without-Pi wizard install walk. Asserting them from a fixture would be exactly the over-claim the gates exist to prevent, so they stay open with this reason recorded rather than being ticked on the strength of a passing suite that does not cover them.
 
 **Phase 3 — Tool surface, the Brain, fleet execution, SCOUT, watcher, recovery (3 wk)** **[R3 — expanded]** — substrate + real Pi harness path shipped (`tooling/gates/phase-3.mjs` G1–G13; vitest `phase3-*.test.ts`). Console full-live Fleet panels shipped in **Phase 6 first slice** (was deliberately deferred here).
-- [x] **Tool-surface gates:** catalog tools schema-validated in `packages/protocol`; illegal transition `run_gate` before `GATE_AUTHORING` → `ILLEGAL_TRANSITION` (G3); same-family builder/validator `resolve_cast` → `POLICY_VIOLATION` (G4); tool calls evidence-logged. Secondmate tools return typed `NOT_FOUND` until Phase 7.
+- [x] **Tool-surface gates:** catalog tools schema-validated in `packages/protocol`; illegal transition `run_gate` before `GATE_AUTHORING` → `ILLEGAL_TRANSITION` (G3); same-family builder/validator `resolve_cast` → `POLICY_VIOLATION` (G4); tool calls evidence-logged. Secondmate tools were typed stubs (`NOT_FOUND`) here; live routing/bearings/provision → **Phase 7**.
 - [x] **Brain decision loop (scripted):** with `AGENTOS_FAKE_BRAIN` / `AGENTOS_FAKE_PI` (explicit-only; never inferred from a missing binary), a SHIP (local-only, fusion off) on a real git fixture runs end-to-end: tmux window, leased worktree, local `ao/*` branch (G5). Real Brain on a live connection remains opt-in (no paid subscription in CI). **[CONSENSUS, re-targeted]**
 - [x] **Brain reconcile gate [R3]:** SIGKILL Brain pane → fresh Brain session reconciles (`read_fleet_state` path) (G13).
 - [x] **BRAIN_DOWN gate [R3]:** Brain respawn blocked (fixture) → `brain.status=down`, orchestration tools refuse with `BRAIN_DOWN` (G7). Console wake-queue surface shipped Phase 6 first slice (`/notifications`); dedicated BRAIN_DOWN banner polish may still deepen.
@@ -1288,10 +1295,12 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] Remaining §7 frames: **Network I/O Detail** (`41:4815`) — `/network` + `/network/[id]`, backed by `net.request` frames recorded for every outbound HTTP call the daemon originates (today, the quota probes). Credentials are redacted **at capture** to their last four characters, since the log is append-only and a secret written there could never be withdrawn (G12 asserts both the real call and the redaction, in the log and in the rendered page). The frame's per-phase timeline (DNS/TCP/TLS/processing/transfer) is not instrumented by the fetch API, so those rows render `—` with the reason stated rather than a fabricated split of the measured total.
 - [ ] **Figma-fidelity gate [R6.3, replaces R6.2's brand-parity gate]:** every shipped screen has a **Figma-frame-vs-implementation side-by-side** in the evidence pack (per breakpoint where the frame specifies); implementation was built from `get_design_context` per screen (figma-design-to-code skill), not eyeballed screenshots; visual diffs reviewed against the canonical frames in the §7 inventory. **Kept from R6.2:** marketing renders identically after component promotion (no-regression parity on marketing routes).
 
-**Phase 7 — Secondmates & fleet operations (v1.x, 3 wk)** — Rev-2 gates plus:
-- [ ] Isolated homes; no shared inodes; double-start blocked; **no auth material under secondmate homes** (fs scan). [A]+[B]+[R2]
-- [ ] Charter config pack drives a secondmate Brain's model + routing (edit → sync → observed) [R3].
-- [ ] Broker serialization across primaries/secondmates; routing + `/bearings` ≤5 s; FF-only sync; dual-restart reconcile without duplicates. **[CONSENSUS + [B]]**
+**Phase 7 — Secondmates & fleet operations (v1.x, 3 wk)** — daemon + gates shipped (`tooling/gates/phase-7.mjs` G1–G14; vitest `phase7-secondmates.test.ts`). Console secondmate topology frames (§7 Inference Jobs) remain open below.
+- [x] Isolated homes; no shared inodes; double-start blocked (`daemon.lock` on the secondmate home); **no auth material under secondmate homes** (fs scan + audit, incl. while live — tokens under primary `runtime/secondmates/`). [A]+[B]+[R2] (G1, G2, G10, G12)
+- [x] Charter config pack drives a secondmate Brain's model + routing (edit → sync → observed) [R3] (G3, G9).
+- [x] Cross-process broker serialization across primaries/secondmates (`auth-broker.lock`); routing handover (task exists once, not duplicated); `/bearings` ≤5 s with unreachable as a fact; dual-restart reconcile without duplicates. **[CONSENSUS + [B]]** (G4–G7)
+- [ ] FF-only secondmate **version** sync (divergent app checkout refuses non-ff; clean checkout fast-forwards and restarts). **[CONSENSUS]** — not in phase-7 gates yet.
+- [ ] Console secondmate fleet topology UI (Figma Inference Jobs / Cluster Nodes) live against registry + bearings.
 
 **Phase 8 — Hardening, /afk & /stow, analytics, packaging (2 wk)** — daemon + gates shipped (`tooling/gates/phase-8.mjs` G1–G9; vitest `phase8-hardening.test.ts`):
 - [x] `/afk` FAQ auto-answer via `escalate_to_captain`; a question with no recorded FAQ entry still escalates and still waits (G1). `/stow` ships as `agentos stow <projectId> <notes>` through the same containment-checked `stow_knowledge` tool the Brain uses. [A]+[B]
