@@ -51,6 +51,7 @@ function levelOf(envelope: EventEnvelope): Level {
     case "brain.handoff":
     case "tool.invoked":
     case "gate.result":
+    case "gate.red_proven":
     case "fusion.dispatched":
     case "fusion.side_completed":
     case "prompt.installed":
@@ -126,6 +127,7 @@ function sourceOf(envelope: EventEnvelope): string {
     case "tool.invoked":
       return "tools";
     case "gate.result":
+    case "gate.red_proven":
       return "gate";
     case "fusion.dispatched":
     case "fusion.side_completed":
@@ -218,6 +220,8 @@ function messageOf(envelope: EventEnvelope): string {
       return `Tool ${event.payload.tool} ${event.payload.ok ? "ok" : event.payload.errorCode ?? "err"} (${event.payload.durationMs}ms)`;
     case "gate.result":
       return `Gate ${event.payload.target} → ${event.payload.outcome}`;
+    case "gate.red_proven":
+      return `Gate RED proven — ${event.payload.outcome} · source ${event.payload.gateSourceHash.slice(0, 8)}`;
     case "fusion.dispatched":
       return `Fusion ${event.payload.kind} dispatched`;
     case "fusion.side_completed":
