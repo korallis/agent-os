@@ -5,10 +5,10 @@
   // shipped default is deliberately QUIET: depth is opted into, never opted
   // out of, so a fresh install does not bury the signals that matter under a
   // firehose the Captain never asked for.
-  activeProfile: "working",
+  activeProfile: "quiet",
 
   profiles: {
-    // Only what needs a decision.
+    // The shipped default: only what needs a decision.
     quiet: {
       surface: ["task.", "captain.", "brain.down", "pipeline.unavailable"],
       streamPipelineLogs: false,
@@ -16,7 +16,7 @@
       wakeOn: ["captain.escalation"],
     },
 
-    // The default: see the fleet work, including the gate, without the noise.
+    // Opt into fleet work visibility, including the gate, without the noise.
     working: {
       surface: ["task.", "captain.", "brain.", "session.", "gate.", "fusion.", "pipeline."],
       streamPipelineLogs: true,

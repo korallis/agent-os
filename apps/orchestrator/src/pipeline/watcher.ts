@@ -1,8 +1,21 @@
-import { existsSync, readFileSync, statSync, watch, type FSWatcher } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readSync,
+  statSync,
+  watch,
+  type FSWatcher,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import type { OrchestratorEvent, PipelineRunSnapshot, PipelineStepSnapshot } from "@agent-os/protocol";
+import type {
+  OrchestratorEvent,
+  PipelineFinding,
+  PipelineRunSnapshot,
+  PipelineStepSnapshot,
+} from "@agent-os/protocol";
 
 /**
  * Live view of the `no-mistakes` gate (master plan §11 Phase 9, [R7]).
@@ -28,8 +41,17 @@ import type { OrchestratorEvent, PipelineRunSnapshot, PipelineStepSnapshot } fro
  *     absorbed into a reported status, never thrown into the event loop.
  */
 
-/** Columns this watcher depends on. A missing one means the schema moved. */
-const REQUIRED_RUN_COLUMNS = ["id", "branch", "status", "head_sha", "updated_at"] as const;
+/** Every column tick() SELECTs — a missing one means the schema moved. */
+const REQUIRED_RUN_COLUMNS = [
+  "id",
+  "branch",
+  "status",
+  "head_sha",
+  "pr_url",
+  "error",
+  "intent",
+  "updated_at",
+] as const;
 const REQUIRED_STEP_COLUMNS = [
   "run_id",
   "step_name",
@@ -38,9 +60,17 @@ const REQUIRED_STEP_COLUMNS = [
   "findings_json",
   "log_path",
   "last_activity",
+  "last_activity_at",
+  "duration_ms",
+  "agent_pid",
 ] as const;
 
-export type PipelineTransport = "live" | "polled" | "unavailable";
+/**
+ * Honest transport labels for what this adapter actually does today.
+ * `live` is reserved for a true push path (e.g. no-mistakes socket subscribe)
+ * and is intentionally not used until that path exists.
+ */
+export type PipelineTransport = "wal-assisted" | "interval-only" | "unavailable";
 
 export interface PipelineWatcherOptions {
   /** no-mistakes home; defaults to ~/.no-mistakes. */
@@ -49,6 +79,11 @@ export interface PipelineWatcherOptions {
   pollMs?: number;
   /** Emit events into the daemon's log. */
   sink: (event: OrchestratorEvent) => void;
+  /**
+   * Live knobs from the active observability profile. Read each tick so a
+   * hot-reloaded profile is observed without restarting the watcher.
+   */
+  profile?: () => { streamPipelineLogs: boolean };
 }
 
 export interface PipelineCompatibility {
@@ -58,13 +93,18 @@ export interface PipelineCompatibility {
   missingColumns: string[];
 }
 
+const MAX_STRUCTURED_READ_FAILURES = 3;
+const LOG_CHUNK_MAX = 16_384;
+
 export class PipelineWatcher {
   private readonly home: string;
-  private readonly pollMs: number;
+  private pollMs: number;
   private readonly sink: (event: OrchestratorEvent) => void;
+  private readonly profile: () => { streamPipelineLogs: boolean };
   private timer: ReturnType<typeof setInterval> | null = null;
   private walWatcher: FSWatcher | null = null;
   private transport: PipelineTransport = "unavailable";
+  private walWatchAttached = false;
   private compatibility: PipelineCompatibility = {
     ok: false,
     reason: "not started",
@@ -77,6 +117,8 @@ export class PipelineWatcher {
   private lastPollAt: number | null = null;
   /** Emitted once per incompatibility, not once per tick. */
   private incompatibilityReported = false;
+  private structuredReadFailures = 0;
+  private started = false;
 
   constructor(options: PipelineWatcherOptions) {
     // Explicit option wins, then the env override (gates and fixtures point
@@ -87,6 +129,7 @@ export class PipelineWatcher {
       options.home ?? (envHome !== undefined && envHome.length > 0 ? envHome : join(homedir(), ".no-mistakes"));
     this.pollMs = options.pollMs ?? 1000;
     this.sink = options.sink;
+    this.profile = options.profile ?? (() => ({ streamPipelineLogs: true }));
   }
 
   private dbPath(): string {
@@ -167,12 +210,34 @@ export class PipelineWatcher {
   }
 
   /**
+   * Apply hot-reloaded knobs. Starts/stops watching and rebuilds the interval
+   * when the poll cadence changes — no daemon restart required.
+   */
+  applyConfig(options: { watchPipeline: boolean; pollMs: number }): void {
+    this.pollMs = options.pollMs;
+    if (!options.watchPipeline) {
+      this.stop();
+      this.transport = "unavailable";
+      return;
+    }
+    if (!this.started) {
+      this.start();
+      return;
+    }
+    // Already running — refresh interval cadence and re-attach WAL watch.
+    this.restartTimer();
+    this.attachWalWatch();
+    this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
+  }
+
+  /**
    * Start watching. The WAL file changes on every no-mistakes write, so an
    * fs watch on it turns a fixed poll into near-immediate reaction while the
    * interval remains as the floor for anything the watch misses.
    */
   start(): void {
     this.stop();
+    this.started = true;
     const compat = this.checkCompatibility();
     if (!compat.ok) {
       this.transport = "unavailable";
@@ -184,21 +249,15 @@ export class PipelineWatcher {
       return;
     }
 
-    this.transport = "polled";
-    const wal = `${this.dbPath()}-wal`;
-    if (existsSync(wal)) {
-      try {
-        this.walWatcher = watch(wal, () => this.tick());
-      } catch {
-        // fs.watch is best-effort on some platforms; the interval still covers us.
-      }
-    }
+    this.attachWalWatch();
+    this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
     this.timer = setInterval(() => this.tick(), this.pollMs);
     this.timer.unref?.();
     this.tick();
   }
 
   stop(): void {
+    this.started = false;
     if (this.timer !== null) {
       clearInterval(this.timer);
       this.timer = null;
@@ -206,6 +265,33 @@ export class PipelineWatcher {
     if (this.walWatcher !== null) {
       this.walWatcher.close();
       this.walWatcher = null;
+    }
+    this.walWatchAttached = false;
+  }
+
+  private restartTimer(): void {
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    const cadence = this.compatibility.ok ? this.pollMs : Math.max(this.pollMs, 5000);
+    this.timer = setInterval(() => this.tick(), cadence);
+    this.timer.unref?.();
+  }
+
+  private attachWalWatch(): void {
+    if (this.walWatcher !== null) {
+      this.walWatcher.close();
+      this.walWatcher = null;
+    }
+    this.walWatchAttached = false;
+    const wal = `${this.dbPath()}-wal`;
+    if (!existsSync(wal)) return;
+    try {
+      this.walWatcher = watch(wal, () => this.tick());
+      this.walWatchAttached = true;
+    } catch {
+      // fs.watch is best-effort on some platforms; the interval still covers us.
     }
   }
 
@@ -222,6 +308,21 @@ export class PipelineWatcher {
     });
   }
 
+  private markStructuredReadFailed(error: unknown): void {
+    this.structuredReadFailures += 1;
+    if (this.structuredReadFailures < MAX_STRUCTURED_READ_FAILURES) return;
+    this.compatibility = {
+      ok: false,
+      reason:
+        error instanceof Error
+          ? `structured pipeline read failed repeatedly: ${error.message}`
+          : "structured pipeline read failed repeatedly",
+      missingColumns: this.compatibility.missingColumns,
+    };
+    this.transport = "unavailable";
+    this.reportIncompatibility();
+  }
+
   /** One structured read. Bounded, absorbing, and silent when nothing moved. */
   tick(): void {
     let db: Database.Database | null = null;
@@ -234,7 +335,9 @@ export class PipelineWatcher {
         }
         // Recovered — a later no-mistakes version restored what we need.
         this.incompatibilityReported = false;
-        this.transport = "polled";
+        this.structuredReadFailures = 0;
+        this.attachWalWatch();
+        this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
       }
       db = this.open();
       if (db === null) return;
@@ -267,6 +370,8 @@ export class PipelineWatcher {
           ORDER BY step_order`,
       );
 
+      const streamLogs = this.profile().streamPipelineLogs;
+
       for (const run of runs) {
         const rows = stepStmt.all(run.id) as Array<{
           step_name: string;
@@ -280,17 +385,21 @@ export class PipelineWatcher {
           agent_pid: number | null;
         }>;
 
-        const steps: PipelineStepSnapshot[] = rows.map((row) => ({
-          step: row.step_name,
-          order: row.step_order,
-          status: row.status,
-          findingsCount: countFindings(row.findings_json),
-          lastActivity: row.last_activity,
-          lastActivityAt:
-            row.last_activity_at === null ? null : new Date(row.last_activity_at).toISOString(),
-          durationMs: row.duration_ms,
-          agentPid: row.agent_pid,
-        }));
+        const steps: PipelineStepSnapshot[] = rows.map((row) => {
+          const findings = parseFindings(row.findings_json);
+          return {
+            step: row.step_name,
+            order: row.step_order,
+            status: row.status,
+            findingsCount: findings.length,
+            findings,
+            lastActivity: row.last_activity,
+            lastActivityAt:
+              row.last_activity_at === null ? null : new Date(row.last_activity_at).toISOString(),
+            durationMs: row.duration_ms,
+            agentPid: row.agent_pid,
+          };
+        });
 
         const snapshot: PipelineRunSnapshot = {
           runId: run.id,
@@ -307,19 +416,24 @@ export class PipelineWatcher {
         // Emit only on genuine change — a per-tick event for unchanged state
         // would bury the transitions that matter under its own noise.
         const fingerprint = JSON.stringify(snapshot);
-        if (this.lastFingerprint.get(run.id) === fingerprint) continue;
-        this.lastFingerprint.set(run.id, fingerprint);
-        this.sink({ type: "pipeline.run_updated", payload: snapshot });
+        if (this.lastFingerprint.get(run.id) !== fingerprint) {
+          this.lastFingerprint.set(run.id, fingerprint);
+          this.sink({ type: "pipeline.run_updated", payload: snapshot });
+        }
 
-        // Stream newly appended log bytes for the active step.
-        const active = rows.find((r) => r.status === "running" || r.status === "fixing");
-        if (active?.log_path != null) this.emitLogTail(run.id, active.step_name, active.log_path);
+        // Pure log appends must stream even when structured columns are unchanged.
+        if (streamLogs) {
+          const active = rows.find((r) => r.status === "running" || r.status === "fixing");
+          if (active?.log_path != null) this.emitLogTail(run.id, active.step_name, active.log_path);
+        }
       }
 
+      this.structuredReadFailures = 0;
       this.lastPollAt = Date.now();
-    } catch {
-      // A read failure must never take the daemon with it; the next tick retries
-      // and `status()` continues to report the last successful read time.
+    } catch (error) {
+      // A read failure must never take the daemon with it; repeated failures
+      // mark compatibility failed so the UI cannot keep showing last-known rows.
+      this.markStructuredReadFailed(error);
     } finally {
       db?.close();
     }
@@ -337,13 +451,20 @@ export class PipelineWatcher {
         if (size < previous) this.logOffsets.set(key, size);
         return;
       }
-      const buffer = readFileSync(logPath);
-      const chunk = buffer.subarray(previous, Math.min(size, previous + 16_384)).toString("utf8");
-      this.logOffsets.set(key, Math.min(size, previous + 16_384));
+      const toRead = Math.min(LOG_CHUNK_MAX, size - previous);
+      const buffer = Buffer.alloc(toRead);
+      const fd = openSync(logPath, "r");
+      try {
+        readSync(fd, buffer, 0, toRead, previous);
+      } finally {
+        closeSync(fd);
+      }
+      const chunk = buffer.toString("utf8");
+      this.logOffsets.set(key, previous + toRead);
       if (chunk.trim().length === 0) return;
       this.sink({
         type: "pipeline.log_appended",
-        payload: { runId, step, chunk: chunk.slice(0, 16_384) },
+        payload: { runId, step, chunk },
       });
     } catch {
       // Log tailing is best-effort; structured state is the source of truth.
@@ -351,17 +472,36 @@ export class PipelineWatcher {
   }
 }
 
-/** Findings are stored as a JSON blob; count defensively. */
-function countFindings(raw: string | null): number {
-  if (raw === null || raw.length === 0) return 0;
+/** Project findings_json into the decision table the Console renders. */
+function parseFindings(raw: string | null): PipelineFinding[] {
+  if (raw === null || raw.length === 0) return [];
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed.length;
-    if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { findings?: unknown[] }).findings)) {
-      return ((parsed as { findings: unknown[] }).findings).length;
+    const list: unknown[] = Array.isArray(parsed)
+      ? parsed
+      : parsed !== null &&
+          typeof parsed === "object" &&
+          Array.isArray((parsed as { findings?: unknown[] }).findings)
+        ? ((parsed as { findings: unknown[] }).findings)
+        : [];
+    const out: PipelineFinding[] = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const item = list[i];
+      if (item === null || typeof item !== "object") continue;
+      const row = item as Record<string, unknown>;
+      const id = typeof row.id === "string" && row.id.length > 0 ? row.id : `finding-${i + 1}`;
+      const severity = typeof row.severity === "string" ? row.severity : "info";
+      const action = typeof row.action === "string" ? row.action : "ask-user";
+      const description =
+        typeof row.description === "string"
+          ? row.description
+          : typeof row.message === "string"
+            ? row.message
+            : "";
+      out.push({ id, severity, action, description });
     }
-    return 0;
+    return out;
   } catch {
-    return 0;
+    return [];
   }
 }

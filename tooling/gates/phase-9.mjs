@@ -186,10 +186,13 @@ try {
   // ── G5 — transport reported as fact ───────────────────────────────────
   {
     const status = (await get("/v1/pipeline/status")).pipeline;
+    // Only modes that can actually occur today: WAL-assisted (fs.watch attached)
+    // or interval-only. `live` is reserved for a true push path that does not
+    // exist yet and must not appear on the wire.
     gate(
       "G5",
       "the transport in use is reported as fact, with observed lag",
-      (status.transport === "polled" || status.transport === "live") &&
+      (status.transport === "wal-assisted" || status.transport === "interval-only") &&
         status.compatibility.ok === true &&
         typeof status.lagMs === "number",
       `transport=${status.transport} compatible=${status.compatibility.ok} lagMs=${status.lagMs}`,
@@ -239,16 +242,26 @@ try {
   }
 
   // ── G2 — log output streams incrementally ─────────────────────────────
+  // Pure log append: do NOT touch any structured column. The real-world case is
+  // a step writing to its log without updating last_activity / updated_at.
+  // First opt into a profile that streams logs (shipped default is quiet).
   {
+    const configPath = join(home, "config", "observability.json5");
+    const raw = readFileSync(configPath, "utf8");
+    const overridden = raw.replace(/\{\s*\}\s*$/, '{\n  activeProfile: "working",\n}\n');
+    if (overridden === raw) {
+      throw new Error("G2 could not write working profile override");
+    }
+    writeFileSync(configPath, overridden);
+    const profileDeadline = Date.now() + 15_000;
+    while (Date.now() < profileDeadline) {
+      const probe = await get("/v1/config/effective");
+      if (probe.config?.observability?.activeProfile === "working") break;
+      await sleep(250);
+    }
+
     const marker = `LIVE-LINE-${Date.now()}`;
     appendFileSync(logPath, `${marker}\n`);
-    // Touch the run so the watcher re-reads this run's active step.
-    fixtureDb
-      .prepare("UPDATE step_results SET last_activity = ? WHERE run_id = ? AND step_name = 'review'")
-      .run(`round ${Date.now()}`, "01RUNFIXTURE0000000000001");
-    fixtureDb
-      .prepare("UPDATE runs SET updated_at = ? WHERE id = ?")
-      .run(Date.now(), "01RUNFIXTURE0000000000001");
 
     const started = Date.now();
     let streamed = false;
@@ -263,7 +276,7 @@ try {
     }
     gate(
       "G2",
-      "newly appended step-log output streams incrementally",
+      "newly appended step-log output streams incrementally without structured column changes",
       streamed,
       `marker=${marker} streamed=${streamed} in ${Date.now() - started}ms`,
     );
@@ -336,9 +349,13 @@ try {
     const text = (await page.textContent("body")) ?? "";
     gate(
       "G3",
-      "a run parked on a gate renders as needing a decision, with its findings count",
-      text.includes("NEEDS A DECISION") && text.includes("2 findings"),
-      `needsDecision=${text.includes("NEEDS A DECISION")} findingsCount=${text.includes("2 findings")}`,
+      "a run parked on a gate renders as needing a decision, with findings table and actions",
+      text.includes("NEEDS A DECISION") &&
+        text.includes("2 findings") &&
+        text.includes("ask-user") &&
+        text.includes("auto-fix") &&
+        text.includes("needs a call"),
+      `needsDecision=${text.includes("NEEDS A DECISION")} findingsTable=${text.includes("ask-user") && text.includes("auto-fix")}`,
     );
   }
 
@@ -346,8 +363,9 @@ try {
   {
     const text = (await page.textContent("body")) ?? "";
     const statesTransport =
-      (text.includes("POLLED") || text.includes("LIVE STREAM")) &&
-      text.includes("read-only");
+      (text.includes("WAL-ASSISTED") || text.includes("INTERVAL-ONLY")) &&
+      text.includes("read-only") &&
+      !text.includes("LIVE STREAM");
     gate(
       "G5b",
       "the Console states which transport is in use rather than implying live",
@@ -404,46 +422,85 @@ try {
     );
   }
 
-  // ── G7 — visibility profiles are real and hot-reloaded ────────────────
+  // ── G7 — visibility profiles change BEHAVIOUR, hot-reloaded ───────────
+  // Shape checks alone are false confidence. Under quiet, a pipeline log
+  // append must produce no log frames; under firehose it must.
   {
+    const setActiveProfile = async (name) => {
+      const configPath = join(home, "config", "observability.json5");
+      const raw = readFileSync(configPath, "utf8");
+      let next = raw.replace(/activeProfile:\s*"[^"]+"/, `activeProfile: "${name}"`);
+      if (next === raw) {
+        next = raw.replace(/\{\s*\}\s*$/, `{\n  activeProfile: "${name}",\n}\n`);
+      }
+      if (next === raw && !raw.includes(`activeProfile: "${name}"`)) {
+        throw new Error(`G7 could not set activeProfile to ${name}`);
+      }
+      writeFileSync(configPath, next);
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        const probe = await get("/v1/config/effective");
+        if (probe.config?.observability?.activeProfile === name) return;
+        await sleep(250);
+      }
+      throw new Error(`G7 timed out waiting for activeProfile=${name}`);
+    };
+
     const effective = await get("/v1/config/effective");
     const observability = effective.config?.observability;
     const profiles = Object.keys(observability?.profiles ?? {});
     const quiet = observability?.profiles?.quiet;
     const firehose = observability?.profiles?.firehose;
+    // Shipped default must be quiet (depth is opted into). The live active
+    // profile may have been switched earlier in this gate; check the profile
+    // table and the on-disk shipped file.
+    const shippedRaw = readFileSync(
+      join(ROOT, "apps", "orchestrator", "defaults", "observability.json5"),
+      "utf8",
+    );
+    const shippedDefaultIsQuiet =
+      /activeProfile:\s*"quiet"/.test(shippedRaw) && quiet?.streamPipelineLogs === false;
 
-    // Switch the active profile on disk and prove it hot-reloads.
-    // installDefaults writes the shipped values as COMMENTS with an empty
-    // override object at the bottom — so an override must be written into that
-    // object. Rewriting the commented reference line changes nothing, which is
-    // exactly the false-pass this gate previously produced.
-    const configPath = join(home, "config", "observability.json5");
-    const raw = readFileSync(configPath, "utf8");
-    const overridden = raw.replace(/\{\s*\}\s*$/, '{\n  activeProfile: "quiet",\n}\n');
-    if (overridden === raw) {
-      throw new Error("gate could not write an override — the installed template shape changed");
+    await setActiveProfile("quiet");
+
+    const countLogFrames = async () => {
+      const replay = await get("/v1/events/replay?types=pipeline.log_appended&limit=10000");
+      return (replay.events ?? []).length;
+    };
+    const beforeQuiet = await countLogFrames();
+    const quietMarker = `QUIET-LINE-${Date.now()}`;
+    appendFileSync(logPath, `${quietMarker}\n`);
+    await sleep(2500);
+    const afterQuiet = await countLogFrames();
+    const quietBlocks = afterQuiet === beforeQuiet;
+
+    await setActiveProfile("firehose");
+    const firehoseMarker = `FIREHOSE-LINE-${Date.now()}`;
+    appendFileSync(logPath, `${firehoseMarker}\n`);
+    const started = Date.now();
+    let firehoseStreams = false;
+    while (Date.now() - started < 4000) {
+      const replay = await get("/v1/events/replay?types=pipeline.log_appended&limit=1000");
+      if ((replay.events ?? []).some((e) => (e.event?.payload?.chunk ?? "").includes(firehoseMarker))) {
+        firehoseStreams = true;
+        break;
+      }
+      await sleep(100);
     }
-    writeFileSync(configPath, overridden);
-    // Hot-reload is watcher-driven with a debounce; poll rather than guess.
-    let reloaded = "working";
-    const reloadDeadline = Date.now() + 15_000;
-    while (Date.now() < reloadDeadline) {
-      const probe = await get("/v1/config/effective");
-      reloaded = probe.config?.observability?.activeProfile ?? "working";
-      if (reloaded === "quiet") break;
-      await sleep(250);
-    }
-    const after = { config: { observability: { activeProfile: reloaded } } };
+
+    const reloaded = (await get("/v1/config/effective")).config?.observability?.activeProfile;
 
     gate(
       "G7",
-      "visibility profiles ship, differ meaningfully, and hot-reload",
+      "visibility profiles change what reaches the live path and hot-reload",
       profiles.length >= 3 &&
         quiet?.streamPipelineLogs === false &&
         firehose?.streamPipelineLogs === true &&
-        quiet.surface.length < firehose.surface.length + 6 &&
-        after.config?.observability?.activeProfile === "quiet",
-      `profiles=${profiles.join(",")} quietStreams=${quiet?.streamPipelineLogs} firehoseStreams=${firehose?.streamPipelineLogs} reloadedTo=${after.config?.observability?.activeProfile}`,
+        shippedDefaultIsQuiet &&
+        quietBlocks &&
+        firehoseStreams &&
+        reloaded === "firehose",
+      `profiles=${profiles.join(",")} quietBlocks=${quietBlocks} firehoseStreams=${firehoseStreams} reloadedTo=${reloaded}`,
     );
   }
 

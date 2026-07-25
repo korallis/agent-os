@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { cn } from "@agent-os/ui";
-import type { PipelineRunSnapshot } from "@agent-os/protocol";
+import type { PipelineFinding, PipelineRunSnapshot } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
 import { useEventStream } from "@/lib/useEventStream";
 
@@ -13,16 +13,23 @@ import { useEventStream } from "@/lib/useEventStream";
  * gate's own state, republished onto Agent OS's event log, so it arrives over
  * the same SSE path as everything else.
  *
- * The header states the TRANSPORT and the observed lag as fact. A view labelled
- * "live" that is actually a one-second poll misleads in exactly the way a
- * `$0.00` cost estimate would, and this product does not do that.
+ * The header states the TRANSPORT and the observed lag as fact. Labels match
+ * modes that can actually occur today: WAL-assisted (fs.watch + poll floor) or
+ * interval-only. A true push `live` path is not claimed until it exists.
  */
 
+type PipelineTransport = "wal-assisted" | "interval-only" | "unavailable";
+
 type PipelineStatus = {
-  transport: "live" | "polled" | "unavailable";
+  transport: PipelineTransport;
   compatibility: { ok: boolean; reason: string | null; missingColumns: string[] };
   lagMs: number | null;
   home: string;
+  profile?: {
+    name: string;
+    pipelineLogChars: number;
+    streamPipelineLogs: boolean;
+  };
 };
 
 const STEP_TONE: Record<string, string> = {
@@ -42,6 +49,44 @@ function isAwaitingDecision(status: string): boolean {
   return status === "awaiting_approval" || status === "fix_review";
 }
 
+function transportLabel(transport: PipelineTransport | undefined): string {
+  switch (transport) {
+    case "wal-assisted":
+      return "WAL-ASSISTED";
+    case "interval-only":
+      return "INTERVAL-ONLY";
+    default:
+      return "UNAVAILABLE";
+  }
+}
+
+function transportTone(transport: PipelineTransport | undefined): string {
+  switch (transport) {
+    case "wal-assisted":
+      return "bg-ok/10 text-ok";
+    case "interval-only":
+      return "bg-electric/10 text-electric";
+    default:
+      return "bg-warn/10 text-warn";
+  }
+}
+
+function transportDescription(status: PipelineStatus | null): string {
+  if (status === null) return "Checking the local gate…";
+  switch (status.transport) {
+    case "wal-assisted":
+      return `WAL-assisted — near-immediate reaction on gate writes${
+        status.lagMs === null ? "" : ` · last read ${Math.round(status.lagMs)}ms ago`
+      }`;
+    case "interval-only":
+      return `Interval-only — polling the gate at the configured cadence${
+        status.lagMs === null ? "" : ` · last read ${Math.round(status.lagMs)}ms ago`
+      }`;
+    default:
+      return "The local no-mistakes gate could not be read";
+  }
+}
+
 export function PipelineView() {
   const [status, setStatus] = useState<PipelineStatus | null>(null);
   const [runs, setRuns] = useState<PipelineRunSnapshot[] | null>(null);
@@ -49,9 +94,15 @@ export function PipelineView() {
   const [logs, setLogs] = useState<Record<string, string>>({});
   const { events } = useEventStream();
 
+  const logChars = status?.profile?.pipelineLogChars ?? 20_000;
+
   // Newest-first buffer: index 0 is the newest frame (the .at(-1) trap again).
   const pipelineCursor =
-    events.find((envelope) => envelope.event.type === "pipeline.run_updated")?.id ?? "none";
+    events.find(
+      (envelope) =>
+        envelope.event.type === "pipeline.run_updated" ||
+        envelope.event.type === "pipeline.unavailable",
+    )?.id ?? "none";
 
   useEffect(() => {
     let cancelled = false;
@@ -63,10 +114,21 @@ export function PipelineView() {
         ]);
         if (!statusRes.ok || !runsRes.ok) throw new Error("pipeline unavailable");
         const statusBody = (await statusRes.json()) as { pipeline: PipelineStatus };
-        const runsBody = (await runsRes.json()) as { runs: PipelineRunSnapshot[] };
+        const runsBody = (await runsRes.json()) as {
+          runs: PipelineRunSnapshot[];
+          unavailable?: boolean;
+        };
         if (cancelled) return;
         setStatus(statusBody.pipeline);
-        setRuns(runsBody.runs);
+        // Never paint prior snapshots when the gate is unreadable.
+        if (
+          statusBody.pipeline.compatibility.ok === false ||
+          runsBody.unavailable === true
+        ) {
+          setRuns([]);
+        } else {
+          setRuns(runsBody.runs);
+        }
       } catch {
         if (!cancelled) setFailed(true);
       }
@@ -77,9 +139,11 @@ export function PipelineView() {
   }, [pipelineCursor]);
 
   // Incremental log output, accumulated per run+step from the live stream.
+  // Retention is driven by the active observability profile's pipelineLogChars.
   useEffect(() => {
     const appended = events.filter((e) => e.event.type === "pipeline.log_appended");
     if (appended.length === 0) return;
+    const retention = Math.max(0, logChars);
     setLogs((current) => {
       const next = { ...current };
       // Oldest-first so the accumulated text reads in order.
@@ -87,11 +151,15 @@ export function PipelineView() {
         if (envelope.event.type !== "pipeline.log_appended") continue;
         const { runId, step, chunk } = envelope.event.payload;
         const key = `${runId}:${step}`;
-        next[key] = `${next[key] ?? ""}${chunk}`.slice(-20_000);
+        if (retention === 0) {
+          next[key] = "";
+          continue;
+        }
+        next[key] = `${next[key] ?? ""}${chunk}`.slice(-retention);
       }
       return next;
     });
-  }, [events]);
+  }, [events, logChars]);
 
   const unavailableEvent = useMemo(
     () => events.find((e) => e.event.type === "pipeline.unavailable"),
@@ -109,6 +177,9 @@ export function PipelineView() {
   }
 
   const incompatible = status !== null && !status.compatibility.ok;
+  // Suppress the run list whenever compatibility is false — the banner claims
+  // nothing below is current, so nothing below may be rendered as current.
+  const visibleRuns = incompatible ? [] : (runs ?? []);
 
   return (
     <div className="flex flex-col gap-5">
@@ -117,30 +188,12 @@ export function PipelineView() {
         <span
           className={cn(
             "rounded-[20px] px-2.5 py-1 text-[11px] font-semibold",
-            status?.transport === "live"
-              ? "bg-ok/10 text-ok"
-              : status?.transport === "polled"
-                ? "bg-electric/10 text-electric"
-                : "bg-warn/10 text-warn",
+            transportTone(status?.transport),
           )}
         >
-          {status?.transport === "live"
-            ? "LIVE STREAM"
-            : status?.transport === "polled"
-              ? "POLLED"
-              : "UNAVAILABLE"}
+          {transportLabel(status?.transport)}
         </span>
-        <span className="text-[12px] text-fg-2">
-          {status === null
-            ? "Checking the local gate…"
-            : status.transport === "polled"
-              ? `Reading no-mistakes state directly${
-                  status.lagMs === null ? "" : ` · last read ${Math.round(status.lagMs)}ms ago`
-                }`
-              : status.transport === "live"
-                ? "Subscribed to the gate's event stream"
-                : "The local no-mistakes gate could not be read"}
-        </span>
+        <span className="text-[12px] text-fg-2">{transportDescription(status)}</span>
         <span className="ml-auto text-[11px] text-fg-3">read-only · never drives the pipeline</span>
       </div>
 
@@ -161,20 +214,21 @@ export function PipelineView() {
         </div>
       )}
 
-      {runs === null ? (
+      {incompatible ? null : runs === null ? (
         <p className="py-8 text-center text-[13px] text-fg-3">Loading pipeline runs…</p>
-      ) : runs.length === 0 ? (
+      ) : visibleRuns.length === 0 ? (
         <EmptyState
           kind="no-data"
           title="No pipeline runs yet"
           body="Runs appear here as soon as work enters the no-mistakes gate — including runs started outside Agent OS."
         />
       ) : (
-        runs.map((run) => {
+        visibleRuns.map((run) => {
           const awaiting = run.steps.find((s) => isAwaitingDecision(s.status));
           const active = run.steps.find((s) => s.status === "running" || s.status === "fixing");
           const logKey = active ? `${run.runId}:${active.step}` : null;
           const logText = logKey === null ? null : (logs[logKey] ?? null);
+          const findings: PipelineFinding[] = awaiting?.findings ?? [];
           return (
             <div key={run.runId} className="rounded-[10px] border border-line-1 bg-panel">
               <div className="flex flex-wrap items-center gap-3 border-b border-line-1 px-4 py-3">
@@ -227,6 +281,32 @@ export function PipelineView() {
                   </span>
                 ))}
               </div>
+
+              {awaiting !== undefined && findings.length > 0 && (
+                <div className="border-t border-line-1 px-4 py-3">
+                  <p className="mb-2 text-[11px] font-medium text-fg-3">Findings</p>
+                  <div className="overflow-x-auto rounded-[8px] border border-line-1">
+                    <table className="w-full text-left text-[11px]">
+                      <thead className="bg-panel-2 text-fg-3">
+                        <tr>
+                          <th className="px-3 py-2 font-medium">Severity</th>
+                          <th className="px-3 py-2 font-medium">Action</th>
+                          <th className="px-3 py-2 font-medium">Description</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {findings.map((finding) => (
+                          <tr key={finding.id} className="border-t border-line-1">
+                            <td className="px-3 py-2 font-mono text-fg-2">{finding.severity}</td>
+                            <td className="px-3 py-2 font-mono text-warn">{finding.action}</td>
+                            <td className="px-3 py-2 text-fg-1">{finding.description}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
 
               {active !== undefined && (
                 <div className="border-t border-line-1 px-4 py-3">

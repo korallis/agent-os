@@ -58,6 +58,7 @@ import type { AnalyticsService } from "../analytics/service.js";
 import type { PtyTicketStore } from "../pty/tickets.js";
 import { runConfigDoctor } from "../prompts/doctor.js";
 import type { PipelineWatcher } from "../pipeline/watcher.js";
+import { eventMatchesSurface, resolveActiveProfile } from "../observability/profile.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -752,10 +753,34 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 404, "NOT_FOUND", "pipeline watcher unavailable");
       return;
     }
-    return { pipeline: deps.pipeline.status() };
+    const { name, profile } = resolveActiveProfile(deps.config.effective().config.observability);
+    return {
+      pipeline: {
+        ...deps.pipeline.status(),
+        profile: {
+          name,
+          pipelineLogChars: profile.pipelineLogChars,
+          streamPipelineLogs: profile.streamPipelineLogs,
+        },
+      },
+    };
   });
 
   app.get("/v1/pipeline/runs", async (_request, reply) => {
+    if (deps.pipeline === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "pipeline watcher unavailable");
+      return;
+    }
+    const status = deps.pipeline.status();
+    // Schema drift / unreadable gate: never serve prior snapshots as current.
+    if (!status.compatibility.ok) {
+      void reply;
+      return {
+        runs: [],
+        unavailable: true as const,
+        reason: status.compatibility.reason,
+      };
+    }
     const { events } = deps.store.eventsOfTypes(["pipeline.run_updated"], 500);
     void reply;
     // Newest-first: keep only the latest frame per run id.
@@ -765,7 +790,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       const snapshot = envelope.event.payload;
       if (!latest.has(snapshot.runId)) latest.set(snapshot.runId, snapshot);
     }
-    return { runs: [...latest.values()] };
+    return { runs: [...latest.values()], unavailable: false as const, reason: null };
   });
 
   // ── Network I/O (§7 Network I/O Detail, Figma 41:4815) ────────────────
@@ -1331,10 +1356,21 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       return result;
     };
 
-    const writeFrame = (envelope: { id: string; event: { type: string } }): Promise<boolean> =>
-      enqueueWrite(
+    const surfaceAllows = (eventType: string): boolean => {
+      // Control-plane frames always reach the live path so the Console can stay
+      // honest about config/daemon state; the profile filters product noise.
+      if (eventMatchesSurface(eventType, ["daemon.", "config.", "policy."])) return true;
+      const { profile } = resolveActiveProfile(deps.config.effective().config.observability);
+      return eventMatchesSurface(eventType, profile.surface);
+    };
+
+    const writeFrame = (envelope: { id: string; event: { type: string } }): Promise<boolean> => {
+      // Visibility profiles filter the Console live path; durable store is unchanged.
+      if (!surfaceAllows(envelope.event.type)) return Promise.resolve(true);
+      return enqueueWrite(
         `id: ${envelope.id}\nevent: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
       );
+    };
 
     void (async () => {
       let live = false;

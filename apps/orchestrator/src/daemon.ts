@@ -24,7 +24,11 @@ import {
 } from "./quota-probes/scheduler.js";
 import { enableQuotaProviders } from "./quota-probes/enable.js";
 import { PipelineWatcher } from "./pipeline/watcher.js";
-import type { QuotaSample } from "@agent-os/protocol";
+import {
+  eventMatchesWakeOn,
+  resolveActiveProfile,
+} from "./observability/profile.js";
+import type { OrchestratorEvent, QuotaSample, WakeClass } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
 import { PromptService } from "./prompts/service.js";
 import { AnalyticsService } from "./analytics/service.js";
@@ -147,10 +151,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       logger.info({ replayed: opened.replayed }, "projection replayed from event log");
     }
 
-    config = new ConfigService(SHIPPED_DEFAULTS_DIR, paths.configDir);
-    const installed = config.installDefaults();
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, paths.configDir);
+    config = configService;
+    const installed = configService.installDefaults();
     const eventStore = store;
-    config.onEvent((event) => {
+    // Assigned after construction; config listener needs a stable ref before fleet exists.
+    let fleetRef: FleetService | null = null;
+    let pipelineWatcherRef: PipelineWatcher | null = null;
+    configService.onEvent((event) => {
       eventStore.append(event);
       // FleetService.reloadConfig existed but nothing ever called it, so a
       // hot-reloaded change reached `/v1/config/effective` while the fleet's
@@ -164,12 +172,19 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
           // A bad reload must never take the daemon down; the previous
           // in-memory config keeps running and the rejection is already logged.
         }
+        if (event.type === "config.changed" && event.payload.domain === "observability") {
+          try {
+            applyPipelineObservability(configService, pipelineWatcherRef);
+          } catch {
+            // Keep previous watcher config; rejection is already on the log.
+          }
+        }
       }
     });
     if (installed.length > 0) {
       store.append({ type: "config.installed", payload: { domains: installed } });
     }
-    config.startWatching();
+    configService.startWatching();
 
     const startedAt = new Date().toISOString();
 
@@ -180,7 +195,6 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       eventStore.append(event);
     });
     // R5.1: new / detected connections auto-enable matching quota probes.
-    const configService = config;
     connections.onProbeAutoEnable(({ provider, billingMode }) => {
       enableQuotaProviders(configService, [{ provider, billingMode }]);
     });
@@ -225,7 +239,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
 
     const fleet = new FleetService({
       home,
-      config,
+      config: configService,
       connections,
       prompts,
       pi,
@@ -308,16 +322,36 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
 
     // Phase 9: live view of the no-mistakes gate. Strictly read-only — it
     // never writes under the no-mistakes home and never drives the pipeline.
-    const observability = config.effective().config.observability;
+    // Profile knobs (streamPipelineLogs / surface / wakeOn) are read live so a
+    // hot-reloaded observability.json5 reconfigures without a daemon restart.
     const pipelineWatcher = new PipelineWatcher({
-      pollMs: observability.pipelinePollMs,
+      pollMs: configService.effective().config.observability.pipelinePollMs,
       sink: (event) => {
         eventStore.append(event);
       },
+      profile: () => {
+        const { profile } = resolveActiveProfile(configService.effective().config.observability);
+        return { streamPipelineLogs: profile.streamPipelineLogs };
+      },
     });
-    if (observability.watchPipeline) {
-      pipelineWatcher.start();
-    }
+    pipelineWatcherRef = pipelineWatcher;
+    applyPipelineObservability(configService, pipelineWatcher);
+
+    // wakeOn: event types that raise a Captain/Brain wake under the active profile.
+    eventStore.subscribe((envelope: { event: OrchestratorEvent }) => {
+      try {
+        const { profile } = resolveActiveProfile(configService.effective().config.observability);
+        if (!eventMatchesWakeOn(envelope.event.type, profile.wakeOn)) return;
+        fleet.watcher.classify({
+          class: wakeClassForEvent(envelope.event),
+          taskId: taskIdFromEvent(envelope.event),
+          summary: wakeSummaryForEvent(envelope.event),
+          detail: { eventType: envelope.event.type, source: "observability.wakeOn" },
+        });
+      } catch {
+        // Wake classification must never break append fan-out.
+      }
+    });
 
     const deps = {
       store,
@@ -477,3 +511,47 @@ function resolveAgentosdBin(): string {
   if (existsSync(candidate)) return candidate;
   return join(here, "bin", "agentosd.js");
 }
+
+function applyPipelineObservability(
+  config: ConfigService,
+  watcher: PipelineWatcher | null,
+): void {
+  if (watcher === null) return;
+  const observability = config.effective().config.observability;
+  watcher.applyConfig({
+    watchPipeline: observability.watchPipeline,
+    pollMs: observability.pipelinePollMs,
+  });
+}
+
+function wakeClassForEvent(event: OrchestratorEvent): WakeClass {
+  switch (event.type) {
+    case "pipeline.unavailable":
+      return "GATE_FAILED";
+    case "scout.write_violation":
+      return "SECURITY";
+    case "captain.escalation":
+      return event.payload.severity === "critical" ? "BLOCKED" : "NEEDS_INPUT";
+    default:
+      return "STATUS";
+  }
+}
+
+function taskIdFromEvent(event: OrchestratorEvent): string | null {
+  if (event.type === "captain.escalation") return event.payload.taskId;
+  return null;
+}
+
+function wakeSummaryForEvent(event: OrchestratorEvent): string {
+  switch (event.type) {
+    case "pipeline.unavailable":
+      return `pipeline unreadable: ${event.payload.reason}`;
+    case "captain.escalation":
+      return event.payload.summary;
+    case "scout.write_violation":
+      return `scout write violation: ${event.payload.changedPaths.slice(0, 3).join(", ")}`;
+    default:
+      return `observability wake: ${event.type}`;
+  }
+}
+

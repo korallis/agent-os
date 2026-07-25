@@ -622,11 +622,22 @@ export const sessionWedgedEventSchema = z.strictObject({
  * gate's own state onto its append-only log so the Console consumes pipeline
  * progress through the same SSE + projection path as everything else.
  */
+export const pipelineFindingSchema = z.strictObject({
+  id: z.string(),
+  severity: z.string(),
+  /** Captain-facing disposition: auto-fix / no-op / ask-user (or gate-specific). */
+  action: z.string(),
+  description: z.string(),
+});
+export type PipelineFinding = z.infer<typeof pipelineFindingSchema>;
+
 export const pipelineStepSnapshotSchema = z.strictObject({
   step: z.string(),
   order: z.number().int().min(0),
   status: z.string(),
   findingsCount: z.number().int().min(0),
+  /** Projected from findings_json when present — the parked-gate decision table. */
+  findings: z.array(pipelineFindingSchema).default([]),
   lastActivity: z.string().nullable(),
   lastActivityAt: isoTimestampSchema.nullable(),
   durationMs: z.number().int().min(0).nullable(),
