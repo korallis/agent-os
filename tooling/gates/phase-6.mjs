@@ -11,6 +11,8 @@
  *   G6  Task Detail renders the Brain decision lane and validation evidence
  *   G7  quota strip renders from seeded samples and states its honesty tier
  *   G8  empty/error treatments render for an unknown route
+ *   G9  Session Detail renders seat model, pane, attach command, and agent log
+ *       (label+value pairs — never bare values that could match empty-state copy)
  *
  * Real daemon, real Console production build, real browser (Playwright).
  * Usage: node tooling/gates/phase-6.mjs
@@ -65,6 +67,7 @@ const PAGES = [
   "/providers",
   "/notifications",
   "/runs",
+  "/runs/history",
   "/analytics",
   "/policies",
   "/settings",
@@ -454,6 +457,44 @@ try {
         seededQuotaMetric !== undefined,
       `provider=${seededQuotaProvider} tier=${seededQuotaTier} daemon=${daemonSeeded} uiProvider=${providerPresent} uiTier=${tierAdjacent}`,
     );
+  }
+
+  // G9 — session detail renders one seat's real log and its attach command
+  {
+    const state = await (await fetch(`${BASE}/v1/fleet/state`, { headers: auth })).json();
+    const session = (state.state?.sessions ?? [])[0];
+    let ok = false;
+    let detail = "no session seeded";
+    if (session !== undefined) {
+      const apiDetail = await (
+        await fetch(`${BASE}/v1/sessions/${session.sessionId}`, { headers: auth })
+      ).json();
+      await page.goto(`${CONSOLE}/sessions/${session.sessionId}`, { waitUntil: "networkidle" });
+      await sleep(700);
+      // Label+value pairs only — never bare values that could appear anywhere in the DOM.
+      // Model and pane are exposed via aria-label "Model: …" / "Pane: …".
+      // Attach requires the "Attach to this seat" heading in the same card as the command.
+      // Log is the section heading, not a value floating alone.
+      const hasModel =
+        (await page.getByLabel(`Model: ${session.model}`, { exact: true }).count()) > 0;
+      const hasWindow =
+        (await page.getByLabel(`Pane: ${session.tmuxWindow}`, { exact: true }).count()) > 0;
+      const attachCommand =
+        typeof apiDetail.attachCommand === "string" ? apiDetail.attachCommand : null;
+      const attachCard =
+        attachCommand === null
+          ? null
+          : page
+              .locator("div")
+              .filter({ has: page.getByText("Attach to this seat", { exact: true }) })
+              .filter({ has: page.getByText(attachCommand, { exact: true }) });
+      const hasAttach = attachCard !== null && (await attachCard.count()) > 0;
+      const hasLogHeading =
+        (await page.getByRole("heading", { name: "Agent log", exact: true }).count()) > 0;
+      ok = hasModel && hasWindow && hasAttach && hasLogHeading;
+      detail = `model=${hasModel} window=${hasWindow} attach=${hasAttach} log=${hasLogHeading}`;
+    }
+    gate("G9", "session detail renders the seat's model, pane, attach command and log", ok, detail);
   }
 
   // G8 — unknown route renders the shared empty treatment

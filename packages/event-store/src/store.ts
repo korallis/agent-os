@@ -18,6 +18,17 @@ export interface EventStoreOpenResult {
   quarantinedTail: string | null;
 }
 
+/** Per-task gate/fusion totals for Pipeline Run History (daemon-side). */
+export type RunHistoryAggregate = {
+  taskId: string;
+  gateRuns: number;
+  gateFailures: number;
+  gateErrors: number;
+  fusionRuns: number;
+  firstSeen: string | null;
+  lastSeen: string | null;
+};
+
 /**
  * The event store: append-only NDJSON log (truth) + SQLite projection
  * (rebuildable cache) + in-process fan-out for the SSE hub.
@@ -172,6 +183,75 @@ export class EventStore {
     const newestFirst = this.projection.eventsForTask(taskId, types, limit);
     const truncated = total > newestFirst.length;
     return { events: newestFirst.reverse(), truncated };
+  }
+
+  /**
+   * Session-scoped history for the agent log view. Same truncation semantics as
+   * `eventsForTask`: `truncated` is about THIS session, not the global log.
+   */
+  eventsForSession(
+    sessionId: string,
+    types: readonly string[] | null,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const total = this.projection.countForSession(sessionId, types);
+    const newestFirst = this.projection.eventsForSession(sessionId, types, limit);
+    const truncated = total > newestFirst.length;
+    return { events: newestFirst.reverse(), truncated };
+  }
+
+  /**
+   * Per-task gate/fusion aggregates for Pipeline Run History.
+   * Scans only sparse lifecycle types (never the full chatty log) so counts
+   * are complete — no page window, no "most recent frames" lie.
+   * firstSeen/lastSeen use min/max timestamps, not iteration order.
+   */
+  aggregateRunHistory(): RunHistoryAggregate[] {
+    const types = [
+      "task.created",
+      "task.phase_changed",
+      "gate.result",
+      "fusion.dispatched",
+      "fusion.completed",
+    ] as const;
+    const byTask = new Map<string, RunHistoryAggregate>();
+    const touch = (taskId: string): RunHistoryAggregate => {
+      let row = byTask.get(taskId);
+      if (row === undefined) {
+        row = {
+          taskId,
+          gateRuns: 0,
+          gateFailures: 0,
+          gateErrors: 0,
+          fusionRuns: 0,
+          firstSeen: null,
+          lastSeen: null,
+        };
+        byTask.set(taskId, row);
+      }
+      return row;
+    };
+
+    for (const envelope of this.projection.eventsOfTypesForTasks(types)) {
+      const payload = envelope.event.payload as { taskId?: string };
+      const taskId = payload.taskId;
+      if (taskId === undefined) continue;
+      const row = touch(taskId);
+      if (row.firstSeen === null || envelope.ts < row.firstSeen) {
+        row.firstSeen = envelope.ts;
+      }
+      if (row.lastSeen === null || envelope.ts > row.lastSeen) {
+        row.lastSeen = envelope.ts;
+      }
+      if (envelope.event.type === "gate.result") {
+        row.gateRuns += 1;
+        if (envelope.event.payload.outcome === "FAIL") row.gateFailures += 1;
+        if (envelope.event.payload.outcome === "GATE_ERROR") row.gateErrors += 1;
+      } else if (envelope.event.type === "fusion.dispatched") {
+        row.fusionRuns += 1;
+      }
+    }
+    return [...byTask.values()];
   }
 
   count(): number {

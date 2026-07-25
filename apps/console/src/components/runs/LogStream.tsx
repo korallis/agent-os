@@ -5,6 +5,7 @@ import Link from "next/link";
 import { cn } from "@agent-os/ui";
 import type { EventEnvelope } from "@agent-os/protocol";
 import { Icon } from "@/components/shell/Icon";
+import { RunsSubnav } from "@/components/runs/RunsSubnav";
 import { useEventStream } from "@/lib/useEventStream";
 
 type Level = "INFO" | "WARN" | "ERROR";
@@ -329,6 +330,7 @@ export function LogStream() {
           <span className="font-mono text-sm font-bold text-fg-1 tracking-[2px]">
             LIVE LOG STREAM
           </span>
+          <RunsSubnav />
           <span
             className={cn(
               "flex items-center gap-1.5 h-[19px] rounded px-2",

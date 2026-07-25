@@ -29,6 +29,9 @@ import {
   type HealthResponse,
   type OnboardingState,
   type QuotaSample,
+  type RunHistoryResponse,
+  type SessionDetailResponse,
+  type SessionEventsResponse,
   type StatusResponse,
   type TaskEventsResponse,
 } from "@agent-os/protocol";
@@ -324,41 +327,126 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
   });
 
   /**
-   * Task-scoped event history for Task Detail evidence (tool.invoked, gate.result,
-   * session/fusion frames). Truncation is meaningful for THIS task only.
+   * Shared query parse for task- and session-scoped event routes so the two
+   * stay in lockstep (types split, empty-types rejection, limit bounds).
    */
-  const taskEventsQuerySchema = z.object({
+  const scopedEventsQuerySchema = z.object({
     types: z.string().optional(),
     limit: z.coerce.number().int().min(1).max(10_000).default(5_000),
   });
 
+  type ScopedEventsQuery =
+    | { ok: true; types: string[] | null; limit: number }
+    | { ok: false; message: string };
+
+  function parseScopedEventsQuery(raw: unknown): ScopedEventsQuery {
+    const query = scopedEventsQuerySchema.safeParse(raw);
+    if (!query.success) {
+      return { ok: false, message: "invalid events query" };
+    }
+    const types =
+      query.data.types === undefined || query.data.types.trim() === ""
+        ? null
+        : query.data.types
+            .split(",")
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0);
+    if (types !== null && types.length === 0) {
+      return { ok: false, message: "empty types filter" };
+    }
+    return { ok: true, types, limit: query.data.limit };
+  }
+
+  /**
+   * Task-scoped event history for Task Detail evidence (tool.invoked, gate.result,
+   * session/fusion frames). Truncation is meaningful for THIS task only.
+   */
   app.get<{ Params: { id: string } }>(
     "/v1/tasks/:id/events",
     (request, reply): TaskEventsResponse | undefined => {
-      const query = taskEventsQuerySchema.safeParse(request.query);
-      if (!query.success) {
-        sendError(reply, 400, "BAD_REQUEST", "invalid task events query");
-        return undefined;
-      }
-      const types =
-        query.data.types === undefined || query.data.types.trim() === ""
-          ? null
-          : query.data.types
-              .split(",")
-              .map((t) => t.trim())
-              .filter((t) => t.length > 0);
-      if (types !== null && types.length === 0) {
-        sendError(reply, 400, "BAD_REQUEST", "empty types filter");
+      const parsed = parseScopedEventsQuery(request.query);
+      if (!parsed.ok) {
+        sendError(reply, 400, "BAD_REQUEST", parsed.message);
         return undefined;
       }
       const { events, truncated } = deps.store.eventsForTask(
         request.params.id,
-        types,
-        query.data.limit,
+        parsed.types,
+        parsed.limit,
       );
       return { taskId: request.params.id, events, truncated };
     },
   );
+
+  // ── Sessions: Agent Detail (41:2) + Agent Logs (41:456) ─────────────────
+  app.get<{ Params: { id: string } }>(
+    "/v1/sessions/:id",
+    (request, reply): SessionDetailResponse | undefined => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return undefined;
+      }
+      const session =
+        deps.fleet.tools.listSessions().find((s) => s.sessionId === request.params.id) ?? null;
+      if (session === null) {
+        sendError(reply, 404, "NOT_FOUND", "session not found");
+        return undefined;
+      }
+      const task = session.taskId !== null ? deps.fleet.tools.getTask(session.taskId) : null;
+      return {
+        session,
+        taskTitle: task?.title ?? null,
+        // Surfaced so a human can attach; the daemon never runs this itself.
+        attachCommand: deps.fleet.tmux.attachCommand(session.tmuxWindow),
+      };
+    },
+  );
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/sessions/:id/events",
+    (request, reply): SessionEventsResponse | undefined => {
+      const parsed = parseScopedEventsQuery(request.query);
+      if (!parsed.ok) {
+        sendError(reply, 400, "BAD_REQUEST", parsed.message);
+        return undefined;
+      }
+      const { events, truncated } = deps.store.eventsForSession(
+        request.params.id,
+        parsed.types,
+        parsed.limit,
+      );
+      return { sessionId: request.params.id, events, truncated };
+    },
+  );
+
+  /**
+   * Pipeline Run History — daemon-side per-task gate/fusion aggregates.
+   * The Console must not reconstruct these counts from a paged global replay.
+   */
+  app.get("/v1/runs/history", (_request, reply): RunHistoryResponse | undefined => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return undefined;
+    }
+    const tasks = deps.fleet.listTaskItems();
+    const aggregates = deps.store.aggregateRunHistory();
+    const byTask = new Map(aggregates.map((row) => [row.taskId, row]));
+    const runs = tasks
+      .map((task) => {
+        const agg = byTask.get(task.id);
+        return {
+          task,
+          gateRuns: agg?.gateRuns ?? 0,
+          gateFailures: agg?.gateFailures ?? 0,
+          gateErrors: agg?.gateErrors ?? 0,
+          fusionRuns: agg?.fusionRuns ?? 0,
+          firstSeen: agg?.firstSeen ?? null,
+          lastSeen: agg?.lastSeen ?? null,
+        };
+      })
+      .sort((a, b) => b.task.updatedAt.localeCompare(a.task.updatedAt));
+    return { runs };
+  });
 
   // ── Analytics (master plan §7 Token Usage / §8.2) ───────────────────────
   app.get<{ Querystring: { days?: string } }>("/v1/analytics", async (request, reply) => {

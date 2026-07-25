@@ -46,6 +46,18 @@ export function FusionColumns({ taskId }: { taskId: string }) {
   const [detailFailedRunId, setDetailFailedRunId] = useState<string | null>(null);
   /** RunId currently being fetched (null when idle). */
   const [detailLoadingRunId, setDetailLoadingRunId] = useState<string | null>(null);
+  // Adjust state during render when the task id changes (React-recommended;
+  // never via refs — react-hooks/refs forbids ref reads in render).
+  const [boundTaskId, setBoundTaskId] = useState(taskId);
+  if (boundTaskId !== taskId) {
+    setBoundTaskId(taskId);
+    setRuns([]);
+    setDetail(null);
+    setSelected(null);
+    setListStatus("loading");
+    setDetailFailedRunId(null);
+    setDetailLoadingRunId(null);
+  }
 
   useEffect(() => {
     let cancelled = false;
