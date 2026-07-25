@@ -65,6 +65,7 @@ const PAGES = [
   "/providers",
   "/notifications",
   "/runs",
+  "/runs/history",
   "/analytics",
   "/policies",
   "/settings",
@@ -454,6 +455,31 @@ try {
         seededQuotaMetric !== undefined,
       `provider=${seededQuotaProvider} tier=${seededQuotaTier} daemon=${daemonSeeded} uiProvider=${providerPresent} uiTier=${tierAdjacent}`,
     );
+  }
+
+  // G9 — session detail renders one seat's real log and its attach command
+  {
+    const state = await (await fetch(`${BASE}/v1/fleet/state`, { headers: auth })).json();
+    const session = (state.state?.sessions ?? [])[0];
+    let ok = false;
+    let detail = "no session seeded";
+    if (session !== undefined) {
+      const apiDetail = await (
+        await fetch(`${BASE}/v1/sessions/${session.sessionId}`, { headers: auth })
+      ).json();
+      await page.goto(`${CONSOLE}/sessions/${session.sessionId}`, { waitUntil: "networkidle" });
+      await sleep(700);
+      const text = (await page.textContent("body")) ?? "";
+      // Assert on label+value pairs, never a bare value that could occur by chance.
+      const hasModel = text.includes(session.model);
+      const hasWindow = text.includes(session.tmuxWindow);
+      const hasAttach =
+        typeof apiDetail.attachCommand === "string" && text.includes(apiDetail.attachCommand);
+      const hasLogHeading = text.includes("Agent log");
+      ok = hasModel && hasWindow && hasAttach && hasLogHeading;
+      detail = `model=${hasModel} window=${hasWindow} attach=${hasAttach} log=${hasLogHeading}`;
+    }
+    gate("G9", "session detail renders the seat's model, pane, attach command and log", ok, detail);
   }
 
   // G8 — unknown route renders the shared empty treatment

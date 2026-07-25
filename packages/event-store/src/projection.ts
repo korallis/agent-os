@@ -72,6 +72,7 @@ export class SqliteProjection {
         ts: envelope.ts,
         type: envelope.event.type,
         taskId: taskIdFromEnvelope(envelope),
+        sessionId: sessionIdFromEnvelope(envelope),
         envelope: JSON.stringify(envelope),
       })
       .onConflictDoNothing();
@@ -230,6 +231,46 @@ export class SqliteProjection {
     return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
   }
 
+  /**
+   * Events whose projected session_id matches, newest-first, optionally typed.
+   * Mirrors eventsForTask so a session log never falls back to a full scan.
+   */
+  eventsForSession(
+    sessionId: string,
+    types: readonly string[] | null,
+    limit: number,
+  ): EventEnvelope[] {
+    if (types !== null && types.length === 0) return [];
+    const typeFilter =
+      types === null ? "" : ` AND type IN (${types.map(() => "?").join(", ")})`;
+    const params: unknown[] =
+      types === null ? [sessionId, limit] : [sessionId, ...types, limit];
+    const rows = this.sqlite
+      .prepare(
+        `SELECT envelope FROM events
+         WHERE session_id = ?${typeFilter}
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(...params) as { envelope: string }[];
+    return rows.map((r) => JSON.parse(r.envelope) as EventEnvelope);
+  }
+
+  /** Count of events whose projected session_id matches (optional type filter). */
+  countForSession(sessionId: string, types: readonly string[] | null): number {
+    if (types !== null && types.length === 0) return 0;
+    const typeFilter =
+      types === null ? "" : ` AND type IN (${types.map(() => "?").join(", ")})`;
+    const params: unknown[] = types === null ? [sessionId] : [sessionId, ...types];
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM events
+         WHERE session_id = ?${typeFilter}`,
+      )
+      .get(...params) as { n: number } | undefined;
+    return row?.n ?? 0;
+  }
+
   /** Count of events whose projected task_id matches (optional type filter). */
   countForTask(taskId: string, types: readonly string[] | null): number {
     if (types !== null && types.length === 0) return 0;
@@ -302,6 +343,11 @@ export class SqliteProjection {
 function taskIdFromEnvelope(envelope: EventEnvelope): string | null {
   const payload = envelope.event.payload as { taskId?: unknown };
   return typeof payload.taskId === "string" ? payload.taskId : null;
+}
+
+function sessionIdFromEnvelope(envelope: EventEnvelope): string | null {
+  const payload = envelope.event.payload as { sessionId?: unknown };
+  return typeof payload.sessionId === "string" ? payload.sessionId : null;
 }
 
 // Silence unused-export noise if drizzle tables are only used for types elsewhere.

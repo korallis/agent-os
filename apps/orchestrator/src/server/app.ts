@@ -29,6 +29,8 @@ import {
   type HealthResponse,
   type OnboardingState,
   type QuotaSample,
+  type SessionDetailResponse,
+  type SessionEventsResponse,
   type StatusResponse,
   type TaskEventsResponse,
 } from "@agent-os/protocol";
@@ -357,6 +359,58 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         query.data.limit,
       );
       return { taskId: request.params.id, events, truncated };
+    },
+  );
+
+  // ── Sessions: Agent Detail (41:2) + Agent Logs (41:456) ─────────────────
+  app.get<{ Params: { id: string } }>(
+    "/v1/sessions/:id",
+    (request, reply): SessionDetailResponse | undefined => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return undefined;
+      }
+      const session =
+        deps.fleet.tools.listSessions().find((s) => s.sessionId === request.params.id) ?? null;
+      if (session === null) {
+        sendError(reply, 404, "NOT_FOUND", "session not found");
+        return undefined;
+      }
+      const task = session.taskId !== null ? deps.fleet.tools.getTask(session.taskId) : null;
+      return {
+        session,
+        taskTitle: task?.title ?? null,
+        // Surfaced so a human can attach; the daemon never runs this itself.
+        attachCommand: deps.fleet.tmux.attachCommand(session.tmuxWindow),
+      };
+    },
+  );
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/sessions/:id/events",
+    (request, reply): SessionEventsResponse | undefined => {
+      const query = taskEventsQuerySchema.safeParse(request.query);
+      if (!query.success) {
+        sendError(reply, 400, "BAD_REQUEST", "invalid session events query");
+        return undefined;
+      }
+      const types =
+        query.data.types === undefined || query.data.types.trim() === ""
+          ? null
+          : query.data.types
+              .split(",")
+              .map((t) => t.trim())
+              .filter((t) => t.length > 0);
+      if (types !== null && types.length === 0) {
+        sendError(reply, 400, "BAD_REQUEST", "empty types filter");
+        return undefined;
+      }
+      const { events, truncated } = deps.store.eventsForSession(
+        request.params.id,
+        types,
+        query.data.limit,
+      );
+      return { sessionId: request.params.id, events, truncated };
     },
   );
 

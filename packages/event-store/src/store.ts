@@ -174,6 +174,21 @@ export class EventStore {
     return { events: newestFirst.reverse(), truncated };
   }
 
+  /**
+   * Session-scoped history for the agent log view. Same truncation semantics as
+   * `eventsForTask`: `truncated` is about THIS session, not the global log.
+   */
+  eventsForSession(
+    sessionId: string,
+    types: readonly string[] | null,
+    limit: number,
+  ): { events: EventEnvelope[]; truncated: boolean } {
+    const total = this.projection.countForSession(sessionId, types);
+    const newestFirst = this.projection.eventsForSession(sessionId, types, limit);
+    const truncated = total > newestFirst.length;
+    return { events: newestFirst.reverse(), truncated };
+  }
+
   count(): number {
     return this.projection.count();
   }

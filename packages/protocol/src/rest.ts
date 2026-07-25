@@ -12,6 +12,7 @@ import { quotaSampleSchema } from "./quota.js";
 import { onboardingStateSchema } from "./onboarding.js";
 import { PI_PINNED_VERSION } from "./pi.js";
 import {
+  fleetSessionSchema,
   fleetStateSnapshotSchema,
   fleetSummarySchema,
   projectRecordSchema,
@@ -74,6 +75,30 @@ export const taskEventsResponseSchema = z.strictObject({
   truncated: z.boolean(),
 });
 export type TaskEventsResponse = z.infer<typeof taskEventsResponseSchema>;
+
+/**
+ * GET `/v1/sessions/:id` — one crewmate seat: its spawn facts, current status
+ * and (when known) the task it belongs to. Figma "Agent Detail" (`41:2`).
+ */
+export const sessionDetailResponseSchema = z.strictObject({
+  session: fleetSessionSchema.nullable(),
+  /** Null when the session predates the current daemon's in-memory registry. */
+  taskTitle: z.string().nullable(),
+  /** Human attach command; the daemon never executes it. */
+  attachCommand: z.string().nullable(),
+});
+export type SessionDetailResponse = z.infer<typeof sessionDetailResponseSchema>;
+
+/**
+ * GET `/v1/sessions/:id/events` — session-scoped frames for the log view.
+ * Figma "Agent Logs" (`41:456`). Same truncation semantics as task events.
+ */
+export const sessionEventsResponseSchema = z.strictObject({
+  sessionId: ulidSchema,
+  events: z.array(eventEnvelopeSchema),
+  truncated: z.boolean(),
+});
+export type SessionEventsResponse = z.infer<typeof sessionEventsResponseSchema>;
 
 export const apiErrorCodeSchema = z.enum([
   "UNAUTHORIZED",

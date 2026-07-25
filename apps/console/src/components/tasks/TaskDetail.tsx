@@ -191,9 +191,10 @@ export function TaskDetail({ taskId }: { taskId: string }) {
             <p className="text-[13px] text-fg-3">No crewmates spawned.</p>
           ) : (
             task.sessions.map((s) => (
-              <div
+              <Link
                 key={s.sessionId}
-                className="rounded-2xl border border-line-2 bg-panel p-4 flex flex-col gap-1"
+                href={`/sessions/${s.sessionId}`}
+                className="rounded-2xl border border-line-2 bg-panel p-4 flex flex-col gap-1 hover:border-line-2/80 transition-colors"
               >
                 <div className="flex items-center justify-between">
                   <span className="text-[11px] uppercase tracking-wide text-fg-3">{s.role}</span>
@@ -217,7 +218,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
                     {s.worktreePath}
                   </span>
                 )}
-              </div>
+              </Link>
             ))
           )}
         </div>
