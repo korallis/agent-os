@@ -171,7 +171,7 @@ export const observabilityConfigSchema = z.strictObject({
 export type ObservabilityConfig = z.infer<typeof observabilityConfigSchema>;
 
 /**
- * `balancer.json5` — config surface #12 (§11 Phase 10, [R7]).
+ * `balancer.json5` — config surface #16 (§11 Phase 10, [R7]).
  *
  * The auto-balancer spreads work across the Captain's models. Two rules the
  * design study made non-negotiable:
