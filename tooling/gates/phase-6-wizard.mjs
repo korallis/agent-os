@@ -21,12 +21,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
 const TMUX_SOCKET = `agentos-p6w-${process.pid}`;
-const PORT = 4700 + 1200 + Math.floor(Math.random() * 40);
-const CONSOLE_PORT = 3200 + Math.floor(Math.random() * 60);
+const PORT = pickPort(5900, 40);
+const CONSOLE_PORT = pickPort(3200, 60);
 const BASE = `http://127.0.0.1:${PORT}`;
 const CONSOLE = `http://127.0.0.1:${CONSOLE_PORT}`;
 
