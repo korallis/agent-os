@@ -321,11 +321,18 @@ export function PipelineView() {
       const key = `${runId}:${step}`;
       const offset =
         "offset" in payload && typeof payload.offset === "number" ? payload.offset : undefined;
+      // Prefer the server-measured end offset — recomputing from the decoded
+      // string desyncs forever when a multi-byte sequence was split at a chunk edge.
+      const endOffset =
+        "endOffset" in payload && typeof payload.endOffset === "number"
+          ? payload.endOffset
+          : undefined;
       const prior = nextRanges[key];
       const merged = mergeLogRange(
         prior ? { start: prior.start, end: prior.end, text: next[key] ?? "" } : undefined,
         offset ?? prior?.end ?? 0,
         chunk,
+        endOffset,
       );
       if (merged.text !== (next[key] ?? "")) {
         next[key] = merged.text;

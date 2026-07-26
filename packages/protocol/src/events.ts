@@ -670,8 +670,15 @@ export const pipelineLogAppendedEventSchema = z.strictObject({
     runId: z.string(),
     step: z.string(),
     chunk: z.string(),
-    /** Byte offset of `chunk` in the step log file (for attach/stream de-dupe). */
+    /** Inclusive start byte offset of `chunk` in the step log file. */
     offset: z.number().int().min(0),
+    /**
+     * Exclusive end byte offset in the step log file after this chunk.
+     * Authoritative file position — clients must use this rather than
+     * recomputing from the decoded string (UTF-8 decode is lossy at
+     * incomplete sequence boundaries).
+     */
+    endOffset: z.number().int().min(0),
   }),
 });
 

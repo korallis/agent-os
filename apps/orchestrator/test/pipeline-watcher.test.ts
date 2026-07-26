@@ -1338,4 +1338,163 @@ describe("PipelineWatcher", () => {
     watcher.stop();
     await app.close();
   });
+
+  it("carries multi-byte UTF-8 across chunk boundaries with authoritative endOffset", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-utf8-boundary-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "seed\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 200_000 }),
+    });
+    watcher.start();
+
+    // Place a 3-byte euro so its first byte is the last byte of chunk 1.
+    const pad = "x".repeat(PIPELINE_LOG_CHUNK_MAX - 1);
+    const euro = "€";
+    const suffix = "AFTER\n";
+    appendFileSync(logPath, pad + euro + suffix);
+    events.length = 0;
+    watcher.tick();
+    // Drain any residual incomplete sequence left for the next tick.
+    for (let i = 0; i < 4; i += 1) {
+      watcher.tick();
+    }
+
+    const logs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(logs.length).toBeGreaterThanOrEqual(1);
+    const joined = logs
+      .map((e) => (e.type === "pipeline.log_appended" ? e.payload.chunk : ""))
+      .join("");
+    expect(joined).toContain(euro);
+    expect(joined).toContain("AFTER");
+    expect(joined).not.toContain("\uFFFD");
+
+    // Server-measured endOffset must match file progress; client must not
+    // recompute end from Buffer.byteLength of a lossy decode.
+    let clientEnd = -1;
+    for (const e of logs) {
+      if (e.type !== "pipeline.log_appended") continue;
+      const { offset, endOffset, chunk } = e.payload;
+      expect(typeof endOffset).toBe("number");
+      expect(endOffset).toBeGreaterThan(offset);
+      expect(endOffset - offset).toBe(Buffer.byteLength(chunk, "utf8"));
+      if (clientEnd < 0) clientEnd = offset;
+      expect(offset).toBe(clientEnd);
+      clientEnd = endOffset;
+    }
+    // Following chunk continuity: last end equals current file size.
+    const finalSize = Buffer.byteLength("seed\n" + pad + euro + suffix, "utf8");
+    expect(clientEnd).toBe(finalSize);
+    watcher.stop();
+  });
+
+  it("emits whitespace-only log appends (newline and CR redraw)", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-ws-log-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "seed\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 20_000 }),
+    });
+    watcher.start();
+
+    events.length = 0;
+    appendFileSync(logPath, "\n");
+    watcher.tick();
+    const newlineLogs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(newlineLogs).toHaveLength(1);
+    if (newlineLogs[0]?.type === "pipeline.log_appended") {
+      expect(newlineLogs[0].payload.chunk).toBe("\n");
+    }
+
+    events.length = 0;
+    appendFileSync(logPath, "\r");
+    watcher.tick();
+    const crLogs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(crLogs).toHaveLength(1);
+    if (crLogs[0]?.type === "pipeline.log_appended") {
+      expect(crLogs[0].payload.chunk).toBe("\r");
+    }
+    watcher.stop();
+  });
+
+  it("activeLogTails and Console retention agree on character window for non-ASCII", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-logchars-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    // α is 2 UTF-8 bytes and 1 JS character — byte budget would under-fill.
+    const body = "α".repeat(100);
+    writeFileSync(logPath, body);
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const retention = 10;
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: () => {},
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: retention }),
+    });
+    watcher.start();
+
+    const tails = watcher.activeLogTails();
+    expect(tails.tails).toHaveLength(1);
+    const tail = tails.tails[0]!;
+    const consoleWindow = body.slice(-retention);
+    expect(tail.text).toBe(consoleWindow);
+    expect(tail.text.length).toBe(retention);
+    expect(tail.endOffset - tail.startOffset).toBe(Buffer.byteLength(tail.text, "utf8"));
+    expect(tail.truncated).toBe(true);
+    // Byte-budget read of `retention` bytes would yield only 5 α's — not 10.
+    expect(tail.text).not.toBe("α".repeat(Math.floor(retention / 2)));
+    watcher.stop();
+  });
 });

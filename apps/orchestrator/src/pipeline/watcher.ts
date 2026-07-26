@@ -155,6 +155,91 @@ function nowUnixSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+/**
+ * Bytes to skip at the front of a mid-file read so decoding starts on a
+ * complete UTF-8 character (not a continuation byte from a prior code point).
+ */
+export function utf8LeadingSkip(buffer: Buffer): number {
+  if (buffer.length === 0) return 0;
+  let i = 0;
+  while (i < Math.min(3, buffer.length) && (buffer[i]! & 0xc0) === 0x80) {
+    i += 1;
+  }
+  return i;
+}
+
+/**
+ * Length of the longest prefix of `buffer` that ends on a complete UTF-8
+ * character boundary. Returns 0 when the whole buffer is an incomplete
+ * multi-byte sequence (caller should wait for more file bytes).
+ */
+export function utf8CompletePrefixLength(buffer: Buffer): number {
+  const n = buffer.length;
+  if (n === 0) return 0;
+  // Last byte is ASCII → whole buffer ends cleanly (reads start on a boundary).
+  if ((buffer[n - 1]! & 0x80) === 0) return n;
+
+  let cont = 0;
+  while (cont < 3 && n - 1 - cont >= 0 && (buffer[n - 1 - cont]! & 0xc0) === 0x80) {
+    cont += 1;
+  }
+  const leadIdx = n - 1 - cont;
+  if (leadIdx < 0) return 0;
+  const lead = buffer[leadIdx]!;
+  let expected: number;
+  if ((lead & 0xe0) === 0xc0) expected = 2;
+  else if ((lead & 0xf0) === 0xe0) expected = 3;
+  else if ((lead & 0xf8) === 0xf0) expected = 4;
+  else if ((lead & 0x80) === 0) return n;
+  else {
+    // Invalid lead — include it so the stream still advances.
+    return n;
+  }
+  const actual = cont + 1;
+  if (actual < expected) return leadIdx;
+  return n;
+}
+
+/**
+ * Read the last `maxChars` UTF-16 code units (JS string length) of a log file,
+ * reporting the file byte range that produced them. Matches Console retention
+ * (`String.prototype.slice`) so attach seed and live window agree on characters.
+ */
+function readLogTailByChars(
+  logPath: string,
+  size: number,
+  maxChars: number,
+): { text: string; startOffset: number; endOffset: number; truncated: boolean } {
+  if (size <= 0 || maxChars <= 0) {
+    return { text: "", startOffset: size, endOffset: size, truncated: false };
+  }
+  // Over-read: UTF-8 uses at most 4 bytes per Unicode code point.
+  const maxBytes = Math.min(size, maxChars * 4);
+  const readStart = size - maxBytes;
+  const buffer = Buffer.alloc(maxBytes);
+  const fd = openSync(logPath, "r");
+  try {
+    readSync(fd, buffer, 0, maxBytes, readStart);
+  } finally {
+    closeSync(fd);
+  }
+  const leadSkip = readStart === 0 ? 0 : utf8LeadingSkip(buffer);
+  const slice = buffer.subarray(leadSkip);
+  let text = slice.toString("utf8");
+  let startOffset = readStart + leadSkip;
+  if (text.length > maxChars) {
+    const dropped = text.slice(0, text.length - maxChars);
+    startOffset += Buffer.byteLength(dropped, "utf8");
+    text = text.slice(-maxChars);
+  }
+  return {
+    text,
+    startOffset,
+    endOffset: size,
+    truncated: startOffset > 0,
+  };
+}
+
 type OpenResult =
   | { kind: "ok"; db: Database.Database }
   | { kind: "missing" }
@@ -361,26 +446,18 @@ export class PipelineWatcher {
       try {
         if (!existsSync(logPath)) continue;
         const size = statSync(logPath).size;
-        const toRead = Math.min(pipelineLogChars, size);
-        const start = size - toRead;
-        let text = "";
-        if (toRead > 0) {
-          const buffer = Buffer.alloc(toRead);
-          const fd = openSync(logPath, "r");
-          try {
-            readSync(fd, buffer, 0, toRead, start);
-          } finally {
-            closeSync(fd);
-          }
-          text = buffer.toString("utf8");
-        }
+        const { text, startOffset, endOffset, truncated } = readLogTailByChars(
+          logPath,
+          size,
+          pipelineLogChars,
+        );
         tails.push({
           runId,
           step,
           text,
-          truncated: size > pipelineLogChars,
-          startOffset: start,
-          endOffset: size,
+          truncated,
+          startOffset,
+          endOffset,
         });
       } catch {
         // Best-effort; structured cards remain the source of truth.
@@ -834,22 +911,26 @@ export class PipelineWatcher {
           );
           if (toRead <= 0) break;
           const buffer = Buffer.alloc(toRead);
-          readSync(fd, buffer, 0, toRead, offset);
-          const chunk = buffer.toString("utf8");
-          if (chunk.trim().length === 0) {
-            offset += toRead;
-            drained += toRead;
-            chunks += 1;
-            this.logOffsets.set(key, offset);
-            continue;
+          const bytesRead = readSync(fd, buffer, 0, toRead, offset);
+          if (bytesRead <= 0) break;
+          const raw = buffer.subarray(0, bytesRead);
+          // Keep multi-byte sequences intact: emit only a complete UTF-8 prefix
+          // and leave a trailing partial sequence for the next read.
+          const emitBytes = utf8CompletePrefixLength(raw);
+          if (emitBytes <= 0) {
+            // Incomplete multi-byte only — wait for more file bytes next tick.
+            break;
           }
+          const chunk = raw.subarray(0, emitBytes).toString("utf8");
+          const endOffset = offset + emitBytes;
           // Sink before advancing: if append fails, the next tick retries these bytes.
+          // Whitespace-only chunks (\\n, \\r redraws) are real terminal output — emit them.
           this.sink({
             type: "pipeline.log_appended",
-            payload: { runId, step, chunk, offset },
+            payload: { runId, step, chunk, offset, endOffset },
           });
-          offset += toRead;
-          drained += toRead;
+          offset = endOffset;
+          drained += emitBytes;
           chunks += 1;
           this.logOffsets.set(key, offset);
         }
