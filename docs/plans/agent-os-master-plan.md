@@ -2,8 +2,8 @@
 
 > **Provenance:** FUSED MASTER PLAN produced by the FUSION agent from two independent plans:
 > **[A]** = PLAN A (`plan-a-fable.md`, architect: Claude Fable 5, thinking high) · **[B]** = PLAN B (`plan-b-sol.md`, architect: GPT-5.6 Sol, medium).
-> **[CONSENSUS]** marks positions both plans reached independently. **[R2]** marks the Pi single-harness revision; **[R3]** marks the LLM-Brain + full-configurability revision; **[R4]** marks the Captain's decisions revision; **[R5]**/**[R5.1]** mark the live quota & balance metering revision and its detection-driven amendment; **[R6]** marks the guided onboarding wizard + Claude Agent SDK subscription-billing revision; **[R7]** marks live pipeline visibility + auto-balancer roadmap; **[R8]** marks the configurable per-model harness (reverses Pi-only) + external-review remediation (all Captain's directives). Divergences are resolved inline with attribution and a one-to-two-sentence rationale; materially contested losers are preserved as "Rejected alternative" notes. A mandatory **Consensus & Divergence** ledger closes the document.
-> **Status:** Revision 8 — configurable per-model harness (R8) + R7 roadmap, 2026-07-26.
+> **[CONSENSUS]** marks positions both plans reached independently. **[R2]** marks the Pi single-harness revision; **[R3]** marks the LLM-Brain + full-configurability revision; **[R4]** marks the Captain's decisions revision; **[R5]**/**[R5.1]** mark the live quota & balance metering revision and its detection-driven amendment; **[R6]** marks the guided onboarding wizard + Claude Agent SDK subscription-billing revision; **[R7]** marks live pipeline visibility + auto-balancer roadmap; **[R8]** marks the configurable per-model harness (reverses Pi-only) + external-review remediation; **[R9]** marks the Captain's 2026-07-26 ruling that removed the marketing site (all Captain's directives). Divergences are resolved inline with attribution and a one-to-two-sentence rationale; materially contested losers are preserved as "Rejected alternative" notes. A mandatory **Consensus & Divergence** ledger closes the document.
+> **Status:** Revision 9 — marketing site removed **[R9]**, 2026-07-26 (builds on Rev 8 configurable harness + R7 roadmap).
 
 ---
 
@@ -1204,11 +1204,11 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 **[CONSENSUS on gate philosophy]** — executable gates authored before each phase, RED at phase start. **[R3] re-sequencing:** the config layering system lands in Phase 1 (everything after it consumes it), and the **substrate tool surface + Brain land in Phase 3** — the Brain is the orchestrator from the first end-to-end task onward; there is no interim rule-engine orchestrator to build and then discard.
 
 **Phase 0 — Monorepo scaffold & migration (1 wk)** — unchanged:
-- [x] pnpm+Turborepo; marketing verbatim; console/orchestrator workspace slots; CLI skeleton path established. (Product chrome is Figma [R6.3], not marketing-idiom — delivered Phase 1.)
+- [x] pnpm+Turborepo; ~~marketing verbatim~~ **[R9]-removed**; console/orchestrator workspace slots; CLI skeleton path established. (Product chrome is Figma [R6.3], not marketing-idiom — delivered Phase 1.)
 - [x] Strict TS + `no-explicit-any` + zero-`any` scanner. [B]
 - [x] Deprecation gates clean. **[CONSENSUS]**
-- [x] Marketing pixel-identical smoke [A]; honesty pass [B]. Evidence: `docs/qa/runs/phase-0-monorepo-2026-07-24/`.
-- [x] **Design-system extraction (Phase 0→1):** `SiteHeader`, `GlassCard`, `MagneticButton`, and existing `packages/ui` motion primitives (`AnimatedCard`, TextReveal helpers, …) + shared tokens; marketing rewired and renders identically. **[R6.3]** product screens use Figma tokens in `packages/ui` `theme.css` (Figma wins over marketing palette on console).
+- [x] ~~Marketing pixel-identical smoke [A]; honesty pass [B].~~ **[R9]-void** (no marketing app). Historical evidence retained: `docs/qa/runs/phase-0-monorepo-2026-07-24/`.
+- [x] **Design-system extraction (Phase 0→1):** ~~`SiteHeader`, `GlassCard`, `MagneticButton`, and marketing-only motion primitives; marketing rewired and renders identically.~~ **[R9]-removed** those exports (marketing-only). **[R6.3]** product screens use Figma tokens in `packages/ui` `theme.css`; **[R9]** package surface is `cn` + theme stylesheet only.
 
 **Phase 1 — Daemon substrate, persistence, events, config layering, live product pages (2.5 wk)** [B]+[R3]+[R6.3]:
 - [x] Loopback-only enforced; 401s; BFF never leaks the token. [B] (`tooling/gates/phase-1.mjs` G1)
@@ -1510,7 +1510,7 @@ Carried forward where live; **[R3-Q]** marks new questions:
 
 ### 13.3 Explicit assumptions
 
-**Platform [R4]:** macOS 14+ only; Node ≥ 24, pnpm 10, tmux ≥ 3.3, git ≥ 2.40, **`uv` (gate runtime, hard dependency)**, `gh` authed for PR modes; macOS Keychain available (no fallback needed in v1). Otherwise unchanged from Rev 2 (**[CONSENSUS + R2]**: Pi capabilities incl. `agent_settled`/`tool_call` blocking/provider hooks/tree-structured sessions, graceful subscription-subset degradation, partial quota introspection, static marketing, no accounts, artifacts-not-prose completion) plus **[R3]**: Pi's extension tool registration is sufficient to host the full Brain tool bridge (verified in the Phase 2/3 contract suite); a scripted fake Brain adequately exercises orchestration paths in CI, with real-Brain runs opt-in.
+**Platform [R4]:** macOS 14+ only; Node ≥ 24, pnpm 10, tmux ≥ 3.3, git ≥ 2.40, **`uv` (gate runtime, hard dependency)**, `gh` authed for PR modes; macOS Keychain available (no fallback needed in v1). Otherwise unchanged from Rev 2 (**[CONSENSUS + R2]**: Pi capabilities incl. `agent_settled`/`tool_call` blocking/provider hooks/tree-structured sessions, graceful subscription-subset degradation, partial quota introspection, no accounts, artifacts-not-prose completion) plus **[R3]**: Pi's extension tool registration is sufficient to host the full Brain tool bridge (verified in the Phase 2/3 contract suite); a scripted fake Brain adequately exercises orchestration paths in CI, with real-Brain runs opt-in. **[R9]** no marketing site (Rev 2's "static marketing" assumption is void).
 
 ### 13.4 Rejected alternative — per-vendor CLI harnesses (Rev-1 §4) **[R2; reopened R8]**
 
@@ -1548,7 +1548,7 @@ Rev 1/2 specified a deterministic, LLM-free Orchestrator Core making dispatch an
 
 | # | Topic | [A] | [B] | Winner & why | Status after R2/R3 |
 |---|---|---|---|---|---|
-| D1 | Marketing site | Separate app | `/site` fold-in | **[A]** — exposure coupling | Unchanged |
+| D1 | Marketing site | Separate app | `/site` fold-in | **[A]** — exposure coupling | **Reversed by [R9]** — no marketing app (neither separate nor `/site`) |
 | D2 | Transport & console auth | All-WS, bearer in browser | SSE+replay, BFF, tickets | **[B]** | Unchanged; extension socket channel added [R2]; tool frames added [R3] |
 | D3 | Monorepo tooling | pnpm+Turborepo | npm workspaces | **[A]** | Unchanged |
 | D4 | Secrets library | `@napi-rs/keyring` | keytar fork | **[A]** | Unchanged |
@@ -1612,7 +1612,7 @@ Consolidated in §13.2. **Still open after R4:** Brain wake-batching/token budge
 - **§4.9 rebuilt as the Quota & Balance Probes module** (`quota-probes/`): verified per-provider endpoints (Claude `api/oauth/usage`, Codex `wham/usage`, OpenRouter credits+key, Moonshot balance, Grok consumer endpoint, Gateway budgets; prior art cclimits/openusage); **three honesty tiers** (`live` / `best-effort` / `estimate`) with tier + source + synced-at on every metric; configurable polling (config #14: 5 min default + on-demand + post-task, courtesy limits); `quota_samples` in NDJSON + SQLite; `quota.updated`/`quota.threshold` SSE.
 - **A deliberate amendment to Rev-2's auth-store opacity** (§4.3/§10.2 #1): the probe module may read OAuth bearers for read-only usage GETs against a code-baked endpoint allowlist only — never inference, never persisted, never logged, never configurable (exfiltration vector), never connection-invalidating.
 - **Scheduler/Brain integration:** `resolve_cast` excludes `LIMIT REACHED` connections with a Console-visible reason; the §5.11 80% handoff now triggers from real probe windows where `live`; budget ceilings check probed balances; `QUOTA_THRESHOLD` wake class feeds the Brain.
-- **Design-system mandate (§1.5/§7):** Console = marketing design language, extracted to `packages/ui` in Phase 0 (gate added): ink/`bg-ink` palette, `border-rule` hairlines, Geist Sans display numerals, Geist Mono uppercase micro-labels, section-grid, Framer Motion. New §7.3 quota card grid + Fleet usage strip; Phase 2/6 gates for tier labeling, Claude-probe verification, fake-clock countdowns, LIMIT REACHED exclusion, and Playwright UI coverage.
+- **Design-system mandate (§1.5/§7):** ~~Console = marketing design language~~ **[R9] superseded** — Console design language is the Figma file per [R6.3]; `packages/ui` holds Figma tokens + `cn` only. Historical R5 extraction list (ink/`bg-ink`, hairlines, Geist, Framer Motion, marketing promotion) is not current. New §7.3 quota card grid + Fleet usage strip; Phase 2/6 gates for tier labeling, Claude-probe verification, fake-clock countdowns, LIMIT REACHED exclusion, and Playwright UI coverage.
 - **New risks** R20 (consumer-endpoint churn → version-tolerant parsers, flags, degrade-to-estimate, weekly canary), R21 (currency verbatim, no FX), R22 (probe courtesy: min interval, jitter, back-off).
 - **R5.1 amendment (Captain's answer to R5-Q1):** probe enablement is **detection-driven** — a first-run onboarding flow reads Pi's auth-store presence metadata, shows the detected connections, and auto-enables the matching probes (Grok best-effort ON iff a Grok credential is detected; undetected providers offered as "connect in Pi" actions). Individually toggleable afterward (§4.9, config #14). No remaining R5 open questions.
 
@@ -1645,7 +1645,15 @@ Consolidated in §13.2. **Still open after R4:** Brain wake-batching/token budge
 
 **What changed:** the UI's single source of truth is the Captain's Figma file; every product screen **exactly replicates** its frame. The file was inspected via the Figma MCP (2026-07-24): 10 sections, ~40 frames — a **dark dashboard** design (charcoal surfaces, slim icon-only left rail, top bar, stat cards with delta chips, teal→green charts, status-pill tables, amber warnings) plus a light marketing landing frame. §7 gained the full **screen inventory table** (frame + node id → route → live-in phase). §1.5/§3: `packages/ui` is now dual-sourced — promoted marketing components (marketing keeps rendering identically) + Figma tokens/components for the product app; **Figma wins on product screens where they conflict**. Process: implementers must build each screen from Figma MCC design context (`get_design_context` + figma-design-to-code skill), never eyeballed screenshots; evidence packs carry per-screen **Figma-vs-implementation side-by-sides** (Phase 1 Figma-source gate; Phase 6 Figma-fidelity gate replacing R6.2's brand-parity gate, with the marketing no-regression parity kept). Future-phase frames are built pixel-faithful with placeholder data and wired live in their phase (§7.3 quota + §7.7 wizard visual forms now follow frames `37:2265`/`41:6186` and `37:1300`; all §4.9/§4.10 content requirements stand).
 
-**What it supersedes:** R6.2's "no admin shell / marketing-idiom editorial pages" reading is **overridden wherever the Figma file shows dashboard chrome — the Figma file wins** (and its Workspace frames do show an icon rail and top bar). What survives of R6.2: components in `packages/ui`, no bespoke lookalikes, marketing render-parity. All §7 ASCII wireframes demote to information-architecture references — visual truth lives in Figma. **R6.3.1 (Captain's answer to R6.3-Q1): "skip"** — the out-of-scope frames (Login, Pricing/Checkout, Team Members, Knowledge Base) are not implemented; only frames mapping to the local single-user product are built; they remain in the inventory as `SKIPPED` future/marketing candidates. No open R6.3 questions remain.
+**What it supersedes:** R6.2's "no admin shell / marketing-idiom editorial pages" reading is **overridden wherever the Figma file shows dashboard chrome — the Figma file wins** (and its Workspace frames do show an icon rail and top bar). What survives of R6.2: components in `packages/ui`, no bespoke lookalikes. *(R6.3 originally also kept marketing render-parity; that obligation is **[R9]-void**.)* All §7 ASCII wireframes demote to information-architecture references — visual truth lives in Figma. **R6.3.1 (Captain's answer to R6.3-Q1): "skip"** — the out-of-scope frames (Login, Pricing/Checkout, Team Members, Knowledge Base) are not implemented; only frames mapping to the local single-user product are built; they remain in the inventory as `SKIPPED`. **[R9]** they are not marketing candidates. No open R6.3 questions remain.
+
+### Revision 9 (Captain's ruling) — marketing site removed **[R9]**
+
+**Directive (2026-07-26):** Agent OS is a local-only web app; there is no need for a marketing page — remove or repurpose. **Ruling applied:** remove. Owner write-up: §1.5.
+
+**What changed:** `apps/marketing` deleted; marketing-only `packages/ui` exports deleted (`SiteHeader`, `GlassCard`, `MagneticButton`, `MicroLabel`, `TextAnimations`, motion variants, bundled Geist fonts); `packages/ui` peer/dev deps that existed only for those components (`framer-motion`, `next`) removed. `packages/ui` retains `cn` + theme stylesheet for the Console. AGENTS.md records: do not reintroduce a marketing site.
+
+**What it supersedes:** Rev-1 D1 ([A] separate marketing app), Rev-2 "static marketing", R5/R6.2 marketing-idiom / component-promotion / render-parity gates, R6.3 dual-source packaging and "future/marketing candidates" framing for skipped Figma frames. Product UI remains Figma-canonical [R6.3]; design-token home in `packages/ui` is unaffected.
 
 ### Revision 7 (Captain's roadmap) — live pipeline visibility + auto-balancer **[R7]**
 
@@ -1669,4 +1677,4 @@ Consolidated in §13.2. **Still open after R4:** Brain wake-batching/token budge
 
 ---
 
-*End of FUSED MASTER PLAN — Revision 8.*
+*End of FUSED MASTER PLAN — Revision 9.*
