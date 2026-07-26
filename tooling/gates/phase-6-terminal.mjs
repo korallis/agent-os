@@ -27,11 +27,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
 const TMUX_SOCKET = `agentos-p6t-${process.pid}`;
-const PORT = 4700 + 1100 + Math.floor(Math.random() * 40);
+const PORT = pickPort(5800, 40);
 const BASE = `http://127.0.0.1:${PORT}`;
 const DEFAULT_SOAK_MS = 600_000;
 const parsedSoak = Number(process.env.AGENTOS_TERMINAL_SOAK_MS);
