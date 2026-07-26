@@ -876,6 +876,9 @@ export class ToolSurface {
     if (role === "builder") {
       const enforceRedBaseline =
         this.cfg().policies.redBaselineGateRequired && !this.hasRedBaselineOverride(task);
+      if (enforceRedBaseline && !this.deps.gates.hasRedProofForCurrentSource(task.id)) {
+        return false;
+      }
       return canSpawnBuilder(task.phase, { redBaselineRequired: enforceRedBaseline });
     }
     return true;
@@ -1001,6 +1004,38 @@ export class ToolSurface {
     });
   }
 
+  private hasLiveSeatForTaskRole(taskId: string, role: string): boolean {
+    for (const session of this.sessions.values()) {
+      if (session.taskId !== taskId || session.role !== role) continue;
+      if (
+        session.status === "running" ||
+        session.status === "starting" ||
+        session.status === "settled"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private retirePendingWedgeCaptainNotify(taskId: string, sessionId: string): boolean {
+    const task = this.tasks.get(taskId);
+    if (task === undefined) return false;
+    const pending = task.wedgePendingCaptainNotifies ?? [];
+    const remaining = pending.filter((n) => n.sessionId !== sessionId);
+    if (remaining.length === pending.length) return false;
+    const completed = task.wedgeLadderCompletedSessionIds ?? [];
+    const needsCompleted = !completed.includes(sessionId);
+    this.saveTask({
+      ...task,
+      wedgePendingCaptainNotifies: remaining,
+      wedgeLadderCompletedSessionIds: needsCompleted ? [...completed, sessionId] : completed,
+      updatedAt: new Date().toISOString(),
+    });
+    this.wedgeLadderCompleted.add(sessionId);
+    return true;
+  }
+
   /**
    * Sink captain.escalation for one pending entry and clear it only when the
    * escalation event was actually sunk (not AFK-auto-answered, not thrown).
@@ -1013,6 +1048,11 @@ export class ToolSurface {
     const pending = task.wedgePendingCaptainNotifies ?? [];
     const entry = pending.find((n) => n.sessionId === sessionId);
     if (entry === undefined) return false;
+
+    if (this.hasLiveSeatForTaskRole(taskId, entry.role)) {
+      return this.retirePendingWedgeCaptainNotify(taskId, sessionId);
+    }
+
     let sank = false;
     try {
       // Structural wedges must reach the Captain — never FAQ-auto-answer them.
@@ -3431,6 +3471,7 @@ export class ToolSurface {
     }
 
     this.questions.delete(input.questionId);
+    this.touchSessionActivity(pending.sessionId);
     this.sink({
       type: "crew.answered",
       payload: {

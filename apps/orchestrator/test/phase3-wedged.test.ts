@@ -965,7 +965,7 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.listQuestions()).toHaveLength(1);
   });
 
-  it("wedges a seat again after its pending question is answered", () => {
+  it("does not wedge on the next tick after a long-pending question is answered", () => {
     const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
@@ -990,6 +990,46 @@ describe("structural WEDGED ladder", () => {
     expect(answered.ok).toBe(true);
     expect(service.tools.listQuestions()).toHaveLength(0);
 
+    events.length = 0;
+    const acted = service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted).toHaveLength(0);
+    expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "running",
+    );
+  });
+
+  it("wedges after a further full stale window of silence following an answer", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const questionId = "01JQ5T0000000000000000000C";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Need a decision before continuing.",
+      ts: new Date().toISOString(),
+    });
+    expect(service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
+
+    const answered = service.tools.invoke("answer_crewmate", {
+      questionId,
+      answer: "Ship the migration as-is.",
+    });
+    expect(answered.ok).toBe(true);
+    expect(service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
+
+    // Answer stamped activity; only a further full window of silence re-arms.
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
     events.length = 0;
     const acted = service.tools.reconcileWedgedSessions(Date.now());
     expect(acted).toHaveLength(1);
@@ -1025,10 +1065,146 @@ describe("structural WEDGED ladder", () => {
 
     expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
     expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
-    // Spend + seat stop already landed before clear; evidence may be incomplete
-    // because the throw aborted the post-respawn path, but action must not be
-    // rewritten to escalate.
     expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
     expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+    // Write-ahead pending may still be durable; next tick must reconcile against
+    // the live replacement and retire without false-escalating.
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(1);
+    const replacement = service.tools
+      .listSessions()
+      .find((s) => s.taskId === taskId && s.role === role && s.status === "running");
+    expect(replacement).toBeDefined();
+    expect(replacement!.sessionId).not.toBe(sessionId);
+
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
+  });
+
+  it("does not false-escalate when pending survives a successful respawn", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    // Land a real wedge respawn, then re-stamp durable pending as if clear never
+    // ran after the successful spawn (crash window between spawn and clear).
+    expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("respawned");
+    const after = service.tools.getTask(taskId)!;
+    const replacement = after.sessions.find(
+      (s) => s.role === role && s.status === "running" && s.sessionId !== sessionId,
+    );
+    expect(replacement).toBeDefined();
+    service.tools.hydrateTask({
+      ...after,
+      wedgePendingCaptainNotifies: [
+        {
+          sessionId,
+          role,
+          summary: `Seat ${role} wedged and could not be respawned — no activity for 60m`,
+          severity: "critical",
+          recordedAt: new Date().toISOString(),
+        },
+      ],
+      wedgeLadderCompletedSessionIds: (after.wedgeLadderCompletedSessionIds ?? []).filter(
+        (id) => id !== sessionId,
+      ),
+      updatedAt: new Date().toISOString(),
+    });
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies).toHaveLength(1);
+    expect(
+      service.tools
+        .listSessions()
+        .some((s) => s.taskId === taskId && s.role === role && s.status === "running"),
+    ).toBe(true);
+
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
+
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+  });
+
+  it("still escalates once across restart when a wedge respawn genuinely failed", () => {
+    const { service, events, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+    service.tmux.newWindow = () => {
+      throw new Error("simulated spawn refusal after stop");
+    };
+    try {
+      expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("escalated");
+    } finally {
+      service.tmux.newWindow = originalNewWindow;
+    }
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
+    expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+
+    const restarted = fleet({ home, start: false });
+    const reEvents: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => reEvents.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      0,
+    );
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(restarted.service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+  });
+
+  it("preflights missing RED proof: escalate without stop or ledger spend", () => {
+    const { service, events, config } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    config.writeGlobal("policies", "{ redBaselineGateRequired: true }\n");
+    const { taskId, sessionId, role } = seedBuilder(service);
+    // Spawn used a Captain override; strip it so policy re-engages without proof.
+    const task = service.tools.getTask(taskId)!;
+    service.tools.hydrateTask({
+      ...task,
+      phase: "BUILDING",
+      policyOverrides: task.policyOverrides.filter(
+        (o) => o.policyId !== "redBaselineGateRequired",
+      ),
+      updatedAt: new Date().toISOString(),
+    });
+    expect(service.tools.getTask(taskId)?.policyOverrides.some(
+      (o) => o.policyId === "redBaselineGateRequired",
+    )).toBe(false);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    events.length = 0;
+    const acted = service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted).toHaveLength(1);
+    expect(acted[0]?.action).toBe("escalated");
+    const session = service.tools.listSessions().find((s) => s.sessionId === sessionId);
+    expect(session?.status).toBe("wedged");
+    expect(service.tmux.hasWindow(session!.tmuxWindow)).toBe(true);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
+    const wedged = events.find((e) => e.type === "session.wedged");
+    if (wedged?.type === "session.wedged") {
+      expect(wedged.payload.action).toBe("escalated");
+      expect(wedged.payload.respawnsUsed).toBe(0);
+    }
   });
 });
