@@ -39,7 +39,7 @@ import {
   pruneAppliedLogIds,
   retentionIncreaseInvalidatesSeeds,
   streamReconnectInvalidatesSeeds,
-} from "../../console/src/lib/pipelineLogState.ts";
+} from "../../console/src/lib/pipelineLogState.js";
 
 /** Real no-mistakes stores unix epoch seconds — fixtures must match or unit bugs pass. */
 function nowUnixSeconds(): number {
