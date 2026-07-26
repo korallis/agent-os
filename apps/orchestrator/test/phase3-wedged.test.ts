@@ -939,10 +939,6 @@ describe("structural WEDGED ladder", () => {
   it("does not wedge a seat with an outstanding pending question past the stale window", () => {
     const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
-    backdateSession(service, sessionId, {
-      idleMinutes: 60,
-      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
-    });
 
     const questionId = "01JQ5T0000000000000000000A";
     service.handleExtensionFrame({
@@ -953,6 +949,13 @@ describe("structural WEDGED ladder", () => {
       ts: new Date().toISOString(),
     });
     expect(service.tools.listQuestions()).toHaveLength(1);
+
+    // Silence while blocked on the Captain still ages the clock — backdate after
+    // the ask so the open-question exemption is what keeps the seat alive.
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
 
     events.length = 0;
     const acted = service.tools.reconcileWedgedSessions(Date.now());
@@ -968,10 +971,6 @@ describe("structural WEDGED ladder", () => {
   it("does not wedge on the next tick after a long-pending question is answered", () => {
     const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
-    backdateSession(service, sessionId, {
-      idleMinutes: 60,
-      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
-    });
 
     const questionId = "01JQ5T0000000000000000000B";
     service.handleExtensionFrame({
@@ -980,6 +979,10 @@ describe("structural WEDGED ladder", () => {
       questionId,
       question: "Need a decision before continuing.",
       ts: new Date().toISOString(),
+    });
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
     expect(service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
 
@@ -1003,10 +1006,6 @@ describe("structural WEDGED ladder", () => {
   it("wedges after a further full stale window of silence following an answer", () => {
     const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
-    backdateSession(service, sessionId, {
-      idleMinutes: 60,
-      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
-    });
 
     const questionId = "01JQ5T0000000000000000000C";
     service.handleExtensionFrame({
@@ -1015,6 +1014,10 @@ describe("structural WEDGED ladder", () => {
       questionId,
       question: "Need a decision before continuing.",
       ts: new Date().toISOString(),
+    });
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
     expect(service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
 
@@ -1036,6 +1039,192 @@ describe("structural WEDGED ladder", () => {
     expect(acted[0]?.action).toBe("respawned");
     expect(events.some((e) => e.type === "session.wedged")).toBe(true);
     expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+  });
+
+  it("keeps an open question across daemon restart (exemption + answer_crewmate)", () => {
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    const preRestart = service.tools.listSessions().find((s) => s.sessionId === sessionId)!;
+    const windowName = preRestart.tmuxWindow.includes(":")
+      ? preRestart.tmuxWindow.split(":")[1]!
+      : preRestart.tmuxWindow;
+
+    const questionId = "01JQ5T0000000000000000000D";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Which path should I take before the restart?",
+      ts: new Date().toISOString(),
+    });
+    expect(service.tools.listQuestions()).toHaveLength(1);
+    expect(service.tools.getTask(taskId)?.pendingQuestions).toHaveLength(1);
+
+    const durable = JSON.parse(
+      readFileSync(join(home, "runs", taskId, "task.json"), "utf8"),
+    ) as { pendingQuestions: unknown[] };
+    expect(durable.pendingQuestions).toHaveLength(1);
+
+    // Bounce empties process-local Maps; only task.json rehydrates the view.
+    // start:true so Brain is up (answer_crewmate is orchestration-gated).
+    const restarted = fleet({ home, start: true });
+    expect(restarted.service.tools.listQuestions()).toHaveLength(1);
+    expect(restarted.service.tools.listQuestions()[0]?.questionId).toBe(questionId);
+    expect(restarted.service.tools.getTask(taskId)?.pendingQuestions).toHaveLength(1);
+
+    // Boot mark-lost may have cleared the live pane; restore seat shape so
+    // structural WEDGED can classify, then prove the open-question skip holds.
+    restarted.service.tmux.newWindow({
+      windowName,
+      argv: ["true"],
+    });
+    const task = restarted.service.tools.getTask(taskId)!;
+    const startedAt = new Date(Date.now() - 60 * 60_000).toISOString();
+    const lastEventAt = new Date(Date.now() - 60 * 60_000).toISOString();
+    restarted.service.tools.hydrateTask({
+      ...task,
+      sessions: task.sessions.map((s) =>
+        s.sessionId === sessionId
+          ? { ...s, status: "running", startedAt, lastEventAt }
+          : s,
+      ),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const events: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => events.push(e));
+    const acted = restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted).toHaveLength(0);
+    expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    expect(
+      restarted.service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status,
+    ).toBe("running");
+
+    const answered = restarted.service.tools.invoke("answer_crewmate", {
+      questionId,
+      answer: "Take the migration path.",
+    });
+    expect(answered.ok).toBe(true);
+    expect(answered.error).toBeUndefined();
+    expect(restarted.service.tools.listQuestions()).toHaveLength(0);
+    expect(restarted.service.tools.getTask(taskId)?.pendingQuestions ?? []).toHaveLength(0);
+  });
+
+  it("after restart, answering resets activity so wedge needs a further full window", () => {
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    const preRestart = service.tools.listSessions().find((s) => s.sessionId === sessionId)!;
+    const windowName = preRestart.tmuxWindow.includes(":")
+      ? preRestart.tmuxWindow.split(":")[1]!
+      : preRestart.tmuxWindow;
+
+    const questionId = "01JQ5T0000000000000000000E";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Need a decision that survives bounce.",
+      ts: new Date().toISOString(),
+    });
+
+    const restarted = fleet({ home, start: true });
+    restarted.service.tmux.newWindow({
+      windowName,
+      argv: ["true"],
+    });
+    // Boot may promote SESSION_LOST when the pane is gone; restore BUILDING so
+    // a later post-answer wedge can still take the legal respawn branch.
+    if (restarted.service.tools.getTask(taskId)?.phase === "SESSION_LOST") {
+      const advanced = restarted.service.tools.invoke("advance_phase", {
+        taskId,
+        to: "BUILDING",
+        reason: "resume after rehydrate for open-question durability test",
+      });
+      expect(advanced.ok).toBe(true);
+    }
+    const task = restarted.service.tools.getTask(taskId)!;
+    const startedAt = new Date(Date.now() - 60 * 60_000).toISOString();
+    const lastEventAt = new Date(Date.now() - 60 * 60_000).toISOString();
+    restarted.service.tools.hydrateTask({
+      ...task,
+      sessions: task.sessions.map((s) =>
+        s.sessionId === sessionId
+          ? { ...s, status: "running", startedAt, lastEventAt }
+          : s,
+      ),
+      updatedAt: new Date().toISOString(),
+    });
+
+    expect(restarted.service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
+
+    const answered = restarted.service.tools.invoke("answer_crewmate", {
+      questionId,
+      answer: "Proceed with the plan.",
+    });
+    expect(answered.ok).toBe(true);
+    expect(restarted.service.tools.listQuestions()).toHaveLength(0);
+
+    const events: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => events.push(e));
+    // Immediately after answer — activity was stamped; must not wedge yet.
+    expect(restarted.service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
+    expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+
+    backdateSession(restarted.service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    events.length = 0;
+    const acted = restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted).toHaveLength(1);
+    expect(acted[0]?.action).toBe("respawned");
+    expect(events.some((e) => e.type === "session.wedged")).toBe(true);
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+  });
+
+  it("stamps activity when a question is recorded so near-threshold seats are not wedged", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    // Seat is already idle for almost the full window.
+    const almostStaleAt = new Date(Date.now() - 29 * 60_000).toISOString();
+    backdateSession(service, sessionId, {
+      idleMinutes: 29,
+      lastEventAt: almostStaleAt,
+    });
+
+    const questionId = "01JQ5T0000000000000000000F";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Quick decision while near the stale threshold.",
+      ts: new Date().toISOString(),
+    });
+
+    const afterAsk = service.tools.listSessions().find((s) => s.sessionId === sessionId);
+    expect(afterAsk?.lastActivityAt).not.toBeNull();
+    expect(Date.parse(afterAsk!.lastActivityAt!)).toBeGreaterThan(Date.parse(almostStaleAt));
+
+    // Advance "now" past the original pre-question deadline; recorded-question
+    // activity stamp must keep the seat non-wedged even with the exemption.
+    const pastOriginalWindow = Date.now() + 5 * 60_000;
+    events.length = 0;
+    // Drop the exemption path by answering, then immediately check that the
+    // ask-time activity stamp alone is still fresh enough.
+    const answered = service.tools.invoke("answer_crewmate", {
+      questionId,
+      answer: "Go ahead.",
+    });
+    expect(answered.ok).toBe(true);
+
+    const acted = service.tools.reconcileWedgedSessions(pastOriginalWindow);
+    expect(acted).toHaveLength(0);
+    expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "running",
+    );
   });
 
   it("does not escalate when pending-clear throws after a successful respawn", () => {

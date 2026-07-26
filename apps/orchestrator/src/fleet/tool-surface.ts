@@ -464,6 +464,7 @@ export class ToolSurface {
     const wedgeRespawnsByRole = task.wedgeRespawnsByRole ?? {};
     const wedgePendingCaptainNotifies = task.wedgePendingCaptainNotifies ?? [];
     const wedgeLadderCompletedSessionIds = task.wedgeLadderCompletedSessionIds ?? [];
+    const pendingQuestions = task.pendingQuestions ?? [];
     const normalized: TaskSnapshot = {
       ...task,
       deliveryBlocked: task.deliveryBlocked ?? null,
@@ -472,6 +473,7 @@ export class ToolSurface {
       wedgeRespawnsByRole,
       wedgePendingCaptainNotifies,
       wedgeLadderCompletedSessionIds,
+      pendingQuestions,
     };
     this.tasks.set(normalized.id, normalized);
     if (normalized.idempotencyKey !== null) {
@@ -491,6 +493,20 @@ export class ToolSurface {
     }
     for (const sessionId of wedgeLadderCompletedSessionIds) {
       this.wedgeLadderCompleted.add(sessionId);
+    }
+    // Replace this task's pending-questions view from durable snapshot so
+    // wedge exemption and answer_crewmate survive daemon restart.
+    for (const [questionId, q] of this.questions) {
+      if (q.taskId === normalized.id) this.questions.delete(questionId);
+    }
+    for (const q of pendingQuestions) {
+      this.questions.set(q.questionId, {
+        questionId: q.questionId,
+        sessionId: q.sessionId,
+        taskId: normalized.id,
+        question: q.question,
+        askedAt: q.askedAt,
+      });
     }
     task = normalized;
     for (const s of task.sessions) {
@@ -1719,6 +1735,7 @@ export class ToolSurface {
       wedgeRespawnsByRole: {},
       wedgePendingCaptainNotifies: [],
       wedgeLadderCompletedSessionIds: [],
+      pendingQuestions: [],
       idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
       updatedAt: now,
@@ -3406,6 +3423,28 @@ export class ToolSurface {
       askedAt: new Date().toISOString(),
     };
     this.questions.set(input.questionId, pending);
+    this.touchSessionActivity(input.sessionId);
+    if (pending.taskId !== null) {
+      const task = this.tasks.get(pending.taskId);
+      if (task !== undefined) {
+        const prior = (task.pendingQuestions ?? []).filter(
+          (q) => q.questionId !== pending.questionId,
+        );
+        this.saveTask({
+          ...task,
+          pendingQuestions: [
+            ...prior,
+            {
+              questionId: pending.questionId,
+              sessionId: pending.sessionId,
+              question: pending.question,
+              askedAt: pending.askedAt,
+            },
+          ],
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
     this.sink({
       type: "crew.question",
       payload: {
@@ -3472,6 +3511,18 @@ export class ToolSurface {
 
     this.questions.delete(input.questionId);
     this.touchSessionActivity(pending.sessionId);
+    if (pending.taskId !== null) {
+      const task = this.tasks.get(pending.taskId);
+      if (task !== undefined) {
+        this.saveTask({
+          ...task,
+          pendingQuestions: (task.pendingQuestions ?? []).filter(
+            (q) => q.questionId !== input.questionId,
+          ),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
     this.sink({
       type: "crew.answered",
       payload: {

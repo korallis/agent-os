@@ -197,6 +197,21 @@ export const taskSnapshotSchema = z.strictObject({
    * escalate seat and re-arm a cleared Captain-notify obligation.
    */
   wedgeLadderCompletedSessionIds: z.array(z.string().min(1)).default([]),
+  /**
+   * Outstanding crewmate questions awaiting Captain/Brain answer.
+   * Rehydrated into the live pending-questions view on boot so the structural
+   * WEDGED open-question exemption and answer_crewmate survive daemon restart.
+   */
+  pendingQuestions: z
+    .array(
+      z.strictObject({
+        questionId: z.string().min(1),
+        sessionId: z.string().min(1),
+        question: z.string().min(1),
+        askedAt: isoTimestampSchema,
+      }),
+    )
+    .default([]),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
