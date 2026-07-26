@@ -30,9 +30,15 @@ import {
   wakeClassForEvent,
 } from "../src/observability/profile.js";
 import {
+  isRangeFullyCovered,
+  LOG_COVERAGE_GAP,
+  logSegmentsText,
   markSeededFromLogTails,
+  mergeLogRange,
   needsLogTailSeed,
   pruneAppliedLogIds,
+  retentionIncreaseInvalidatesSeeds,
+  streamReconnectInvalidatesSeeds,
 } from "../../console/src/lib/pipelineLogState.ts";
 
 /** Real no-mistakes stores unix epoch seconds — fixtures must match or unit bugs pass. */
@@ -1713,5 +1719,78 @@ describe("attach-time seed independence", () => {
     markSeededFromLogTails(seeded, [{ runId: "run2", step: "test" }]);
     expect(needsLogTailSeed(seeded, "run1", "review")).toBe(true);
     expect(needsLogTailSeed(seeded, "run2", "test")).toBe(false);
+  });
+});
+
+describe("mergeLogRange coverage honesty (live-only recovery)", () => {
+  it("leaves a genuine gap when a chunk is missed — does not fabricate coverage", () => {
+    // Held [0, 10), missed [10, 20), received [20, 30).
+    let segs = mergeLogRange(undefined, 0, "AAAAAAAAAA");
+    segs = mergeLogRange(segs, 20, "CCCCCCCCCC");
+    expect(segs).toHaveLength(2);
+    expect(segs[0]).toMatchObject({ start: 0, end: 10, text: "AAAAAAAAAA" });
+    expect(segs[1]).toMatchObject({ start: 20, end: 30, text: "CCCCCCCCCC" });
+    // Falsely continuous coverage would claim [0, 30) and block the seed.
+    expect(isRangeFullyCovered(segs, 0, 30)).toBe(false);
+    expect(isRangeFullyCovered(segs, 10, 20)).toBe(false);
+  });
+
+  it("fills a gap when a subsequent log-tails seed covers the hole", () => {
+    let segs = mergeLogRange(undefined, 0, "AAAAAAAAAA");
+    segs = mergeLogRange(segs, 20, "CCCCCCCCCC");
+    // Seed returns the full window including the missed middle.
+    segs = mergeLogRange(segs, 0, "AAAAAAAAAABBBBBBBBBBCCCCCCCCCC", 30);
+    expect(segs).toHaveLength(1);
+    expect(segs[0]).toMatchObject({
+      start: 0,
+      end: 30,
+      text: "AAAAAAAAAABBBBBBBBBBCCCCCCCCCC",
+    });
+    expect(isRangeFullyCovered(segs, 10, 20)).toBe(true);
+  });
+
+  it("never concatenates discontinuous regions as consecutive lines", () => {
+    let segs = mergeLogRange(undefined, 0, "line-a\n");
+    segs = mergeLogRange(segs, 100, "line-c\n");
+    const display = logSegmentsText(segs);
+    expect(display).toBe(`line-a\n${LOG_COVERAGE_GAP}line-c\n`);
+    expect(display.includes("line-a\nline-c\n")).toBe(false);
+  });
+
+  it("merges adjacent and overlapping ranges without inventing a hole", () => {
+    let segs = mergeLogRange(undefined, 0, "AAAA");
+    segs = mergeLogRange(segs, 4, "BBBB"); // abut
+    expect(segs).toEqual([{ start: 0, end: 8, text: "AAAABBBB" }]);
+    segs = mergeLogRange(segs, 6, "BBCC"); // overlap + extend
+    expect(segs).toEqual([{ start: 0, end: 10, text: "AAAABBBBCC" }]);
+  });
+});
+
+describe("seed invalidation for live-only recovery", () => {
+  it("invalidates seeds when pipelineLogChars grows (working → firehose)", () => {
+    expect(retentionIncreaseInvalidatesSeeds(20_000, 200_000)).toBe(true);
+    expect(retentionIncreaseInvalidatesSeeds(200_000, 20_000)).toBe(false);
+    expect(retentionIncreaseInvalidatesSeeds(20_000, 20_000)).toBe(false);
+    // Behaviour: clear markers so needsLogTailSeed returns true again.
+    const seeded = new Set<string>();
+    markSeededFromLogTails(seeded, [{ runId: "run1", step: "review" }]);
+    expect(needsLogTailSeed(seeded, "run1", "review")).toBe(false);
+    if (retentionIncreaseInvalidatesSeeds(20_000, 200_000)) {
+      seeded.clear();
+    }
+    expect(needsLogTailSeed(seeded, "run1", "review")).toBe(true);
+  });
+
+  it("invalidates seeds on EventSource reconnect (down → live)", () => {
+    expect(streamReconnectInvalidatesSeeds("down", "live")).toBe(true);
+    expect(streamReconnectInvalidatesSeeds("connecting", "live")).toBe(false);
+    expect(streamReconnectInvalidatesSeeds("live", "down")).toBe(false);
+    expect(streamReconnectInvalidatesSeeds("live", "live")).toBe(false);
+    const seeded = new Set<string>();
+    markSeededFromLogTails(seeded, [{ runId: "run1", step: "review" }]);
+    if (streamReconnectInvalidatesSeeds("down", "live")) {
+      seeded.clear();
+    }
+    expect(needsLogTailSeed(seeded, "run1", "review")).toBe(true);
   });
 });

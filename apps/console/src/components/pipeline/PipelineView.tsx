@@ -5,9 +5,15 @@ import { cn } from "@agent-os/ui";
 import type { PipelineFinding, PipelineRunSnapshot } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
 import {
+  type LogSegment,
+  logSegmentsText,
   markSeededFromLogTails,
+  mergeLogRange,
   needsLogTailSeed,
   pruneAppliedLogIds,
+  retentionIncreaseInvalidatesSeeds,
+  streamReconnectInvalidatesSeeds,
+  trimSegmentsToCharRetention,
 } from "@/lib/pipelineLogState";
 import { useEventStream } from "@/lib/useEventStream";
 
@@ -28,6 +34,10 @@ import { useEventStream } from "@/lib/useEventStream";
  * The header states the TRANSPORT and the observed lag as fact. Labels match
  * modes that can actually occur today: WAL-assisted (fs.watch + poll floor) or
  * interval-only. A true push `live` path is not claimed until it exists.
+ *
+ * Step logs are live-only: missed SSE bytes recover only via log-tails. Seed
+ * markers therefore invalidate on retention growth and stream reconnect, and
+ * coverage maps never claim bytes that were not received.
  */
 
 type PipelineTransport = "wal-assisted" | "interval-only" | "unavailable";
@@ -58,55 +68,6 @@ type PipelineStatus = {
     streamPipelineLogs: boolean;
   };
 };
-
-type LogRange = { start: number; end: number };
-
-const utf8Encoder = new TextEncoder();
-const utf8Decoder = new TextDecoder();
-
-function utf8ByteLength(text: string): number {
-  return utf8Encoder.encode(text).byteLength;
-}
-
-function utf8SliceByBytes(text: string, startByte: number, endByte?: number): string {
-  const bytes = utf8Encoder.encode(text);
-  return utf8Decoder.decode(bytes.subarray(startByte, endByte));
-}
-
-/**
- * Merge a file range into a continuous client buffer by byte offset.
- * Overlapping regions keep the existing text and only take uncovered suffixes/prefixes.
- */
-function mergeLogRange(
-  cur: { start: number; end: number; text: string } | undefined,
-  rangeStart: number,
-  rangeText: string,
-  rangeEnd?: number,
-): { start: number; end: number; text: string } {
-  const end = rangeEnd ?? rangeStart + utf8ByteLength(rangeText);
-  if (!cur) return { start: rangeStart, end, text: rangeText };
-  if (rangeStart >= cur.start && end <= cur.end) return cur;
-
-  if (rangeStart <= cur.end && end > cur.end) {
-    const skip = Math.max(0, cur.end - rangeStart);
-    const suffix = skip === 0 ? rangeText : utf8SliceByBytes(rangeText, skip);
-    return { start: cur.start, end, text: cur.text + suffix };
-  }
-
-  if (end >= cur.start && rangeStart < cur.start) {
-    const take = Math.max(0, cur.start - rangeStart);
-    const prefix = take === 0 ? "" : utf8SliceByBytes(rangeText, 0, take);
-    return { start: rangeStart, end: cur.end, text: prefix + cur.text };
-  }
-
-  if (rangeStart > cur.end) {
-    return { start: cur.start, end, text: cur.text + rangeText };
-  }
-  if (end < cur.start) {
-    return { start: rangeStart, end: cur.end, text: rangeText + cur.text };
-  }
-  return cur;
-}
 
 const STEP_TONE: Record<string, string> = {
   completed: "text-ok",
@@ -170,7 +131,7 @@ function clearLogState(
   appliedLogIds: { current: Set<string> },
   logsRef: { current: Record<string, string> },
   logTruncatedRef: { current: Record<string, boolean> },
-  logRangesRef: { current: Record<string, LogRange> },
+  logSegmentsRef: { current: Record<string, LogSegment[]> },
   setLogs: (v: Record<string, string>) => void,
   setLogTruncated: (v: Record<string, boolean>) => void,
   seededCatchUpKeys: { current: Set<string> },
@@ -179,9 +140,17 @@ function clearLogState(
   seededCatchUpKeys.current.clear();
   logsRef.current = {};
   logTruncatedRef.current = {};
-  logRangesRef.current = {};
+  logSegmentsRef.current = {};
   setLogs({});
   setLogTruncated({});
+}
+
+function segmentsToLogs(segmentsByKey: Record<string, LogSegment[]>): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [key, segments] of Object.entries(segmentsByKey)) {
+    next[key] = logSegmentsText(segments);
+  }
+  return next;
 }
 
 export function PipelineView() {
@@ -193,22 +162,25 @@ export function PipelineView() {
   const [logs, setLogs] = useState<Record<string, string>>({});
   const [logTruncated, setLogTruncated] = useState<Record<string, boolean>>({});
   const [pollTick, setPollTick] = useState(0);
-  const { events } = useEventStream();
+  const { events, state: streamState } = useEventStream();
   /** Event ids already folded into log state — SSE ring eviction must not erase text. */
   const appliedLogIds = useRef(new Set<string>());
   /** Mirror of `logs` for append-only updates without reading stale state. */
   const logsRef = useRef<Record<string, string>>({});
   const logTruncatedRef = useRef<Record<string, boolean>>({});
-  /** Byte ranges covered by each step log buffer (for seed/SSE de-dupe). */
-  const logRangesRef = useRef<Record<string, LogRange>>({});
+  /** Contiguous file regions actually received per step (never fabricated). */
+  const logSegmentsRef = useRef<Record<string, LogSegment[]>>({});
   const consecutivePollFailures = useRef(0);
   /** Whether we have ever painted a successful pipeline status response. */
   const hasLastKnown = useRef(false);
   /**
    * Keys already seeded via /v1/pipeline/log-tails only. Live SSE frames must
    * not mark a key seeded — seed and live answer different questions.
+   * Invalidated on retention growth and EventSource reconnect so re-seed runs.
    */
   const seededCatchUpKeys = useRef(new Set<string>());
+  const prevLogCharsRef = useRef(0);
+  const prevStreamStateRef = useRef(streamState);
 
   // Hold retention at 0 until /v1/pipeline/status lands the real profile
   // budget — a provisional 20k window permanently discards middle text when
@@ -272,7 +244,7 @@ export function PipelineView() {
             appliedLogIds,
             logsRef,
             logTruncatedRef,
-            logRangesRef,
+            logSegmentsRef,
             setLogs,
             setLogTruncated,
             seededCatchUpKeys,
@@ -299,10 +271,27 @@ export function PipelineView() {
     };
   }, [pollTick, observabilityConfigCursor, runUpdatedCursor, unavailableCursor]);
 
+  // Invalidate one-shot seeds when retention grows or the EventSource returns
+  // after a disconnect — both require a fresh log-tails catch-up.
+  useEffect(() => {
+    if (retentionIncreaseInvalidatesSeeds(prevLogCharsRef.current, logChars)) {
+      seededCatchUpKeys.current.clear();
+    }
+    prevLogCharsRef.current = logChars;
+  }, [logChars]);
+
+  useEffect(() => {
+    if (streamReconnectInvalidatesSeeds(prevStreamStateRef.current, streamState)) {
+      seededCatchUpKeys.current.clear();
+    }
+    prevStreamStateRef.current = streamState;
+  }, [streamState]);
+
   // Append-only by event id, then window with pipelineLogChars. Rebuilding the
   // whole string from the capped SSE ring would drop middle text when frames
   // leave the ring while retention still had room — worse than a trailing window.
   // Chunks carry a file byte offset so attach-time seeds can de-dupe by range.
+  // Coverage never spans unreceived bytes (live-only recovery depends on it).
   useEffect(() => {
     const retention = Math.max(0, logChars);
     if (retention === 0) {
@@ -310,7 +299,7 @@ export function PipelineView() {
         appliedLogIds,
         logsRef,
         logTruncatedRef,
-        logRangesRef,
+        logSegmentsRef,
         setLogs,
         setLogTruncated,
         seededCatchUpKeys,
@@ -323,9 +312,8 @@ export function PipelineView() {
     const chronological = [...appended].reverse();
     const fresh = chronological.filter((e) => !appliedLogIds.current.has(e.id));
 
-    const next = { ...logsRef.current };
+    const nextSegments = { ...logSegmentsRef.current };
     const nextTrunc = { ...logTruncatedRef.current };
-    const nextRanges = { ...logRangesRef.current };
     let textChanged = false;
     let truncChanged = false;
 
@@ -343,18 +331,15 @@ export function PipelineView() {
         "endOffset" in payload && typeof payload.endOffset === "number"
           ? payload.endOffset
           : undefined;
-      const prior = nextRanges[key];
+      const prior = nextSegments[key];
+      const priorEnd = prior !== undefined && prior.length > 0 ? prior[prior.length - 1]!.end : 0;
       const merged = mergeLogRange(
-        prior ? { start: prior.start, end: prior.end, text: next[key] ?? "" } : undefined,
-        offset ?? prior?.end ?? 0,
+        prior,
+        offset ?? priorEnd,
         chunk,
         endOffset,
       );
-      if (merged.text !== (next[key] ?? "")) {
-        next[key] = merged.text;
-        textChanged = true;
-      }
-      nextRanges[key] = { start: merged.start, end: merged.end };
+      nextSegments[key] = merged;
       // Do not mark seeded here. A live chunk is not evidence that attach-time
       // catch-up was fetched; pre-sight bytes still need log-tails.
     }
@@ -367,26 +352,26 @@ export function PipelineView() {
     );
 
     // Re-window against current retention (overflow from new chunks or profile shrink).
-    for (const [key, text] of Object.entries(next)) {
-      if (text.length > retention) {
-        const sliced = text.slice(-retention);
-        next[key] = sliced;
-        textChanged = true;
-        const range = nextRanges[key];
-        if (range !== undefined) {
-          const newBytes = utf8ByteLength(sliced);
-          nextRanges[key] = { start: range.end - newBytes, end: range.end };
-        }
-        if (nextTrunc[key] !== true) {
-          nextTrunc[key] = true;
-          truncChanged = true;
-        }
+    for (const key of Object.keys(nextSegments)) {
+      const trimmed = trimSegmentsToCharRetention(nextSegments[key]!, retention);
+      nextSegments[key] = trimmed.segments;
+      if (trimmed.truncated && nextTrunc[key] !== true) {
+        nextTrunc[key] = true;
+        truncChanged = true;
       }
+    }
+
+    const next = segmentsToLogs(nextSegments);
+    for (const key of Object.keys(next)) {
+      if (next[key] !== logsRef.current[key]) textChanged = true;
+    }
+    for (const key of Object.keys(logsRef.current)) {
+      if (!(key in next)) textChanged = true;
     }
 
     if (textChanged || fresh.length > 0) {
       logsRef.current = next;
-      logRangesRef.current = nextRanges;
+      logSegmentsRef.current = nextSegments;
       if (textChanged) setLogs(next);
     }
     if (truncChanged) {
@@ -417,7 +402,7 @@ export function PipelineView() {
 
     const prunedLogs = pruneRecord(logsRef.current);
     const prunedTrunc = pruneRecord(logTruncatedRef.current);
-    const prunedRanges = pruneRecord(logRangesRef.current);
+    const prunedSegments = pruneRecord(logSegmentsRef.current);
     if (prunedLogs.changed) {
       logsRef.current = prunedLogs.next;
       setLogs(prunedLogs.next);
@@ -426,8 +411,8 @@ export function PipelineView() {
       logTruncatedRef.current = prunedTrunc.next;
       setLogTruncated(prunedTrunc.next);
     }
-    if (prunedRanges.changed) {
-      logRangesRef.current = prunedRanges.next;
+    if (prunedSegments.changed) {
+      logSegmentsRef.current = prunedSegments.next;
     }
     for (const key of [...seededCatchUpKeys.current]) {
       const sep = key.indexOf(":");
@@ -439,6 +424,7 @@ export function PipelineView() {
   // Attach-time catch-up: seed the last pipelineLogChars of each active step.
   // Pure read on the daemon — seed and live frames may overlap; merge by byte
   // offset so early SSE chunks never permanently discard the seed prefix.
+  // Also re-runs after retention growth or EventSource reconnect (seed keys cleared).
   useEffect(() => {
     if (runs === null || status === null) return;
     if (!status.compatibility.ok || status.transport === "unavailable") return;
@@ -469,9 +455,8 @@ export function PipelineView() {
           }>;
         };
         if (cancelled || !body.streamPipelineLogs) return;
-        const next = { ...logsRef.current };
+        const nextSegments = { ...logSegmentsRef.current };
         const nextTrunc = { ...logTruncatedRef.current };
-        const nextRanges = { ...logRangesRef.current };
         let textChanged = false;
         let truncChanged = false;
         // Only keys present in the response are seeded — including empty text
@@ -481,18 +466,13 @@ export function PipelineView() {
         for (const tail of body.tails) {
           const key = `${tail.runId}:${tail.step}`;
           if (tail.text.length === 0) continue;
-          const prior = nextRanges[key];
           const merged = mergeLogRange(
-            prior ? { start: prior.start, end: prior.end, text: next[key] ?? "" } : undefined,
+            nextSegments[key],
             tail.startOffset,
             tail.text,
             tail.endOffset,
           );
-          if (merged.text !== (next[key] ?? "")) {
-            next[key] = merged.text;
-            textChanged = true;
-          }
-          nextRanges[key] = { start: merged.start, end: merged.end };
+          nextSegments[key] = merged;
           if (tail.truncated) {
             nextTrunc[key] = true;
             truncChanged = true;
@@ -501,31 +481,26 @@ export function PipelineView() {
         // Re-window after merge so a large seed cannot exceed retention.
         const retention = Math.max(0, logChars);
         if (retention > 0) {
-          for (const [key, text] of Object.entries(next)) {
-            if (text.length > retention) {
-              const sliced = text.slice(-retention);
-              next[key] = sliced;
-              textChanged = true;
-              const range = nextRanges[key];
-              if (range !== undefined) {
-                nextRanges[key] = {
-                  start: range.end - utf8ByteLength(sliced),
-                  end: range.end,
-                };
-              }
-              if (nextTrunc[key] !== true) {
-                nextTrunc[key] = true;
-                truncChanged = true;
-              }
+          for (const key of Object.keys(nextSegments)) {
+            const trimmed = trimSegmentsToCharRetention(nextSegments[key]!, retention);
+            nextSegments[key] = trimmed.segments;
+            if (trimmed.truncated && nextTrunc[key] !== true) {
+              nextTrunc[key] = true;
+              truncChanged = true;
             }
           }
         }
+        const next = segmentsToLogs(nextSegments);
+        for (const key of Object.keys(next)) {
+          if (next[key] !== logsRef.current[key]) textChanged = true;
+        }
+        for (const key of Object.keys(logsRef.current)) {
+          if (!(key in next)) textChanged = true;
+        }
+        logSegmentsRef.current = nextSegments;
         if (textChanged) {
           logsRef.current = next;
-          logRangesRef.current = nextRanges;
           setLogs(next);
-        } else {
-          logRangesRef.current = nextRanges;
         }
         if (truncChanged) {
           logTruncatedRef.current = nextTrunc;
@@ -538,7 +513,7 @@ export function PipelineView() {
     return () => {
       cancelled = true;
     };
-  }, [runs, status, streamPipelineLogs, logChars]);
+  }, [runs, status, streamPipelineLogs, logChars, streamState]);
 
   const unavailableEvent = useMemo(
     () => events.find((e) => e.event.type === "pipeline.unavailable"),
