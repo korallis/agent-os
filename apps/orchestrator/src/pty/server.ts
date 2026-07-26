@@ -7,11 +7,15 @@ import type { TmuxController } from "../fleet/tmux.js";
  * Read-only terminal attach over WebSocket (master plan §7.2, §8).
  *
  * This streams what the pane actually shows, by polling `tmux capture-pane` and
- * sending only when the content changed. It is deliberately READ-ONLY: the
- * Console never writes keystrokes into a crewmate's pane. Taking over is done
- * by the Captain running the attach command in their own terminal, which is
- * what "human-attachable" means in the plan — the daemon is not a proxy for the
- * Captain's hands.
+ * sending only when the content changed. Each pane frame carries a monotonic
+ * per-stream `seq` (from 1); a quiet pane sends nothing, so a gap is a real
+ * drop rather than silence. Reconnect is a new stream that renumbers from 1;
+ * `closed` includes `lastSeq` so the client knows how far the stream got.
+ *
+ * Deliberately READ-ONLY: the Console never writes keystrokes into a crewmate's
+ * pane. Taking over is done by the Captain running the attach command in their
+ * own terminal, which is what "human-attachable" means in the plan — the daemon
+ * is not a proxy for the Captain's hands.
  *
  * Polling rather than a real PTY is a deliberate trade: `tmux pipe-pane` would
  * stream raw output but requires a writable FIFO per session, and a true PTY
@@ -147,13 +151,27 @@ function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
   const endStream = (reason: string): void => {
     if (closed) return;
     stop();
-    safeSend(ws, JSON.stringify({ type: "closed", reason }));
+    safeSend(ws, JSON.stringify({ type: "closed", reason, lastSeq: seq }));
     try {
       ws.close();
     } catch {
       // already closing or closed
     }
   };
+
+  /**
+   * Monotonic frame sequence, per stream.
+   *
+   * Without it a dropped frame is indistinguishable from a pane that simply did
+   * not change — which is exactly the ambiguity the "no dropped frames" soak
+   * has to rule out. The client asserts `seq` increases by one; a gap means a
+   * genuine loss, not a quiet pane.
+   *
+   * It also makes reconnect honest: a resumed stream reports the target it
+   * re-attached to and restarts its own numbering from 1, so continuity is a
+   * claim the client can check rather than one the server just asserts.
+   */
+  let seq = 0;
 
   const tick = (): void => {
     if (closed || inFlight) return;
@@ -171,7 +189,9 @@ function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
         }
         failures = 0;
         if (captured !== last) {
-          if (safeSend(ws, JSON.stringify({ type: "pane", content: captured }))) {
+          const next = seq + 1;
+          if (safeSend(ws, JSON.stringify({ type: "pane", seq: next, content: captured }))) {
+            seq = next;
             last = captured;
           } else if (
             ws.readyState === WebSocket.CLOSING ||
