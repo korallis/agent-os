@@ -8,7 +8,8 @@
  *       the rendered HTML of the pages that used to carry them
  *   G4  Analytics figures equal the daemon's own /v1/analytics numbers
  *   G5  Notifications renders the real wake queue, including absorbed wakes
- *   G6  Task Detail renders the Brain decision lane and validation evidence
+ *   G6  Task Detail renders the fusion clean-room columns (against a really
+ *       dispatched run), the Brain decision lane, and validation evidence
  *   G7  quota strip renders from seeded samples and states its honesty tier
  *   G8  empty/error treatments render for an unknown route
  *   G9  Session Detail renders seat model, pane, attach command, and agent log
@@ -21,6 +22,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -272,6 +274,65 @@ try {
     ],
     { withGateEvidence: true },
   );
+  // Dispatch a REAL fusion run on task A. Without one, `FusionColumns` takes its
+  // `runs.length === 0 → return null` path and the whole clean-room column
+  // surface could be deleted while G6 stayed green. `spawnSides: false` keeps
+  // this to a durable run record so no extra tmux seats perturb G9/G11.
+  const fusionCasts = [
+    {
+      role: "planner",
+      model: "anthropic/claude-fable-5",
+      thinking: "high",
+      family: "anthropic",
+      cleanRoom: true,
+    },
+    // Deliberately a model that is NOT in task A's cast or sessions, so the
+    // column body cannot be satisfied by the Cast/Sessions sections above it.
+    { role: "planner", model: "xai/grok-4.5", thinking: "high", family: "xai", cleanRoom: true },
+  ];
+  const fusionDispatch = await tool("dispatch_fusion", {
+    taskId: taskA,
+    kind: "opinion",
+    spawnSides: false,
+    casts: fusionCasts,
+    vars: {
+      QUESTION: "Should Task Detail keep the clean-room columns?",
+      CONTEXT: "phase-6 console fixture",
+    },
+  });
+  if (fusionDispatch.ok !== true) {
+    throw new Error(
+      `dispatch_fusion seed failed: ${fusionDispatch.error?.code ?? ""} ${fusionDispatch.error?.message ?? ""}`,
+    );
+  }
+  const fusionList = await (
+    await fetch(`${BASE}/v1/tasks/${taskA}/fusion`, { headers: auth })
+  ).json();
+  const fusionRun = (fusionList.runs ?? []).find(
+    (r) => r.runId === fusionDispatch.data?.runId,
+  );
+  if (fusionRun === undefined) {
+    throw new Error(`fusion run ${fusionDispatch.data?.runId} not readable over REST`);
+  }
+  const fusionSideModel = fusionCasts[1].model;
+  // The clean-room claim is "every side received THESE bytes", so bind the
+  // reported hash to the bytes the daemon actually persisted as the shared
+  // instruction. Taking the daemon's `promptsIdentical` flag on its own would
+  // prove nothing: it is computed as `new Set(sides.map(s => s.promptHash))
+  // .size === 1` over a single `instructionHash` variable assigned to every
+  // side, so it is true by construction and can never go red.
+  const fusionDetail = await (
+    await fetch(`${BASE}/v1/tasks/${taskA}/fusion/${fusionRun.runId}`, { headers: auth })
+  ).json();
+  const fusionInstruction =
+    typeof fusionDetail.instruction === "string" ? fusionDetail.instruction : null;
+  const fusionInstructionHash =
+    fusionInstruction === null || fusionInstruction.length === 0
+      ? null
+      : createHash("sha256").update(fusionInstruction).digest("hex");
+  const fusionSideHashes = (fusionRun.sides ?? []).map((side) => side.promptHash);
+  const fusionPromptHash = fusionSideHashes[0] ?? null;
+
   const taskBTitle = "Second console task";
   const taskB = await seedTask(taskBTitle, [
     { role: "builder", model: "xai/grok-4.5", thinking: "medium", cleanRoom: true },
@@ -472,10 +533,11 @@ try {
     );
   }
 
-  // G6 — Task Detail shows Brain decisions + validation evidence (FAIL vs GATE_ERROR)
+  // G6 — Task Detail shows the fusion clean-room columns, Brain decisions, and
+  // validation evidence (FAIL vs GATE_ERROR)
   {
     await page.goto(`${CONSOLE}/tasks/${taskA}`, { waitUntil: "networkidle" });
-    await sleep(800);
+    await sleep(1200);
     const text = (await page.textContent("body")) ?? "";
     const brain = text.includes("Brain decisions") && text.includes("resolve_cast");
     const evidence = text.includes("Validation evidence");
@@ -484,11 +546,46 @@ try {
     // FAIL and GATE_ERROR must both appear and be distinguishable (different meaning copy).
     const failMeaning = text.includes("Candidate rejected by the gate");
     const gateErrorMeaning = text.includes("infrastructure error");
+
+    // Fusion side-by-side columns for the run seeded above. The clean-room
+    // header is the load-bearing half: "these answers are independent" must be
+    // evidenced by the shared prompt hash, not asserted. The hash every side
+    // reports is therefore recomputed here from the instruction bytes the
+    // daemon persisted — a run that reports a hash of something other than what
+    // it stored as "the instruction every side received" is exactly the defect
+    // the CLEAN-ROOM badge would be lying about.
+    const daemonProof =
+      fusionRun.promptsIdentical === true &&
+      fusionSideHashes.length === 2 &&
+      typeof fusionInstructionHash === "string" &&
+      fusionSideHashes.every((hash) => hash === fusionInstructionHash);
+    const cleanRoomHeader = text.includes("CLEAN-ROOM ✓ identical prompts");
+    // shortHash() renders the first 12 chars beside the literal "prompt", once
+    // per column. "Shared" means BOTH columns carry it: a single occurrence
+    // would also be satisfied by one column rendering "prompt —".
+    const hashOccurrences =
+      typeof fusionPromptHash === "string"
+        ? text.split(`prompt ${fusionPromptHash.slice(0, 12)}`).length - 1
+        : 0;
+    const sharedHashShown = hashOccurrences === fusionSideHashes.length;
+    const sideRendered = text.includes(fusionSideModel);
+    const aggregatorShown =
+      typeof fusionRun.aggregatorFamily === "string" &&
+      text.includes(`aggregator: ${fusionRun.aggregatorFamily}`);
+    const fusionColumns =
+      daemonProof && cleanRoomHeader && sharedHashShown && sideRendered && aggregatorShown;
+
     gate(
       "G6",
-      "Task Detail renders Brain decisions and validation evidence with FAIL vs GATE_ERROR",
-      brain && evidence && hasFail && hasGateError && failMeaning && gateErrorMeaning,
-      `brain=${brain} evidence=${evidence} FAIL=${hasFail} GATE_ERROR=${hasGateError}`,
+      "Task Detail renders fusion clean-room columns, Brain decisions, and FAIL vs GATE_ERROR evidence",
+      brain &&
+        evidence &&
+        hasFail &&
+        hasGateError &&
+        failMeaning &&
+        gateErrorMeaning &&
+        fusionColumns,
+      `brain=${brain} evidence=${evidence} FAIL=${hasFail} GATE_ERROR=${hasGateError} hashBinding=${daemonProof} cleanRoom=${cleanRoomHeader} hash=${sharedHashShown}(x${hashOccurrences}) side=${sideRendered} aggregator=${aggregatorShown}`,
     );
   }
 
@@ -662,6 +759,27 @@ try {
       policiesText.includes(String(deviated)) &&
       policiesText.includes(`differs from shipped default`);
 
+    // NEGATIVE HALF — the PUT above wrote EVERY supervision key at the global
+    // layer, but only heartbeatSeconds got a new value. A ◆ that fires on "some
+    // layer mentions this key" would mark them all, so enumerate exactly which
+    // keys carry the mark and require the restated-at-default keys to be bare.
+    const markedKeys = await page.$$eval(
+      '[aria-label="differs from shipped default"]',
+      (nodes) =>
+        nodes.map((node) => (node.parentElement?.textContent ?? "").replace("◆", "").trim()),
+    );
+    // Keys the global layer restates verbatim from the shipped defaults.
+    const restatedKeys = Object.keys(shipped.value ?? {}).filter(
+      (key) => key !== "heartbeatSeconds",
+    );
+    // Guard the guard: if the domain only had the one key, the negative proves
+    // nothing, so demand at least one restated sibling actually on the page.
+    const restatedRendered = restatedKeys.filter((key) => policiesText.includes(key));
+    const marksOnlyDeviation =
+      restatedRendered.length > 0 &&
+      markedKeys.length === 1 &&
+      markedKeys[0] === "heartbeatSeconds";
+
     // Safety write without the confirmation header must be refused by the daemon.
     const effective = await (
       await fetch(`${BASE}/v1/config/effective`, { headers: auth })
@@ -754,14 +872,15 @@ try {
 
     gate(
       "G13",
-      "Policies marks real deviations, gates safety writes, and renders the three-way prompt diff",
+      "Policies marks real deviations (and only those), gates safety writes, and renders the three-way prompt diff",
       marksDeviation &&
+        marksOnlyDeviation &&
         unconfirmed.status === 428 &&
         confirmed.ok &&
         badgeShown &&
         typedBlocksEmpty &&
         diffShown,
-      `diamond=${marksDeviation} unconfirmed=${unconfirmed.status} confirmed=${confirmed.status} badge=${badgeShown} typedBlock=${typedBlocksEmpty} threeWay=${diffShown}`,
+      `diamond=${marksDeviation} markedKeys=[${markedKeys.join(",")}] restated=${restatedRendered.length} unconfirmed=${unconfirmed.status} confirmed=${confirmed.status} badge=${badgeShown} typedBlock=${typedBlocksEmpty} threeWay=${diffShown}`,
     );
   }
 
@@ -787,7 +906,10 @@ try {
       },
       {
         provider: "xai",
-        label: "best-effort",
+        // The label deliberately avoids the words "best" and "effort": the tier
+        // assertion below must be satisfied by the product's honesty-tier badge,
+        // never by this fixture naming itself after the thing under test.
+        label: "telemetry-tier",
         metrics: [
           { kind: "weekly-window-pct", value: 61, unit: "percent", tier: "best-effort", source: "TELEMETRY", syncedAt: new Date().toISOString(), reason: "derived from local telemetry", resetsAt: null, limitReached: false },
         ],
@@ -864,8 +986,14 @@ try {
       providersText.includes("LIMIT REACHED") &&
       providersText.includes("Excluded from casts") &&
       providersText.includes("weekly plan window exhausted");
+    // Best-effort archetype: the card must state the honesty tier the daemon
+    // reported, using the product's own badge glyph + wording, plus the reason
+    // and value that make the tier actionable.
     const bestEffortShown =
-      providersText.includes("best-effort fixture") && /best-effort/i.test(providersText);
+      providersText.includes("telemetry-tier fixture") &&
+      providersText.includes("◌ BEST-EFFORT") &&
+      providersText.includes("derived from local telemetry") &&
+      /61%/.test(providersText);
     // Balance-split: connection label + primary currency + credit-split sub-rows.
     const balanceShown =
       providersText.includes("balance-split fixture") &&

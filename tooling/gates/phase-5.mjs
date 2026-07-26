@@ -5,11 +5,14 @@
  *   G1  GATE_ERROR is not RED — a gate that could not run proves nothing
  *   G2  baseline-pass fixture → GATE DEFECT, no builder spawn
  *   G3  same-family builder/validator refused at spawn too, not only at cast
- *   G4  validator is write-jailed to the gate workspace; builder never sees it
+ *   G4  validator is write-jailed to the gate workspace (a write into the
+ *       project checkout is refused, audited and never reaches disk, while its
+ *       own workspace stays writable); builder never sees the gate tree
  *   G5  verbatim FAIL lines are substrate-composed and hash-matched
  *   G6  editing the gate drops RED proof (forged sibling/validation disk ignored); re-prove restores
  *   G7  uv/PEP 723: a gate importing a dependency absent from the project runs
- *       in its own cached venv without touching the product tree
+ *       in its own cached venv, in the gate workspace, and the product tree is
+ *       byte-for-byte identical afterwards
  *   G8  gateLanguage "ts" override runs gate.ts via node strip-types
  *   G9  halt lands exactly on the configured cap, and on a RECONFIGURED cap
  *
@@ -23,7 +26,9 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -102,6 +107,108 @@ async function callTool(token, tool, input, base = BASE) {
   ).json();
 }
 
+/**
+ * Drive the REAL extension entry (packages/pi-extension/dist/index.js) as one
+ * seat and hand it a single tool_call, exactly as Pi would. Returns the fence
+ * decision plus every frame the extension pushed down its daemon socket, so a
+ * gate can assert the refusal AND the ext.tool_blocked audit trail.
+ *
+ * `tempRoots` overrides TMPDIR/TMP/TEMP for the probe: the fence treats the OS
+ * temp root as neutral ground, and gate fixtures live there, so a fixture that
+ * must stand in for a real (non-temp) checkout points the temp roots elsewhere.
+ */
+async function fenceProbe(options) {
+  const { createServer } = await import("node:net");
+  const { agentOsPiExtension } = await import(
+    join(ROOT, "packages", "pi-extension", "dist", "index.js")
+  );
+  const sockDir = mkdtempSync(join(tmpdir(), "agentos-p5-fence-"));
+  cleanups.push(sockDir);
+  const sockPath = join(sockDir, "ext.sock");
+  const frames = [];
+  let toolCallHandler = null;
+  const result = await new Promise((resolve, reject) => {
+    const server = createServer((socket) => {
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        let nl;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (line.length === 0) continue;
+          try {
+            frames.push(JSON.parse(line));
+          } catch {
+            // ignore non-JSON noise
+          }
+        }
+      });
+    });
+    server.on("error", reject);
+    server.listen(sockPath, () => {
+      const keys = [
+        "AGENTOS_SOCKET",
+        "AGENTOS_SESSION_ID",
+        "AGENTOS_ROLE",
+        "AGENTOS_HOME",
+        "AGENTOS_GATE_WORKSPACE",
+        "AGENTOS_SEAT_WORKSPACE",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+      ];
+      const prev = new Map(keys.map((key) => [key, process.env[key]]));
+      const restore = () => {
+        for (const key of keys) {
+          const value = prev.get(key);
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      };
+      process.env.AGENTOS_SOCKET = sockPath;
+      process.env.AGENTOS_SESSION_ID = options.sessionId;
+      process.env.AGENTOS_ROLE = options.role;
+      process.env.AGENTOS_HOME = options.home;
+      process.env.AGENTOS_GATE_WORKSPACE = options.gateWorkspace;
+      process.env.AGENTOS_SEAT_WORKSPACE = options.seatWorkspace;
+      if (options.tempRoots !== undefined) {
+        process.env.TMPDIR = options.tempRoots;
+        process.env.TMP = options.tempRoots;
+        process.env.TEMP = options.tempRoots;
+      }
+      const pi = {
+        version: "0.82.0",
+        on: (event, handler) => {
+          if (event === "tool_call") toolCallHandler = handler;
+        },
+      };
+      const host = agentOsPiExtension(pi);
+      if (host === undefined || toolCallHandler === null) {
+        restore();
+        server.close();
+        reject(new Error(`extension did not register a ${options.role} tool_call fence`));
+        return;
+      }
+      void host.connect().then(() => {
+        const decision = toolCallHandler({
+          toolName: options.toolName,
+          toolCallId: options.toolCallId ?? "t1",
+          input: options.input,
+        });
+        // Let any ext.tool_blocked frame land on the socket before teardown.
+        setTimeout(() => {
+          host.close();
+          server.close();
+          restore();
+          resolve(decision);
+        }, 80);
+      });
+    });
+  });
+  return { result, frames };
+}
+
 function fixtureRepo() {
   const dir = mkdtempSync(join(tmpdir(), "agentos-p5-repo-"));
   const git = (...args) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
@@ -112,6 +219,34 @@ function fixtureRepo() {
   git("add", "-A");
   git("commit", "-qm", "seed");
   return dir;
+}
+
+/**
+ * Deep listing of a tree (every path plus file size) so "the product tree was
+ * not touched" means the whole tree, not just its top level. `.git` is skipped:
+ * the daemon legitimately leases builder worktrees off this repo elsewhere in
+ * the run, which rewrites git's own bookkeeping.
+ */
+function treeSnapshot(root) {
+  const lines = [];
+  const walk = (dir, prefix) => {
+    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    );
+    for (const entry of entries) {
+      if (prefix === "" && entry.name === ".git") continue;
+      const rel = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      const abs = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        lines.push(`d ${rel}`);
+        walk(abs, rel);
+      } else {
+        lines.push(`f ${rel} ${statSync(abs).size}`);
+      }
+    }
+  };
+  walk(root, "");
+  return lines.join("\n");
 }
 
 let exitCode = 0;
@@ -286,8 +421,14 @@ print("PASS")
     );
   }
 
-  // G4 — validator write-jailed; builder tree separate; builder tool path into
-  // the gate workspace is BLOCKED and an ext.tool_blocked frame is emitted.
+  // G4 — both write-jails, driven through the real extension entry:
+  //   validator: seated in the gate workspace, refused when it writes into the
+  //              Captain's project checkout — refusal audited, nothing on disk,
+  //              yet still free to write inside its own workspace;
+  //   builder:   separate tree, refused any path into the gate workspace.
+  // Asserting only "validatorPath === gateWorkspace" proves the seat LOCATION
+  // and nothing about the jail: gutting validatorJailBlockReason to `return
+  // null` left this gate green, which is why the validator probe below exists.
   let jailTaskId;
   {
     jailTaskId = await readyTask(token, projectId, "Write jail", {
@@ -313,95 +454,81 @@ print("PASS")
     const builderPath = builder.data?.session?.worktreePath ?? "";
     const blockedAbs = join(gateWorkspace, "gate.py");
 
-    // Drive the real extension entry: default-deny seat fence must block a read
-    // of an absolute path inside the gate dir and emit ext.tool_blocked.
-    const { createServer } = await import("node:net");
-    const { agentOsPiExtension } = await import(
-      join(ROOT, "packages", "pi-extension", "dist", "index.js")
-    );
-    const sockDir = mkdtempSync(join(tmpdir(), "agentos-p5-g4-"));
-    cleanups.push(sockDir);
-    const sockPath = join(sockDir, "ext.sock");
-    const frames = [];
-    let toolCallHandler = null;
-    const blockResult = await new Promise((resolve, reject) => {
-      const server = createServer((socket) => {
-        let buffer = "";
-        socket.on("data", (chunk) => {
-          buffer += chunk.toString("utf8");
-          let nl;
-          while ((nl = buffer.indexOf("\n")) !== -1) {
-            const line = buffer.slice(0, nl).trim();
-            buffer = buffer.slice(nl + 1);
-            if (line.length === 0) continue;
-            try {
-              frames.push(JSON.parse(line));
-            } catch {
-              // ignore
-            }
-          }
-        });
-      });
-      server.on("error", reject);
-      server.listen(sockPath, () => {
-        const prev = {
-          socket: process.env.AGENTOS_SOCKET,
-          session: process.env.AGENTOS_SESSION_ID,
-          role: process.env.AGENTOS_ROLE,
-          gate: process.env.AGENTOS_GATE_WORKSPACE,
-          seat: process.env.AGENTOS_SEAT_WORKSPACE,
-          ahome: process.env.AGENTOS_HOME,
-        };
-        process.env.AGENTOS_SOCKET = sockPath;
-        process.env.AGENTOS_SESSION_ID = builder.data?.session?.sessionId ?? "01ARZ3NDEKTSV4RRFFQ69G5FG4";
-        process.env.AGENTOS_ROLE = "builder";
-        process.env.AGENTOS_HOME = home;
-        process.env.AGENTOS_GATE_WORKSPACE = gateWorkspace;
-        process.env.AGENTOS_SEAT_WORKSPACE = builderPath || join(home, "worktrees", "builder");
-        const pi = {
-          version: "0.82.0",
-          on: (event, handler) => {
-            if (event === "tool_call") toolCallHandler = handler;
-          },
-        };
-        const host = agentOsPiExtension(pi);
-        if (host === undefined || toolCallHandler === null) {
-          server.close();
-          reject(new Error("extension did not register tool_call fence"));
-          return;
-        }
-        void host.connect().then(() => {
-          const result = toolCallHandler({
-            toolName: "read",
-            toolCallId: "t1",
-            input: { path: blockedAbs },
-          });
-          setTimeout(() => {
-            host.close();
-            server.close();
-            if (prev.socket === undefined) delete process.env.AGENTOS_SOCKET;
-            else process.env.AGENTOS_SOCKET = prev.socket;
-            if (prev.session === undefined) delete process.env.AGENTOS_SESSION_ID;
-            else process.env.AGENTOS_SESSION_ID = prev.session;
-            if (prev.role === undefined) delete process.env.AGENTOS_ROLE;
-            else process.env.AGENTOS_ROLE = prev.role;
-            if (prev.gate === undefined) delete process.env.AGENTOS_GATE_WORKSPACE;
-            else process.env.AGENTOS_GATE_WORKSPACE = prev.gate;
-            if (prev.seat === undefined) delete process.env.AGENTOS_SEAT_WORKSPACE;
-            else process.env.AGENTOS_SEAT_WORKSPACE = prev.seat;
-            if (prev.ahome === undefined) delete process.env.AGENTOS_HOME;
-            else process.env.AGENTOS_HOME = prev.ahome;
-            resolve(result);
-          }, 80);
-        });
-      });
+    // --- VALIDATOR half: the write-jail itself, not just the seat location ---
+    // The fixture checkout sits under the OS temp root, which the fence treats
+    // as neutral ground; a Captain's checkout does not. Point the probe's temp
+    // roots at an empty scratch dir so the refusal has to come from the
+    // default-deny rule under test rather than from an accident of fixtures.
+    const neutralScratch = mkdtempSync(join(tmpdir(), "agentos-p5-neutral-"));
+    cleanups.push(neutralScratch);
+    const escapeTarget = join(repo, "pwned-by-validator.txt");
+    const validatorSeat = validatorPath || gateWorkspace;
+    const validatorProbe = await fenceProbe({
+      role: "validator",
+      sessionId: validator.data?.session?.sessionId ?? "01ARZ3NDEKTSV4RRFFQ69G5FG4",
+      home,
+      gateWorkspace,
+      seatWorkspace: validatorSeat,
+      toolName: "write",
+      toolCallId: "t-validator-escape",
+      input: { path: escapeTarget, content: "validator escaped its jail\n" },
+      tempRoots: neutralScratch,
     });
+    // Pi executes any tool the fence did not block, so model that faithfully:
+    // an unblocked write really does land in the product tree. Without this the
+    // "no file on disk" clause would be true by construction.
+    if (validatorProbe.result?.block !== true) {
+      writeFileSync(escapeTarget, "validator escaped its jail\n");
+    }
+    const escapedOnDisk = existsSync(escapeTarget);
+    if (escapedOnDisk) rmSync(escapeTarget, { force: true });
+    const validatorReason = String(validatorProbe.result?.reason ?? "");
+    const validatorBlocked =
+      validatorProbe.result?.block === true &&
+      validatorReason.includes("write-jailed to the gate workspace") &&
+      validatorReason.includes(gateWorkspace) &&
+      validatorReason.includes("pwned-by-validator.txt");
+    const validatorFrame = validatorProbe.frames.find(
+      (f) => f.type === "ext.tool_blocked" && f.toolName === "write",
+    );
+    const validatorAudited =
+      validatorFrame !== undefined &&
+      String(validatorFrame.reason ?? "").includes("write-jailed");
 
+    // Positive control: a fence that refuses everything is not a write-jail, it
+    // is a broken seat. The validator must still write inside its own workspace.
+    const validatorAllowProbe = await fenceProbe({
+      role: "validator",
+      sessionId: validator.data?.session?.sessionId ?? "01ARZ3NDEKTSV4RRFFQ69G5FG4",
+      home,
+      gateWorkspace,
+      seatWorkspace: validatorSeat,
+      toolName: "write",
+      toolCallId: "t-validator-own",
+      input: { path: join(validatorSeat, "validator-notes.md"), content: "gate notes\n" },
+      tempRoots: neutralScratch,
+    });
+    const ownWorkspaceAllowed =
+      validatorAllowProbe.result === undefined &&
+      !validatorAllowProbe.frames.some((f) => f.type === "ext.tool_blocked");
+
+    // --- BUILDER half: default-deny seat fence refuses gate-dir paths --------
+    const builderProbe = await fenceProbe({
+      role: "builder",
+      sessionId: builder.data?.session?.sessionId ?? "01ARZ3NDEKTSV4RRFFQ69G5FG4",
+      home,
+      gateWorkspace,
+      seatWorkspace: builderPath || join(home, "worktrees", "builder"),
+      toolName: "read",
+      toolCallId: "t-builder-gate-read",
+      input: { path: blockedAbs },
+    });
+    const blockResult = builderProbe.result;
     const blockedOk =
       blockResult &&
       blockResult.block === true &&
       String(blockResult.reason ?? "").includes("tool/fs-blocked");
-    const toolBlockedFrame = frames.find((f) => f.type === "ext.tool_blocked");
+    const toolBlockedFrame = builderProbe.frames.find((f) => f.type === "ext.tool_blocked");
     const toolBlockedRecorded =
       toolBlockedFrame !== undefined &&
       toolBlockedFrame.toolName === "read" &&
@@ -410,16 +537,20 @@ print("PASS")
 
     gate(
       "G4",
-      "validator write-jailed; builder blocked from gate-dir paths; ext.tool_blocked recorded",
+      "validator write-jailed out of the project checkout (audited, nothing on disk, own workspace still writable); builder blocked from gate-dir paths",
       validator.ok === true &&
         builder.ok === true &&
         validatorPath === gateWorkspace &&
         builderPath !== gateWorkspace &&
         !builderPath.startsWith(gateWorkspace) &&
         builderPath !== repo &&
+        validatorBlocked &&
+        validatorAudited &&
+        escapedOnDisk === false &&
+        ownWorkspaceAllowed &&
         blockedOk &&
         toolBlockedRecorded,
-      `validator=${validatorPath === gateWorkspace} blocked=${blockedOk} tool_blocked=${toolBlockedRecorded}`,
+      `validatorSeat=${validatorPath === gateWorkspace} jailed=${validatorBlocked} audited=${validatorAudited} onDisk=${escapedOnDisk} ownWs=${ownWorkspaceAllowed} builderBlocked=${blockedOk} tool_blocked=${toolBlockedRecorded}`,
     );
     await releaseTask(token, jailTaskId);
   }
@@ -695,16 +826,56 @@ raise SystemExit(1)
     await releaseTask(token, taskId);
   }
 
-  // G7 — PEP 723 inline dependency resolves in its own venv, product tree untouched
+  // G7 — PEP 723 inline dependency resolves in its own venv, product tree untouched.
+  // The old form asserted `!readdirSync(repo).includes(".venv")` against a fixture
+  // holding one README: true whatever the runner did. Rerouting the baseline cwd
+  // to the Captain's checkout — the exact defect — left it green. So the gate now
+  // makes the gate process report where it was put and where its dependency came
+  // from, writes a probe file into whatever cwd it was given, and checks the
+  // product tree against its PRISTINE listing.
+  //
+  // Pristine, not a before/after delta around this one call: G1–G6 have already
+  // driven gates against the shared fixture repo, so anything they leaked is in
+  // both halves of a delta and cancels out. Proven: a runner that wrote a fixed
+  // `.gate-scratch` into the checkout on every run_gate left the delta form
+  // green (the file was already in `treeBefore`); only a leak with a fresh name
+  // each run turned it red. A real regression — a `.venv`, a lockfile, a stray
+  // probe file — leaks the SAME path every time, i.e. exactly the case the
+  // delta could not see. So G7 gets its own untouched checkout, snapshotted
+  // before any task exists, and asserts the whole listing is still that.
   {
-    const taskId = await readyTask(token, projectId, "PEP 723 isolation", {
+    const g7Repo = fixtureRepo();
+    cleanups.push(g7Repo);
+    const g7Pristine = treeSnapshot(g7Repo);
+    const g7ProjectId = (
+      await (
+        await api("/v1/projects", token, {
+          method: "POST",
+          body: JSON.stringify({ name: "p5-g7", path: g7Repo, mode: "local-only", trusted: true }),
+        })
+      ).json()
+    ).project.id;
+    const taskId = await readyTask(token, g7ProjectId, "PEP 723 isolation", {
       gateSource: `#!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["six"]
 # ///
-import os, six
-assert six.PY3
+import json, os, sys
+import six
+
+report = {
+    "cwd": os.path.realpath(os.getcwd()),
+    "prefix": os.path.realpath(sys.prefix),
+    "basePrefix": os.path.realpath(sys.base_prefix),
+    "six": os.path.realpath(six.__file__),
+    "py3": six.PY3,
+}
+# Written into the working directory the RUNNER chose. If that is the product
+# checkout, this file lands in the Captain's tree and the gate must go red.
+with open("gate-probe.json", "w", encoding="utf-8") as fh:
+    json.dump(report, fh)
+
 if os.environ.get("AGENTOS_GATE_TARGET") == "baseline":
     print("EXPECTED_RED")
     print("FAIL six present but feature absent")
@@ -713,15 +884,47 @@ print("PASS")
 `,
     });
     const body = await callTool(token, "run_gate", { taskId, target: "baseline" });
-    const repoEntries = readdirSync(repo);
+    const treeAfter = treeSnapshot(g7Repo);
+
+    const gateWorkspace = join(home, "runs", taskId, "gate-workspace");
+    let probe = null;
+    try {
+      probe = JSON.parse(readFileSync(join(gateWorkspace, "gate-probe.json"), "utf8"));
+    } catch {
+      // absent or unparseable → the assertions below fail, which is the point
+    }
+    const realRepo = realpathSync(g7Repo);
+    const insideRepo = (p) =>
+      typeof p === "string" && (p === realRepo || p.startsWith(`${realRepo}/`));
+
+    // Ran where the runner promises: the per-task gate workspace, not the checkout.
+    const ranInGateWorkspace =
+      probe !== null && probe.cwd === realpathSync(gateWorkspace) && !insideRepo(probe.cwd);
+    // The inline dependency came from a real venv of uv's own making, not from
+    // anything inside the product tree.
+    const depIsolated =
+      probe !== null &&
+      probe.py3 === true &&
+      typeof probe.six === "string" &&
+      !insideRepo(probe.six) &&
+      typeof probe.prefix === "string" &&
+      probe.prefix !== probe.basePrefix &&
+      !insideRepo(probe.prefix);
+    // Whole listing still equals the pristine one — not merely unchanged since
+    // just before this call. Catches a leak that repeats the same path/size on
+    // every run, which is what an isolation regression actually looks like.
+    const productTreeUntouched =
+      treeAfter === g7Pristine && !existsSync(join(g7Repo, "gate-probe.json"));
+
     gate(
       "G7",
-      "uv/PEP 723 inline dependency runs in an isolated venv; product tree untouched",
+      "uv/PEP 723 inline dependency resolves in its own venv; gate runs in the gate workspace and the product tree is byte-for-byte identical to its pristine listing",
       body.ok === true &&
         body.data?.outcome === "EXPECTED_RED" &&
-        !repoEntries.includes(".venv") &&
-        !repoEntries.includes("node_modules"),
-      `outcome=${body.data?.outcome} repoClean=${!repoEntries.includes(".venv")}`,
+        ranInGateWorkspace &&
+        depIsolated &&
+        productTreeUntouched,
+      `outcome=${body.data?.outcome} cwd=${ranInGateWorkspace} venv=${depIsolated} untouched=${productTreeUntouched}`,
     );
   }
 

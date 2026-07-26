@@ -426,38 +426,6 @@ export class BrainManager {
     this.deps.tools.setBrainSessionId(null);
   }
 
-  /**
-   * Scripted local-only SHIP path for gates (fake brain decides deterministically).
-   * sequence: resolve_cast → spawn builder → stop crewmate → deliver
-   */
-  runScriptedLocalShip(taskId: string, model = "openai/gpt-4.1"): void {
-    this.deps.tools.invoke("resolve_cast", {
-      taskId,
-      roles: [{ role: "builder", model, thinking: "medium", cleanRoom: true }],
-      familyCheckOverride: false,
-    });
-    const spawned = this.deps.tools.invoke("spawn_crewmate", {
-      taskId,
-      role: "builder",
-      model,
-      thinking: "medium",
-      cleanRoom: true,
-      vars: {},
-      prompt: "local-only ship — implement and stop",
-    });
-    if (spawned.ok === true && spawned.data !== undefined) {
-      const sessionId = (spawned.data as { session?: { sessionId?: string } }).session
-        ?.sessionId;
-      if (typeof sessionId === "string") {
-        this.deps.tools.invoke("stop_crewmate", {
-          sessionId,
-          reason: "scripted local-only ship complete",
-        });
-      }
-    }
-    this.deps.tools.invoke("deliver_task", { taskId });
-  }
-
   private onWake(digest: WakeDigest): void {
     if (this.snapshot.status === "down") return;
     // Fake brain: absorb settle digests; escalate security.
