@@ -50,7 +50,7 @@ This is an unusually disciplined codebase — the backend engineering is genuine
     - Dead surface area: `/privacy` and `/terms` footer links 404, newsletter/contact forms fake success, `ResourceCard` is inert. Notably, the marketing site presents **fabricated customer testimonials as real** (`lib/data/customers.ts:10-51`) — which contradicts the honesty discipline the product itself enforces.
     - Agent data is defined three times with mismatched slug schemes; ~15 dead exports/files (matches the 19 lint warnings).
 
-11. **Sweep the security-claim docstrings.** Repeated doc-vs-code mismatches: protocol claims frames are "zod-validated both ways" (inbound isn't), the seat fence docstring overclaims default-deny, `familyOfClaudeAgentSdkModel` claims "always anthropic" but isn't, `PROTOCOL_VERSION` says `"1.2.0-phase3"` at Phase 6e. These comments carry security weight — they should be true.
+11. **Sweep the security-claim docstrings.** Repeated doc-vs-code mismatches: protocol claims frames are "zod-validated both ways" (inbound isn't), `familyOfClaudeAgentSdkModel` claims "always anthropic" but isn't, `PROTOCOL_VERSION` says `"1.2.0-phase3"` at Phase 6e. These comments carry security weight — they should be true.
 
 ### Lower priority
 

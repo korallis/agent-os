@@ -1,0 +1,26 @@
+{
+  "//": "Route → Figma frame, and the evidence pack holding the side-by-side.",
+  "//fileKey": "Ria7UpyEPRd9jNlF9B6xgF (AgentOS — AI Agent Orchestration Dashboard)",
+  "//rule": "Every route the Console serves must appear here with a Figma frame, or be listed in outOfScope with a reason. A screen with no canonical frame cannot be checked for fidelity, and silently omitting it is how drift starts. Exempt (outOfScope) screens are allowed when the product needs them, but they MUST still be built from the Figma design system: shared shell (Topbar + the same page scaffold mapped screens use) and colours/type from packages/ui tokens (bg-shell, bg-panel, text-fg-*, border-line-*, accents) — hard-coded hex colours and ad-hoc style font sizes in the exempt screen's own components fail F4. A prose reason alone is not enough.",
+  "fileKey": "Ria7UpyEPRd9jNlF9B6xgF",
+  "routes": {
+    "/fleet": { "node": "10:11978", "pack": "phase-1-figma-ui-2026-07-24", "slug": "fleet-dashboard" },
+    "/tasks": { "node": "37:1300", "pack": "phase-1-figma-ui-2026-07-24", "slug": "tasks-inference-jobs" },
+    "/projects": { "node": "37:1553", "pack": "phase-1-figma-ui-2026-07-24", "slug": "projects-workflows" },
+    "/providers": { "node": "37:1845", "pack": "phase-1-figma-ui-2026-07-24", "slug": "providers-api" },
+    "/analytics": { "node": "37:2265", "pack": "phase-1-figma-ui-2026-07-24", "slug": "analytics-token-usage" },
+    "/runs": { "node": "37:2871", "pack": "phase-1-figma-ui-2026-07-24", "slug": "runs-log-stream" },
+    "/policies": { "node": "37:3447", "pack": "phase-1-figma-ui-2026-07-24", "slug": "policies-config" },
+    "/settings": { "node": "37:3607", "pack": "phase-1-figma-ui-2026-07-24", "slug": "settings-workspace" },
+    "/alerts": { "node": "41:5674", "pack": "phase-6g-figma-fidelity", "slug": "alerts" },
+    "/analytics/models": { "node": "41:4355", "pack": "phase-6g-figma-fidelity", "slug": "analytics-models" },
+    "/settings/billing": { "node": "41:6309", "pack": "phase-6g-figma-fidelity", "slug": "settings-billing" },
+    "/network": { "node": "41:4815", "pack": "phase-6g-figma-fidelity", "slug": "network-io" },
+    "/runs/history": { "node": "41:5136", "pack": "phase-6g-figma-fidelity", "slug": "runs-history" },
+    "/notifications": { "node": "41:2412", "pack": "phase-6g-figma-fidelity", "slug": "notifications" },
+    "/onboarding": { "node": "41:1226", "pack": "phase-6g-figma-fidelity", "slug": "onboarding" }
+  },
+  "outOfScope": {
+    "/pipeline": "Phase 9 [R7] — a Captain-requested screen with no Figma frame; the Captain asked for live no-mistakes visibility after the design file was drawn."
+  }
+}

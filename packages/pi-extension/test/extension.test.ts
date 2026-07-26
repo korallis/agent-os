@@ -804,6 +804,11 @@ describe("validator write-jail tool fence", () => {
         env,
       ),
     ).toMatch(/write-jailed/);
+    // This previously asserted `toBeNull()` — i.e. that a validator could
+    // touch an arbitrary path outside AGENTOS_HOME. That was the fence's
+    // fall-through-to-allow, and the assertion codified it as intended
+    // behaviour. `env` here declares no TMPDIR, so /tmp is NOT a neutral root
+    // in this fixture and must be refused under default-deny.
     expect(
       validatorJailBlockReason(
         "read",
@@ -812,6 +817,18 @@ describe("validator write-jail tool fence", () => {
         agentHome,
         cwd,
         env,
+      ),
+    ).toMatch(/write-jailed/);
+    // A genuinely declared neutral temp root is still allowed, so the
+    // default-deny has not simply refused everything.
+    expect(
+      validatorJailBlockReason(
+        "read",
+        { path: "/tmp/outside.txt" },
+        gate,
+        agentHome,
+        cwd,
+        { ...env, TMPDIR: "/tmp" },
       ),
     ).toBeNull();
     expect(
