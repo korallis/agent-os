@@ -177,6 +177,34 @@ describe("auto-balancer suggestions", () => {
     expect(headroomOf(candidate({ model: "openai/gpt-4.1", usedPct: null }))).toBe(100);
   });
 
+  it("does not claim cost refinement in basis when costUsable is true", () => {
+    const result = suggestCast({
+      config: config(),
+      candidates: [
+        candidate({ model: "openai/gpt-4.1", usedPct: 20 }),
+        candidate({ model: "anthropic/claude-sonnet-4-5", usedPct: 40 }),
+      ],
+      roles: ["builder"],
+      costUsable: true,
+    });
+    expect(result.basis).not.toContain("refined by");
+    expect(result.basis).toContain("headroom");
+  });
+
+  it("does not treat unknown usage as under steerAwayPct", () => {
+    const result = suggestCast({
+      config: config({ steerAwayPct: 50 }),
+      candidates: [
+        candidate({ model: "openai/gpt-4.1", usedPct: null }),
+        candidate({ model: "anthropic/claude-sonnet-4-5", usedPct: 30 }),
+      ],
+      roles: ["builder"],
+      costUsable: false,
+    });
+    expect(result.suggestions[0]?.model).toBe("anthropic/claude-sonnet-4-5");
+    expect(result.basis).toContain("steerAwayPct");
+  });
+
   it("keeps distinct families across multi-role casts so /opinion stays legal", () => {
     const result = suggestCast({
       config: config(),

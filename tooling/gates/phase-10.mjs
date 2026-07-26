@@ -9,6 +9,8 @@
  *   G5  headroom-driven: balances with cost coverage absent, and says so
  *   G6  a LIMIT REACHED connection is never suggested; near-threshold is de-preferred
  *   G7  every decision is recorded with its inputs — "why this model?" is answerable
+ *   G8  /opinion and plan-fusion casts keep ≥2 distinct families; side order preserved
+ *   G9  balancer and Brain handoff converge — steer first, handoff only when steering fails
  *
  * Real daemon, real config writes, real quota fixtures.
  * Usage: node tooling/gates/phase-10.mjs
@@ -305,6 +307,110 @@ try {
       "a balanced pair spreads across the roster instead of pinning one model",
       models.size === 2,
       `distinctModels=${models.size} models=${[...models].join(",")}`,
+    );
+  }
+
+  // ── G8 — /opinion and plan-fusion casts preserve ≥2 families + order ──
+  {
+    const suggestion = await tool("suggest_cast", { roles: ["planner", "planner"] });
+    const suggestions = suggestion.data?.suggestions ?? [];
+    const families = new Set(suggestions.map((s) => s.family));
+    const roles = suggestions.map((s) => s.role);
+    const firstPlannerFamily = suggestions[0]?.family ?? null;
+
+    gate(
+      "G8",
+      "/opinion and plan-fusion casts keep ≥2 distinct families; side order preserved",
+      suggestions.length === 2 &&
+        families.size >= 2 &&
+        roles[0] === "planner" &&
+        roles[1] === "planner" &&
+        firstPlannerFamily !== null,
+      `families=${[...families].join(",")} firstPlannerFamily=${firstPlannerFamily} rolesPreserved=${roles.join(",")}`,
+    );
+  }
+
+  // ── G9 — balancer and Brain handoff converge, never oscillate ─────────
+  {
+    const { suggestCast: suggestCastPure } = await import(
+      join(ROOT, "apps", "orchestrator", "dist", "fleet", "balancer.js")
+    );
+    const { decideHandoff: decideHandoffPure } = await import(
+      join(ROOT, "apps", "orchestrator", "dist", "fleet", "brain-handoff.js")
+    );
+
+    const mkCandidate = (model, provider, family, usedPct) => ({
+      model, family, connectionId: `conn-${provider}`, provider, usedPct, tier: "live", limitReached: false, healthy: true,
+    });
+    const mkSamples = (anthropicPct) => [
+      { id: "s1", connectionId: "conn-anthropic", provider: "anthropic", metrics: [{ kind: "weekly-window-pct", value: anthropicPct, unit: "percent", tier: "live", source: "fixture", syncedAt: new Date().toISOString(), reason: null, resetsAt: null, limitReached: false }], sampledAt: new Date().toISOString() },
+      { id: "s2", connectionId: "conn-openai", provider: "openai", metrics: [{ kind: "weekly-window-pct", value: 25, unit: "percent", tier: "live", source: "fixture", syncedAt: new Date().toISOString(), reason: null, resetsAt: null, limitReached: false }], sampledAt: new Date().toISOString() },
+    ];
+    const balancerCfg = {
+      enabled: true,
+      roster: [
+        { model: "anthropic/claude-sonnet-4-5", brainCapable: true },
+        { model: "openai/gpt-4.1", brainCapable: true },
+      ],
+      steerAwayPct: 60,
+      useReportedCost: false,
+    };
+    const brainCfg = {
+      cast: "auto", thinking: "medium",
+      preferenceOrder: ["anthropic/claude-sonnet-4-5"],
+      handoff: { thresholdPct: 80, target: "best-available-other-family" },
+      respawnBlocked: false,
+    };
+    const budgets = { perTaskUsd: 0, claudeExtraUsageDailyUsd: 0, brainTokensPerDay: 0, gatewayHardUsd: 0 };
+
+    // Scenario 1: 70% — over steerAway (60) but under handoff (80).
+    // Balancer steers crew to openai; Brain stays because 70 < 80.
+    const bal1 = suggestCastPure({
+      config: balancerCfg,
+      candidates: [
+        mkCandidate("anthropic/claude-sonnet-4-5", "anthropic", "anthropic", 70),
+        mkCandidate("openai/gpt-4.1", "openai", "openai", 25),
+      ],
+      roles: ["builder"],
+      costUsable: false,
+    });
+    const ho1 = decideHandoffPure({
+      brainModel: "anthropic/claude-sonnet-4-5",
+      brainConnectionId: "conn-anthropic",
+      config: brainCfg, budgets,
+      samples: mkSamples(70),
+      candidates: [{ model: "openai/gpt-4.1", worstWindowPct: 25 }],
+    });
+
+    const s1Steers = bal1.suggestions[0]?.model === "openai/gpt-4.1";
+    const s1NoHandoff = !ho1.shouldHandoff;
+
+    // Scenario 2: 85% — over both thresholds. Both agree: move to openai.
+    const bal2 = suggestCastPure({
+      config: balancerCfg,
+      candidates: [
+        mkCandidate("anthropic/claude-sonnet-4-5", "anthropic", "anthropic", 85),
+        mkCandidate("openai/gpt-4.1", "openai", "openai", 25),
+      ],
+      roles: ["builder"],
+      costUsable: false,
+    });
+    const ho2 = decideHandoffPure({
+      brainModel: "anthropic/claude-sonnet-4-5",
+      brainConnectionId: "conn-anthropic",
+      config: brainCfg, budgets,
+      samples: mkSamples(85),
+      candidates: [{ model: "openai/gpt-4.1", worstWindowPct: 25 }],
+    });
+
+    const s2Steers = bal2.suggestions[0]?.model === "openai/gpt-4.1";
+    const s2Handoff = ho2.shouldHandoff && ho2.toModel === "openai/gpt-4.1";
+
+    gate(
+      "G9",
+      "balancer and Brain handoff converge — steer first, handoff only when steering fails",
+      s1Steers && s1NoHandoff && s2Steers && s2Handoff,
+      `@70%: steers=${s1Steers} noHandoff=${s1NoHandoff}; @85%: steers=${s2Steers} handoff=${s2Handoff} to=${ho2.toModel}`,
     );
   }
 

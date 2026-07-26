@@ -132,7 +132,7 @@ export function suggestCast(input: {
   costUsable: boolean;
 }): BalancerSuggestion {
   const basis = input.costUsable
-    ? "quota-window headroom, refined by reported cost"
+    ? "quota-window headroom; per-request cost is tracked but does not influence ranking"
     : "quota-window headroom only — no provider reported per-request cost, so spend was not a factor";
 
   if (!input.config.enabled) {
@@ -162,26 +162,23 @@ export function suggestCast(input: {
     };
   }
 
+  const steerPct = input.config.steerAwayPct;
+  const underThreshold = eligible.filter(
+    (c) => c.usedPct !== null && c.usedPct < steerPct,
+  );
+
   const wantsPair = input.roles.includes("builder") && input.roles.includes("validator");
+
   if (wantsPair) {
-    // Joint optimisation: the best-headroom PAIR that is cross-family.
-    let best: { builder: BalancerCandidate; validator: BalancerCandidate } | null = null;
-    for (const builder of eligible) {
-      for (const validator of eligible) {
-        if (validator.model === builder.model) continue;
-        if (validator.family === builder.family) continue;
-        if (
-          best === null ||
-          headroomOf(builder) + headroomOf(validator) >
-            headroomOf(best.builder) + headroomOf(best.validator)
-        ) {
-          best = { builder, validator };
-        }
-      }
+    let pool = underThreshold.length > 0 ? underThreshold : eligible;
+    let steered = underThreshold.length > 0 && underThreshold.length < eligible.length;
+    let best = findCrossFamilyPair(pool);
+    if (best === null && steered) {
+      pool = eligible;
+      steered = false;
+      best = findCrossFamilyPair(pool);
     }
     if (best === null) {
-      // Refuse rather than suggest an illegal pair. The balancer must never be
-      // the reason a familyCheckOverride gets stamped onto a task.
       return {
         enabled: true,
         suggestions: [],
@@ -210,22 +207,20 @@ export function suggestCast(input: {
       ],
       considered: eligible,
       costUsable: input.costUsable,
-      basis,
+      basis: steered
+        ? `${basis}; candidates past ${steerPct}% usage excluded (steerAwayPct)`
+        : basis,
       refusal: null,
     };
   }
 
-  // Single-role (or planner-only) casts: spread by headroom, distinct families
-  // where more than one role is asked for, so /opinion stays legal.
-  const suggestions: BalancedRoleSuggestion[] = [];
-  const usedFamilies = new Set<string>();
-  for (const role of input.roles) {
-    const pick =
-      eligible.find((c) => !usedFamilies.has(c.family)) ??
-      eligible.find((c) => !suggestions.some((s) => s.model === c.model));
-    if (pick === undefined) break;
-    usedFamilies.add(pick.family);
-    suggestions.push({ role, model: pick.model, family: pick.family, reason: reasonFor(pick) });
+  let pool = underThreshold.length > 0 ? underThreshold : eligible;
+  let steered = underThreshold.length > 0 && underThreshold.length < eligible.length;
+  let suggestions = fillRoles(pool, input.roles);
+  if (suggestions.length < input.roles.length && steered) {
+    pool = eligible;
+    steered = false;
+    suggestions = fillRoles(pool, input.roles);
   }
 
   return {
@@ -233,7 +228,9 @@ export function suggestCast(input: {
     suggestions,
     considered: eligible,
     costUsable: input.costUsable,
-    basis,
+    basis: steered
+      ? `${basis}; candidates past ${steerPct}% usage excluded (steerAwayPct)`
+      : basis,
     refusal:
       suggestions.length < input.roles.length
         ? "not enough distinct eligible models in the roster for every requested role"
@@ -248,6 +245,43 @@ function reasonFor(candidate: BalancerCandidate): string {
   return `${candidate.model}: ${Math.round(100 - candidate.usedPct)}% window headroom (${
     candidate.tier ?? "unknown"
   } reading of ${candidate.usedPct}% used)`;
+}
+
+function findCrossFamilyPair(
+  pool: BalancerCandidate[],
+): { builder: BalancerCandidate; validator: BalancerCandidate } | null {
+  let best: { builder: BalancerCandidate; validator: BalancerCandidate } | null = null;
+  for (const builder of pool) {
+    for (const validator of pool) {
+      if (validator.model === builder.model) continue;
+      if (validator.family === builder.family) continue;
+      if (
+        best === null ||
+        headroomOf(builder) + headroomOf(validator) >
+          headroomOf(best.builder) + headroomOf(best.validator)
+      ) {
+        best = { builder, validator };
+      }
+    }
+  }
+  return best;
+}
+
+function fillRoles(
+  pool: BalancerCandidate[],
+  roles: readonly string[],
+): BalancedRoleSuggestion[] {
+  const suggestions: BalancedRoleSuggestion[] = [];
+  const usedFamilies = new Set<string>();
+  for (const role of roles) {
+    const pick =
+      pool.find((c) => !usedFamilies.has(c.family)) ??
+      pool.find((c) => !suggestions.some((s) => s.model === c.model));
+    if (pick === undefined) break;
+    usedFamilies.add(pick.family);
+    suggestions.push({ role, model: pick.model, family: pick.family, reason: reasonFor(pick) });
+  }
+  return suggestions;
 }
 
 /**

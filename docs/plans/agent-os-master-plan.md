@@ -1366,7 +1366,7 @@ Gates:
 - [x] Visibility profiles: three shipped profiles (quiet / working / firehose) demonstrably change what reaches the Console and the wake queue, hot-reloaded without a restart.
 - [x] No unbounded growth: a long run's step log is windowed in the Console with truncation stated, not silently dropped.
 
-**Phase 10 — Auto-balancer (v1.1, 2 wk)** **[R7 — Captain-requested]** — shipped (`tooling/gates/phase-10.mjs` G1–G7; 7/7 + 14 vitest)
+**Phase 10 — Auto-balancer (v1.1, 2 wk)** **[R7 — Captain-requested]** — shipped (`tooling/gates/phase-10.mjs` G1–G9; 9/9 + 16 vitest)
 
 A toggle that spreads work across the Captain's configured models — cost-effective while staying powerful — with the participating set configurable, fusion intact, and the cross-family rule never weakened.
 
