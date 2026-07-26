@@ -39,7 +39,6 @@ const BASE_ALLOWLIST = new Set([
   "TERM",
   "COLORTERM",
   "SHELL",
-  "SSH_AUTH_SOCK",
   // Path fence vars (AGENTOS_HOME, AGENTOS_SEAT_WORKSPACE, AGENTOS_GATE_WORKSPACE)
   // and session dirs are granted only via extraAllow — never ambient parent env.
   // Signing keys are never env values.
@@ -75,6 +74,20 @@ export function scrubEnv(
     extraAllow?: Record<string, string>;
     /** When true, fail if >1 provider key would remain. */
     assertSingle?: boolean;
+    /**
+     * Forward the Captain's SSH agent socket to this process.
+     *
+     * Deliberately OPT-IN and off by default. `SSH_AUTH_SOCK` is not a
+     * convenience variable: it hands the holder the Captain's forwarded keys,
+     * so anything with shell access can `git push`, `ssh` anywhere those keys
+     * are trusted, or sign as them. It used to sit in the base allowlist, which
+     * meant it also reached Brain-authored GATE code — untrusted code written
+     * by a model, running with the Captain's identity.
+     *
+     * Crewmates that genuinely need to push may be granted it explicitly; gate
+     * subprocesses never are.
+     */
+    grantSshAgent?: boolean;
   } = {},
 ): ScrubResult {
   const env: Record<string, string> = {};
@@ -84,6 +97,12 @@ export function scrubEnv(
     if (BASE_ALLOWLIST.has(key)) {
       env[key] = value;
     }
+  }
+
+  // Opt-in only, and never for gate code. See grantSshAgent above.
+  if (options.grantSshAgent === true) {
+    const sock = parent.SSH_AUTH_SOCK;
+    if (sock !== undefined && sock.length > 0) env.SSH_AUTH_SOCK = sock;
   }
 
   if (options.extraAllow !== undefined) {
@@ -100,6 +119,12 @@ export function scrubEnv(
   const grant = options.grantProviderKey ?? null;
   if (grant !== null) {
     env[grant.name] = grant.value;
+  }
+
+  // Same discipline as provider keys: grantSshAgent is the only way in.
+  // extraAllow must not re-inject SSH_AUTH_SOCK behind the flag.
+  if (options.grantSshAgent !== true) {
+    delete env.SSH_AUTH_SOCK;
   }
 
   const providerKeysPresent = PROVIDER_KEY_ENV_NAMES.filter((name) => env[name] !== undefined);

@@ -21,6 +21,9 @@ export type ExtensionFrameHandler = (frame: ExtensionToDaemonFrame) => void;
 
 const HUB_SOCK_MODE = 0o600;
 
+/** Hard cap on an un-newlined frame; beyond this the peer is malformed. */
+const MAX_LINE_CHARS = 1_000_000;
+
 export class SocketHub {
   private server: Server | null = null;
   private readonly sockets = new Map<string, Socket>();
@@ -159,6 +162,10 @@ export class SocketHub {
 
     socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
+      // A peer that writes bytes without a newline would grow this string
+      // without limit. A frame this large is malformed by definition, so drop
+      // the buffer rather than accumulate it.
+      if (buffer.length > MAX_LINE_CHARS) buffer = "";
       let nl: number;
       while ((nl = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, nl).trim();

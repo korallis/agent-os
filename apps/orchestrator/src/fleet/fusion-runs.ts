@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { parseAttributedSpans } from "@agent-os/fusion-core";
 import type { FusionRun, FusionRunDetailResponse, FusionSide } from "@agent-os/protocol";
 
@@ -16,6 +16,19 @@ import type { FusionRun, FusionRunDetailResponse, FusionSide } from "@agent-os/p
  */
 export class FusionRunStore {
   constructor(private readonly home: string) {}
+
+  /**
+   * True only when `candidate` resolves inside the Agent OS home.
+   *
+   * Deliberately a prefix check on the RESOLVED path with a trailing separator,
+   * so `/home-evil` cannot pass as `/home`, and `..` cannot escape.
+   */
+  private isContained(candidate: string): boolean {
+    const root = resolve(this.home);
+    const target = resolve(candidate);
+    const prefix = root.endsWith(sep) ? root : `${root}${sep}`;
+    return target === root || target.startsWith(prefix);
+  }
 
   private dir(taskId: string, runId: string): string {
     return join(this.home, "runs", taskId, "fusion", runId);
@@ -126,8 +139,14 @@ export class FusionRunStore {
     const fused = read("fused.md");
     const sideArtifacts = run.sides
       .map((side: FusionSide) => {
+        // `artifactPath` comes out of run.json, which lives under a path a
+        // crewmate can write. Reading it absolute and uncontained turns any
+        // ability to plant a run.json into an arbitrary file read served over
+        // REST. Containment-check every path before reading it.
         const content =
-          side.artifactPath !== null && existsSync(side.artifactPath)
+          side.artifactPath !== null &&
+          this.isContained(side.artifactPath) &&
+          existsSync(side.artifactPath)
             ? readFileSync(side.artifactPath, "utf8")
             : null;
         return content === null

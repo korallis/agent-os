@@ -17,6 +17,9 @@ const nextUlid = monotonicFactory();
  * Absorbs benign wakes per supervision.absorb; queues actionable digests for the Brain.
  * Classification never calls an LLM.
  */
+/** Retained wake history. Bounded: the daemon is long-lived. */
+const MAX_HISTORY = 5_000;
+
 export class WakeWatcher {
   private sink: WakeEventSink = () => undefined;
   private deliver: WakeDeliverer = () => undefined;
@@ -84,6 +87,7 @@ export class WakeWatcher {
 
     if (absorbed) {
       this.history.push(digest);
+      if (this.history.length > MAX_HISTORY) this.history.splice(0, this.history.length - MAX_HISTORY);
       this.sink({
         type: "wake.classified",
         payload: {
@@ -102,6 +106,7 @@ export class WakeWatcher {
     if (this.brainDown) {
       this.queue.push(digest);
       this.history.push(digest);
+      if (this.history.length > MAX_HISTORY) this.history.splice(0, this.history.length - MAX_HISTORY);
       this.sink({
         type: "wake.classified",
         payload: {
@@ -119,6 +124,7 @@ export class WakeWatcher {
 
     digest.deliveredToBrain = true;
     this.history.push(digest);
+    if (this.history.length > MAX_HISTORY) this.history.splice(0, this.history.length - MAX_HISTORY);
     this.sink({
       type: "wake.classified",
       payload: {

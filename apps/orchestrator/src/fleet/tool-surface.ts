@@ -745,7 +745,7 @@ export class ToolSurface {
     const now = new Date().toISOString();
     const maxValidations = this.cfg().validation.maxValidations;
     const yolo = input.spec.shape === "SHIP" ? input.spec.yolo : false;
-    const mode = input.spec.shape === "SHIP" ? input.spec.mode : input.spec.mode;
+    const mode = input.spec.mode;
 
     const task: TaskSnapshot = {
       id: nextUlid(),
