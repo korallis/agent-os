@@ -654,11 +654,14 @@ export class ToolSurface {
    *   illegal spawn, and nothing is spent.
    *
    * Captain-notify durability (one invariant):
-   * - Once the substrate has decided the Captain must be told, that obligation
-   *   is recorded on the task (`wedgePendingCaptainNotifies`) before the
-   *   attempt, survives seat state (stopped / lost / wedged / dead pane),
-   *   process death and restart, and is discharged exactly once when
-   *   `captain.escalation` is actually sunk. Seat shape is secondary to that.
+   * - Once the substrate has decided the Captain must be told — or is about to
+   *   consume a seat on a path that may need the Captain — that obligation is
+   *   recorded on the task (`wedgePendingCaptainNotifies`) before ledger spend
+   *   and before stop. It survives seat state (stopped / lost / wedged / dead
+   *   pane), process death and restart, and is discharged exactly once when
+   *   `captain.escalation` is actually sunk. A successful respawn clears the
+   *   provisional entry without escalate; failure or incomplete recovery
+   *   discharges it. Seat shape is secondary to that.
    */
   reconcileWedgedSessions(now = Date.now()): Array<{ sessionId: string; action: string }> {
     // Coalesce hot activity stamps before idle checks so the durable clock
@@ -736,6 +739,18 @@ export class ToolSurface {
         action = "escalated";
         escalateSummary = `Seat ${session.role} wedged — completing deferred Captain notify (no activity for ${Math.round(idleMinutes)}m)`;
       } else if (canRespawn && spawnLegal) {
+        // Write-ahead Captain-notify BEFORE ledger spend and stop so a crash
+        // after stop cannot leave a spent budget with no obligation. Success
+        // clears without escalate; failure/incomplete recovery discharges.
+        escalateSummary = `Seat ${session.role} wedged and could not be respawned — no activity for ${Math.round(idleMinutes)}m`;
+        if (session.taskId !== null) {
+          this.recordPendingWedgeCaptainNotify(session.taskId, {
+            sessionId: session.sessionId,
+            role: session.role,
+            summary: escalateSummary,
+            severity: "critical",
+          });
+        }
         try {
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
           this.respawnCrewmate({
@@ -743,15 +758,19 @@ export class ToolSurface {
             reason: `structural WEDGED — no activity for ${Math.round(idleMinutes)}m (threshold ${thresholdMinutes}m)`,
           });
           action = "respawned";
+          // Respawn landed — provisional obligation is no longer needed.
+          if (session.taskId !== null) {
+            this.clearPendingWedgeCaptainNotify(session.taskId, session.sessionId);
+          }
+          escalateSummary = null;
         } catch {
           action = "escalated";
-          escalateSummary = `Seat ${session.role} wedged and could not be respawned — no activity for ${Math.round(idleMinutes)}m`;
           const current = this.sessions.get(session.sessionId) ?? session;
           // respawnCrewmate stops first; once status is stopped/lost the seat
           // was consumed even if spawn failed — spend stands. Leave those
           // terminal rows alone: rewriting them as wedged with a dead pane
-          // strands a seat nothing reconsiders. Captain notify is recorded
-          // durably below and discharged without requiring a live/wedged seat.
+          // strands a seat nothing reconsiders. Write-ahead pending already
+          // records the Captain obligation and is discharged below.
           if (current.status !== "stopped" && current.status !== "lost") {
             this.setWedgeRespawns(session.taskId, session.role, used);
             this.persistSessionWedged(current);
@@ -898,7 +917,8 @@ export class ToolSurface {
   /**
    * Durable record that the Captain must be told about this wedge outcome.
    * Idempotent per sessionId (latest summary wins). Survives seat mutation and
-   * daemon restart until dischargePendingWedgeCaptainNotify clears it.
+   * daemon restart until dischargePendingWedgeCaptainNotify clears it (or a
+   * successful respawn clears the provisional entry without escalate).
    */
   private recordPendingWedgeCaptainNotify(
     taskId: string,
@@ -928,6 +948,24 @@ export class ToolSurface {
         },
       ],
       updatedAt: now,
+    });
+  }
+
+  /**
+   * Drop a provisional Captain-notify without escalating. Used only when a
+   * seat-consuming respawn fully succeeded so the write-ahead obligation is
+   * no longer needed. Does not mark ladder completion (caller does that).
+   */
+  private clearPendingWedgeCaptainNotify(taskId: string, sessionId: string): void {
+    const task = this.tasks.get(taskId);
+    if (task === undefined) return;
+    const pending = task.wedgePendingCaptainNotifies ?? [];
+    const remaining = pending.filter((n) => n.sessionId !== sessionId);
+    if (remaining.length === pending.length) return;
+    this.saveTask({
+      ...task,
+      wedgePendingCaptainNotifies: remaining,
+      updatedAt: new Date().toISOString(),
     });
   }
 

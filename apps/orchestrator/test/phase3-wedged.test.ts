@@ -861,4 +861,78 @@ describe("structural WEDGED ladder", () => {
     expect(events.some((e) => e.type === "captain.escalation")).toBe(false);
     expect(events.some((e) => e.type === "afk.auto_answered")).toBe(true);
   });
+
+  it("write-ahead pending before seat-consuming respawn so crash after stop still escalates", () => {
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    // Capture durable state at the first stop write for this seat — that is the
+    // process-death window between spend/stop and post-outcome work. Restoring
+    // only that snapshot simulates kill -9 inside the window (not after catch).
+    type MidFlightTask = {
+      sessions: Array<{ sessionId: string; status: string }>;
+      wedgeRespawnsByRole: Record<string, number>;
+      wedgePendingCaptainNotifies: unknown[];
+    };
+    let midFlight: MidFlightTask | null = null;
+    const tools = service.tools as unknown as {
+      saveTask: (task: MidFlightTask) => void;
+    };
+    const originalSaveTask = tools.saveTask.bind(service.tools);
+    tools.saveTask = (task: MidFlightTask) => {
+      originalSaveTask(task);
+      if (midFlight !== null) return;
+      const row = task.sessions.find((s) => s.sessionId === sessionId);
+      if (row?.status === "stopped") {
+        midFlight = JSON.parse(JSON.stringify(service.tools.getTask(taskId))) as MidFlightTask;
+      }
+    };
+
+    const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+    service.tmux.newWindow = () => {
+      throw new Error("simulated spawn refusal after stop");
+    };
+
+    try {
+      service.tools.reconcileWedgedSessions(Date.now());
+    } finally {
+      tools.saveTask = originalSaveTask;
+      service.tmux.newWindow = originalNewWindow;
+    }
+
+    expect(midFlight).not.toBeNull();
+    // Obligation must already exist at stop — write-ahead, not post-catch.
+    expect(midFlight!.wedgePendingCaptainNotifies).toHaveLength(1);
+    expect(midFlight!.wedgeRespawnsByRole[role]).toBe(1);
+    expect(midFlight!.sessions.find((s) => s.sessionId === sessionId)?.status).toBe("stopped");
+
+    writeFileSync(
+      join(home, "runs", taskId, "task.json"),
+      `${JSON.stringify(midFlight, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const restarted = fleet({ home, start: false });
+    const reEvents: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => reEvents.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies).toHaveLength(1);
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      0,
+    );
+    expect(restarted.service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    // Ledger not double-spent across the restart recovery.
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+
+    reEvents.length = 0;
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+  });
 });
