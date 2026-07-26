@@ -8,9 +8,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { EventStore } from "@agent-os/event-store";
+import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { observabilityConfigSchema, type OrchestratorEvent } from "@agent-os/protocol";
+import { ConfigService } from "../src/config/service.js";
+import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
 import { PipelineWatcher } from "../src/pipeline/watcher.js";
+import { buildServer } from "../src/server/app.js";
 import {
   eventMatchesSurface,
   eventMatchesWakeOn,
@@ -661,5 +666,126 @@ describe("PipelineWatcher", () => {
     watcher.tick();
     expect(watcher.status().transport).toBe("wal-assisted");
     watcher.stop();
+  });
+
+  it("drops runs that leave the SQL-visible set from liveSnapshots", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-live-drop-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', NULL, 'round 1', ?, NULL, NULL)`,
+    ).run(now);
+    db.close();
+
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: () => undefined,
+    });
+    watcher.start();
+    expect(watcher.liveSnapshots().some((r) => r.runId === "run1")).toBe(true);
+
+    // Age the run outside the recency window and mark terminal so SQL drops it.
+    const writer = new Database(join(gateHome, "state.sqlite"));
+    writer
+      .prepare(
+        `UPDATE runs SET status = 'completed', updated_at = ? WHERE id = 'run1'`,
+      )
+      .run(now - 7 * 60 * 60);
+    writer.close();
+    watcher.tick();
+
+    expect(watcher.liveSnapshots()).toHaveLength(0);
+    watcher.stop();
+  });
+
+  it("GET /v1/pipeline/runs does not report event-store ghosts outside the live set", async () => {
+    // Fails on the pre-fix behaviour: rebuilding cards from durable
+    // pipeline.run_updated frames resurrects non-terminal history the watcher
+    // no longer considers live.
+    const agentHome = mkdtempSync(join(tmpdir(), "p9-ghost-home-"));
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-ghost-gate-"));
+    homes.push(agentHome, gateHome);
+    mkdirSync(join(agentHome, "config"), { recursive: true });
+    buildGate(gateHome).close();
+
+    const { store } = EventStore.open(agentHome);
+    store.append({
+      type: "pipeline.run_updated",
+      payload: {
+        runId: "ghost-run-outside-window",
+        branch: "phase-x/ghost",
+        status: "running",
+        headSha: "deadbeef",
+        prUrl: null,
+        error: null,
+        intent: "should not appear",
+        steps: [
+          {
+            step: "review",
+            order: 0,
+            status: "running",
+            findingsCount: 0,
+            findings: [],
+            lastActivity: "stale",
+            lastActivityAt: new Date().toISOString(),
+            durationMs: null,
+            agentPid: null,
+          },
+        ],
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (event) => {
+        store.append(event);
+      },
+    });
+    watcher.start();
+    // Gate has no runs — live set is empty even though the durable log has a
+    // non-terminal pipeline.run_updated frame.
+    expect(watcher.liveSnapshots()).toHaveLength(0);
+    expect(watcher.status().compatibility.ok).toBe(true);
+
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(agentHome, "config"));
+    config.installDefaults();
+    const token = "ghost-test-token-0001";
+    const app = buildServer({
+      store,
+      config,
+      token,
+      home: agentHome,
+      port: 0,
+      startedAt: new Date().toISOString(),
+      logger: pino({ level: "silent" }),
+      pipeline: watcher,
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/pipeline/runs",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      runs: Array<{ runId: string; status: string }>;
+      unavailable: boolean;
+    };
+    expect(body.unavailable).toBe(false);
+    expect(body.runs.some((r) => r.runId === "ghost-run-outside-window")).toBe(false);
+    expect(body.runs.some((r) => r.status === "running")).toBe(false);
+
+    watcher.stop();
+    await app.close();
   });
 });

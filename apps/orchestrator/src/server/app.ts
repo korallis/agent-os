@@ -786,16 +786,15 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
             : null),
       };
     }
-    const { events } = deps.store.eventsOfTypes(["pipeline.run_updated"], 500);
     void reply;
-    // Newest-first: keep only the latest frame per run id.
-    const latest = new Map<string, unknown>();
-    for (const envelope of events) {
-      if (envelope.event.type !== "pipeline.run_updated") continue;
-      const snapshot = envelope.event.payload;
-      if (!latest.has(snapshot.runId)) latest.set(snapshot.runId, snapshot);
-    }
-    return { runs: [...latest.values()], unavailable: false as const, reason: null };
+    // Serve the watcher's SQL-visible set only — never rebuild from durable
+    // pipeline.run_updated history, which would resurrect ghosts that left the
+    // gate without a terminal emission (or fell outside the recency window).
+    return {
+      runs: deps.pipeline.liveSnapshots(),
+      unavailable: false as const,
+      reason: null,
+    };
   });
 
   // ── Network I/O (§7 Network I/O Detail, Figma 41:4815) ────────────────

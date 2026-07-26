@@ -3,7 +3,7 @@
  * Phase 9 executable gates (master plan §11 Phase 9, [R7]) — live pipeline
  * visibility and configurable observability.
  *
- *   G1  a run appears in the Console within 1 s of a state change
+ *   G1  a run appears in the Console (browser) within 1 s under quiet
  *   G2  step log output streams incrementally, not as a replay
  *   G3  a run parked on a gate is unmistakably "needs a decision", with findings
  *   G4  schema drift degrades VISIBLY — never stale rows rendered as current
@@ -200,17 +200,54 @@ try {
     );
   }
 
-  // ── G1 — a state change reaches the API within 1 s ────────────────────
+  // Console must be up before G1: the claim is Console visibility, not API.
+  consoleServer = spawn(
+    join(ROOT, "apps", "console", "node_modules", ".bin", "next"),
+    ["start", "-p", String(CONSOLE_PORT), "-H", "127.0.0.1"],
+    {
+      cwd: join(ROOT, "apps", "console"),
+      env: { ...process.env, AGENTOS_HOME: home, AGENTOS_PORT: String(PORT) },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   {
+    const upDeadline = Date.now() + 90_000;
+    let up = false;
+    while (Date.now() < upDeadline && !up) {
+      try {
+        up = (await fetch(`${CONSOLE}/pipeline`)).status < 500;
+      } catch {
+        // not up
+      }
+      if (!up) await sleep(300);
+    }
+    if (!up) throw new Error("console did not start");
+  }
+
+  browser = await chromium.launch();
+  const page = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
+
+  // ── G1 — a state change appears in the Console within 1 s under quiet ─
+  // Quiet is the shipped default. The assertion is Playwright against the
+  // rendered page body — polling /v1/pipeline/runs alone would pass with a
+  // broken Console.
+  {
+    const profile = (await get("/v1/config/effective")).config?.observability?.activeProfile;
+    if (profile !== "quiet") {
+      throw new Error(`G1 requires the shipped quiet default; activeProfile=${profile}`);
+    }
+    await page.goto(`${CONSOLE}/pipeline`, { waitUntil: "networkidle" });
+    await sleep(800);
+    const branch = "phase-x/second";
     const started = Date.now();
-    seedRun(fixtureDb, "01RUNFIXTURE0000000000002", "phase-x/second", [
+    seedRun(fixtureDb, "01RUNFIXTURE0000000000002", branch, [
       { name: "intent", status: "completed" },
       { name: "review", status: "running", lastActivity: "auto-fix 1/3" },
     ]);
     let seen = false;
     while (Date.now() - started < 3000) {
-      const runs = (await get("/v1/pipeline/runs")).runs ?? [];
-      if (runs.some((r) => r.runId === "01RUNFIXTURE0000000000002")) {
+      const text = (await page.textContent("body")) ?? "";
+      if (text.includes(branch)) {
         seen = true;
         break;
       }
@@ -219,9 +256,9 @@ try {
     const elapsed = Date.now() - started;
     gate(
       "G1",
-      "a pipeline state change is visible within 1 s",
+      "a pipeline run appears in the Console within 1 s under quiet",
       seen && elapsed <= 1000,
-      `seen=${seen} in ${elapsed}ms`,
+      `seen=${seen} in ${elapsed}ms profile=${profile}`,
     );
   }
 
@@ -336,33 +373,6 @@ try {
       `modified=${changed.length} added=${added.length}${added.length > 0 ? ` (${added.slice(0, 3).join(", ")})` : ""}`,
     );
   }
-
-  // ── Console-side gates ────────────────────────────────────────────────
-  consoleServer = spawn(
-    join(ROOT, "apps", "console", "node_modules", ".bin", "next"),
-    ["start", "-p", String(CONSOLE_PORT), "-H", "127.0.0.1"],
-    {
-      cwd: join(ROOT, "apps", "console"),
-      env: { ...process.env, AGENTOS_HOME: home, AGENTOS_PORT: String(PORT) },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  {
-    const upDeadline = Date.now() + 90_000;
-    let up = false;
-    while (Date.now() < upDeadline && !up) {
-      try {
-        up = (await fetch(`${CONSOLE}/pipeline`)).status < 500;
-      } catch {
-        // not up
-      }
-      if (!up) await sleep(300);
-    }
-    if (!up) throw new Error("console did not start");
-  }
-
-  browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
 
   // ── G3 — a parked gate is unmistakably a decision point ───────────────
   {
@@ -569,14 +579,27 @@ try {
     const afterQuiet = await countLogFrames();
     const quietBlocks = afterQuiet === beforeQuiet;
 
-    // ── axis 2: surface — SSE under quiet must filter pipeline.* ────────
-    // Quiet surfaces task./captain./brain.down/pipeline.unavailable only.
-    // A live pipeline.run_updated must not reach the Console SSE path; a
-    // captain.escalation must. Collect a fixed window (do not wait for the
-    // blocked type — it must never arrive).
+    // ── axis 2: surface — quiet admits run cards, not log firehose ──────
+    // Quiet surfaces pipeline.run_updated (so the Console can show that a run
+    // exists within 1s) plus task./captain./brain.down/pipeline.unavailable.
+    // pipeline.log_appended stays off the live path (and is not emitted at all
+    // while streamPipelineLogs is false).
     const quietEscalationSummary = `G7-quiet-surface-${Date.now()}`;
     const quietRunId = `01RUNG7QUIET${String(Date.now()).slice(-10)}`;
-    const quietSsePromise = readSse(() => false, 4000);
+    const quietSsePromise = readSse(
+      (frames) =>
+        frames.some(
+          (f) =>
+            f.event?.type === "pipeline.run_updated" &&
+            f.event?.payload?.runId === quietRunId,
+        ) &&
+        frames.some(
+          (f) =>
+            f.event?.type === "captain.escalation" &&
+            f.event?.payload?.summary === quietEscalationSummary,
+        ),
+      5000,
+    );
     await sleep(300);
     seedRun(fixtureDb, quietRunId, "phase-x/g7-quiet", [
       { name: "review", status: "running", lastActivity: "g7 quiet surface" },
@@ -591,10 +614,18 @@ try {
         f.event?.type === "captain.escalation" &&
         f.event?.payload?.summary === quietEscalationSummary,
     );
-    const quietBlocksPipelineSse = !quietFrames.some(
-      (f) => f.event?.type === "pipeline.run_updated",
+    const quietSurfacesRunUpdated = quietFrames.some(
+      (f) =>
+        f.event?.type === "pipeline.run_updated" &&
+        f.event?.payload?.runId === quietRunId,
     );
-    // Durable store still has the run update — filtering is live-path only.
+    const quietBlocksLogSse = !quietFrames.some(
+      (f) => f.event?.type === "pipeline.log_appended",
+    );
+    const quietSurfaceListsRunUpdated = (quiet?.surface ?? []).includes(
+      "pipeline.run_updated",
+    );
+    // Durable store still has the run update.
     const durableHasQuietRun = (
       (await get("/v1/events/replay?types=pipeline.run_updated&limit=200")).events ?? []
     ).some((e) => e.event?.payload?.runId === quietRunId);
@@ -699,7 +730,9 @@ try {
         quietBlocks &&
         firehoseStreams &&
         quietSurfacesEscalation &&
-        quietBlocksPipelineSse &&
+        quietSurfacesRunUpdated &&
+        quietBlocksLogSse &&
+        quietSurfaceListsRunUpdated &&
         durableHasQuietRun &&
         firehoseSurfacesPipeline &&
         quietWarnWoke &&
@@ -712,7 +745,9 @@ try {
         `quietBlocks=${quietBlocks}`,
         `firehoseStreams=${firehoseStreams}`,
         `quietSseEscalation=${quietSurfacesEscalation}`,
-        `quietSseBlocksPipeline=${quietBlocksPipelineSse}`,
+        `quietSseRunUpdated=${quietSurfacesRunUpdated}`,
+        `quietSseBlocksLog=${quietBlocksLogSse}`,
+        `quietSurfaceRunUpdated=${quietSurfaceListsRunUpdated}`,
         `durableQuietRun=${durableHasQuietRun}`,
         `firehoseSsePipeline=${firehoseSurfacesPipeline}`,
         `quietWarnWoke=${quietWarnWoke}`,

@@ -8,9 +8,17 @@
   activeProfile: "quiet",
 
   profiles: {
-    // The shipped default: only what needs a decision.
+    // The shipped default: decisions and run-level gate state, not log volume.
+    // pipeline.run_updated is intentionally on the surface so the Console can
+    // show that a run exists within the 1s budget without opting into log firehose.
     quiet: {
-      surface: ["task.", "captain.", "brain.down", "pipeline.unavailable"],
+      surface: [
+        "task.",
+        "captain.",
+        "brain.down",
+        "pipeline.unavailable",
+        "pipeline.run_updated",
+      ],
       streamPipelineLogs: false,
       pipelineLogChars: 0,
       wakeOn: ["captain.escalation"],

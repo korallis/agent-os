@@ -135,6 +135,12 @@ export class PipelineWatcher {
   };
   /** runId → last emitted fingerprint, so unchanged state emits nothing. */
   private readonly lastFingerprint = new Map<string, string>();
+  /**
+   * SQL-visible runs from the last successful structured tick. The REST API
+   * serves this map so durable event-store history cannot resurrect ghosts that
+   * have left the gate or fallen outside the recency window.
+   */
+  private liveSnapshotsById = new Map<string, PipelineRunSnapshot>();
   /** Log tail offsets, so each poll emits only newly appended bytes. */
   private readonly logOffsets = new Map<string, number>();
   private lastPollAt: number | null = null;
@@ -249,6 +255,16 @@ export class PipelineWatcher {
   }
 
   /**
+   * Current SQL-visible run cards from the last successful tick. Empty when the
+   * view is unreadable or watching is disabled — never historical event-store
+   * frames the gate no longer considers live.
+   */
+  liveSnapshots(): PipelineRunSnapshot[] {
+    if (!this.compatibility.ok || this.transport === "unavailable") return [];
+    return [...this.liveSnapshotsById.values()];
+  }
+
+  /**
    * Apply hot-reloaded knobs. Starts/stops watching and rebuilds the interval
    * when the poll cadence changes — no daemon restart required.
    */
@@ -292,6 +308,9 @@ export class PipelineWatcher {
     // A (re)start must re-project current runs — fingerprints from a prior
     // session would suppress the frames the Console needs to leave unreadable.
     this.lastFingerprint.clear();
+    // Drop the previous SQL-visible set until the first successful tick rebuilds
+    // it; otherwise a re-attach could briefly serve cards the gate no longer has.
+    this.liveSnapshotsById = new Map();
     // Drop prior log offsets so the next first-sight re-seeds to current size
     // instead of replaying every byte written while the watcher was stopped.
     this.logOffsets.clear();
@@ -397,6 +416,7 @@ export class PipelineWatcher {
       missingColumns,
     };
     this.transport = "unavailable";
+    this.liveSnapshotsById = new Map();
     this.incompatibilityReported = false;
     this.reportIncompatibility();
   }
@@ -474,6 +494,7 @@ export class PipelineWatcher {
       );
 
       const streamLogs = this.profile().streamPipelineLogs;
+      const nextLive = new Map<string, PipelineRunSnapshot>();
 
       for (const run of runs) {
         const rows = stepStmt.all(run.id) as Array<{
@@ -515,6 +536,7 @@ export class PipelineWatcher {
           steps,
           updatedAt: secondsToIso(run.updated_at),
         };
+        nextLive.set(run.id, snapshot);
 
         // Emit only on genuine change — a per-tick event for unchanged state
         // would bury the transitions that matter under its own noise.
@@ -532,6 +554,14 @@ export class PipelineWatcher {
           this.emitLogTail(run.id, active.step_name, active.log_path, streamLogs);
         }
       }
+
+      // Drop runs that left the SQL-visible set (terminal + outside recency,
+      // deleted, or aged out). Fingerprints for dropped ids would otherwise
+      // suppress a re-appearance after a long gap.
+      for (const id of this.lastFingerprint.keys()) {
+        if (!nextLive.has(id)) this.lastFingerprint.delete(id);
+      }
+      this.liveSnapshotsById = nextLive;
 
       this.structuredReadFailures = 0;
       this.lastPollAt = Date.now();

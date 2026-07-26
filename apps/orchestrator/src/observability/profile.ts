@@ -24,7 +24,13 @@ export function resolveActiveProfile(config: ObservabilityConfig): {
     return {
       name: "quiet",
       profile: {
-        surface: ["task.", "captain.", "brain.down", "pipeline.unavailable"],
+        surface: [
+          "task.",
+          "captain.",
+          "brain.down",
+          "pipeline.unavailable",
+          "pipeline.run_updated",
+        ],
         streamPipelineLogs: false,
         pipelineLogChars: 0,
         wakeOn: ["captain.escalation"],

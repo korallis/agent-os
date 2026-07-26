@@ -13,13 +13,12 @@ import { useEventStream } from "@/lib/useEventStream";
  * gate's own state, republished onto Agent OS's event log, so it arrives over
  * the same SSE path as everything else.
  *
- * Quiet-by-default vs live pipeline page: the active observability profile
- * filters the general Console live log (so under `quiet`, pipeline.run_updated
- * does not flood LogStream). Opening /pipeline is the Captain's intent to watch
- * the gate, so this page always short-polls REST for run cards rather than
- * depending on profile-gated SSE frames for its invalidation cursor. SSE still
- * supplies log_appended chunks when the profile streams them, and config.changed
- * still refreshes profile knobs without a full reload.
+ * Latency under quiet: quiet surfaces pipeline.run_updated (run-level state is
+ * not log firehose) so this page invalidates from those SSE frames and hits the
+ * 1s Console budget without a 1s REST poll floor. A short REST poll remains as
+ * a backstop when SSE is down or a frame is missed; streamPipelineLogs stays
+ * off under quiet so step-log volume is still opted into. config.changed still
+ * refreshes profile knobs without a full reload.
  *
  * The header states the TRANSPORT and the observed lag as fact. Labels match
  * modes that can actually occur today: WAL-assisted (fs.watch + poll floor) or
@@ -131,12 +130,18 @@ export function PipelineView() {
         envelope.event.payload.domain === "observability",
     )?.id ?? "none";
 
-  // Always short-poll while mounted: under quiet, pipeline.run_updated never
-  // reaches SSE, so a cursor on that frame would freeze the page after mount.
+  // Run-card frames (including under quiet) invalidate the REST snapshot.
+  const runUpdatedCursor =
+    events.find((envelope) => envelope.event.type === "pipeline.run_updated")?.id ?? "none";
+  const unavailableCursor =
+    events.find((envelope) => envelope.event.type === "pipeline.unavailable")?.id ?? "none";
+
+  // Short REST backstop (~400ms) so a missed SSE frame cannot freeze the page.
+  // Primary path is SSE-driven invalidation of pipeline.run_updated above.
   useEffect(() => {
     const id = setInterval(() => {
       setPollTick((n) => n + 1);
-    }, 1000);
+    }, 400);
     return () => clearInterval(id);
   }, []);
 
@@ -188,7 +193,7 @@ export function PipelineView() {
     return () => {
       cancelled = true;
     };
-  }, [pollTick, observabilityConfigCursor]);
+  }, [pollTick, observabilityConfigCursor, runUpdatedCursor, unavailableCursor]);
 
   // Append-only by event id, then window with pipelineLogChars. Rebuilding the
   // whole string from the capped SSE ring would drop middle text when frames
