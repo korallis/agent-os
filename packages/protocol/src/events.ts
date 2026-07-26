@@ -670,6 +670,8 @@ export const pipelineLogAppendedEventSchema = z.strictObject({
     runId: z.string(),
     step: z.string(),
     chunk: z.string(),
+    /** Byte offset of `chunk` in the step log file (for attach/stream de-dupe). */
+    offset: z.number().int().min(0),
   }),
 });
 

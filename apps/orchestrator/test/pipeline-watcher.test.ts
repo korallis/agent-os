@@ -14,7 +14,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { observabilityConfigSchema, type OrchestratorEvent } from "@agent-os/protocol";
 import { ConfigService } from "../src/config/service.js";
 import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
-import { PipelineWatcher } from "../src/pipeline/watcher.js";
+import {
+  PIPELINE_LOG_CHUNK_MAX,
+  PIPELINE_LOG_DRAIN_MAX_BYTES,
+  PIPELINE_LOG_DRAIN_MAX_CHUNKS,
+  PipelineWatcher,
+} from "../src/pipeline/watcher.js";
 import { buildServer } from "../src/server/app.js";
 import {
   eventMatchesSurface,
@@ -1091,8 +1096,11 @@ describe("PipelineWatcher", () => {
     expect(seeded.tails).toHaveLength(1);
     expect(seeded.tails[0]?.text).toContain("prior-line-one");
     expect(seeded.tails[0]?.text).toContain("prior-line-two");
+    expect(typeof seeded.tails[0]?.startOffset).toBe("number");
+    expect(typeof seeded.tails[0]?.endOffset).toBe("number");
 
-    // Aligning the offset to EOF means a subsequent append emits only new bytes.
+    // First-sight offset already sits at EOF; pure-read catch-up leaves it there
+    // so a subsequent append still emits only new bytes.
     events.length = 0;
     appendFileSync(logPath, "after-seed\n");
     watcher.tick();
@@ -1101,12 +1109,169 @@ describe("PipelineWatcher", () => {
     if (logs[0]?.type === "pipeline.log_appended") {
       expect(logs[0].payload.chunk).toContain("after-seed");
       expect(logs[0].payload.chunk).not.toContain("prior-line-one");
+      expect(typeof logs[0].payload.offset).toBe("number");
     }
 
     streamLogs = false;
     const quiet = watcher.activeLogTails();
     expect(quiet.streamPipelineLogs).toBe(false);
     expect(quiet.tails).toHaveLength(0);
+    watcher.stop();
+  });
+
+  it("activeLogTails does not advance logOffsets so unread SSE region still streams", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-pure-tail-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "seed\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 20_000 }),
+    });
+    watcher.start();
+    const offsets = (watcher as unknown as { logOffsets: Map<string, number> }).logOffsets;
+    const key = "run1:review";
+    const offsetBeforeGrowth = offsets.get(key);
+    expect(offsetBeforeGrowth).toBeDefined();
+
+    appendFileSync(logPath, "UNREAD_BY_SSE_YET\n");
+    const offsetBeforeTails = offsets.get(key);
+    expect(offsetBeforeTails).toBe(offsetBeforeGrowth);
+
+    const tails = watcher.activeLogTails();
+    expect(tails.tails.some((t) => t.text.includes("UNREAD_BY_SSE_YET"))).toBe(true);
+    expect(offsets.get(key)).toBe(offsetBeforeTails);
+
+    events.length = 0;
+    watcher.tick();
+    const logs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(logs.length).toBeGreaterThanOrEqual(1);
+    const joined = logs
+      .map((e) => (e.type === "pipeline.log_appended" ? e.payload.chunk : ""))
+      .join("");
+    expect(joined).toContain("UNREAD_BY_SSE_YET");
+    watcher.stop();
+  });
+
+  it("drains multi-chunk log growth within a bounded number of ticks", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-multichunk-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "seed\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 200_000 }),
+    });
+    watcher.start();
+
+    // Two full chunks plus a marker — one-chunk-per-tick would need 3 ticks.
+    const burst = "A".repeat(PIPELINE_LOG_CHUNK_MAX * 2) + "MULTI_CHUNK_END\n";
+    appendFileSync(logPath, burst);
+    events.length = 0;
+    watcher.tick();
+    const firstTickLogs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(firstTickLogs.length).toBeGreaterThan(1);
+    expect(firstTickLogs.length).toBeLessThanOrEqual(PIPELINE_LOG_DRAIN_MAX_CHUNKS);
+
+    let joined = firstTickLogs
+      .map((e) => (e.type === "pipeline.log_appended" ? e.payload.chunk : ""))
+      .join("");
+    // Full drain of ~2 chunks fits one tick's bound; if not, finish within bound ticks.
+    let ticks = 1;
+    const maxTicks =
+      Math.ceil(burst.length / PIPELINE_LOG_CHUNK_MAX) + 1;
+    while (!joined.includes("MULTI_CHUNK_END") && ticks < maxTicks) {
+      events.length = 0;
+      watcher.tick();
+      const more = events.filter((e) => e.type === "pipeline.log_appended");
+      joined += more
+        .map((e) => (e.type === "pipeline.log_appended" ? e.payload.chunk : ""))
+        .join("");
+      ticks += 1;
+    }
+    expect(joined).toContain("MULTI_CHUNK_END");
+    expect(ticks).toBeLessThanOrEqual(Math.ceil(burst.length / PIPELINE_LOG_CHUNK_MAX));
+    watcher.stop();
+  });
+
+  it("reports logBehind when unread growth exceeds the per-tick drain bound", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-log-behind-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "seed\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 200_000 }),
+    });
+    watcher.start();
+
+    const overflow = PIPELINE_LOG_DRAIN_MAX_BYTES + PIPELINE_LOG_CHUNK_MAX;
+    appendFileSync(logPath, "B".repeat(overflow));
+    watcher.tick();
+
+    const status = watcher.status();
+    expect(status.logBehind.length).toBe(1);
+    expect(status.logBehind[0]?.runId).toBe("run1");
+    expect(status.logBehind[0]?.step).toBe("review");
+    expect(status.logBehind[0]?.unreadBytes ?? 0).toBeGreaterThan(0);
+
+    // Catch up fully over subsequent ticks; behind clears when drained.
+    for (let i = 0; i < 8; i += 1) {
+      watcher.tick();
+      if (watcher.status().logBehind.length === 0) break;
+    }
+    expect(watcher.status().logBehind).toEqual([]);
     watcher.stop();
   });
 

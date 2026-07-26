@@ -800,8 +800,8 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
   /**
    * Bounded attach-time log catch-up for active steps. Honours the active
    * profile's streamPipelineLogs / pipelineLogChars so quiet cannot be
-   * bypassed, and aligns the watcher's SSE offset to EOF so the seed and the
-   * first pipeline.log_appended frames do not overlap.
+   * bypassed. Pure read — does not move the watcher's streaming offsets;
+   * clients de-dupe seed vs SSE by byte offset.
    */
   app.get("/v1/pipeline/log-tails", async (_request, reply) => {
     if (deps.pipeline === undefined) {

@@ -99,6 +99,10 @@ export interface PipelineLogTail {
   step: string;
   text: string;
   truncated: boolean;
+  /** Inclusive start byte offset of `text` in the step log file. */
+  startOffset: number;
+  /** Exclusive end byte offset of `text` in the step log file. */
+  endOffset: number;
 }
 
 export interface PipelineLogTailsResult {
@@ -107,8 +111,21 @@ export interface PipelineLogTailsResult {
   tails: PipelineLogTail[];
 }
 
+/** Per-step unread log growth that exceeded the per-tick drain bound. */
+export interface PipelineLogBehind {
+  runId: string;
+  step: string;
+  unreadBytes: number;
+}
+
 const MAX_STRUCTURED_READ_FAILURES = 3;
-const LOG_CHUNK_MAX = 16_384;
+/** Per-frame log slice size (bytes). */
+export const PIPELINE_LOG_CHUNK_MAX = 16_384;
+/** Max frames drained from one step log in a single tick. */
+export const PIPELINE_LOG_DRAIN_MAX_CHUNKS = 8;
+/** Cap total log bytes drained per step per tick. */
+export const PIPELINE_LOG_DRAIN_MAX_BYTES =
+  PIPELINE_LOG_CHUNK_MAX * PIPELINE_LOG_DRAIN_MAX_CHUNKS;
 /** Floor between WAL-driven ticks so dense notifications cannot storm the loop. */
 const WAL_TICK_COALESCE_MS = 75;
 const SQLITE_BUSY_TIMEOUT_MS = 250;
@@ -174,6 +191,11 @@ export class PipelineWatcher {
    * Powers attach-time catch-up without replaying into the durable event log.
    */
   private readonly stepLogPaths = new Map<string, string>();
+  /**
+   * Steps whose file growth exceeded the per-tick drain bound — unread bytes
+   * remain after the last emitLogTail. Cleared when the stream catches up.
+   */
+  private readonly logBehind = new Map<string, number>();
   private lastPollAt: number | null = null;
   /** Emitted once per incompatibility, not once per tick. */
   private incompatibilityReported = false;
@@ -279,12 +301,26 @@ export class PipelineWatcher {
     /** ms since the last successful structured read; null when never read. */
     lagMs: number | null;
     home: string;
+    /** Active steps whose log stream is behind the on-disk file. */
+    logBehind: PipelineLogBehind[];
   } {
+    const logBehind: PipelineLogBehind[] = [];
+    for (const [key, unreadBytes] of this.logBehind) {
+      if (unreadBytes <= 0) continue;
+      const sep = key.indexOf(":");
+      if (sep === -1) continue;
+      logBehind.push({
+        runId: key.slice(0, sep),
+        step: key.slice(sep + 1),
+        unreadBytes,
+      });
+    }
     return {
       transport: this.transport,
       compatibility: this.compatibility,
       lagMs: this.lastPollAt === null ? null : Date.now() - this.lastPollAt,
       home: this.home,
+      logBehind,
     };
   }
 
@@ -300,9 +336,9 @@ export class PipelineWatcher {
 
   /**
    * Bounded tail of each currently active step log for Console attach-time
-   * catch-up. Reads the file directly (last `pipelineLogChars`) and aligns the
-   * watcher's offset to EOF so subsequent `pipeline.log_appended` frames do not
-   * overlap the seed. Does not append into the durable event log.
+   * catch-up. Pure read — does not advance streaming logOffsets, so the SSE
+   * path continues from its prior position. Overlap with live frames is
+   * resolved by byte offset on the client.
    *
    * Under quiet (`streamPipelineLogs: false`) returns no tails so catch-up
    * cannot bypass the profile's deliberate log suppression.
@@ -338,17 +374,13 @@ export class PipelineWatcher {
           }
           text = buffer.toString("utf8");
         }
-        // Align SSE boundary to EOF so the seed and first log_appended frames
-        // meet exactly at `size` rather than overlapping by text de-dupe.
-        const known = this.logOffsets.get(key);
-        if (known === undefined || known < size) {
-          this.logOffsets.set(key, size);
-        }
         tails.push({
           runId,
           step,
           text,
           truncated: size > pipelineLogChars,
+          startOffset: start,
+          endOffset: size,
         });
       } catch {
         // Best-effort; structured cards remain the source of truth.
@@ -400,6 +432,7 @@ export class PipelineWatcher {
     // Drop prior log offsets so the next first-sight re-seeds to current size
     // instead of replaying every byte written while the watcher was stopped.
     this.logOffsets.clear();
+    this.logBehind.clear();
     this.stepLogPaths.clear();
     this.incompatibilityReported = false;
     this.structuredReadFailures = 0;
@@ -721,7 +754,13 @@ export class PipelineWatcher {
       for (const key of [...this.logOffsets.keys()]) {
         const sep = key.indexOf(":");
         const runId = sep === -1 ? key : key.slice(0, sep);
-        if (!nextLive.has(runId)) this.logOffsets.delete(key);
+        if (!nextLive.has(runId)) {
+          this.logOffsets.delete(key);
+          this.logBehind.delete(key);
+        }
+      }
+      for (const key of [...this.logBehind.keys()]) {
+        if (!nextLogPaths.has(key)) this.logBehind.delete(key);
       }
       this.liveSnapshotsById = nextLive;
       this.stepLogPaths.clear();
@@ -744,8 +783,9 @@ export class PipelineWatcher {
   /**
    * Track the active step log offset every tick. When `emit` is false (quiet
    * profile), jump the offset to EOF in one step so a later profile flip cannot
-   * replay residual quiet-period bytes. When emitting, sink first and only
-   * advance the offset after sink returns (same ordering as run fingerprints).
+   * replay residual quiet-period bytes. When emitting, drain in a bounded loop
+   * (multiple chunks / bytes per tick), sink-before-offset each frame, and
+   * record logBehind when unread growth still exceeds the per-tick bound.
    */
   private emitLogTail(runId: string, step: string, logPath: string, emit: boolean): void {
     try {
@@ -759,39 +799,70 @@ export class PipelineWatcher {
       // growth only.
       if (known === undefined) {
         this.logOffsets.set(key, size);
+        this.logBehind.delete(key);
         return;
       }
       if (size <= known) {
         // Truncation or rotation — resync rather than emitting garbage.
         if (size < known) this.logOffsets.set(key, size);
+        this.logBehind.delete(key);
         return;
       }
       // Non-streaming: snap to EOF immediately. Chunked catch-up here would leave
-      // a residual unread region after multi-LOG_CHUNK_MAX growth that a later
+      // a residual unread region after multi-chunk growth that a later
       // firehose/working flip would dump into the durable event log.
       if (!emit) {
         this.logOffsets.set(key, size);
+        this.logBehind.delete(key);
         return;
       }
-      const toRead = Math.min(LOG_CHUNK_MAX, size - known);
-      const buffer = Buffer.alloc(toRead);
+
+      let offset = known;
+      let drained = 0;
+      let chunks = 0;
       const fd = openSync(logPath, "r");
       try {
-        readSync(fd, buffer, 0, toRead, known);
+        while (
+          offset < size &&
+          chunks < PIPELINE_LOG_DRAIN_MAX_CHUNKS &&
+          drained < PIPELINE_LOG_DRAIN_MAX_BYTES
+        ) {
+          const toRead = Math.min(
+            PIPELINE_LOG_CHUNK_MAX,
+            size - offset,
+            PIPELINE_LOG_DRAIN_MAX_BYTES - drained,
+          );
+          if (toRead <= 0) break;
+          const buffer = Buffer.alloc(toRead);
+          readSync(fd, buffer, 0, toRead, offset);
+          const chunk = buffer.toString("utf8");
+          if (chunk.trim().length === 0) {
+            offset += toRead;
+            drained += toRead;
+            chunks += 1;
+            this.logOffsets.set(key, offset);
+            continue;
+          }
+          // Sink before advancing: if append fails, the next tick retries these bytes.
+          this.sink({
+            type: "pipeline.log_appended",
+            payload: { runId, step, chunk, offset },
+          });
+          offset += toRead;
+          drained += toRead;
+          chunks += 1;
+          this.logOffsets.set(key, offset);
+        }
       } finally {
         closeSync(fd);
       }
-      const chunk = buffer.toString("utf8");
-      if (chunk.trim().length === 0) {
-        this.logOffsets.set(key, known + toRead);
-        return;
+
+      const unread = size - offset;
+      if (unread > 0) {
+        this.logBehind.set(key, unread);
+      } else {
+        this.logBehind.delete(key);
       }
-      // Sink before advancing: if append fails, the next tick retries these bytes.
-      this.sink({
-        type: "pipeline.log_appended",
-        payload: { runId, step, chunk },
-      });
-      this.logOffsets.set(key, known + toRead);
     } catch {
       // Log tailing is best-effort; structured state is the source of truth.
     }

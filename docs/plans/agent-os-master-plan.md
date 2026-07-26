@@ -416,10 +416,11 @@ agentosd (:4710, AGENTOS_HOME=~/.agentos/secondmates/infra)
 | 8 | Project modes & `+yolo` scope | `projects.json5` + per-project | `pipeline`; yolo boundaries per §5.2 | next task |
 | 9 | Budgets & ceilings: per-connection soft/hard USD, per-task ceiling, Claude extra-usage daily cap, Brain token budget | `budgets.json5` | Gateway $25 hard; Claude extra-usage $10/day; task $5; Brain 200k tok/day (open Q) | yes |
 | 10 | Console layout preferences: default page, column density, wake-queue visibility | `console.json5` | as wireframed | yes |
-| 11 | Secondmate charters: domain, capacity, Brain model, routing acceptance | under secondmate home: `secondmates/<name>/config/charter.json5` (not primary global config) | none (created on provision) | on sync (live Brain model when running) |
+| 11 | **[R7]** Observability profiles: which event classes surface live, step-log streaming/retention, wake classes, pipeline watch + poll cadence | `observability.json5` | `activeProfile: quiet`; profiles quiet / working / firehose; watch on; poll 1000 ms | yes |
 | 12 | **Safety policies (default ON, Captain-only changes, mechanically enforced, overrides evidence-stamped):** cross-family builder≠validator; distinct planner families; RED-baseline gate requirement; scout read-only; verbatim-FAIL delivery; halt-cap-not-overridable-by-yolo; destructive-git denial | `policies.json5` | all ON | policy version bump; applies next task |
 | 13 | **Config-locked (not configurable in v1):** loopback-only bind; secret redaction; **quota-probe endpoint URLs [R5]** (exfiltration vector if configurable) | — | always on | — |
 | 14 | **[R5]** Quota probes: polling cadence, per-provider enable, best-effort feature flags (e.g. Grok consumer endpoint), threshold levels for `quota.threshold`, courtesy limits (min interval, jitter, back-off) | `quota.json5` | 5 min + on-demand + post-task; **probes auto-enabled per detected Pi connections at onboarding [R5.1]** (Grok best-effort ON when a Grok credential is detected); thresholds 80/95% + low-balance | yes |
+| 15 | Secondmate charters: domain, capacity, Brain model, routing acceptance | under secondmate home: `secondmates/<name>/config/charter.json5` (not primary global config) | none (created on provision) | on sync (live Brain model when running) |
 
 **Configurable ≠ unenforced (the critical nuance):** whatever is configured is enforced **mechanically by the substrate** — the Brain cannot bypass configured policy, silently or otherwise; only the Captain can change policy (Console auth or config file on disk, which only the OS user can write). Any run executed under a weakened safety policy carries `policyOverrides[]` in `summary.json` (what, when, by which config layer) and the Console badges it. **Config-locked justification:** loopback-only and secret redaction protect the *machine and credentials themselves*, not workflow preferences — a workflow knob misconfigured wastes tokens; these two misconfigured expose the host. They are defensible as non-configurable and remain so in v1.
 
@@ -756,7 +757,8 @@ Substrate boot sequence unchanged from Rev 2 (lock → migrate → replay NDJSON
 
 ### 5.9 Secondmates
 
-**[Phase 7 shipped]** isolation, cross-process broker grants, structured bearings, handover routing (task exists once), dual-restart reconcile — gates in `tooling/gates/phase-7.mjs`. **[R3]:** each secondmate runs its own Brain configured by its charter pack under `secondmates/<name>/config/charter.json5`; the primary Brain routes via `route_to_secondmate`, reads `read_secondmate_bearings`, and may `provision_secondmate`. **FF-only version sync** remains open (not gated).
+**[Phase 7 shipped]** isolation, cross-process broker grants, structured bearings, handover routing (task exists once), dual-restart reconcile — gates in `tooling/gates/phase-7.mjs`. **[R3]:** each secondmate runs its own Brain configured by its charter pack under `secondmates/<name>/config/charter.json5` (#15); the primary Brain routes via `route_to_secondmate`, reads `read_secondmate_bearings`, and may `provision_secondmate`. **FF-only version sync** remains open (not gated).
+
 
 ### 5.10 Brain skills
 
@@ -1340,7 +1342,7 @@ The Captain's framing: *"the purpose of this app is not just extremely good Agen
 - **Socket `subscribe` is NOT DONE.** no-mistakes v1.40.0 does expose a Unix-socket pub/sub surface, but it is undocumented and apparently unused even by its own TUI. Agent OS does not open that socket today; claiming `live`/`polled` from a path that never runs would be a false tick. If a socket subscribe path is built later, `live` can mean it.
 - **Read-only, always.** The watcher never writes to `~/.no-mistakes/`, never execs `axi run`/`respond`/`abort`. Driving the pipeline stays an explicit act.
 - **Version-drift is expected, not exceptional.** We are reading another tool's private state across versions (v1.41.2 is already out). A compatibility probe runs at attach: on an unrecognised schema the watcher **degrades visibly** — the surface says "pipeline state unreadable on no-mistakes vX" rather than rendering stale rows as current.
-- **Configurable visibility is the point, not a setting.** A new `observability.json5` config surface (**#15** — #11 remains secondmate charters in §2.6) defines *visibility profiles*: which event classes reach the Console, at what density, and which raise a wake. The default profile is quiet; the Captain opts into depth. This is the config-layered, hot-reloadable house pattern — not a per-page toggle.
+- **Configurable visibility is the point, not a setting.** A new `observability.json5` config surface (**#11** in §2.6; secondmate charters are **#15**) defines *visibility profiles*: which event classes reach the Console, at what density, and which raise a wake. The default profile is quiet; the Captain opts into depth. This is the config-layered, hot-reloadable house pattern — not a per-page toggle.
 
 Gates:
 - [ ] Transport honesty: the surface reports the transport actually in use (`wal-assisted` / `interval-only` / `unavailable`) **and the observed lag** — a fixture that attaches or loses the WAL watch must flip the label within one cycle. (`live` and the no-mistakes socket `subscribe` path are explicitly not claimed until implemented.)
