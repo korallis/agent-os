@@ -30,6 +30,7 @@ export function resolveActiveProfile(config: ObservabilityConfig): {
           "brain.down",
           "pipeline.unavailable",
           "pipeline.run_updated",
+          "quota.",
         ],
         streamPipelineLogs: false,
         pipelineLogChars: 0,

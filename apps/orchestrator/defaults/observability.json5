@@ -11,6 +11,8 @@
     // The shipped default: decisions and run-level gate state, not log volume.
     // pipeline.run_updated is intentionally on the surface so the Console can
     // show that a run exists within the 1s budget without opting into log firehose.
+    // quota. is operational state (usage strip / LIMIT REACHED), not log volume —
+    // Phase 6 G14 requires the strip to reflect quota.updated over SSE within 1s.
     quiet: {
       surface: [
         "task.",
@@ -18,6 +20,7 @@
         "brain.down",
         "pipeline.unavailable",
         "pipeline.run_updated",
+        "quota.",
       ],
       streamPipelineLogs: false,
       pipelineLogChars: 0,
@@ -26,7 +29,16 @@
 
     // Opt into fleet work visibility, including the gate, without the noise.
     working: {
-      surface: ["task.", "captain.", "brain.", "session.", "gate.", "fusion.", "pipeline."],
+      surface: [
+        "task.",
+        "captain.",
+        "brain.",
+        "session.",
+        "gate.",
+        "fusion.",
+        "pipeline.",
+        "quota.",
+      ],
       streamPipelineLogs: true,
       pipelineLogChars: 20000,
       wakeOn: ["captain.escalation", "pipeline.unavailable"],
