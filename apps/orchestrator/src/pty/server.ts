@@ -190,7 +190,18 @@ function streamPane(ws: WebSocket, target: string, tmux: TmuxController): void {
         failures = 0;
         if (captured !== last) {
           const next = seq + 1;
-          if (safeSend(ws, JSON.stringify({ type: "pane", seq: next, content: captured }))) {
+          // `target` rides on every frame so a reconnect's continuity is
+          // OBSERVABLE. The docstring above already claimed "a resumed stream
+          // reports the target it re-attached to" while the frame carried only
+          // seq and content, so a client — and the gate — could compare
+          // numbering but never pane identity. A reattach that silently landed
+          // on a different pane looked identical to a correct one.
+          if (
+            safeSend(
+              ws,
+              JSON.stringify({ type: "pane", seq: next, target, content: captured }),
+            )
+          ) {
             seq = next;
             last = captured;
           } else if (
