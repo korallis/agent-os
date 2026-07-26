@@ -1,0 +1,66 @@
+{
+  // Config surface #11 — visibility profiles (master plan §11 Phase 9, [R7]).
+  //
+  // Visibility is the product, and it is the Captain's to configure. The
+  // shipped default is deliberately QUIET: depth is opted into, never opted
+  // out of, so a fresh install does not bury the signals that matter under a
+  // firehose the Captain never asked for.
+  activeProfile: "quiet",
+
+  profiles: {
+    // The shipped default: decisions and run-level gate state, not log volume.
+    // pipeline.run_updated is intentionally on the surface so the Console can
+    // show that a run exists within the 1s budget without opting into log firehose.
+    // quota. is operational state (usage strip / LIMIT REACHED), not log volume —
+    // Phase 6 G14 requires the strip to reflect quota.updated over SSE within 1s.
+    quiet: {
+      surface: [
+        "task.",
+        "captain.",
+        "brain.down",
+        "pipeline.unavailable",
+        "pipeline.run_updated",
+        "quota.",
+      ],
+      streamPipelineLogs: false,
+      pipelineLogChars: 0,
+      wakeOn: ["captain.escalation"],
+    },
+
+    // Opt into fleet work visibility, including the gate, without the noise.
+    working: {
+      surface: [
+        "task.",
+        "captain.",
+        "brain.",
+        "session.",
+        "gate.",
+        "fusion.",
+        "pipeline.",
+        "quota.",
+      ],
+      streamPipelineLogs: true,
+      pipelineLogChars: 20000,
+      wakeOn: ["captain.escalation", "pipeline.unavailable"],
+    },
+
+    // Everything the fleet emits ("*" is the explicit wildcard — a blank
+    // prefix is rejected, so a value left empty can never mean "show all").
+    firehose: {
+      surface: ["*"],
+      streamPipelineLogs: true,
+      pipelineLogChars: 200000,
+      // Task-linked scout audits already raise captain.escalation (critical);
+      // listing scout.write_violation here would double-wake on the same failure.
+      wakeOn: ["captain.escalation", "pipeline.unavailable"],
+    },
+  },
+
+  // Watch the local no-mistakes gate. STRICTLY read-only: Agent OS never writes
+  // under the no-mistakes home and never execs `axi run`/`respond`/`abort`.
+  watchPipeline: true,
+
+  // Structured-read cadence. The WAL file watch reacts faster than this; the
+  // interval is the floor for anything the watch misses.
+  pipelinePollMs: 1000,
+}

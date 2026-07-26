@@ -11,6 +11,9 @@ importers:
       axe-core:
         specifier: ^4.12.1
         version: 4.12.1
+      better-sqlite3:
+        specifier: 13.0.1
+        version: 13.0.1
       eslint:
         specifier: 9.39.4
         version: 9.39.4(jiti@2.7.0)
@@ -93,6 +96,9 @@ importers:
       '@agentos/claude-agent-sdk-pi':
         specifier: workspace:*
         version: link:../../packages/pi-ext-claude-agent-sdk
+      better-sqlite3:
+        specifier: 13.0.1
+        version: 13.0.1
       fastify:
         specifier: 5.10.0
         version: 5.10.0
@@ -112,6 +118,9 @@ importers:
         specifier: 4.4.3
         version: 4.4.3
     devDependencies:
+      '@types/better-sqlite3':
+        specifier: 7.6.13
+        version: 7.6.13
       '@types/node':
         specifier: 26.1.1
         version: 26.1.1

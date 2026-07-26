@@ -266,9 +266,15 @@ describe("SSE replay & resume", () => {
     const resumed = await readSse(
       "/v1/events",
       { "last-event-id": cursor.id },
-      (frames) => frames.length >= all.length - 2,
+      (frames) => frames.length >= Math.max(1, all.length - 2),
     );
-    expect(resumed[0]?.seq).toBe(cursor.seq + 1);
+    // Visibility profiles filter the live path, so durable seqs are not always
+    // contiguous on the wire (e.g. prompt.installed is suppressed under quiet).
+    // Resume must skip already-seen frames and only emit later-or-equal-live ones.
+    expect(resumed.length).toBeGreaterThan(0);
+    expect(resumed[0]?.seq).toBeGreaterThan(cursor.seq);
+    expect(resumed.every((frame) => frame.seq > cursor.seq)).toBe(true);
+    expect(resumed.some((frame) => frame.id === cursor.id)).toBe(false);
   });
 
   it("REST replay honors after + limit with truncation flag", async () => {
@@ -276,6 +282,142 @@ describe("SSE replay & resume", () => {
     const parsed = eventsReplayResponseSchema.parse(await response.json());
     expect(parsed.events).toHaveLength(2);
     expect(parsed.truncated).toBe(true);
+  });
+
+  it("omits SSE id for live-only frames so reconnect stays on durable cursor", async () => {
+    // Live log frames only surface under working/firehose; quiet filters them out.
+    const profileRes = await fetch(`${base}/v1/config/global/observability`, {
+      method: "PUT",
+      headers: { ...auth, "content-type": "text/plain" },
+      body: '{ activeProfile: "firehose" }',
+    });
+    expect(profileRes.status).toBe(200);
+
+    // Pad durable history so a full-history resume would be obviously large.
+    const padCount = 40;
+    for (let i = 0; i < padCount; i += 1) {
+      daemon.store.append({
+        type: "config.changed",
+        payload: {
+          domain: "supervision",
+          layer: "global",
+          hotReloaded: true,
+          contentHash: `live-id-pad-${i}`,
+        },
+      });
+    }
+    const lastDurable = daemon.store.append({
+      type: "config.changed",
+      payload: {
+        domain: "supervision",
+        layer: "global",
+        hotReloaded: true,
+        contentHash: "live-id-last-durable",
+      },
+    });
+
+    const controller = new AbortController();
+    const response = await fetch(`${base}/v1/events`, {
+      headers: auth,
+      signal: controller.signal,
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    if (reader === undefined) throw new Error("no body");
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let liveBlock: string | null = null;
+    let durableIdSeen = false;
+    const deadline = Date.now() + 8000;
+    let pending: ReturnType<typeof reader.read> | null = null;
+
+    // Wait until durable history has been paged, then emit a live-only frame.
+    while (Date.now() < deadline && !durableIdSeen) {
+      pending ??= reader.read();
+      const race = await Promise.race([
+        pending,
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 100)),
+      ]);
+      if (race === "timeout") continue;
+      pending = null;
+      if (race.done) break;
+      buffer += decoder.decode(race.value, { stream: true });
+      if (buffer.includes(lastDurable.id)) durableIdSeen = true;
+    }
+    expect(durableIdSeen).toBe(true);
+
+    daemon.store.emitLive({
+      type: "pipeline.log_appended",
+      payload: {
+        runId: "run-live-id",
+        step: "review",
+        chunk: "LIVE-ONLY-SSE-ID-TEST\n",
+        offset: 0,
+        endOffset: 22,
+      },
+    });
+
+    while (Date.now() < deadline && liveBlock === null) {
+      pending ??= reader.read();
+      const race = await Promise.race([
+        pending,
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 100)),
+      ]);
+      if (race === "timeout") continue;
+      pending = null;
+      if (race.done) break;
+      buffer += decoder.decode(race.value, { stream: true });
+      let sep = buffer.indexOf("\n\n");
+      while (sep !== -1) {
+        const block = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        if (
+          block.includes("event: pipeline.log_appended") &&
+          block.includes("LIVE-ONLY-SSE-ID-TEST")
+        ) {
+          liveBlock = block;
+        }
+        sep = buffer.indexOf("\n\n");
+      }
+    }
+    controller.abort();
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+
+    expect(liveBlock).not.toBeNull();
+    // Wire format: no resumable id line for live-only frames.
+    expect(liveBlock!.split("\n").some((l) => l.startsWith("id: "))).toBe(false);
+    expect(liveBlock!.includes("event: pipeline.log_appended")).toBe(true);
+
+    // Reconnect pinned to the last durable frame — must not page full history.
+    // A buggy server that advertised the live ULID as Last-Event-ID would resume
+    // from seq 0 and serve padCount+ frames; the bound is the proof.
+    const resumed = await readSse(
+      "/v1/events",
+      { "last-event-id": lastDurable.id },
+      (frames) => frames.length > 0,
+      2000,
+    );
+    // Only events after lastDurable — nothing from the pad, and no log_appended
+    // (live-only never replays). Idle reconnect may yield zero frames.
+    expect(resumed.length).toBeLessThan(padCount);
+    expect(resumed.every((f) => f.event.type !== "pipeline.log_appended")).toBe(true);
+    if (resumed.length > 0) {
+      expect(resumed[0]!.seq).toBeGreaterThan(lastDurable.seq);
+    }
+
+    // Contrast: an unknown (live-only) cursor still forces full history — the
+    // footgun that advertising live ids would reintroduce on every blip.
+    const fromUnknown = await readSse(
+      "/v1/events",
+      { "last-event-id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+      (frames) => frames.length >= padCount,
+      5000,
+    );
+    expect(fromUnknown.length).toBeGreaterThanOrEqual(padCount);
   });
 });
 

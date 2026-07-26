@@ -39,7 +39,7 @@ import {
   type StatusResponse,
   type TaskEventsResponse,
 } from "@agent-os/protocol";
-import type { EventStore } from "@agent-os/event-store";
+import { isLiveOnlyEnvelope, type EventStore } from "@agent-os/event-store";
 import { ConfigService, ConfigWriteError } from "../config/service.js";
 import { AGENTOSD_VERSION } from "../version.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
@@ -57,6 +57,8 @@ import type { PromptService } from "../prompts/service.js";
 import type { AnalyticsService } from "../analytics/service.js";
 import type { PtyTicketStore } from "../pty/tickets.js";
 import { runConfigDoctor } from "../prompts/doctor.js";
+import type { PipelineWatcher } from "../pipeline/watcher.js";
+import { eventMatchesSurface, resolveActiveProfile } from "../observability/profile.js";
 
 /** Drop an SSE client if its write buffer stays stalled this long. */
 const SSE_STALL_MS = 30_000;
@@ -87,6 +89,8 @@ export interface ServerDeps {
   analytics?: AnalyticsService;
   /** Phase 6 single-use tickets for the read-only PTY WebSocket. */
   ptyTickets?: PtyTicketStore;
+  /** Phase 9 live view of the local no-mistakes gate (read-only). */
+  pipeline?: PipelineWatcher;
 }
 
 export type AgentosdServer = FastifyInstance<
@@ -737,6 +741,77 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     }
   });
 
+  // ── Phase 9: live pipeline visibility ─────────────────────────────────
+
+  /**
+   * Transport and freshness of the pipeline view. Reported as fact: a Console
+   * showing a "live" view that is actually a 1 s poll is misleading in exactly
+   * the way this product refuses to be elsewhere.
+   */
+  app.get("/v1/pipeline/status", async (_request, reply) => {
+    if (deps.pipeline === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "pipeline watcher unavailable");
+      return;
+    }
+    const { name, profile } = resolveActiveProfile(deps.config.effective().config.observability);
+    return {
+      pipeline: {
+        ...deps.pipeline.status(),
+        profile: {
+          name,
+          pipelineLogChars: profile.pipelineLogChars,
+          streamPipelineLogs: profile.streamPipelineLogs,
+        },
+      },
+    };
+  });
+
+  app.get("/v1/pipeline/runs", async (_request, reply) => {
+    if (deps.pipeline === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "pipeline watcher unavailable");
+      return;
+    }
+    const status = deps.pipeline.status();
+    // Whenever the view is not currently readable — schema drift, watching
+    // disabled, missing DB, repeated read failures — serve empty, not last-known.
+    if (!status.compatibility.ok || status.transport === "unavailable") {
+      void reply;
+      return {
+        runs: [],
+        unavailable: true as const,
+        reason:
+          status.compatibility.reason ??
+          (status.transport === "unavailable"
+            ? "pipeline watcher is not reading the gate"
+            : null),
+      };
+    }
+    void reply;
+    // Serve the watcher's SQL-visible set only — never rebuild from durable
+    // pipeline.run_updated history, which would resurrect ghosts that left the
+    // gate without a terminal emission (or fell outside the recency window).
+    return {
+      runs: deps.pipeline.liveSnapshots(),
+      unavailable: false as const,
+      reason: null,
+    };
+  });
+
+  /**
+   * Bounded attach-time log catch-up for active steps. Honours the active
+   * profile's streamPipelineLogs / pipelineLogChars so quiet cannot be
+   * bypassed. Pure read — does not move the watcher's streaming offsets;
+   * clients de-dupe seed vs SSE by byte offset.
+   */
+  app.get("/v1/pipeline/log-tails", async (_request, reply) => {
+    if (deps.pipeline === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "pipeline watcher unavailable");
+      return;
+    }
+    void reply;
+    return deps.pipeline.activeLogTails();
+  });
+
   // ── Network I/O (§7 Network I/O Detail, Figma 41:4815) ────────────────
 
   /**
@@ -1300,10 +1375,26 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       return result;
     };
 
-    const writeFrame = (envelope: { id: string; event: { type: string } }): Promise<boolean> =>
-      enqueueWrite(
-        `id: ${envelope.id}\nevent: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
+    const surfaceAllows = (eventType: string): boolean => {
+      // Control-plane frames always reach the live path so the Console can stay
+      // honest about config/daemon state; the profile filters product noise.
+      if (eventMatchesSurface(eventType, ["daemon.", "config.", "policy."])) return true;
+      const { profile } = resolveActiveProfile(deps.config.effective().config.observability);
+      return eventMatchesSurface(eventType, profile.surface);
+    };
+
+    const writeFrame = (envelope: { id: string; event: { type: string } }): Promise<boolean> => {
+      // Visibility profiles filter the Console live path; durable store is unchanged.
+      if (!surfaceAllows(envelope.event.type)) return Promise.resolve(true);
+      // Live-only frames (emitLive) are never projected, so they have no durable
+      // position to resume from. Emitting `id:` would pin EventSource's
+      // Last-Event-ID to an unknown cursor; eventsAfterId then replays from
+      // seq 0. Omit id so Last-Event-ID stays on the last durable frame.
+      const idLine = isLiveOnlyEnvelope(envelope) ? "" : `id: ${envelope.id}\n`;
+      return enqueueWrite(
+        `${idLine}event: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
       );
+    };
 
     void (async () => {
       let live = false;

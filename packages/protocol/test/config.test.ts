@@ -154,6 +154,31 @@ const validConfig: AgentOsConfig = {
     brainTokensPerDay: 2_000_000,
     gatewayHardUsd: 100,
   },
+  observability: {
+    activeProfile: "quiet",
+    profiles: {
+      quiet: {
+        surface: ["task.", "captain.", "pipeline.run_updated"],
+        streamPipelineLogs: false,
+        pipelineLogChars: 0,
+        wakeOn: ["captain.escalation"],
+      },
+      working: {
+        surface: ["task.", "captain.", "brain.", "pipeline."],
+        streamPipelineLogs: true,
+        pipelineLogChars: 20_000,
+        wakeOn: ["captain.escalation", "pipeline.unavailable"],
+      },
+      firehose: {
+        surface: ["*"],
+        streamPipelineLogs: true,
+        pipelineLogChars: 200_000,
+        wakeOn: ["captain.escalation", "pipeline.unavailable"],
+      },
+    },
+    watchPipeline: true,
+    pipelinePollMs: 1000,
+  },
 };
 
 const validMetric: QuotaMetric = {

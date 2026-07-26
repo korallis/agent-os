@@ -46,6 +46,23 @@ function gate(id, name, ok, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Playwright waitUntil for Console navigations.
+ *
+ * Most pages settle under `networkidle` (EventSource alone does not keep
+ * in-flight requests open after the stream is established). PipelineView is
+ * different: it runs a ~400ms REST backstop poll, so networkidle never settles
+ * and the default 30s timeout fires. Use `load` only for that route — same
+ * strategy as tooling/gates/phase-9.mjs. Callers still sleep after goto so
+ * client data can paint.
+ */
+function consoleGotoOptions(path = "") {
+  if (path === "/pipeline" || path.startsWith("/pipeline/")) {
+    return { waitUntil: "load" };
+  }
+  return { waitUntil: "networkidle" };
+}
+
+/**
  * Values that appeared in the Figma-derived placeholder markup. If any of these
  * come back in rendered HTML, mock data has returned.
  */
@@ -74,6 +91,7 @@ const PAGES = [
   "/runs",
   "/runs/history",
   "/network",
+  "/pipeline",
   "/settings/billing",
   "/analytics/models",
   "/alerts",
@@ -406,7 +424,7 @@ try {
   {
     const statuses = [];
     for (const path of PAGES) {
-      const res = await page.goto(`${CONSOLE}${path}`, { waitUntil: "networkidle" });
+      const res = await page.goto(`${CONSOLE}${path}`, consoleGotoOptions(path));
       await sleep(400);
       const body = await page.content();
       statuses.push({
@@ -428,7 +446,7 @@ try {
   {
     const found = [];
     for (const path of PAGES) {
-      await page.goto(`${CONSOLE}${path}`, { waitUntil: "networkidle" });
+      await page.goto(`${CONSOLE}${path}`, consoleGotoOptions(path));
       await sleep(400);
       const html = await page.content();
       for (const needle of PLACEHOLDER_STRINGS) {
@@ -445,7 +463,7 @@ try {
 
   // G2 — Fleet reflects a state change within 1 s
   {
-    await page.goto(`${CONSOLE}/fleet`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/fleet`, consoleGotoOptions("/fleet"));
     await sleep(600);
     const before = await page.textContent("body");
     const newTitle = `Reflected ${Date.now().toString().slice(-6)}`;
@@ -481,7 +499,7 @@ try {
   // G4 — Analytics numbers equal the daemon's own (never bare digits)
   {
     const snapshot = await (await fetch(`${BASE}/v1/analytics`, { headers: auth })).json();
-    await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/analytics`, consoleGotoOptions("/analytics"));
     await sleep(600);
     const text = (await page.textContent("body")) ?? "";
     const windowDays = snapshot.windowDays ?? 14;
@@ -518,7 +536,7 @@ try {
     const wakes = await (await fetch(`${BASE}/v1/fleet/wakes`, { headers: auth })).json();
     const absorbedWakes = (wakes.wakes ?? []).filter((w) => w.absorbed);
     const seededAbsorbed = absorbedWakes.find((w) => w.summary === absorbedSummary);
-    await page.goto(`${CONSOLE}/notifications`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/notifications`, consoleGotoOptions("/notifications"));
     await sleep(600);
     const text = (await page.textContent("body")) ?? "";
     // Require the specific absorbed wake's summary AND the "absorbed" marker —
@@ -536,7 +554,7 @@ try {
   // G6 — Task Detail shows the fusion clean-room columns, Brain decisions, and
   // validation evidence (FAIL vs GATE_ERROR)
   {
-    await page.goto(`${CONSOLE}/tasks/${taskA}`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/tasks/${taskA}`, consoleGotoOptions(`/tasks/${taskA}`));
     await sleep(1200);
     const text = (await page.textContent("body")) ?? "";
     const brain = text.includes("Brain decisions") && text.includes("resolve_cast");
@@ -597,7 +615,7 @@ try {
         s.provider === seededQuotaProvider &&
         (s.metrics ?? []).some((m) => m.tier === seededQuotaTier),
     );
-    await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/analytics`, consoleGotoOptions("/analytics"));
     await sleep(600);
     const text = (await page.textContent("body")) ?? "";
     // Require the concrete provider next to its tier label — never pass on the
@@ -628,7 +646,7 @@ try {
       const apiDetail = await (
         await fetch(`${BASE}/v1/sessions/${session.sessionId}`, { headers: auth })
       ).json();
-      await page.goto(`${CONSOLE}/sessions/${session.sessionId}`, { waitUntil: "networkidle" });
+      await page.goto(`${CONSOLE}/sessions/${session.sessionId}`, consoleGotoOptions(`/sessions/${session.sessionId}`));
       await sleep(700);
       // Label+value pairs only — never bare values that could appear anywhere in the DOM.
       // Model and pane are exposed via aria-label "Model: …" / "Pane: …".
@@ -715,7 +733,7 @@ try {
         !authHeader[1].includes(CANARY_KEY);
 
       // And the detail page must render that same real call.
-      await page.goto(`${CONSOLE}/network/${request.requestId}`, { waitUntil: "networkidle" });
+      await page.goto(`${CONSOLE}/network/${request.requestId}`, consoleGotoOptions(`/network/${request.requestId}`));
       await sleep(500);
       const body = (await page.textContent("body")) ?? "";
       const rendersUrl = body.includes(request.url);
@@ -744,7 +762,7 @@ try {
     await put("/v1/config/global/supervision", { ...shipped.value, heartbeatSeconds: deviated });
     await sleep(600);
 
-    await page.goto(`${CONSOLE}/policies`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/policies`, consoleGotoOptions("/policies"));
     await sleep(900);
     // Land on the supervision domain.
     const supervisionTab = page.getByRole("button", { name: /^supervision$/i }).first();
@@ -801,7 +819,7 @@ try {
     await sleep(700);
 
     // With a policy off, the persistent override badge must be on the page.
-    await page.goto(`${CONSOLE}/policies`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/policies`, consoleGotoOptions("/policies"));
     await sleep(600);
     const safetyTab = page.getByRole("button", { name: /^safety$/i }).first();
     let badgeShown = false;
@@ -822,7 +840,7 @@ try {
         },
         body: JSON.stringify({ ...effective.config.policies, scoutReadOnly: true }),
       });
-      await page.reload({ waitUntil: "networkidle" });
+      await page.reload(consoleGotoOptions("/policies"));
       await sleep(700);
       const safetyTab2 = page.getByRole("button", { name: /^safety$/i }).first();
       if ((await safetyTab2.count()) > 0) {
@@ -976,7 +994,7 @@ try {
     }
     await sleep(900);
 
-    await page.goto(`${CONSOLE}/providers`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/providers`, consoleGotoOptions("/providers"));
     await sleep(1200);
     const providersText = (await page.textContent("body")) ?? "";
 
@@ -1004,7 +1022,7 @@ try {
       providersText.includes("$15.00");
 
     // The usage strip must reflect a NEW quota.updated within 1s over SSE.
-    await page.goto(`${CONSOLE}/analytics`, { waitUntil: "networkidle" });
+    await page.goto(`${CONSOLE}/analytics`, consoleGotoOptions("/analytics"));
     await sleep(900);
     const bumped = seeded[0];
     const distinctPct = 77;
@@ -1041,9 +1059,10 @@ try {
 
   // G8 — unknown route renders the shared empty treatment
   {
-    const res = await page.goto(`${CONSOLE}/definitely-not-a-route`, {
-      waitUntil: "networkidle",
-    });
+    const res = await page.goto(
+      `${CONSOLE}/definitely-not-a-route`,
+      consoleGotoOptions("/definitely-not-a-route"),
+    );
     const text = (await page.textContent("body")) ?? "";
     gate(
       "G8",
@@ -1085,7 +1104,7 @@ try {
       const path = toVisit.shift();
       if (path === undefined || visited.has(path)) continue;
       visited.add(path);
-      await page.goto(`${CONSOLE}${path}`, { waitUntil: "networkidle" });
+      await page.goto(`${CONSOLE}${path}`, consoleGotoOptions(path));
       await sleep(300);
       const hrefs = await page.$$eval("a[href]", (anchors) =>
         anchors.map((a) => a.getAttribute("href")).filter((h) => typeof h === "string"),

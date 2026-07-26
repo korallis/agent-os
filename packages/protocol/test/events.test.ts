@@ -413,6 +413,57 @@ const SAMPLES: readonly OrchestratorEvent[] = [
     },
   },
   {
+    type: "pipeline.run_updated",
+    payload: {
+      runId: "run-01",
+      branch: "phase-9/live-pipeline-visibility",
+      status: "running",
+      headSha: "d9b25302a048416c75e5dac206b08a2e9c9a9d44",
+      prUrl: "https://github.com/korallis/agent-os/pull/27",
+      error: null,
+      intent: "live pipeline visibility",
+      steps: [
+        {
+          step: "review",
+          order: 0,
+          status: "running",
+          findingsCount: 1,
+          findings: [
+            {
+              id: "f-1",
+              severity: "info",
+              action: "no-op",
+              description: "watcher attached",
+            },
+          ],
+          lastActivity: "reading state.sqlite",
+          lastActivityAt: TS,
+          durationMs: 1200,
+          agentPid: 4321,
+        },
+      ],
+      updatedAt: TS,
+    },
+  },
+  {
+    type: "pipeline.log_appended",
+    payload: {
+      runId: "run-01",
+      step: "review",
+      chunk: "line one\n",
+      offset: 0,
+      endOffset: 9,
+    },
+  },
+  {
+    type: "pipeline.unavailable",
+    payload: {
+      reason: "schema drift",
+      missingColumns: ["runs.head_sha"],
+      home: "/Users/captain/.no-mistakes",
+    },
+  },
+  {
     type: "captain.escalation",
     payload: { taskId: ULID_A, summary: "validation exhausted", severity: "critical" },
   },
@@ -550,6 +601,9 @@ describe("ORCHESTRATOR_EVENT_TYPES", () => {
     "secondmate.charter_changed",
     "secondmate.routed",
     "session.wedged",
+    "pipeline.run_updated",
+    "pipeline.log_appended",
+    "pipeline.unavailable",
     "captain.escalation",
     "task.delivery_block_resolved",
   ];

@@ -23,7 +23,13 @@ import {
   QuotaProbeScheduler,
 } from "./quota-probes/scheduler.js";
 import { enableQuotaProviders } from "./quota-probes/enable.js";
-import type { QuotaSample } from "@agent-os/protocol";
+import { PipelineWatcher } from "./pipeline/watcher.js";
+import {
+  eventMatchesWakeOn,
+  resolveActiveProfile,
+  wakeClassForEvent,
+} from "./observability/profile.js";
+import type { OrchestratorEvent, QuotaSample } from "@agent-os/protocol";
 import { FleetService } from "./fleet/service.js";
 import { PromptService } from "./prompts/service.js";
 import { AnalyticsService } from "./analytics/service.js";
@@ -119,7 +125,22 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const token = ensureDaemonToken(home);
     const port = resolvePort(options.port);
 
+    // sync:false opens the log file on the event loop. Wait for ready before
+    // anything else so flushSync on shutdown cannot race "sonic boom is not
+    // ready yet" under short-lived test daemons / loaded CI.
     const fileDestination = pino.destination({ dest: paths.logFile, mkdir: true, sync: false });
+    await new Promise<void>((resolve, reject) => {
+      const onReady = () => {
+        fileDestination.off("error", onError);
+        resolve();
+      };
+      const onError = (err: Error) => {
+        fileDestination.off("ready", onReady);
+        reject(err);
+      };
+      fileDestination.once("ready", onReady);
+      fileDestination.once("error", onError);
+    });
     const streams: pino.StreamEntry[] = [{ level: "info", stream: fileDestination }];
     if (options.stdout === true) {
       streams.push({ level: "info", stream: process.stdout });
@@ -146,10 +167,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       logger.info({ replayed: opened.replayed }, "projection replayed from event log");
     }
 
-    config = new ConfigService(SHIPPED_DEFAULTS_DIR, paths.configDir);
-    const installed = config.installDefaults();
+    const configService = new ConfigService(SHIPPED_DEFAULTS_DIR, paths.configDir);
+    config = configService;
+    const installed = configService.installDefaults();
     const eventStore = store;
-    config.onEvent((event) => {
+    // Assigned after construction; config listener needs a stable ref before fleet exists.
+    let fleetRef: FleetService | null = null;
+    let pipelineWatcherRef: PipelineWatcher | null = null;
+    configService.onEvent((event) => {
       eventStore.append(event);
       // FleetService.reloadConfig existed but nothing ever called it, so a
       // hot-reloaded change reached `/v1/config/effective` while the fleet's
@@ -163,12 +188,19 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
           // A bad reload must never take the daemon down; the previous
           // in-memory config keeps running and the rejection is already logged.
         }
+        if (event.type === "config.changed" && event.payload.domain === "observability") {
+          try {
+            applyPipelineObservability(configService, pipelineWatcherRef);
+          } catch {
+            // Keep previous watcher config; rejection is already on the log.
+          }
+        }
       }
     });
     if (installed.length > 0) {
       store.append({ type: "config.installed", payload: { domains: installed } });
     }
-    config.startWatching();
+    configService.startWatching();
 
     const startedAt = new Date().toISOString();
 
@@ -179,7 +211,6 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       eventStore.append(event);
     });
     // R5.1: new / detected connections auto-enable matching quota probes.
-    const configService = config;
     connections.onProbeAutoEnable(({ provider, billingMode }) => {
       enableQuotaProviders(configService, [{ provider, billingMode }]);
     });
@@ -217,14 +248,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     prompts.installDefaults();
 
     const agentosdBin = resolveAgentosdBin();
-    // Assigned after FleetService construction; the config listener above
-    // closes over this ref so hot-reload can reach the fleet.
-    let fleetRef: FleetService | null = null;
-
 
     const fleet = new FleetService({
       home,
-      config,
+      config: configService,
       connections,
       prompts,
       pi,
@@ -305,6 +332,58 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     // REST, redeemed once on the WS upgrade. WS is used for PTY only (§8).
     const ptyTickets = new PtyTicketStore();
 
+    // Phase 9: live view of the no-mistakes gate. Strictly read-only — it
+    // never writes under the no-mistakes home and never drives the pipeline.
+    // Profile knobs (streamPipelineLogs / surface / wakeOn) are read live so a
+    // hot-reloaded observability.json5 reconfigures without a daemon restart.
+    const pipelineWatcher = new PipelineWatcher({
+      pollMs: configService.effective().config.observability.pipelinePollMs,
+      sink: (event) => {
+        // Step stdout is bulk output whose durable artifact is the log FILE
+        // under the no-mistakes home. Do not dual-write it into the append-only
+        // event store — live SSE + attach-time log-tails are the recovery path.
+        if (event.type === "pipeline.log_appended") {
+          eventStore.emitLive(event);
+          return;
+        }
+        eventStore.append(event);
+      },
+      profile: () => {
+        const { profile } = resolveActiveProfile(configService.effective().config.observability);
+        return {
+          streamPipelineLogs: profile.streamPipelineLogs,
+          pipelineLogChars: profile.pipelineLogChars,
+        };
+      },
+    });
+    pipelineWatcherRef = pipelineWatcher;
+
+    // Ordering rule: listeners must exist before the first append, because
+    // append has no replay for late subscribers. applyPipelineObservability
+    // may start() the watcher and synchronously sink pipeline.unavailable
+    // (or run_updated) on a cold gate — wakeOn must already be registered or
+    // that one-shot boot signal is permanently swallowed for the profile.
+    eventStore.subscribe((envelope: { event: OrchestratorEvent }) => {
+      try {
+        const { profile } = resolveActiveProfile(configService.effective().config.observability);
+        if (!eventMatchesWakeOn(envelope.event.type, profile.wakeOn)) return;
+        const wakeClass = wakeClassForEvent(envelope.event);
+        // null = profile-matched type that is still not worth a Brain wake
+        // (e.g. captain.escalation with severity "info").
+        if (wakeClass === null) return;
+        fleet.watcher.classify({
+          class: wakeClass,
+          taskId: taskIdFromEvent(envelope.event),
+          summary: wakeSummaryForEvent(envelope.event),
+          detail: { eventType: envelope.event.type, source: "observability.wakeOn" },
+        });
+      } catch {
+        // Wake classification must never break append fan-out.
+      }
+    });
+
+    applyPipelineObservability(configService, pipelineWatcher);
+
     const deps = {
       store,
       config,
@@ -322,6 +401,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       prompts,
       analytics,
       ptyTickets,
+      pipeline: pipelineWatcher,
     };
     server = buildServer(deps);
     await server.listen({ host: LOOPBACK_HOST, port });
@@ -396,6 +476,8 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         closed = true;
         try {
           await runningFleet.stop();
+          pipelineWatcher.stop();
+
           quotaScheduler.stop();
           runningStore.append({
             type: "daemon.stopping",
@@ -410,7 +492,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
           runningServer.server.closeAllConnections();
           await closePromise;
           logger.info({ reason }, "agentosd stopped");
-          fileDestination.flushSync();
+          try {
+            fileDestination.flushSync();
+          } catch {
+            // Best-effort: destination may already be closed/destroyed under
+            // rapid teardown. Never fail shutdown on log flush.
+          }
         } finally {
           try {
             runningStore.close();
@@ -460,3 +547,34 @@ function resolveAgentosdBin(): string {
   if (existsSync(candidate)) return candidate;
   return join(here, "bin", "agentosd.js");
 }
+
+function applyPipelineObservability(
+  config: ConfigService,
+  watcher: PipelineWatcher | null,
+): void {
+  if (watcher === null) return;
+  const observability = config.effective().config.observability;
+  watcher.applyConfig({
+    watchPipeline: observability.watchPipeline,
+    pollMs: observability.pipelinePollMs,
+  });
+}
+
+function taskIdFromEvent(event: OrchestratorEvent): string | null {
+  if (event.type === "captain.escalation") return event.payload.taskId;
+  return null;
+}
+
+function wakeSummaryForEvent(event: OrchestratorEvent): string {
+  switch (event.type) {
+    case "pipeline.unavailable":
+      return `pipeline unreadable: ${event.payload.reason}`;
+    case "captain.escalation":
+      return event.payload.summary;
+    case "scout.write_violation":
+      return `scout write violation: ${event.payload.changedPaths.slice(0, 3).join(", ")}`;
+    default:
+      return `observability wake: ${event.type}`;
+  }
+}
+

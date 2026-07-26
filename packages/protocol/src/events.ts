@@ -617,6 +617,89 @@ export const sessionWedgedEventSchema = z.strictObject({
   }),
 });
 
+/**
+ * Live view of the `no-mistakes` gate (§11 Phase 9). Agent OS republishes the
+ * gate's own state onto its append-only log so the Console consumes pipeline
+ * progress through the same SSE + projection path as everything else.
+ */
+export const pipelineFindingSchema = z.strictObject({
+  id: z.string(),
+  severity: z.string(),
+  /** Captain-facing disposition: auto-fix / no-op / ask-user (or gate-specific). */
+  action: z.string(),
+  description: z.string(),
+});
+export type PipelineFinding = z.infer<typeof pipelineFindingSchema>;
+
+export const pipelineStepSnapshotSchema = z.strictObject({
+  step: z.string(),
+  order: z.number().int().min(0),
+  status: z.string(),
+  findingsCount: z.number().int().min(0),
+  /** Projected from findings_json when present — the parked-gate decision table. */
+  findings: z.array(pipelineFindingSchema).default([]),
+  lastActivity: z.string().nullable(),
+  lastActivityAt: isoTimestampSchema.nullable(),
+  durationMs: z.number().int().min(0).nullable(),
+  agentPid: z.number().int().nullable(),
+});
+export type PipelineStepSnapshot = z.infer<typeof pipelineStepSnapshotSchema>;
+
+export const pipelineRunSnapshotSchema = z.strictObject({
+  runId: z.string(),
+  branch: z.string(),
+  status: z.string(),
+  headSha: z.string(),
+  prUrl: z.string().nullable(),
+  error: z.string().nullable(),
+  intent: z.string().nullable(),
+  steps: z.array(pipelineStepSnapshotSchema),
+  updatedAt: isoTimestampSchema,
+});
+export type PipelineRunSnapshot = z.infer<typeof pipelineRunSnapshotSchema>;
+
+export const pipelineRunUpdatedEventSchema = z.strictObject({
+  type: z.literal("pipeline.run_updated"),
+  payload: pipelineRunSnapshotSchema,
+});
+
+/**
+ * Newly appended bytes from the active step's log — live-only, not durable.
+ * The log FILE under the no-mistakes home is the durable artifact; this frame
+ * is never written to the append-only event store and is never replayed on a
+ * fresh EventSource. Attach-time recovery uses bounded log-tails instead.
+ */
+export const pipelineLogAppendedEventSchema = z.strictObject({
+  type: z.literal("pipeline.log_appended"),
+  payload: z.strictObject({
+    runId: z.string(),
+    step: z.string(),
+    chunk: z.string(),
+    /** Inclusive start byte offset of `chunk` in the step log file. */
+    offset: z.number().int().min(0),
+    /**
+     * Exclusive end byte offset in the step log file after this chunk.
+     * Authoritative file position — clients must use this rather than
+     * recomputing from the decoded string (UTF-8 decode is lossy at
+     * incomplete sequence boundaries).
+     */
+    endOffset: z.number().int().min(0),
+  }),
+});
+
+/**
+ * The gate's state could not be read — most often a schema change in a newer
+ * no-mistakes. Emitted ONCE per incompatibility so the Console can degrade
+ * visibly instead of rendering stale rows as current.
+ */
+export const pipelineUnavailableEventSchema = z.strictObject({
+  type: z.literal("pipeline.unavailable"),
+  payload: z.strictObject({
+    reason: z.string(),
+    missingColumns: z.array(z.string()),
+    home: z.string(),
+  }),
+});
 
 export const captainEscalationEventSchema = z.strictObject({
   type: z.literal("captain.escalation"),
@@ -689,7 +772,9 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   secondmateCharterChangedEventSchema,
   secondmateRoutedEventSchema,
   sessionWedgedEventSchema,
-
+  pipelineRunUpdatedEventSchema,
+  pipelineLogAppendedEventSchema,
+  pipelineUnavailableEventSchema,
   captainEscalationEventSchema,
   taskDeliveryBlockResolvedEventSchema,
 ]);

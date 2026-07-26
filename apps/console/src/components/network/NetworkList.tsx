@@ -5,6 +5,8 @@ import { useEffect, useState } from "react";
 import { cn } from "@agent-os/ui";
 import { EmptyState } from "@/components/shell/EmptyState";
 import { useEventStream } from "@/lib/useEventStream";
+import { statusTone, formatBytes, type NetworkRequestRow } from "@/lib/formatNetwork";
+import { LocalTime } from "@/components/shell/LocalTime";
 import { useDebouncedRefreshKey } from "@/lib/useDebouncedRefreshKey";
 
 /**
@@ -16,35 +18,8 @@ import { useDebouncedRefreshKey } from "@/lib/useDebouncedRefreshKey";
  * outbound calls yet, which is a real and informative state.
  */
 
-export interface NetworkRequestRow {
-  requestId: string;
-  connectionId: string | null;
-  provider: string;
-  method: string;
-  url: string;
-  protocol: string;
-  status: number | null;
-  durationMs: number;
-  requestBytes: number | null;
-  responseBytes: number | null;
-  error: string | null;
-  ts: string;
-}
-
-export function statusTone(status: number | null, error: string | null): string {
-  if (error !== null) return "text-danger";
-  if (status === null) return "text-fg-2";
-  if (status >= 500) return "text-danger";
-  if (status >= 400) return "text-warn";
-  return "text-ok";
-}
-
-export function formatBytes(bytes: number | null): string {
-  if (bytes === null) return "—";
-  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
+/** Module scope so the hook dependency is stable across renders. */
+const isNetRequest = (eventType: string): boolean => eventType === "net.request";
 
 function Card({ className, children }: { className?: string; children: React.ReactNode }) {
   return (
@@ -56,7 +31,7 @@ export function NetworkList() {
   const [rows, setRows] = useState<NetworkRequestRow[] | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "unavailable">("loading");
   const { events } = useEventStream();
-  const refreshKey = useDebouncedRefreshKey(events, (eventType) => eventType === "net.request");
+  const refreshKey = useDebouncedRefreshKey(events, isNetRequest);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,7 +95,7 @@ export function NetworkList() {
           className="flex items-center px-4 py-2 text-xs border-b border-line-1 last:border-0 hover:bg-panel-2/60 transition-colors"
         >
           <span className="w-[90px] shrink-0 font-mono text-[11px] text-fg-2">
-            {new Date(row.ts).toLocaleTimeString()}
+            <LocalTime iso={row.ts} />
           </span>
           <span className="w-[70px] shrink-0 font-mono text-[11px] text-fg-1">{row.method}</span>
           <span className="flex-1 min-w-0 truncate font-mono text-[11px] text-fg-1">{row.url}</span>
