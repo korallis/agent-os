@@ -1282,7 +1282,7 @@ describe("structural WEDGED ladder", () => {
     });
 
     // Land a real wedge respawn, then re-stamp durable pending as if clear never
-    // ran after the successful spawn (crash window between spawn and clear).
+    // ran after the successful spawn (crash window between replacement stamp and clear).
     expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("respawned");
     const after = service.tools.getTask(taskId)!;
     const replacement = after.sessions.find(
@@ -1298,6 +1298,8 @@ describe("structural WEDGED ladder", () => {
           summary: `Seat ${role} wedged and could not be respawned — no activity for 60m`,
           severity: "critical",
           recordedAt: new Date().toISOString(),
+          writeAheadRespawn: true,
+          replacementSessionId: replacement!.sessionId,
         },
       ],
       wedgeLadderCompletedSessionIds: (after.wedgeLadderCompletedSessionIds ?? []).filter(
@@ -1395,5 +1397,211 @@ describe("structural WEDGED ladder", () => {
       expect(wedged.payload.action).toBe("escalated");
       expect(wedged.payload.respawnsUsed).toBe(0);
     }
+  });
+
+  it("escalates when seat B's respawn fails even if same-role peer A is live", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId: sessionB, role } = seedBuilder(service);
+    // Peer A: second builder on the same task (first-class multi-seat shape).
+    const peerSpawn = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role,
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+      redBaselineOverride: true,
+    });
+    expect(peerSpawn.ok).toBe(true);
+    const sessionA = (peerSpawn.data as { session: { sessionId: string } }).session.sessionId;
+    expect(sessionA).not.toBe(sessionB);
+
+    backdateSession(service, sessionB, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+    let refuseSpawn = true;
+    service.tmux.newWindow = (opts) => {
+      if (refuseSpawn) {
+        refuseSpawn = false;
+        throw new Error("simulated spawn refusal for wedged seat B");
+      }
+      return originalNewWindow(opts);
+    };
+
+    events.length = 0;
+    try {
+      const acted = service.tools.reconcileWedgedSessions(Date.now());
+      expect(acted.some((a) => a.sessionId === sessionB && a.action === "escalated")).toBe(true);
+    } finally {
+      service.tmux.newWindow = originalNewWindow;
+    }
+
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionB);
+    // Peer A must not absorb or prevent the notify.
+    expect(
+      service.tools.listSessions().find((s) => s.sessionId === sessionA)?.status,
+    ).toBe("running");
+
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+  });
+
+  it("retires write-ahead only for B's recorded replacement, not peer A", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId: sessionB, role } = seedBuilder(service);
+    const peerSpawn = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role,
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+      redBaselineOverride: true,
+    });
+    expect(peerSpawn.ok).toBe(true);
+    const sessionA = (peerSpawn.data as { session: { sessionId: string } }).session.sessionId;
+
+    backdateSession(service, sessionB, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    events.length = 0;
+    expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("respawned");
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+
+    const after = service.tools.getTask(taskId)!;
+    const replacement = after.sessions.find(
+      (s) =>
+        s.role === role &&
+        s.status === "running" &&
+        s.sessionId !== sessionB &&
+        s.sessionId !== sessionA,
+    );
+    expect(replacement).toBeDefined();
+    expect(replacement!.sessionId).not.toBe(sessionA);
+
+    // Crash window: replacement stamped, clear never ran.
+    service.tools.hydrateTask({
+      ...after,
+      wedgePendingCaptainNotifies: [
+        {
+          sessionId: sessionB,
+          role,
+          summary: `Seat ${role} wedged and could not be respawned — no activity for 60m`,
+          severity: "critical",
+          recordedAt: new Date().toISOString(),
+          writeAheadRespawn: true,
+          replacementSessionId: replacement!.sessionId,
+        },
+      ],
+      wedgeLadderCompletedSessionIds: (after.wedgeLadderCompletedSessionIds ?? []).filter(
+        (id) => id !== sessionB,
+      ),
+      updatedAt: new Date().toISOString(),
+    });
+
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionB);
+  });
+
+  it("clears unanswered questions when a seat is stopped or lost", () => {
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId } = seedBuilder(service);
+    const questionId = "01JQ5T0000000000000000001A";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Will die with this seat.",
+      ts: new Date().toISOString(),
+    });
+    expect(service.tools.listQuestions()).toHaveLength(1);
+    expect(service.tools.getTask(taskId)?.pendingQuestions).toHaveLength(1);
+
+    const stopped = service.tools.invoke("stop_crewmate", {
+      sessionId,
+      reason: "captain stopped seat with open question",
+    });
+    expect(stopped.ok).toBe(true);
+    expect(service.tools.listQuestions()).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.pendingQuestions ?? []).toHaveLength(0);
+    const durable = JSON.parse(
+      readFileSync(join(home, "runs", taskId, "task.json"), "utf8"),
+    ) as { pendingQuestions: unknown[] };
+    expect(durable.pendingQuestions).toHaveLength(0);
+
+    const answer = service.tools.invoke("answer_crewmate", {
+      questionId,
+      answer: "too late",
+    });
+    expect(answer.ok).toBe(false);
+    expect(answer.error?.code).toBe("NOT_FOUND");
+
+    // Lost path: new seat + question, then markSessionLost.
+    const respawned = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role: "builder",
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+      redBaselineOverride: true,
+    });
+    expect(respawned.ok).toBe(true);
+    const liveId = (respawned.data as { session: { sessionId: string } }).session.sessionId;
+    const lostQuestionId = "01JQ5T0000000000000000001B";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId: liveId,
+      questionId: lostQuestionId,
+      question: "Will die when pane is lost.",
+      ts: new Date().toISOString(),
+    });
+    expect(service.tools.listQuestions()).toHaveLength(1);
+    service.tools.markSessionLost(liveId, "pane died with open question");
+    expect(service.tools.listQuestions()).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.pendingQuestions ?? []).toHaveLength(0);
+    const answerLost = service.tools.invoke("answer_crewmate", {
+      questionId: lostQuestionId,
+      answer: "too late",
+    });
+    expect(answerLost.ok).toBe(false);
+    expect(answerLost.error?.code).toBe("NOT_FOUND");
+  });
+
+  it("keeps open questions and wedge exemption while seat is merely waiting", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    const questionId = "01JQ5T0000000000000000001C";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Still waiting on Captain — not terminal.",
+      ts: new Date().toISOString(),
+    });
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    events.length = 0;
+    expect(service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
+    expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+    expect(service.tools.listQuestions()).toHaveLength(1);
+    expect(service.tools.getTask(taskId)?.pendingQuestions).toHaveLength(1);
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "running",
+    );
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
   });
 });

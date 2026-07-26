@@ -679,6 +679,15 @@ export class FleetService {
     // restart still receives artifacts + fusion.completed for live sides.
     this.tools.hydrateFusionOwnership();
     this.tools.rebindSessionListeners();
+    // Fake tmux has no cross-process pane state. Re-bind virtual windows for
+    // still-running seats so restart fixtures match real tmux persistence and
+    // do not false-mark-lost (which would also wipe durable pending questions).
+    if (this.tmux.isFake) {
+      for (const session of this.tools.listSessions()) {
+        if (session.status !== "starting" && session.status !== "running") continue;
+        this.tmux.ensureFakeWindow(session.tmuxWindow);
+      }
+    }
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
     this.reclaimOrphanedWorktreeLeases();

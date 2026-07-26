@@ -188,6 +188,18 @@ export const taskSnapshotSchema = z.strictObject({
         summary: z.string().min(1),
         severity: z.enum(["info", "warn", "critical"]),
         recordedAt: isoTimestampSchema,
+        /**
+         * Session id of the seat created by a successful wedge respawn.
+         * Discharge retires the obligation only when THIS id is live — never
+         * when some other same-role peer happens to be running.
+         */
+        replacementSessionId: z.string().min(1).optional(),
+        /**
+         * True when this entry is the write-ahead obligation recorded before a
+         * respawn attempt. Incomplete recovery (original still starting/running,
+         * no live replacement) clears the provisional entry without escalate.
+         */
+        writeAheadRespawn: z.boolean().optional(),
       }),
     )
     .default([]),

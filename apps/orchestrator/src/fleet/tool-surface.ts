@@ -772,16 +772,19 @@ export class ToolSurface {
             role: session.role,
             summary: escalateSummary,
             severity: "critical",
+            writeAheadRespawn: true,
           });
         }
         action = "escalated";
         let respawnLanded = false;
+        let replacementSessionId: string | null = null;
         try {
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
-          this.respawnCrewmate({
+          const spawned = this.respawnCrewmate({
             sessionId: session.sessionId,
             reason: `structural WEDGED — no activity for ${Math.round(idleMinutes)}m (threshold ${thresholdMinutes}m)`,
-          });
+          }) as { session: { sessionId: string } };
+          replacementSessionId = spawned.session.sessionId;
           respawnLanded = true;
         } catch {
           const current = this.sessions.get(session.sessionId) ?? session;
@@ -797,7 +800,17 @@ export class ToolSurface {
         }
         if (respawnLanded) {
           action = "respawned";
-          if (session.taskId !== null) {
+          if (session.taskId !== null && replacementSessionId !== null) {
+            // Stamp the exact replacement id before clear so a crash between
+            // spawn and clear still retires by identity, not by same-role peer.
+            this.recordPendingWedgeCaptainNotify(session.taskId, {
+              sessionId: session.sessionId,
+              role: session.role,
+              summary: escalateSummary,
+              severity: "critical",
+              writeAheadRespawn: true,
+              replacementSessionId,
+            });
             this.clearPendingWedgeCaptainNotify(session.taskId, session.sessionId);
           }
           escalateSummary = null;
@@ -930,6 +943,9 @@ export class ToolSurface {
   private persistSessionWedged(session: FleetSession): void {
     this.pendingActivityAt.delete(session.sessionId);
     this.sessions.set(session.sessionId, { ...session, status: "wedged" });
+    // Terminal wedge: drop unanswered questions for this seat (durable + memory).
+    // The open-question exemption never reaches here while a question is live.
+    this.clearPendingQuestionsForSession(session.sessionId);
     if (session.taskId === null) return;
     const task = this.tasks.get(session.taskId);
     if (task === undefined) return;
@@ -941,6 +957,48 @@ export class ToolSurface {
       ),
       updatedAt: now,
     });
+  }
+
+  /**
+   * Drop unanswered questions for a seat that is stopped, lost, or terminally
+   * wedged — both the process-local map and the durable task snapshot.
+   * Does not run on the open-question wedge-exemption path (that seat stays live).
+   * Prior crew.question events remain in the event stream as evidence the ask
+   * happened; there is no separate "question died with seat" event type.
+   */
+  private clearPendingQuestionsForSession(sessionId: string): void {
+    const doomed = [...this.questions.values()].filter((q) => q.sessionId === sessionId);
+    if (doomed.length === 0) {
+      // Still scrub durable rows that lost their memory entry (partial rehydrate).
+      for (const task of [...this.tasks.values()]) {
+        const pending = task.pendingQuestions ?? [];
+        const remaining = pending.filter((q) => q.sessionId !== sessionId);
+        if (remaining.length === pending.length) continue;
+        this.saveTask({
+          ...task,
+          pendingQuestions: remaining,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+    const taskIds = new Set<string>();
+    for (const q of doomed) {
+      this.questions.delete(q.questionId);
+      if (q.taskId !== null) taskIds.add(q.taskId);
+    }
+    for (const taskId of taskIds) {
+      const task = this.tasks.get(taskId);
+      if (task === undefined) continue;
+      const pending = task.pendingQuestions ?? [];
+      const remaining = pending.filter((q) => q.sessionId !== sessionId);
+      if (remaining.length === pending.length) continue;
+      this.saveTask({
+        ...task,
+        pendingQuestions: remaining,
+        updatedAt: new Date().toISOString(),
+      });
+    }
   }
 
   /**
@@ -956,6 +1014,8 @@ export class ToolSurface {
       role: string;
       summary: string;
       severity: "info" | "warn" | "critical";
+      replacementSessionId?: string;
+      writeAheadRespawn?: boolean;
     },
   ): void {
     const task = this.tasks.get(taskId);
@@ -974,6 +1034,12 @@ export class ToolSurface {
           summary: entry.summary,
           severity: entry.severity,
           recordedAt: now,
+          ...(entry.replacementSessionId !== undefined
+            ? { replacementSessionId: entry.replacementSessionId }
+            : {}),
+          ...(entry.writeAheadRespawn !== undefined
+            ? { writeAheadRespawn: entry.writeAheadRespawn }
+            : {}),
         },
       ],
       updatedAt: now,
@@ -1020,18 +1086,15 @@ export class ToolSurface {
     });
   }
 
-  private hasLiveSeatForTaskRole(taskId: string, role: string): boolean {
-    for (const session of this.sessions.values()) {
-      if (session.taskId !== taskId || session.role !== role) continue;
-      if (
-        session.status === "running" ||
-        session.status === "starting" ||
-        session.status === "settled"
-      ) {
-        return true;
-      }
-    }
-    return false;
+  /** True when the exact session id is starting, running, or settled. */
+  private isSessionLive(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) return false;
+    return (
+      session.status === "running" ||
+      session.status === "starting" ||
+      session.status === "settled"
+    );
   }
 
   private retirePendingWedgeCaptainNotify(taskId: string, sessionId: string): boolean {
@@ -1055,8 +1118,12 @@ export class ToolSurface {
   /**
    * Sink captain.escalation for one pending entry and clear it only when the
    * escalation event was actually sunk (not AFK-auto-answered, not thrown).
-   * Returns false when there was nothing to discharge, or the sink did not land
-   * (entry left in place for a later tick).
+   * Returns false when there was nothing to discharge, the sink did not land
+   * (entry left in place for a later tick), or a provisional write-ahead was
+   * dropped without completing the ladder.
+   *
+   * Retirement is identity-keyed: only a recorded replacementSessionId that is
+   * live retires without escalate. A same-role peer must never absorb notify.
    */
   private dischargePendingWedgeCaptainNotify(taskId: string, sessionId: string): boolean {
     const task = this.tasks.get(taskId);
@@ -1065,8 +1132,23 @@ export class ToolSurface {
     const entry = pending.find((n) => n.sessionId === sessionId);
     if (entry === undefined) return false;
 
-    if (this.hasLiveSeatForTaskRole(taskId, entry.role)) {
-      return this.retirePendingWedgeCaptainNotify(taskId, sessionId);
+    const replacementId = entry.replacementSessionId;
+    if (typeof replacementId === "string" && replacementId.length > 0) {
+      if (this.isSessionLive(replacementId)) {
+        return this.retirePendingWedgeCaptainNotify(taskId, sessionId);
+      }
+      // Recorded replacement is absent/stopped/lost — escalate even if a peer lives.
+    } else if (entry.writeAheadRespawn === true) {
+      const original = this.sessions.get(sessionId);
+      if (
+        original !== undefined &&
+        (original.status === "running" || original.status === "starting")
+      ) {
+        // Crash/incomplete before stop: provisional write-ahead only. Drop it
+        // without completing the ladder so the next tick can re-classify.
+        this.clearPendingWedgeCaptainNotify(taskId, sessionId);
+        return false;
+      }
     }
 
     let sank = false;
@@ -2534,6 +2616,7 @@ export class ToolSurface {
     // Re-read after release so cleared worktreePath refs are not re-stamped.
     const released = this.sessions.get(input.sessionId) ?? session;
     this.sessions.set(input.sessionId, { ...released, status: "stopped" });
+    this.clearPendingQuestionsForSession(input.sessionId);
     if (session.taskId !== null) {
       const task = this.tasks.get(session.taskId);
       if (task !== undefined) {
@@ -4913,6 +4996,7 @@ export class ToolSurface {
     const released = this.sessions.get(sessionId) ?? session;
     this.sessions.set(sessionId, { ...released, status: "lost" });
     this.clearFusionSession(sessionId);
+    this.clearPendingQuestionsForSession(sessionId);
     this.sink({
       type: "session.lost",
       payload: { sessionId, taskId: session.taskId, reason },
