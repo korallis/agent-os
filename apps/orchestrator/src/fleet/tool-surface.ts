@@ -777,14 +777,12 @@ export class ToolSurface {
         }
         action = "escalated";
         let respawnLanded = false;
-        let replacementSessionId: string | null = null;
         try {
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
-          const spawned = this.respawnCrewmate({
+          this.respawnCrewmate({
             sessionId: session.sessionId,
             reason: `structural WEDGED — no activity for ${Math.round(idleMinutes)}m (threshold ${thresholdMinutes}m)`,
-          }) as { session: { sessionId: string } };
-          replacementSessionId = spawned.session.sessionId;
+          });
           respawnLanded = true;
         } catch {
           const current = this.sessions.get(session.sessionId) ?? session;
@@ -800,17 +798,10 @@ export class ToolSurface {
         }
         if (respawnLanded) {
           action = "respawned";
-          if (session.taskId !== null && replacementSessionId !== null) {
-            // Stamp the exact replacement id before clear so a crash between
-            // spawn and clear still retires by identity, not by same-role peer.
-            this.recordPendingWedgeCaptainNotify(session.taskId, {
-              sessionId: session.sessionId,
-              role: session.role,
-              summary: escalateSummary,
-              severity: "critical",
-              writeAheadRespawn: true,
-              replacementSessionId,
-            });
+          // Drop the write-ahead without stamping replacementSessionId. Discharge
+          // derives success from the live seat spawn already wrote into the task
+          // snapshot; a separate bookkeeping stamp is not required for correctness.
+          if (session.taskId !== null) {
             this.clearPendingWedgeCaptainNotify(session.taskId, session.sessionId);
           }
           escalateSummary = null;
@@ -1097,6 +1088,41 @@ export class ToolSurface {
     );
   }
 
+  /**
+   * Derive whether a wedge respawn already landed from durable session state.
+   * Success = a live same-task same-role seat that is not the wedged session and
+   * was created at/after the pending entry's recordedAt (spawn writes after the
+   * write-ahead). Peers started earlier must not satisfy this.
+   *
+   * Optional replacementSessionId is only an optimisation: it may agree with
+   * the derived seat, but derivation always wins when they disagree.
+   */
+  private findDerivedWedgeReplacement(
+    taskId: string,
+    entry: { sessionId: string; role: string; recordedAt: string; replacementSessionId?: string },
+  ): string | null {
+    const recordedMs = Date.parse(entry.recordedAt);
+    if (!Number.isFinite(recordedMs)) return null;
+
+    const candidates: string[] = [];
+    for (const session of this.sessions.values()) {
+      if (session.taskId !== taskId) continue;
+      if (session.role !== entry.role) continue;
+      if (session.sessionId === entry.sessionId) continue;
+      if (!this.isSessionLive(session.sessionId)) continue;
+      const startMs = Date.parse(session.startedAt);
+      if (!Number.isFinite(startMs) || startMs < recordedMs) continue;
+      candidates.push(session.sessionId);
+    }
+    if (candidates.length === 0) return null;
+
+    const stamped = entry.replacementSessionId;
+    if (typeof stamped === "string" && stamped.length > 0 && candidates.includes(stamped)) {
+      return stamped;
+    }
+    return candidates[0] ?? null;
+  }
+
   private retirePendingWedgeCaptainNotify(taskId: string, sessionId: string): boolean {
     const task = this.tasks.get(taskId);
     if (task === undefined) return false;
@@ -1122,8 +1148,9 @@ export class ToolSurface {
    * (entry left in place for a later tick), or a provisional write-ahead was
    * dropped without completing the ladder.
    *
-   * Retirement is identity-keyed: only a recorded replacementSessionId that is
-   * live retires without escalate. A same-role peer must never absorb notify.
+   * Successful respawn is derived from durable seat state (live same-role seat
+   * created after the write-ahead), not from a follow-up replacementSessionId
+   * stamp that may never land. A same-role peer started earlier never retires.
    */
   private dischargePendingWedgeCaptainNotify(taskId: string, sessionId: string): boolean {
     const task = this.tasks.get(taskId);
@@ -1132,13 +1159,12 @@ export class ToolSurface {
     const entry = pending.find((n) => n.sessionId === sessionId);
     if (entry === undefined) return false;
 
-    const replacementId = entry.replacementSessionId;
-    if (typeof replacementId === "string" && replacementId.length > 0) {
-      if (this.isSessionLive(replacementId)) {
-        return this.retirePendingWedgeCaptainNotify(taskId, sessionId);
-      }
-      // Recorded replacement is absent/stopped/lost — escalate even if a peer lives.
-    } else if (entry.writeAheadRespawn === true) {
+    const derivedReplacement = this.findDerivedWedgeReplacement(taskId, entry);
+    if (derivedReplacement !== null) {
+      return this.retirePendingWedgeCaptainNotify(taskId, sessionId);
+    }
+
+    if (entry.writeAheadRespawn === true) {
       const original = this.sessions.get(sessionId);
       if (
         original !== undefined &&

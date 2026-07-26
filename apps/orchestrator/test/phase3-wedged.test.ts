@@ -1256,14 +1256,79 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
     expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
     expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
-    // Write-ahead pending may still be durable; next tick must reconcile against
-    // the live replacement and retire without false-escalating.
+    // Write-ahead pending may still be durable; next tick must derive the live
+    // replacement from task sessions and retire without false-escalating.
     expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(1);
     const replacement = service.tools
       .listSessions()
       .find((s) => s.taskId === taskId && s.role === role && s.status === "running");
     expect(replacement).toBeDefined();
     expect(replacement!.sessionId).not.toBe(sessionId);
+
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
+  });
+
+  it("derives successful respawn without replacementSessionId stamp (spawn→bookkeeping kill)", () => {
+    // Kill -9 after spawn lands in task.json but before any follow-up stamp/clear:
+    // write-ahead remains, no replacementSessionId, original stopped, replacement live.
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const tools = service.tools as unknown as {
+      clearPendingWedgeCaptainNotify: (taskId: string, sessionId: string) => void;
+    };
+    const originalClear = tools.clearPendingWedgeCaptainNotify.bind(service.tools);
+    tools.clearPendingWedgeCaptainNotify = () => {
+      // Leave write-ahead in place (no stamp path either).
+    };
+
+    events.length = 0;
+    try {
+      expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("respawned");
+    } finally {
+      tools.clearPendingWedgeCaptainNotify = originalClear;
+    }
+
+    const after = service.tools.getTask(taskId)!;
+    const pending = after.wedgePendingCaptainNotifies ?? [];
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.replacementSessionId).toBeUndefined();
+    expect(pending[0]?.writeAheadRespawn).toBe(true);
+    const replacement = after.sessions.find(
+      (s) => s.role === role && s.status === "running" && s.sessionId !== sessionId,
+    );
+    expect(replacement).toBeDefined();
+    expect(after.sessions.find((s) => s.sessionId === sessionId)?.status).toBe("stopped");
+
+    // Strip any accidental stamp and ensure recordedAt is before replacement startedAt.
+    service.tools.hydrateTask({
+      ...after,
+      wedgePendingCaptainNotifies: [
+        {
+          sessionId,
+          role,
+          summary:
+            pending[0]?.summary ??
+            `Seat ${role} wedged and could not be respawned — no activity for 60m`,
+          severity: "critical",
+          recordedAt: new Date(Date.parse(replacement!.startedAt) - 1_000).toISOString(),
+          writeAheadRespawn: true,
+        },
+      ],
+      wedgeLadderCompletedSessionIds: (after.wedgeLadderCompletedSessionIds ?? []).filter(
+        (id) => id !== sessionId,
+      ),
+      updatedAt: new Date().toISOString(),
+    });
 
     events.length = 0;
     service.tools.reconcileWedgedSessions(Date.now());
@@ -1281,8 +1346,8 @@ describe("structural WEDGED ladder", () => {
       lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
 
-    // Land a real wedge respawn, then re-stamp durable pending as if clear never
-    // ran after the successful spawn (crash window between replacement stamp and clear).
+    // Land a real wedge respawn, then re-open durable write-ahead as if clear
+    // never ran after spawn (no replacementSessionId stamp required).
     expect(service.tools.reconcileWedgedSessions(Date.now())[0]?.action).toBe("respawned");
     const after = service.tools.getTask(taskId)!;
     const replacement = after.sessions.find(
@@ -1297,9 +1362,8 @@ describe("structural WEDGED ladder", () => {
           role,
           summary: `Seat ${role} wedged and could not be respawned — no activity for 60m`,
           severity: "critical",
-          recordedAt: new Date().toISOString(),
+          recordedAt: new Date(Date.parse(replacement!.startedAt) - 1_000).toISOString(),
           writeAheadRespawn: true,
-          replacementSessionId: replacement!.sessionId,
         },
       ],
       wedgeLadderCompletedSessionIds: (after.wedgeLadderCompletedSessionIds ?? []).filter(
@@ -1324,6 +1388,118 @@ describe("structural WEDGED ladder", () => {
     events.length = 0;
     service.tools.reconcileWedgedSessions(Date.now());
     expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+  });
+
+  it("escalates once after failed respawn with only write-ahead durable state", () => {
+    // Respawn fails and process dies before any post-failure bookkeeping beyond
+    // the write-ahead + stop: next reconcile must escalate exactly once.
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    const task = service.tools.getTask(taskId)!;
+    const crashed = {
+      ...task,
+      sessions: task.sessions.map((s) =>
+        s.sessionId === sessionId ? { ...s, status: "stopped" as const } : s,
+      ),
+      wedgeRespawnsByRole: { ...(task.wedgeRespawnsByRole ?? {}), [role]: 1 },
+      wedgePendingCaptainNotifies: [
+        {
+          sessionId,
+          role,
+          summary: `Seat ${role} wedged and could not be respawned — no activity for 60m`,
+          severity: "critical" as const,
+          recordedAt: new Date().toISOString(),
+          writeAheadRespawn: true,
+        },
+      ],
+      wedgeLadderCompletedSessionIds: [] as string[],
+      updatedAt: new Date().toISOString(),
+    };
+    service.tools.hydrateTask(crashed);
+    writeFileSync(
+      join(home, "runs", taskId, "task.json"),
+      `${JSON.stringify(service.tools.getTask(taskId), null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const restarted = fleet({ home, start: false });
+    const reEvents: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => reEvents.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      1,
+    );
+    expect(
+      restarted.service.tools
+        .listSessions()
+        .some((s) => s.taskId === taskId && s.role === role && s.status === "running"),
+    ).toBe(false);
+
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(restarted.service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      0,
+    );
+    expect(restarted.service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(
+      sessionId,
+    );
+
+    reEvents.length = 0;
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+  });
+
+  it("does not let a pre-wedge same-role peer satisfy derived respawn success", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId: sessionB, role } = seedBuilder(service);
+    const peerSpawn = service.tools.invoke("spawn_crewmate", {
+      taskId,
+      role,
+      model: "openai/gpt-4.1",
+      thinking: "low",
+      vars: {},
+      redBaselineOverride: true,
+    });
+    expect(peerSpawn.ok).toBe(true);
+    const sessionA = (peerSpawn.data as { session: { sessionId: string } }).session.sessionId;
+    const peerStartedAt = service.tools
+      .listSessions()
+      .find((s) => s.sessionId === sessionA)?.startedAt;
+    expect(peerStartedAt).toBeDefined();
+
+    // Durable crash state: write-ahead after stop, respawn never landed, peer A still live.
+    // recordedAt is after peer A's startedAt so derivation must not treat A as the replacement.
+    const task = service.tools.getTask(taskId)!;
+    const recordedAt = new Date(Date.parse(peerStartedAt!) + 60_000).toISOString();
+    service.tools.hydrateTask({
+      ...task,
+      sessions: task.sessions.map((s) =>
+        s.sessionId === sessionB ? { ...s, status: "stopped" } : s,
+      ),
+      wedgeRespawnsByRole: { ...(task.wedgeRespawnsByRole ?? {}), [role]: 1 },
+      wedgePendingCaptainNotifies: [
+        {
+          sessionId: sessionB,
+          role,
+          summary: `Seat ${role} wedged and could not be respawned — no activity for 60m`,
+          severity: "critical",
+          recordedAt,
+          writeAheadRespawn: true,
+        },
+      ],
+      wedgeLadderCompletedSessionIds: [],
+      updatedAt: new Date().toISOString(),
+    });
+
+    events.length = 0;
+    service.tools.reconcileWedgedSessions(Date.now());
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+    expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionB);
+    expect(
+      service.tools.listSessions().find((s) => s.sessionId === sessionA)?.status,
+    ).toBe("running");
   });
 
   it("still escalates once across restart when a wedge respawn genuinely failed", () => {
@@ -1452,7 +1628,7 @@ describe("structural WEDGED ladder", () => {
     expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
 
-  it("retires write-ahead only for B's recorded replacement, not peer A", () => {
+  it("retires write-ahead only for B's derived replacement, not peer A", () => {
     const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId: sessionB, role } = seedBuilder(service);
     const peerSpawn = service.tools.invoke("spawn_crewmate", {
@@ -1486,7 +1662,7 @@ describe("structural WEDGED ladder", () => {
     expect(replacement).toBeDefined();
     expect(replacement!.sessionId).not.toBe(sessionA);
 
-    // Crash window: replacement stamped, clear never ran.
+    // Crash window: clear never ran; no stamp — derivation must pick replacement over peer A.
     service.tools.hydrateTask({
       ...after,
       wedgePendingCaptainNotifies: [
@@ -1495,9 +1671,8 @@ describe("structural WEDGED ladder", () => {
           role,
           summary: `Seat ${role} wedged and could not be respawned — no activity for 60m`,
           severity: "critical",
-          recordedAt: new Date().toISOString(),
+          recordedAt: new Date(Date.parse(replacement!.startedAt) - 1_000).toISOString(),
           writeAheadRespawn: true,
-          replacementSessionId: replacement!.sessionId,
         },
       ],
       wedgeLadderCompletedSessionIds: (after.wedgeLadderCompletedSessionIds ?? []).filter(
