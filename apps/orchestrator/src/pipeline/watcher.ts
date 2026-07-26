@@ -97,6 +97,7 @@ const MAX_STRUCTURED_READ_FAILURES = 3;
 const LOG_CHUNK_MAX = 16_384;
 /** Floor between WAL-driven ticks so dense notifications cannot storm the loop. */
 const WAL_TICK_COALESCE_MS = 75;
+const SQLITE_BUSY_TIMEOUT_MS = 250;
 /** Recency window for completed/failed runs (seconds — matches no-mistakes storage). */
 const RECENT_RUN_WINDOW_SEC = 6 * 60 * 60;
 
@@ -174,7 +175,9 @@ export class PipelineWatcher {
     const path = this.dbPath();
     if (!existsSync(path)) return { kind: "missing" };
     try {
-      return { kind: "ok", db: new Database(path, { readonly: true, fileMustExist: true }) };
+      const db = new Database(path, { readonly: true, fileMustExist: true });
+      db.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+      return { kind: "ok", db };
     } catch (error) {
       return { kind: "error", error };
     }
@@ -542,8 +545,12 @@ export class PipelineWatcher {
         // would bury the transitions that matter under its own noise.
         const fingerprint = JSON.stringify(snapshot);
         if (this.lastFingerprint.get(run.id) !== fingerprint) {
-          this.sink({ type: "pipeline.run_updated", payload: snapshot });
-          this.lastFingerprint.set(run.id, fingerprint);
+          try {
+            this.sink({ type: "pipeline.run_updated", payload: snapshot });
+            this.lastFingerprint.set(run.id, fingerprint);
+          } catch {
+            // Retry this frame on the next tick.
+          }
         }
 
         // Always advance log offsets on the active step; streamPipelineLogs
@@ -560,6 +567,11 @@ export class PipelineWatcher {
       // suppress a re-appearance after a long gap.
       for (const id of this.lastFingerprint.keys()) {
         if (!nextLive.has(id)) this.lastFingerprint.delete(id);
+      }
+      for (const key of [...this.logOffsets.keys()]) {
+        const sep = key.indexOf(":");
+        const runId = sep === -1 ? key : key.slice(0, sep);
+        if (!nextLive.has(runId)) this.logOffsets.delete(key);
       }
       this.liveSnapshotsById = nextLive;
 

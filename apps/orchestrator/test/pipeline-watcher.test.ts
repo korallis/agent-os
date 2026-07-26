@@ -788,4 +788,168 @@ describe("PipelineWatcher", () => {
     watcher.stop();
     await app.close();
   });
+
+  it("keeps the view readable when sink throws on run_updated", () => {
+    // Fails if a sink throw is counted as a structured-read failure: three
+    // append blips would markUnavailable and blank liveSnapshots even though
+    // the SELECT succeeded.
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-sink-throw-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', NULL, 'round 1', ?, NULL, NULL)`,
+    ).run(now);
+    db.close();
+
+    let sinkCalls = 0;
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (event) => {
+        if (event.type === "pipeline.run_updated") {
+          sinkCalls += 1;
+          throw new Error("event store full");
+        }
+      },
+    });
+    watcher.start();
+    watcher.tick();
+    watcher.tick();
+    watcher.tick();
+
+    expect(sinkCalls).toBeGreaterThanOrEqual(3);
+    expect(watcher.status().compatibility.ok).toBe(true);
+    expect(watcher.status().transport).not.toBe("unavailable");
+    expect(watcher.liveSnapshots().some((r) => r.runId === "run1")).toBe(true);
+    expect(watcher.status().compatibility.reason ?? "").not.toMatch(/structured pipeline read failed/);
+    watcher.stop();
+  });
+
+  it("rides out a transient write lock without blanking the view", async () => {
+    // Fails without busy_timeout: SQLITE_BUSY is immediate, three strikes mark
+    // the view unreadable even though the gate DB is healthy. The lock must be
+    // held on another thread/process so the event loop can release it while
+    // better-sqlite3 blocks in busy_timeout.
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-busy-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', NULL, 'round 1', ?, NULL, NULL)`,
+    ).run(now);
+    db.close();
+
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: () => undefined,
+    });
+    watcher.start();
+    expect(watcher.status().compatibility.ok).toBe(true);
+    expect(watcher.liveSnapshots()).toHaveLength(1);
+
+    const { createRequire } = await import("node:module");
+    const { Worker } = await import("node:worker_threads");
+    const requireFromHere = createRequire(import.meta.url);
+    const betterSqlitePath = requireFromHere.resolve("better-sqlite3");
+    const dbPath = join(gateHome, "state.sqlite");
+
+    const holder = new Worker(
+      `
+      const { parentPort, workerData } = require("node:worker_threads");
+      const Database = require(workerData.betterSqlitePath);
+      const db = new Database(workerData.dbPath);
+      db.exec("BEGIN IMMEDIATE");
+      parentPort.postMessage("locked");
+      setTimeout(() => {
+        try { db.exec("COMMIT"); } catch {}
+        db.close();
+        parentPort.postMessage("released");
+      }, 100);
+      `,
+      {
+        eval: true,
+        workerData: { dbPath, betterSqlitePath },
+      },
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("holder did not lock")), 3000);
+      holder.on("message", (msg: string) => {
+        if (msg === "locked") {
+          clearTimeout(t);
+          resolve();
+        }
+      });
+      holder.on("error", reject);
+    });
+
+    watcher.tick();
+    watcher.tick();
+    watcher.tick();
+
+    expect(watcher.status().compatibility.ok).toBe(true);
+    expect(watcher.status().transport).not.toBe("unavailable");
+    expect(watcher.liveSnapshots().some((r) => r.runId === "run1")).toBe(true);
+
+    await holder.terminate().catch(() => undefined);
+    watcher.stop();
+  });
+
+  it("prunes logOffsets when a run leaves the live set", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-offset-prune-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "seed\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: () => undefined,
+      profile: () => ({ streamPipelineLogs: true }),
+    });
+    watcher.start();
+    // Seed offset via first sight, then append so a second tick stores a key.
+    appendFileSync(logPath, "more log\n");
+    watcher.tick();
+
+    const offsets = (watcher as unknown as { logOffsets: Map<string, number> }).logOffsets;
+    expect([...offsets.keys()].some((k) => k.startsWith("run1:"))).toBe(true);
+
+    const writer = new Database(join(gateHome, "state.sqlite"));
+    writer
+      .prepare(`UPDATE runs SET status = 'completed', updated_at = ? WHERE id = 'run1'`)
+      .run(now - 7 * 60 * 60);
+    writer.close();
+    watcher.tick();
+
+    expect([...offsets.keys()].some((k) => k.startsWith("run1:"))).toBe(false);
+    watcher.stop();
+  });
 });
