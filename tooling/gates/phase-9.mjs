@@ -37,12 +37,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { chromium } from "playwright";
+import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
 const TMUX_SOCKET = `agentos-p9-${process.pid}`;
-const PORT = 4700 + 950 + Math.floor(Math.random() * 40);
-const CONSOLE_PORT = 3900 + Math.floor(Math.random() * 80);
+const PORT = pickPort(5650, 40);
+const CONSOLE_PORT = pickPort(3900, 80);
 const BASE = `http://127.0.0.1:${PORT}`;
 const CONSOLE = `http://127.0.0.1:${CONSOLE_PORT}`;
 
