@@ -125,7 +125,22 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const token = ensureDaemonToken(home);
     const port = resolvePort(options.port);
 
+    // sync:false opens the log file on the event loop. Wait for ready before
+    // anything else so flushSync on shutdown cannot race "sonic boom is not
+    // ready yet" under short-lived test daemons / loaded CI.
     const fileDestination = pino.destination({ dest: paths.logFile, mkdir: true, sync: false });
+    await new Promise<void>((resolve, reject) => {
+      const onReady = () => {
+        fileDestination.off("error", onError);
+        resolve();
+      };
+      const onError = (err: Error) => {
+        fileDestination.off("ready", onReady);
+        reject(err);
+      };
+      fileDestination.once("ready", onReady);
+      fileDestination.once("error", onError);
+    });
     const streams: pino.StreamEntry[] = [{ level: "info", stream: fileDestination }];
     if (options.stdout === true) {
       streams.push({ level: "info", stream: process.stdout });
@@ -477,7 +492,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
           runningServer.server.closeAllConnections();
           await closePromise;
           logger.info({ reason }, "agentosd stopped");
-          fileDestination.flushSync();
+          try {
+            fileDestination.flushSync();
+          } catch {
+            // Best-effort: destination may already be closed/destroyed under
+            // rapid teardown. Never fail shutdown on log flush.
+          }
         } finally {
           try {
             runningStore.close();
