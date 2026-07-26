@@ -83,7 +83,7 @@ export interface PipelineWatcherOptions {
    * Live knobs from the active observability profile. Read each tick so a
    * hot-reloaded profile is observed without restarting the watcher.
    */
-  profile?: () => { streamPipelineLogs: boolean };
+  profile?: () => { streamPipelineLogs: boolean; pipelineLogChars: number };
 }
 
 export interface PipelineCompatibility {
@@ -93,6 +93,20 @@ export interface PipelineCompatibility {
   missingColumns: string[];
 }
 
+/** Bounded attach-time seed for the Console (not durable event-log catch-up). */
+export interface PipelineLogTail {
+  runId: string;
+  step: string;
+  text: string;
+  truncated: boolean;
+}
+
+export interface PipelineLogTailsResult {
+  streamPipelineLogs: boolean;
+  pipelineLogChars: number;
+  tails: PipelineLogTail[];
+}
+
 const MAX_STRUCTURED_READ_FAILURES = 3;
 const LOG_CHUNK_MAX = 16_384;
 /** Floor between WAL-driven ticks so dense notifications cannot storm the loop. */
@@ -100,6 +114,17 @@ const WAL_TICK_COALESCE_MS = 75;
 const SQLITE_BUSY_TIMEOUT_MS = 250;
 /** Recency window for completed/failed runs (seconds — matches no-mistakes storage). */
 const RECENT_RUN_WINDOW_SEC = 6 * 60 * 60;
+
+/** Transient open/lock blips — only these get multi-strike grace. */
+function isTransientSqliteError(error: unknown): boolean {
+  const code =
+    error !== null && typeof error === "object" && "code" in error
+      ? String((error as { code: unknown }).code)
+      : "";
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
+  const msg = error instanceof Error ? error.message : String(error);
+  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|unable to open database file/i.test(msg);
+}
 
 /**
  * no-mistakes stores unix epoch *seconds* in INTEGER timestamp columns.
@@ -122,7 +147,7 @@ export class PipelineWatcher {
   private readonly home: string;
   private pollMs: number;
   private readonly sink: (event: OrchestratorEvent) => void;
-  private readonly profile: () => { streamPipelineLogs: boolean };
+  private readonly profile: () => { streamPipelineLogs: boolean; pipelineLogChars: number };
   private timer: ReturnType<typeof setInterval> | null = null;
   private walWatcher: FSWatcher | null = null;
   /** At most one WAL-scheduled tick is outstanding at a time. */
@@ -144,6 +169,11 @@ export class PipelineWatcher {
   private liveSnapshotsById = new Map<string, PipelineRunSnapshot>();
   /** Log tail offsets, so each poll emits only newly appended bytes. */
   private readonly logOffsets = new Map<string, number>();
+  /**
+   * Active-step log paths from the last successful tick (`runId:step` → path).
+   * Powers attach-time catch-up without replaying into the durable event log.
+   */
+  private readonly stepLogPaths = new Map<string, string>();
   private lastPollAt: number | null = null;
   /** Emitted once per incompatibility, not once per tick. */
   private incompatibilityReported = false;
@@ -159,7 +189,8 @@ export class PipelineWatcher {
       options.home ?? (envHome !== undefined && envHome.length > 0 ? envHome : join(homedir(), ".no-mistakes"));
     this.pollMs = options.pollMs ?? 1000;
     this.sink = options.sink;
-    this.profile = options.profile ?? (() => ({ streamPipelineLogs: true }));
+    this.profile =
+      options.profile ?? (() => ({ streamPipelineLogs: true, pipelineLogChars: 20_000 }));
   }
 
   private dbPath(): string {
@@ -268,6 +299,65 @@ export class PipelineWatcher {
   }
 
   /**
+   * Bounded tail of each currently active step log for Console attach-time
+   * catch-up. Reads the file directly (last `pipelineLogChars`) and aligns the
+   * watcher's offset to EOF so subsequent `pipeline.log_appended` frames do not
+   * overlap the seed. Does not append into the durable event log.
+   *
+   * Under quiet (`streamPipelineLogs: false`) returns no tails so catch-up
+   * cannot bypass the profile's deliberate log suppression.
+   */
+  activeLogTails(): PipelineLogTailsResult {
+    const { streamPipelineLogs, pipelineLogChars } = this.profile();
+    if (!streamPipelineLogs || pipelineLogChars <= 0) {
+      return { streamPipelineLogs, pipelineLogChars, tails: [] };
+    }
+    if (!this.compatibility.ok || this.transport === "unavailable") {
+      return { streamPipelineLogs, pipelineLogChars, tails: [] };
+    }
+    const tails: PipelineLogTail[] = [];
+    for (const [key, logPath] of this.stepLogPaths) {
+      const sep = key.indexOf(":");
+      if (sep === -1) continue;
+      const runId = key.slice(0, sep);
+      const step = key.slice(sep + 1);
+      if (!this.liveSnapshotsById.has(runId)) continue;
+      try {
+        if (!existsSync(logPath)) continue;
+        const size = statSync(logPath).size;
+        const toRead = Math.min(pipelineLogChars, size);
+        const start = size - toRead;
+        let text = "";
+        if (toRead > 0) {
+          const buffer = Buffer.alloc(toRead);
+          const fd = openSync(logPath, "r");
+          try {
+            readSync(fd, buffer, 0, toRead, start);
+          } finally {
+            closeSync(fd);
+          }
+          text = buffer.toString("utf8");
+        }
+        // Align SSE boundary to EOF so the seed and first log_appended frames
+        // meet exactly at `size` rather than overlapping by text de-dupe.
+        const known = this.logOffsets.get(key);
+        if (known === undefined || known < size) {
+          this.logOffsets.set(key, size);
+        }
+        tails.push({
+          runId,
+          step,
+          text,
+          truncated: size > pipelineLogChars,
+        });
+      } catch {
+        // Best-effort; structured cards remain the source of truth.
+      }
+    }
+    return { streamPipelineLogs, pipelineLogChars, tails };
+  }
+
+  /**
    * Apply hot-reloaded knobs. Starts/stops watching and rebuilds the interval
    * when the poll cadence changes — no daemon restart required.
    */
@@ -288,16 +378,9 @@ export class PipelineWatcher {
       this.start();
       return;
     }
-    // Already running — refresh interval cadence and re-attach WAL watch.
+    // Already running — refresh interval cadence and re-validate WAL assist.
     this.restartTimer();
-    this.attachWalWatch();
-    // Never promote the honesty banner while the schema is unreadable.
-    // Hot-reloading pollMs must not flip UNAVAILABLE → WAL/INTERVAL-ONLY.
-    this.transport = this.compatibility.ok
-      ? this.walWatchAttached
-        ? "wal-assisted"
-        : "interval-only"
-      : "unavailable";
+    this.refreshWalAssist();
   }
 
   /**
@@ -317,6 +400,7 @@ export class PipelineWatcher {
     // Drop prior log offsets so the next first-sight re-seeds to current size
     // instead of replaying every byte written while the watcher was stopped.
     this.logOffsets.clear();
+    this.stepLogPaths.clear();
     this.incompatibilityReported = false;
     this.structuredReadFailures = 0;
     const compat = this.checkCompatibility();
@@ -330,8 +414,7 @@ export class PipelineWatcher {
       return;
     }
 
-    this.attachWalWatch();
-    this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
+    this.refreshWalAssist();
     this.timer = setInterval(() => this.tick(), this.pollMs);
     this.timer.unref?.();
     this.tick();
@@ -344,11 +427,7 @@ export class PipelineWatcher {
       this.timer = null;
     }
     this.clearPendingWalTick();
-    if (this.walWatcher !== null) {
-      this.walWatcher.close();
-      this.walWatcher = null;
-    }
-    this.walWatchAttached = false;
+    this.detachWalWatch();
   }
 
   private restartTimer(): void {
@@ -382,33 +461,73 @@ export class PipelineWatcher {
     this.pendingWalTick.unref?.();
   }
 
-  private attachWalWatch(): void {
+  private detachWalWatch(): void {
     if (this.walWatcher !== null) {
       this.walWatcher.close();
       this.walWatcher = null;
     }
     this.walWatchAttached = false;
+  }
+
+  /**
+   * Re-validate WAL presence and watch health every tick. Transport is an
+   * observation, not a high-water mark — demote the moment the assist is gone.
+   */
+  private refreshWalAssist(): void {
+    if (!this.compatibility.ok) {
+      this.detachWalWatch();
+      if (this.transport !== "unavailable") this.transport = "unavailable";
+      return;
+    }
     const wal = `${this.dbPath()}-wal`;
-    if (!existsSync(wal)) return;
+    const walPresent = existsSync(wal);
+    if (!walPresent) {
+      this.detachWalWatch();
+      this.transport = "interval-only";
+      return;
+    }
+    if (this.walWatchAttached && this.walWatcher !== null) {
+      this.transport = "wal-assisted";
+      return;
+    }
+    this.detachWalWatch();
     try {
       this.walWatcher = watch(wal, () => this.scheduleWalTick());
+      this.walWatcher.on("error", () => {
+        // Watch died mid-session — demote immediately; the next tick will
+        // re-probe. Interval remains the floor.
+        this.detachWalWatch();
+        if (this.compatibility.ok && this.transport !== "unavailable") {
+          this.transport = "interval-only";
+        }
+      });
       this.walWatchAttached = true;
+      this.transport = "wal-assisted";
     } catch {
       // fs.watch is best-effort on some platforms; the interval still covers us.
+      this.detachWalWatch();
+      this.transport = "interval-only";
     }
   }
 
   private reportIncompatibility(): void {
     if (this.incompatibilityReported) return;
-    this.incompatibilityReported = true;
-    this.sink({
-      type: "pipeline.unavailable",
-      payload: {
-        reason: this.compatibility.reason ?? "no-mistakes state unreadable",
-        missingColumns: this.compatibility.missingColumns,
-        home: this.home,
-      },
-    });
+    // Sink-first: only mark reported AFTER the durable event lands. Same
+    // pattern as run fingerprints and log offsets — never set progress before
+    // the sink returns, or a throw leaves the Console without a retryable signal.
+    try {
+      this.sink({
+        type: "pipeline.unavailable",
+        payload: {
+          reason: this.compatibility.reason ?? "no-mistakes state unreadable",
+          missingColumns: this.compatibility.missingColumns,
+          home: this.home,
+        },
+      });
+      this.incompatibilityReported = true;
+    } catch {
+      // Leave unflagged so the next tick retries.
+    }
   }
 
   /** Mark the view unreadable and emit once so nothing is shown as current. */
@@ -420,17 +539,47 @@ export class PipelineWatcher {
     };
     this.transport = "unavailable";
     this.liveSnapshotsById = new Map();
+    this.stepLogPaths.clear();
+    this.detachWalWatch();
     this.incompatibilityReported = false;
     this.reportIncompatibility();
   }
 
+  /**
+   * Structured-read failures: schema/SQL drift blanks the view on the first
+   * hit; only transient busy/open blips share multi-strike grace.
+   */
   private markStructuredReadFailed(error: unknown): void {
-    this.structuredReadFailures += 1;
-    if (this.structuredReadFailures < MAX_STRUCTURED_READ_FAILURES) return;
+    // Busy/open first — do not let a transient open failure poison
+    // checkCompatibility into an immediate unreadable banner.
+    if (isTransientSqliteError(error)) {
+      this.structuredReadFailures += 1;
+      if (this.structuredReadFailures < MAX_STRUCTURED_READ_FAILURES) return;
+      this.markUnavailable(
+        error instanceof Error
+          ? `structured pipeline read failed repeatedly: ${error.message}`
+          : "structured pipeline read failed repeatedly",
+        this.compatibility.missingColumns,
+      );
+      return;
+    }
+    // Non-transient (e.g. no such column): re-probe so the reason names the
+    // missing columns when possible, then blank on the first strike.
+    const compat = this.checkCompatibility();
+    if (!compat.ok) {
+      this.markUnavailable(
+        compat.reason ??
+          (error instanceof Error
+            ? `structured pipeline read failed: ${error.message}`
+            : "structured pipeline read failed"),
+        compat.missingColumns,
+      );
+      return;
+    }
     this.markUnavailable(
       error instanceof Error
-        ? `structured pipeline read failed repeatedly: ${error.message}`
-        : "structured pipeline read failed repeatedly",
+        ? `structured pipeline read failed: ${error.message}`
+        : "structured pipeline read failed",
       this.compatibility.missingColumns,
     );
   }
@@ -451,8 +600,7 @@ export class PipelineWatcher {
         this.incompatibilityReported = false;
         this.structuredReadFailures = 0;
         this.lastFingerprint.clear();
-        this.attachWalWatch();
-        this.transport = this.walWatchAttached ? "wal-assisted" : "interval-only";
+        this.refreshWalAssist();
         this.restartTimer();
       }
       const opened = this.tryOpen();
@@ -498,6 +646,7 @@ export class PipelineWatcher {
 
       const streamLogs = this.profile().streamPipelineLogs;
       const nextLive = new Map<string, PipelineRunSnapshot>();
+      const nextLogPaths = new Map<string, string>();
 
       for (const run of runs) {
         const rows = stepStmt.all(run.id) as Array<{
@@ -558,6 +707,7 @@ export class PipelineWatcher {
         // swallow bytes appended while quiet.
         const active = rows.find((r) => r.status === "running" || r.status === "fixing");
         if (active?.log_path != null) {
+          nextLogPaths.set(`${run.id}:${active.step_name}`, active.log_path);
           this.emitLogTail(run.id, active.step_name, active.log_path, streamLogs);
         }
       }
@@ -574,23 +724,17 @@ export class PipelineWatcher {
         if (!nextLive.has(runId)) this.logOffsets.delete(key);
       }
       this.liveSnapshotsById = nextLive;
+      this.stepLogPaths.clear();
+      for (const [key, path] of nextLogPaths) this.stepLogPaths.set(key, path);
 
       this.structuredReadFailures = 0;
       this.lastPollAt = Date.now();
-      // A gate that was idle at first attach may not have a WAL yet. Re-try
-      // while interval-only so the honesty label can upgrade to wal-assisted
-      // once no-mistakes creates the file.
-      if (!this.walWatchAttached) {
-        this.attachWalWatch();
-        if (this.walWatchAttached) {
-          this.transport = "wal-assisted";
-        } else if (this.transport !== "unavailable") {
-          this.transport = "interval-only";
-        }
-      }
+      // Re-validate WAL assist every successful tick: promote when the file
+      // appears, demote when it is checkpointed away or the watch dies.
+      this.refreshWalAssist();
     } catch (error) {
-      // A read failure must never take the daemon with it; repeated failures
-      // mark compatibility failed so the UI cannot keep showing last-known rows.
+      // A read failure must never take the daemon with it; schema drift blanks
+      // the view immediately, transient busy/open uses multi-strike grace.
       this.markStructuredReadFailed(error);
     } finally {
       db?.close();
@@ -609,9 +753,10 @@ export class PipelineWatcher {
       const size = statSync(logPath).size;
       const key = `${runId}:${step}`;
       const known = this.logOffsets.get(key);
-      // First sight: seed to current size without emitting. Catch-up of prior
-      // bytes belongs in the UI; replaying into the durable event log on every
-      // daemon restart would bloat it monotonically.
+      // First sight: seed to current size without emitting. Prior bytes are
+      // served on Console attach via activeLogTails() (bounded by
+      // pipelineLogChars) so the durable event log stays append-only for new
+      // growth only.
       if (known === undefined) {
         this.logOffsets.set(key, size);
         return;

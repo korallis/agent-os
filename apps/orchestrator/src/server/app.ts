@@ -797,6 +797,21 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     };
   });
 
+  /**
+   * Bounded attach-time log catch-up for active steps. Honours the active
+   * profile's streamPipelineLogs / pipelineLogChars so quiet cannot be
+   * bypassed, and aligns the watcher's SSE offset to EOF so the seed and the
+   * first pipeline.log_appended frames do not overlap.
+   */
+  app.get("/v1/pipeline/log-tails", async (_request, reply) => {
+    if (deps.pipeline === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "pipeline watcher unavailable");
+      return;
+    }
+    void reply;
+    return deps.pipeline.activeLogTails();
+  });
+
   // ── Network I/O (§7 Network I/O Detail, Figma 41:4815) ────────────────
 
   /**

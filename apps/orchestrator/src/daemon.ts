@@ -332,7 +332,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       },
       profile: () => {
         const { profile } = resolveActiveProfile(configService.effective().config.observability);
-        return { streamPipelineLogs: profile.streamPipelineLogs };
+        return {
+          streamPipelineLogs: profile.streamPipelineLogs,
+          pipelineLogChars: profile.pipelineLogChars,
+        };
       },
     });
     pipelineWatcherRef = pipelineWatcher;

@@ -169,7 +169,7 @@ describe("PipelineWatcher", () => {
       home: gateHome,
       pollMs: 10_000,
       sink: (e) => events.push(e),
-      profile: () => ({ streamPipelineLogs: streamLogs }),
+      profile: () => ({ streamPipelineLogs: streamLogs, pipelineLogChars: 20_000 }),
     });
     watcher.start();
     const firstRun = events.filter((e) => e.type === "pipeline.run_updated");
@@ -252,7 +252,7 @@ describe("PipelineWatcher", () => {
       home: gateHome,
       pollMs: 10_000,
       sink: (e) => events.push(e),
-      profile: () => ({ streamPipelineLogs: streamLogs }),
+      profile: () => ({ streamPipelineLogs: streamLogs, pipelineLogChars: 20_000 }),
     });
     watcher.start();
     expect(events.filter((e) => e.type === "pipeline.log_appended")).toHaveLength(0);
@@ -932,7 +932,7 @@ describe("PipelineWatcher", () => {
       home: gateHome,
       pollMs: 10_000,
       sink: () => undefined,
-      profile: () => ({ streamPipelineLogs: true }),
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 20_000 }),
     });
     watcher.start();
     // Seed offset via first sight, then append so a second tick stores a key.
@@ -951,5 +951,226 @@ describe("PipelineWatcher", () => {
 
     expect([...offsets.keys()].some((k) => k.startsWith("run1:"))).toBe(false);
     watcher.stop();
+  });
+
+  it("demotes transport to interval-only when WAL assist disappears mid-session", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-wal-demote-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.close();
+
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: () => undefined,
+    });
+    watcher.start();
+    expect(watcher.status().transport).toBe("wal-assisted");
+
+    // Switch off WAL so the assist file is gone for good (a mere unlink is
+    // recreated the next time better-sqlite3 opens a WAL-mode database).
+    const writer = new Database(join(gateHome, "state.sqlite"));
+    writer.pragma("journal_mode = DELETE");
+    writer.close();
+    rmSync(join(gateHome, "state.sqlite-wal"), { force: true });
+    rmSync(join(gateHome, "state.sqlite-shm"), { force: true });
+
+    watcher.tick();
+    expect(watcher.status().transport).toBe("interval-only");
+    expect(watcher.status().compatibility.ok).toBe(true);
+    watcher.stop();
+  });
+
+  it("marks unavailable on the first mid-session schema error while busy stays graceful", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-schema-first-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', NULL, 'round 1', ?, NULL, NULL)`,
+    ).run(now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+    });
+    watcher.start();
+    expect(watcher.status().compatibility.ok).toBe(true);
+    expect(watcher.liveSnapshots()).toHaveLength(1);
+
+    // Drop a selected column mid-session — first structured failure must blank.
+    const writer = new Database(join(gateHome, "state.sqlite"));
+    writer.exec("ALTER TABLE step_results RENAME COLUMN findings_json TO findings_blob");
+    writer.close();
+    events.length = 0;
+    watcher.tick();
+
+    expect(watcher.status().compatibility.ok).toBe(false);
+    expect(watcher.status().transport).toBe("unavailable");
+    expect(watcher.liveSnapshots()).toHaveLength(0);
+    expect(events.some((e) => e.type === "pipeline.unavailable")).toBe(true);
+    watcher.stop();
+  });
+
+  it("retries pipeline.unavailable when the sink throws before the flag sticks", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-unavail-retry-"));
+    homes.push(gateHome);
+    // Missing state.sqlite → start reports unavailable.
+    mkdirSync(gateHome, { recursive: true });
+
+    let failUnavailable = true;
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => {
+        if (failUnavailable && e.type === "pipeline.unavailable") {
+          throw new Error("event store full");
+        }
+        events.push(e);
+      },
+    });
+    watcher.start();
+    // First report threw — flag must not stick.
+    expect(events.some((e) => e.type === "pipeline.unavailable")).toBe(false);
+
+    failUnavailable = false;
+    watcher.tick();
+    expect(events.some((e) => e.type === "pipeline.unavailable")).toBe(true);
+    watcher.stop();
+  });
+
+  it("activeLogTails seeds recent log text under streaming profiles and not under quiet", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-catchup-"));
+    homes.push(gateHome);
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "prior-line-one\nprior-line-two\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    let streamLogs = true;
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: streamLogs, pipelineLogChars: 20_000 }),
+    });
+    watcher.start();
+    // First sight seeds offset to EOF without emitting — catch-up is the only
+    // way to see prior-line-* on attach.
+    expect(events.filter((e) => e.type === "pipeline.log_appended")).toHaveLength(0);
+
+    const seeded = watcher.activeLogTails();
+    expect(seeded.streamPipelineLogs).toBe(true);
+    expect(seeded.tails).toHaveLength(1);
+    expect(seeded.tails[0]?.text).toContain("prior-line-one");
+    expect(seeded.tails[0]?.text).toContain("prior-line-two");
+
+    // Aligning the offset to EOF means a subsequent append emits only new bytes.
+    events.length = 0;
+    appendFileSync(logPath, "after-seed\n");
+    watcher.tick();
+    const logs = events.filter((e) => e.type === "pipeline.log_appended");
+    expect(logs).toHaveLength(1);
+    if (logs[0]?.type === "pipeline.log_appended") {
+      expect(logs[0].payload.chunk).toContain("after-seed");
+      expect(logs[0].payload.chunk).not.toContain("prior-line-one");
+    }
+
+    streamLogs = false;
+    const quiet = watcher.activeLogTails();
+    expect(quiet.streamPipelineLogs).toBe(false);
+    expect(quiet.tails).toHaveLength(0);
+    watcher.stop();
+  });
+
+  it("GET /v1/pipeline/log-tails returns bounded catch-up for active steps", async () => {
+    const agentHome = mkdtempSync(join(tmpdir(), "p9-logtail-home-"));
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-logtail-gate-"));
+    homes.push(agentHome, gateHome);
+    mkdirSync(join(agentHome, "config"), { recursive: true });
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    const logPath = join(gateHome, "logs", "run1", "review.log");
+    mkdirSync(join(gateHome, "logs", "run1"), { recursive: true });
+    writeFileSync(logPath, "seeded-from-api\n");
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(logPath, now);
+    db.close();
+
+    const { store } = EventStore.open(agentHome);
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (event) => {
+        store.append(event);
+      },
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 20_000 }),
+    });
+    watcher.start();
+
+    const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(agentHome, "config"));
+    config.installDefaults();
+    const token = "logtail-test-token-0001";
+    const app = buildServer({
+      store,
+      config,
+      token,
+      home: agentHome,
+      port: 0,
+      startedAt: new Date().toISOString(),
+      logger: pino({ level: "silent" }),
+      pipeline: watcher,
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/pipeline/log-tails",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      streamPipelineLogs: boolean;
+      tails: Array<{ runId: string; step: string; text: string }>;
+    };
+    // Profile comes from the watcher callback (streaming), not the default quiet config.
+    expect(body.streamPipelineLogs).toBe(true);
+    expect(body.tails.some((t) => t.text.includes("seeded-from-api"))).toBe(true);
+
+    watcher.stop();
+    await app.close();
   });
 });

@@ -97,6 +97,22 @@ function transportDescription(status: PipelineStatus | null): string {
 /** Consecutive BFF/daemon blips before the whole page is treated as dead. */
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 
+function clearLogState(
+  appliedLogIds: { current: Set<string> },
+  logsRef: { current: Record<string, string> },
+  logTruncatedRef: { current: Record<string, boolean> },
+  setLogs: (v: Record<string, string>) => void,
+  setLogTruncated: (v: Record<string, boolean>) => void,
+  seededCatchUpKeys: { current: Set<string> },
+): void {
+  appliedLogIds.current.clear();
+  seededCatchUpKeys.current.clear();
+  logsRef.current = {};
+  logTruncatedRef.current = {};
+  setLogs({});
+  setLogTruncated({});
+}
+
 export function PipelineView() {
   const [status, setStatus] = useState<PipelineStatus | null>(null);
   const [runs, setRuns] = useState<PipelineRunSnapshot[] | null>(null);
@@ -115,11 +131,14 @@ export function PipelineView() {
   const consecutivePollFailures = useRef(0);
   /** Whether we have ever painted a successful pipeline status response. */
   const hasLastKnown = useRef(false);
+  /** Keys already seeded via /v1/pipeline/log-tails (or SSE) so catch-up runs once. */
+  const seededCatchUpKeys = useRef(new Set<string>());
 
   // Hold retention at 0 until /v1/pipeline/status lands the real profile
   // budget — a provisional 20k window permanently discards middle text when
   // the active profile allows more (e.g. firehose 200k).
   const logChars = status?.profile?.pipelineLogChars ?? 0;
+  const streamPipelineLogs = status?.profile?.streamPipelineLogs ?? false;
 
   // Profile / watch knobs land as config.changed and must re-fetch status so
   // pipelineLogChars and transport updates take effect without waiting a poll.
@@ -173,6 +192,14 @@ export function PipelineView() {
           runsBody.unavailable === true;
         if (unreadable) {
           setRuns([]);
+          clearLogState(
+            appliedLogIds,
+            logsRef,
+            logTruncatedRef,
+            setLogs,
+            setLogTruncated,
+            seededCatchUpKeys,
+          );
         } else {
           setRuns(runsBody.runs);
         }
@@ -201,11 +228,14 @@ export function PipelineView() {
   useEffect(() => {
     const retention = Math.max(0, logChars);
     if (retention === 0) {
-      appliedLogIds.current.clear();
-      logsRef.current = {};
-      logTruncatedRef.current = {};
-      setLogs({});
-      setLogTruncated({});
+      clearLogState(
+        appliedLogIds,
+        logsRef,
+        logTruncatedRef,
+        setLogs,
+        setLogTruncated,
+        seededCatchUpKeys,
+      );
       return;
     }
 
@@ -225,6 +255,7 @@ export function PipelineView() {
       const { runId, step, chunk } = envelope.event.payload;
       const key = `${runId}:${step}`;
       next[key] = `${next[key] ?? ""}${chunk}`;
+      seededCatchUpKeys.current.add(key);
       textChanged = true;
     }
 
@@ -249,6 +280,111 @@ export function PipelineView() {
       setLogTruncated(nextTrunc);
     }
   }, [events, logChars]);
+
+  // Prune retained log text for runs that left the visible set so a long-lived
+  // Console tab under working/firehose cannot accumulate every historical step.
+  useEffect(() => {
+    if (runs === null) return;
+    const liveRunIds = new Set(runs.map((r) => r.runId));
+    const pruneRecord = <T,>(record: Record<string, T>): { next: Record<string, T>; changed: boolean } => {
+      let changed = false;
+      const next: Record<string, T> = {};
+      for (const [key, value] of Object.entries(record)) {
+        const sep = key.indexOf(":");
+        const runId = sep === -1 ? key : key.slice(0, sep);
+        if (liveRunIds.has(runId)) {
+          next[key] = value;
+        } else {
+          changed = true;
+        }
+      }
+      return { next, changed };
+    };
+
+    const prunedLogs = pruneRecord(logsRef.current);
+    const prunedTrunc = pruneRecord(logTruncatedRef.current);
+    if (prunedLogs.changed) {
+      logsRef.current = prunedLogs.next;
+      setLogs(prunedLogs.next);
+    }
+    if (prunedTrunc.changed) {
+      logTruncatedRef.current = prunedTrunc.next;
+      setLogTruncated(prunedTrunc.next);
+    }
+    for (const key of [...seededCatchUpKeys.current]) {
+      const sep = key.indexOf(":");
+      const runId = sep === -1 ? key : key.slice(0, sep);
+      if (!liveRunIds.has(runId)) seededCatchUpKeys.current.delete(key);
+    }
+  }, [runs]);
+
+  // Attach-time catch-up: seed the last pipelineLogChars of each active step
+  // before relying on live pipeline.log_appended frames. The daemon aligns the
+  // watcher offset to EOF so the seed and the first SSE chunks do not overlap.
+  useEffect(() => {
+    if (runs === null || status === null) return;
+    if (!status.compatibility.ok || status.transport === "unavailable") return;
+    if (!streamPipelineLogs || logChars <= 0) return;
+
+    const needsSeed = runs.some((run) => {
+      const active = run.steps.find((s) => s.status === "running" || s.status === "fixing");
+      if (active === undefined) return false;
+      const key = `${run.runId}:${active.step}`;
+      return !seededCatchUpKeys.current.has(key);
+    });
+    if (!needsSeed) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/agentos/pipeline/log-tails", { cache: "no-store" });
+        if (!res.ok || cancelled) return;
+        const body = (await res.json()) as {
+          streamPipelineLogs: boolean;
+          pipelineLogChars: number;
+          tails: Array<{ runId: string; step: string; text: string; truncated: boolean }>;
+        };
+        if (cancelled || !body.streamPipelineLogs) return;
+        const next = { ...logsRef.current };
+        const nextTrunc = { ...logTruncatedRef.current };
+        let textChanged = false;
+        let truncChanged = false;
+        for (const tail of body.tails) {
+          const key = `${tail.runId}:${tail.step}`;
+          seededCatchUpKeys.current.add(key);
+          // Do not clobber text already extended by SSE while the fetch was in flight.
+          if ((next[key] ?? "").length > 0) continue;
+          if (tail.text.length === 0) continue;
+          next[key] = tail.text;
+          textChanged = true;
+          if (tail.truncated) {
+            nextTrunc[key] = true;
+            truncChanged = true;
+          }
+        }
+        // Mark remaining active keys as seeded even when empty so we do not
+        // re-fetch every poll while a step has not written yet.
+        for (const run of runs) {
+          const active = run.steps.find((s) => s.status === "running" || s.status === "fixing");
+          if (active === undefined) continue;
+          seededCatchUpKeys.current.add(`${run.runId}:${active.step}`);
+        }
+        if (textChanged) {
+          logsRef.current = next;
+          setLogs(next);
+        }
+        if (truncChanged) {
+          logTruncatedRef.current = nextTrunc;
+          setLogTruncated(nextTrunc);
+        }
+      } catch {
+        // Catch-up is best-effort; live SSE still covers new growth.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runs, status, streamPipelineLogs, logChars]);
 
   const unavailableEvent = useMemo(
     () => events.find((e) => e.event.type === "pipeline.unavailable"),
@@ -426,7 +562,13 @@ export function PipelineView() {
                       </span>
                     )}
                   </div>
-                  {logText !== null && logText.length > 0 ? (
+                  {!streamPipelineLogs ? (
+                    <p className="text-[11px] text-fg-3">
+                      Step log streaming is off under the active observability profile (
+                      {status?.profile?.name ?? "quiet"}). Switch to working or firehose to see live
+                      output.
+                    </p>
+                  ) : logText !== null && logText.length > 0 ? (
                     <pre className="max-h-[240px] overflow-auto rounded-[8px] bg-shell p-3 font-mono text-[11px] text-fg-2 whitespace-pre-wrap">
                       {logText}
                     </pre>
