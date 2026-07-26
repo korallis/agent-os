@@ -18,6 +18,18 @@ export interface EventStoreOpenResult {
   quarantinedTail: string | null;
 }
 
+/**
+ * Identity set of envelopes produced by {@link EventStore.emitLive}. Used by the
+ * SSE layer to omit resumable `id:` lines — live frames are never projected, so
+ * advertising their ULID as a cursor would force full-history replay on reconnect.
+ */
+const liveOnlyEnvelopes = new WeakSet<object>();
+
+/** True when `envelope` was produced by {@link EventStore.emitLive} (not projected). */
+export function isLiveOnlyEnvelope(envelope: object): boolean {
+  return liveOnlyEnvelopes.has(envelope);
+}
+
 /** Per-task gate/fusion totals for Pipeline Run History (daemon-side). */
 export type RunHistoryAggregate = {
   taskId: string;
@@ -120,6 +132,9 @@ export class EventStore {
       event,
     });
     this.nextLiveOnlySeq += 1;
+    // Structural mark for every live-only frame (not just today's log chunks):
+    // SSE must not advertise these ids as resumable cursors.
+    liveOnlyEnvelopes.add(envelope);
     this.fanOut(envelope);
     return envelope;
   }

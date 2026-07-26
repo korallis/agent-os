@@ -6,6 +6,7 @@ export { NdjsonEventLog, readLog, quarantineCorruptTail, type LogReadResult } fr
 export { SqliteProjection } from "./projection.js";
 export {
   EventStore,
+  isLiveOnlyEnvelope,
   type EventListener,
   type EventStoreOpenResult,
   type RunHistoryAggregate,

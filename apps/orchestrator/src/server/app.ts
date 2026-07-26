@@ -39,7 +39,7 @@ import {
   type StatusResponse,
   type TaskEventsResponse,
 } from "@agent-os/protocol";
-import type { EventStore } from "@agent-os/event-store";
+import { isLiveOnlyEnvelope, type EventStore } from "@agent-os/event-store";
 import { ConfigService, ConfigWriteError } from "../config/service.js";
 import { AGENTOSD_VERSION } from "../version.js";
 import type { ConnectionRegistry } from "../pi/connections.js";
@@ -1386,8 +1386,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     const writeFrame = (envelope: { id: string; event: { type: string } }): Promise<boolean> => {
       // Visibility profiles filter the Console live path; durable store is unchanged.
       if (!surfaceAllows(envelope.event.type)) return Promise.resolve(true);
+      // Live-only frames (emitLive) are never projected, so they have no durable
+      // position to resume from. Emitting `id:` would pin EventSource's
+      // Last-Event-ID to an unknown cursor; eventsAfterId then replays from
+      // seq 0. Omit id so Last-Event-ID stays on the last durable frame.
+      const idLine = isLiveOnlyEnvelope(envelope) ? "" : `id: ${envelope.id}\n`;
       return enqueueWrite(
-        `id: ${envelope.id}\nevent: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
+        `${idLine}event: ${envelope.event.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
       );
     };
 

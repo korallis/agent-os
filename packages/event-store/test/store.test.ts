@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { OrchestratorEvent } from "@agent-os/protocol";
-import { EventStore, readLog } from "../src/index.js";
+import { EventStore, isLiveOnlyEnvelope, readLog } from "../src/index.js";
 
 function configChanged(i: number): OrchestratorEvent {
   return {
@@ -195,7 +195,7 @@ describe("EventStore", () => {
     const { store } = EventStore.open(home);
     const seen: string[] = [];
     store.subscribe((envelope) => seen.push(envelope.event.type));
-    store.emitLive({
+    const live = store.emitLive({
       type: "pipeline.log_appended",
       payload: {
         runId: "run1",
@@ -206,13 +206,18 @@ describe("EventStore", () => {
       },
     });
     expect(seen).toEqual(["pipeline.log_appended"]);
+    expect(isLiveOnlyEnvelope(live)).toBe(true);
     expect(store.count()).toBe(0);
     expect(store.eventsAfterId(null, 10).events).toHaveLength(0);
     expect(store.eventsByType("pipeline.log_appended", 10).events).toHaveLength(0);
     // Durable append still works and is the only thing a fresh client replays.
-    store.append(configChanged(1));
+    const durable = store.append(configChanged(1));
+    expect(isLiveOnlyEnvelope(durable)).toBe(false);
     expect(store.count()).toBe(1);
     expect(store.eventsAfterId(null, 10).events).toHaveLength(1);
+    // Live ULID is unknown to the projection → cursor resolves to seq 0 (full replay).
+    // That is why SSE must not advertise live ids as Last-Event-ID.
+    expect(store.eventsAfterId(live.id, 10).events).toHaveLength(1);
     store.close();
   });
 
