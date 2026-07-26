@@ -5,6 +5,8 @@ import { spawnSync } from "node:child_process";
 import {
   PI_CONFIG_DIR_ENV_CANDIDATES,
   PI_PINNED_VERSION,
+  piVersionSatisfiesPin,
+  piVersionIsPatchDrift,
   type PiSpawnSpec,
 } from "@agent-os/protocol";
 import { readAuthStorePresenceUnion } from "../security/auth-store.js";
@@ -12,14 +14,20 @@ import { scrubEnv, type ProviderKeyEnvName } from "../security/env-scrub.js";
 
 /**
  * Pi manager (master plan §4.5–§4.7).
- * Only this module builds Pi command lines. Exact pin + managed home.
+ * Only this module builds Pi command lines. Pin compatibility + managed home.
  */
 
 export interface PiDetection {
   binary: string | null;
   version: string | null;
   pinnedVersion: typeof PI_PINNED_VERSION;
+  /**
+   * Satisfies the pin rule (same major.minor, patch >= pin), not exact
+   * string equality. Set from {@link piVersionSatisfiesPin}.
+   */
   versionMatchesPin: boolean;
+  /** Compatible with the pin, but not the exact tested version. */
+  versionIsPatchDrift: boolean;
   managedHome: string;
   /** Env var that relocates Pi config, or null if isolation not verified. */
   configDirEnv: string | null;
@@ -93,7 +101,11 @@ export function detectPi(agentosHome: string): PiDetection {
     binary,
     version,
     pinnedVersion: PI_PINNED_VERSION,
-    versionMatchesPin: version === PI_PINNED_VERSION,
+    // Compatibility, not string identity — see piVersionSatisfiesPin. Exact
+    // equality here made a patch release of Pi wedge onboarding at the
+    // doctor step with no way forward.
+    versionMatchesPin: piVersionSatisfiesPin(version),
+    versionIsPatchDrift: piVersionIsPatchDrift(version),
     managedHome,
     configDirEnv,
     isolationMode: configDirEnv !== null ? "managed" : "shared",
