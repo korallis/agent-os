@@ -497,7 +497,9 @@ agent-os/
 │   ├── pi-extension/                 # telemetry + control + Brain tool bridge; clean-room crew surface [R2]+[R3]+[Phase 4]
 │   ├── pi-ext-claude-agent-sdk/      # [R6.1] vendored claude-agent-sdk-pi fork
 │   └── fusion-core/                  # pure fusion contract/templates/attribution (no I/O) [B]
-├── scripts/verify-no-deprecated.mjs
+├── scripts/
+│   ├── verify-no-deprecated.mjs      # zero-deprecated dependency gate (CI)
+│   └── verify-gate-cleanup.mjs       # gates must exit after try/finally (CI; prevents orphaned agentosd)
 └── tooling/
     ├── gates/phase-{1,2,3,4,5,6,8}.mjs # executable phase gates (phase-6/8: Playwright + real daemon where noted)
     ├── evidence/capture-console.mjs    # full Console proof packs (docs/qa/runs/)

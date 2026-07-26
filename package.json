@@ -14,6 +14,7 @@
     "test": "turbo run test",
     "typecheck": "turbo run typecheck",
     "verify:no-deprecated": "node scripts/verify-no-deprecated.mjs",
+    "verify:gate-cleanup": "node scripts/verify-gate-cleanup.mjs",
     "gates": "node tooling/gates/phase-1.mjs && node tooling/gates/phase-2.mjs && node tooling/gates/phase-3.mjs && node tooling/gates/phase-4.mjs && node tooling/gates/phase-5.mjs && node tooling/gates/phase-6.mjs && node tooling/gates/phase-8.mjs",
     "screenshots": "pnpm run build && node tooling/screenshots/capture-console.mjs"
   },

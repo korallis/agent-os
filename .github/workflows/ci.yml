@@ -52,6 +52,12 @@ jobs:
       - name: Zero-deprecated gate
         run: node scripts/verify-no-deprecated.mjs
 
+      # Runs BEFORE the gates it protects: a gate that exits inside its `try`
+      # skips the finally that kills its daemon, and the orphans go on to make
+      # a later, unrelated gate fail for reasons its output never explains.
+      - name: Gate-cleanup gate
+        run: node scripts/verify-gate-cleanup.mjs
+
       - name: Phase 1 gates
         run: node tooling/gates/phase-1.mjs
 
