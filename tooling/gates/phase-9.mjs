@@ -313,10 +313,10 @@ try {
     );
   }
 
-  // ── G2 — log output streams incrementally ─────────────────────────────
+  // ── G2 — log output streams incrementally (live SSE, not durable replay) ─
   // Pure log append: do NOT touch any structured column. The real-world case is
   // a step writing to its log without updating last_activity / updated_at.
-  // First opt into a profile that streams logs (shipped default is quiet).
+  // pipeline.log_appended is live-only — prove it on SSE and absent from history.
   {
     const configPath = join(home, "config", "observability.json5");
     const raw = readFileSync(configPath, "utf8");
@@ -333,24 +333,63 @@ try {
     }
 
     const marker = `LIVE-LINE-${Date.now()}`;
-    appendFileSync(logPath, `${marker}\n`);
-
-    const started = Date.now();
+    const controller = new AbortController();
+    const sseRes = await fetch(`${BASE}/v1/events`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
+    const reader = sseRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
     let streamed = false;
-    while (Date.now() - started < 4000) {
-      const replay = await get("/v1/events/replay?types=pipeline.log_appended&limit=1000");
-      const frames = replay.events ?? [];
-      if (frames.some((e) => (e.event?.payload?.chunk ?? "").includes(marker))) {
-        streamed = true;
-        break;
+    const started = Date.now();
+    let pending = null;
+    // Subscribe first, then append so the live frame cannot be missed.
+    await sleep(200);
+    appendFileSync(logPath, `${marker}\n`);
+    while (Date.now() - started < 4000 && !streamed) {
+      pending ??= reader.read();
+      const race = await Promise.race([pending, sleep(100).then(() => "timeout")]);
+      if (race === "timeout") continue;
+      pending = null;
+      if (race.done) break;
+      buffer += decoder.decode(race.value, { stream: true });
+      let sep = buffer.indexOf("\n\n");
+      while (sep !== -1) {
+        const block = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+        if (dataLine) {
+          try {
+            const frame = JSON.parse(dataLine.slice(6));
+            if (
+              frame.event?.type === "pipeline.log_appended" &&
+              (frame.event?.payload?.chunk ?? "").includes(marker)
+            ) {
+              streamed = true;
+            }
+          } catch {
+            // ignore malformed
+          }
+        }
+        sep = buffer.indexOf("\n\n");
       }
-      await sleep(100);
     }
+    controller.abort();
+    try {
+      reader.cancel();
+    } catch {
+      // ignore
+    }
+    const durableReplay = await get("/v1/events/replay?types=pipeline.log_appended&limit=1000");
+    const durableHasLog = (durableReplay.events ?? []).some((e) =>
+      (e.event?.payload?.chunk ?? "").includes(marker),
+    );
     gate(
       "G2",
-      "newly appended step-log output streams incrementally without structured column changes",
-      streamed,
-      `marker=${marker} streamed=${streamed} in ${Date.now() - started}ms`,
+      "newly appended step-log output streams live without durable history replay",
+      streamed && !durableHasLog,
+      `marker=${marker} streamed=${streamed} durableHasLog=${durableHasLog} in ${Date.now() - started}ms`,
     );
   }
 
@@ -567,17 +606,25 @@ try {
 
     await setActiveProfile("quiet");
 
-    // ── axis 1: streamPipelineLogs ─────────────────────────────────────
-    const countLogFrames = async () => {
-      const replay = await get("/v1/events/replay?types=pipeline.log_appended&limit=10000");
-      return (replay.events ?? []).length;
-    };
-    const beforeQuiet = await countLogFrames();
+    // ── axis 1: streamPipelineLogs (live path; log_appended is never durable) ─
     const quietMarker = `QUIET-LINE-${Date.now()}`;
+    const quietLogSsePromise = readSse(
+      (frames) =>
+        frames.some(
+          (f) =>
+            f.event?.type === "pipeline.log_appended" &&
+            (f.event?.payload?.chunk ?? "").includes(quietMarker),
+        ),
+      3000,
+    );
+    await sleep(200);
     appendFileSync(logPath, `${quietMarker}\n`);
-    await sleep(2500);
-    const afterQuiet = await countLogFrames();
-    const quietBlocks = afterQuiet === beforeQuiet;
+    const quietLogFrames = await quietLogSsePromise;
+    const quietBlocks = !quietLogFrames.some(
+      (f) =>
+        f.event?.type === "pipeline.log_appended" &&
+        (f.event?.payload?.chunk ?? "").includes(quietMarker),
+    );
 
     // ── axis 2: surface — quiet admits run cards, not log firehose ──────
     // Quiet surfaces pipeline.run_updated (so the Console can show that a run
@@ -652,20 +699,31 @@ try {
         w.detail.source === "observability.wakeOn",
     );
 
-    // ── firehose: logs stream + surface admits pipeline.* ──────────────
+    // ── firehose: logs stream live + surface admits pipeline.* ──────────
     await setActiveProfile("firehose");
     const firehoseMarker = `FIREHOSE-LINE-${Date.now()}`;
+    const firehoseLogSsePromise = readSse(
+      (frames) =>
+        frames.some(
+          (f) =>
+            f.event?.type === "pipeline.log_appended" &&
+            (f.event?.payload?.chunk ?? "").includes(firehoseMarker),
+        ),
+      4000,
+    );
+    await sleep(200);
     appendFileSync(logPath, `${firehoseMarker}\n`);
-    const started = Date.now();
-    let firehoseStreams = false;
-    while (Date.now() - started < 4000) {
-      const replay = await get("/v1/events/replay?types=pipeline.log_appended&limit=1000");
-      if ((replay.events ?? []).some((e) => (e.event?.payload?.chunk ?? "").includes(firehoseMarker))) {
-        firehoseStreams = true;
-        break;
-      }
-      await sleep(100);
-    }
+    const firehoseLogFrames = await firehoseLogSsePromise;
+    const firehoseStreams = firehoseLogFrames.some(
+      (f) =>
+        f.event?.type === "pipeline.log_appended" &&
+        (f.event?.payload?.chunk ?? "").includes(firehoseMarker),
+    );
+    // Live-only: durable history must never retain step log chunks.
+    const durableLogAfterFirehose = (
+      (await get("/v1/events/replay?types=pipeline.log_appended&limit=1000")).events ?? []
+    ).some((e) => (e.event?.payload?.chunk ?? "").includes(firehoseMarker));
+    const firehoseNotDurable = !durableLogAfterFirehose;
 
     const firehoseRunId = `01RUNG7FIRE${String(Date.now()).slice(-10)}`;
     const firehoseSsePromise = readSse(
@@ -729,6 +787,7 @@ try {
         shippedDefaultIsQuiet &&
         quietBlocks &&
         firehoseStreams &&
+        firehoseNotDurable &&
         quietSurfacesEscalation &&
         quietSurfacesRunUpdated &&
         quietBlocksLogSse &&
@@ -744,6 +803,7 @@ try {
         `profiles=${profiles.join(",")}`,
         `quietBlocks=${quietBlocks}`,
         `firehoseStreams=${firehoseStreams}`,
+        `firehoseNotDurable=${firehoseNotDurable}`,
         `quietSseEscalation=${quietSurfacesEscalation}`,
         `quietSseRunUpdated=${quietSurfacesRunUpdated}`,
         `quietSseBlocksLog=${quietBlocksLogSse}`,

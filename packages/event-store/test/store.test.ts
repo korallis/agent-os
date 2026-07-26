@@ -191,6 +191,31 @@ describe("EventStore", () => {
     store.close();
   });
 
+  it("emitLive fans out without writing durable history", () => {
+    const { store } = EventStore.open(home);
+    const seen: string[] = [];
+    store.subscribe((envelope) => seen.push(envelope.event.type));
+    store.emitLive({
+      type: "pipeline.log_appended",
+      payload: {
+        runId: "run1",
+        step: "review",
+        chunk: "chunk\n",
+        offset: 0,
+        endOffset: 6,
+      },
+    });
+    expect(seen).toEqual(["pipeline.log_appended"]);
+    expect(store.count()).toBe(0);
+    expect(store.eventsAfterId(null, 10).events).toHaveLength(0);
+    expect(store.eventsByType("pipeline.log_appended", 10).events).toHaveLength(0);
+    // Durable append still works and is the only thing a fresh client replays.
+    store.append(configChanged(1));
+    expect(store.count()).toBe(1);
+    expect(store.eventsAfterId(null, 10).events).toHaveLength(1);
+    store.close();
+  });
+
   it("returns task-scoped events with truncation meaningful for that task", () => {
     const { store } = EventStore.open(home);
     const taskA = "01ARZ3NDEKTSV4RRFFQ69G5FAV";

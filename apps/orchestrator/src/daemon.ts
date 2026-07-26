@@ -328,6 +328,13 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const pipelineWatcher = new PipelineWatcher({
       pollMs: configService.effective().config.observability.pipelinePollMs,
       sink: (event) => {
+        // Step stdout is bulk output whose durable artifact is the log FILE
+        // under the no-mistakes home. Do not dual-write it into the append-only
+        // event store — live SSE + attach-time log-tails are the recovery path.
+        if (event.type === "pipeline.log_appended") {
+          eventStore.emitLive(event);
+          return;
+        }
         eventStore.append(event);
       },
       profile: () => {

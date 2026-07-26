@@ -663,7 +663,12 @@ export const pipelineRunUpdatedEventSchema = z.strictObject({
   payload: pipelineRunSnapshotSchema,
 });
 
-/** Newly appended bytes from the active step's log — incremental, not a replay. */
+/**
+ * Newly appended bytes from the active step's log — live-only, not durable.
+ * The log FILE under the no-mistakes home is the durable artifact; this frame
+ * is never written to the append-only event store and is never replayed on a
+ * fresh EventSource. Attach-time recovery uses bounded log-tails instead.
+ */
 export const pipelineLogAppendedEventSchema = z.strictObject({
   type: z.literal("pipeline.log_appended"),
   payload: z.strictObject({

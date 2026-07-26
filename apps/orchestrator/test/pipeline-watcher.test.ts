@@ -15,6 +15,7 @@ import { observabilityConfigSchema, type OrchestratorEvent } from "@agent-os/pro
 import { ConfigService } from "../src/config/service.js";
 import { SHIPPED_DEFAULTS_DIR, startDaemon } from "../src/daemon.js";
 import {
+  confineLogPath,
   PIPELINE_LOG_CHUNK_MAX,
   PIPELINE_LOG_DRAIN_MAX_BYTES,
   PIPELINE_LOG_DRAIN_MAX_CHUNKS,
@@ -28,7 +29,11 @@ import {
   resolveActiveProfile,
   wakeClassForEvent,
 } from "../src/observability/profile.js";
-import { pruneAppliedLogIds } from "../../console/src/lib/pipelineLogState.ts";
+import {
+  markSeededFromLogTails,
+  needsLogTailSeed,
+  pruneAppliedLogIds,
+} from "../../console/src/lib/pipelineLogState.ts";
 
 /** Real no-mistakes stores unix epoch seconds — fixtures must match or unit bugs pass. */
 function nowUnixSeconds(): number {
@@ -1583,5 +1588,130 @@ describe("Console appliedLogIds growth", () => {
     pruneAppliedLogIds(applied, ring);
     expect(applied.size).toBe(ring.length);
     for (const id of ring) expect(applied.has(id)).toBe(true);
+  });
+});
+
+describe("log path confinement", () => {
+  it("refuses a log_path outside the no-mistakes home with a stated reason", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-jail-"));
+    homes.push(gateHome);
+    const outside = join(tmpdir(), `p9-secret-${Date.now()}.log`);
+    writeFileSync(outside, "SECRET-TOKEN-SHOULD-NOT-STREAM\n");
+    homes.push(outside);
+
+    const db = buildGate(gateHome);
+    const now = nowUnixSeconds();
+    db.prepare(
+      `INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, intent)
+       VALUES ('run1', 'r', 'b', 'abc', 'base', 'running', ?, ?, 'i')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO step_results
+         (id, run_id, step_name, step_order, status, findings_json, log_path, last_activity, last_activity_at, duration_ms, agent_pid)
+       VALUES ('s1', 'run1', 'review', 0, 'running', '[]', ?, 'round 1', ?, NULL, NULL)`,
+    ).run(outside, now);
+    db.close();
+
+    const events: OrchestratorEvent[] = [];
+    const watcher = new PipelineWatcher({
+      home: gateHome,
+      pollMs: 10_000,
+      sink: (e) => events.push(e),
+      profile: () => ({ streamPipelineLogs: true, pipelineLogChars: 20_000 }),
+    });
+    watcher.start();
+    appendFileSync(outside, "more-secret\n");
+    watcher.tick();
+
+    expect(events.filter((e) => e.type === "pipeline.log_appended")).toHaveLength(0);
+    const issues = watcher.status().logPathIssues;
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.reason).toMatch(/outside the no-mistakes home/i);
+    expect(issues[0]?.step).toBe("review");
+
+    const tails = watcher.activeLogTails();
+    expect(tails.tails).toHaveLength(0);
+    expect(tails.refusals.length).toBe(1);
+    expect(tails.refusals[0]?.reason).toMatch(/outside the no-mistakes home/i);
+
+    const confined = confineLogPath(gateHome, outside);
+    expect(confined.ok).toBe(false);
+    if (!confined.ok) expect(confined.reason).toMatch(/outside the no-mistakes home/i);
+
+    watcher.stop();
+  });
+
+  it("accepts a log_path under the no-mistakes home", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-jail-ok-"));
+    homes.push(gateHome);
+    mkdirSync(join(gateHome, "logs"), { recursive: true });
+    const inside = join(gateHome, "logs", "ok.log");
+    writeFileSync(inside, "ok\n");
+    const confined = confineLogPath(gateHome, inside);
+    expect(confined.ok).toBe(true);
+  });
+});
+
+describe("pipeline.log_appended is live-only", () => {
+  it("emitLive fans out without durable replay; append stays durable", () => {
+    const agentHome = mkdtempSync(join(tmpdir(), "p9-liveonly-"));
+    homes.push(agentHome);
+    const { store } = EventStore.open(agentHome);
+    const seen: string[] = [];
+    store.subscribe((env) => seen.push(env.event.type));
+
+    store.emitLive({
+      type: "pipeline.log_appended",
+      payload: {
+        runId: "run1",
+        step: "review",
+        chunk: "live-only-chunk\n",
+        offset: 0,
+        endOffset: 16,
+      },
+    });
+    store.append({
+      type: "pipeline.run_updated",
+      payload: {
+        runId: "run1",
+        branch: "b",
+        status: "running",
+        headSha: "abc",
+        prUrl: null,
+        error: null,
+        intent: null,
+        steps: [],
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    expect(seen).toEqual(["pipeline.log_appended", "pipeline.run_updated"]);
+    const replay = store.eventsByType("pipeline.log_appended", 100);
+    expect(replay.events).toHaveLength(0);
+    const durableRuns = store.eventsByType("pipeline.run_updated", 100);
+    expect(durableRuns.events).toHaveLength(1);
+    // Fresh cursor sees durable only — not the live log frame.
+    const afterBoot = store.eventsAfterId(null, 100);
+    expect(afterBoot.events.every((e) => e.event.type !== "pipeline.log_appended")).toBe(true);
+    store.close();
+  });
+});
+
+describe("attach-time seed independence", () => {
+  it("does not treat a live frame as evidence that catch-up was fetched", () => {
+    const seeded = new Set<string>();
+    // Live SSE arrived first — seed key must still need catch-up.
+    expect(needsLogTailSeed(seeded, "run1", "review")).toBe(true);
+    // Only an explicit log-tails entry (including empty text) marks seeded.
+    markSeededFromLogTails(seeded, [{ runId: "run1", step: "review" }]);
+    expect(needsLogTailSeed(seeded, "run1", "review")).toBe(false);
+  });
+
+  it("does not mark keys absent from a log-tails response as seeded", () => {
+    const seeded = new Set<string>();
+    // Response answered only for run2 — run1 stays unseeded (file may appear later).
+    markSeededFromLogTails(seeded, [{ runId: "run2", step: "test" }]);
+    expect(needsLogTailSeed(seeded, "run1", "review")).toBe(true);
+    expect(needsLogTailSeed(seeded, "run2", "test")).toBe(false);
   });
 });

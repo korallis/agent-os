@@ -3,12 +3,13 @@ import {
   existsSync,
   openSync,
   readSync,
+  realpathSync,
   statSync,
   watch,
   type FSWatcher,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import Database from "better-sqlite3";
 import type {
   OrchestratorEvent,
@@ -23,15 +24,18 @@ import type {
  * When work enters no-mistakes, Agent OS has until now gone blind — the only
  * way to know what was happening was to poll `axi status`. This watcher closes
  * that gap by translating no-mistakes' own state into typed `pipeline.*` events
- * on Agent OS's append-only log, so the Console gets pipeline state through the
- * SSE + projection machinery it already has. One event log, one stream.
+ * so the Console gets pipeline state through the SSE machinery it already has.
+ * Run cards and availability are durable decisions; step log bytes are live-only
+ * (the log FILE under the no-mistakes home is already the durable artifact).
  *
  * Four rules govern this, because we are reading another tool's private state:
  *
- *  1. STRICTLY READ-ONLY. The watcher never writes under the no-mistakes home
- *     and never execs `axi run`/`respond`/`abort`. Driving the pipeline stays
- *     an explicit act by the Captain or the Brain, never a side effect of
- *     watching it.
+ *  1. STRICTLY READ-ONLY w.r.t. the no-mistakes home — both halves:
+ *     (a) never write under it and never exec `axi run`/`respond`/`abort`;
+ *     (b) never read paths that resolve outside it. "Read-only" is not a
+ *         license to open arbitrary absolute paths from state.sqlite and
+ *         republish their contents over SSE. Step log_path values are jailed
+ *         under the configured home before open/stat/read.
  *  2. The transport in use is REPORTED AS FACT. A "live" view that is silently
  *     seconds behind misleads exactly the way a `$0.00` cost estimate would.
  *  3. Version drift is expected, not exceptional. no-mistakes is a separate
@@ -109,6 +113,16 @@ export interface PipelineLogTailsResult {
   streamPipelineLogs: boolean;
   pipelineLogChars: number;
   tails: PipelineLogTail[];
+  /** Active step logs refused because their path escapes the no-mistakes home. */
+  refusals: PipelineLogPathRefusal[];
+}
+
+/** A step log_path that was refused rather than opened. */
+export interface PipelineLogPathRefusal {
+  runId: string;
+  step: string;
+  logPath: string;
+  reason: string;
 }
 
 /** Per-step unread log growth that exceeded the per-tick drain bound. */
@@ -116,6 +130,40 @@ export interface PipelineLogBehind {
   runId: string;
   step: string;
   unreadBytes: number;
+}
+
+/**
+ * Resolve `logPath` and require it stays under the no-mistakes home before any
+ * open/stat/read. Both absolute and home-relative paths are accepted; symlink
+ * escape is defeated with realpath when the path already exists.
+ */
+export function confineLogPath(
+  home: string,
+  logPath: string,
+): { ok: true; path: string } | { ok: false; reason: string; path: string } {
+  const homeResolved = resolve(home);
+  let homeRoot = homeResolved;
+  try {
+    if (existsSync(homeResolved)) homeRoot = realpathSync(homeResolved);
+  } catch {
+    homeRoot = homeResolved;
+  }
+  const candidate = isAbsolute(logPath) ? resolve(logPath) : resolve(homeRoot, logPath);
+  let resolved = candidate;
+  try {
+    if (existsSync(candidate)) resolved = realpathSync(candidate);
+  } catch {
+    resolved = candidate;
+  }
+  const prefix = homeRoot.endsWith(sep) ? homeRoot : `${homeRoot}${sep}`;
+  if (resolved !== homeRoot && !resolved.startsWith(prefix)) {
+    return {
+      ok: false,
+      path: resolved,
+      reason: `log_path is outside the no-mistakes home (${homeRoot})`,
+    };
+  }
+  return { ok: true, path: resolved };
 }
 
 const MAX_STRUCTURED_READ_FAILURES = 3;
@@ -296,6 +344,11 @@ export class PipelineWatcher {
    * remain after the last emitLogTail. Cleared when the stream catches up.
    */
   private readonly logBehind = new Map<string, number>();
+  /**
+   * Active-step log paths refused by the home jail (`runId:step` → refusal).
+   * Surfaced on status so a misconfigured path is diagnosable, not a quiet pane.
+   */
+  private readonly logPathRefusals = new Map<string, PipelineLogPathRefusal>();
   private lastPollAt: number | null = null;
   /** Emitted once per incompatibility, not once per tick. */
   private incompatibilityReported = false;
@@ -403,15 +456,17 @@ export class PipelineWatcher {
     home: string;
     /** Active steps whose log stream is behind the on-disk file. */
     logBehind: PipelineLogBehind[];
+    /** Active step logs refused because path escapes the no-mistakes home. */
+    logPathIssues: PipelineLogPathRefusal[];
   } {
     const logBehind: PipelineLogBehind[] = [];
     for (const [key, unreadBytes] of this.logBehind) {
       if (unreadBytes <= 0) continue;
-      const sep = key.indexOf(":");
-      if (sep === -1) continue;
+      const colon = key.indexOf(":");
+      if (colon === -1) continue;
       logBehind.push({
-        runId: key.slice(0, sep),
-        step: key.slice(sep + 1),
+        runId: key.slice(0, colon),
+        step: key.slice(colon + 1),
         unreadBytes,
       });
     }
@@ -421,6 +476,7 @@ export class PipelineWatcher {
       lagMs: this.lastPollAt === null ? null : Date.now() - this.lastPollAt,
       home: this.home,
       logBehind,
+      logPathIssues: [...this.logPathRefusals.values()],
     };
   }
 
@@ -446,23 +502,37 @@ export class PipelineWatcher {
   activeLogTails(): PipelineLogTailsResult {
     const { streamPipelineLogs, pipelineLogChars } = this.profile();
     if (!streamPipelineLogs || pipelineLogChars <= 0) {
-      return { streamPipelineLogs, pipelineLogChars, tails: [] };
+      return { streamPipelineLogs, pipelineLogChars, tails: [], refusals: [] };
     }
     if (!this.compatibility.ok || this.transport === "unavailable") {
-      return { streamPipelineLogs, pipelineLogChars, tails: [] };
+      return { streamPipelineLogs, pipelineLogChars, tails: [], refusals: [] };
     }
     const tails: PipelineLogTail[] = [];
+    const refusals: PipelineLogPathRefusal[] = [];
     for (const [key, logPath] of this.stepLogPaths) {
-      const sep = key.indexOf(":");
-      if (sep === -1) continue;
-      const runId = key.slice(0, sep);
-      const step = key.slice(sep + 1);
+      const colon = key.indexOf(":");
+      if (colon === -1) continue;
+      const runId = key.slice(0, colon);
+      const step = key.slice(colon + 1);
       if (!this.liveSnapshotsById.has(runId)) continue;
+      const confined = confineLogPath(this.home, logPath);
+      if (!confined.ok) {
+        const refusal: PipelineLogPathRefusal = {
+          runId,
+          step,
+          logPath: confined.path,
+          reason: confined.reason,
+        };
+        refusals.push(refusal);
+        this.logPathRefusals.set(key, refusal);
+        continue;
+      }
+      this.logPathRefusals.delete(key);
       try {
-        if (!existsSync(logPath)) continue;
-        const size = statSync(logPath).size;
+        if (!existsSync(confined.path)) continue;
+        const size = statSync(confined.path).size;
         const { text, startOffset, endOffset, truncated } = readLogTailByChars(
-          logPath,
+          confined.path,
           size,
           pipelineLogChars,
         );
@@ -478,7 +548,7 @@ export class PipelineWatcher {
         // Best-effort; structured cards remain the source of truth.
       }
     }
-    return { streamPipelineLogs, pipelineLogChars, tails };
+    return { streamPipelineLogs, pipelineLogChars, tails, refusals };
   }
 
   /**
@@ -525,6 +595,7 @@ export class PipelineWatcher {
     // instead of replaying every byte written while the watcher was stopped.
     this.logOffsets.clear();
     this.logBehind.clear();
+    this.logPathRefusals.clear();
     this.stepLogPaths.clear();
     this.incompatibilityReported = false;
     this.structuredReadFailures = 0;
@@ -844,15 +915,19 @@ export class PipelineWatcher {
         if (!nextLive.has(id)) this.lastFingerprint.delete(id);
       }
       for (const key of [...this.logOffsets.keys()]) {
-        const sep = key.indexOf(":");
-        const runId = sep === -1 ? key : key.slice(0, sep);
+        const colon = key.indexOf(":");
+        const runId = colon === -1 ? key : key.slice(0, colon);
         if (!nextLive.has(runId)) {
           this.logOffsets.delete(key);
           this.logBehind.delete(key);
+          this.logPathRefusals.delete(key);
         }
       }
       for (const key of [...this.logBehind.keys()]) {
         if (!nextLogPaths.has(key)) this.logBehind.delete(key);
+      }
+      for (const key of [...this.logPathRefusals.keys()]) {
+        if (!nextLogPaths.has(key)) this.logPathRefusals.delete(key);
       }
       this.liveSnapshotsById = nextLive;
       this.stepLogPaths.clear();
@@ -878,17 +953,32 @@ export class PipelineWatcher {
    * replay residual quiet-period bytes. When emitting, drain in a bounded loop
    * (multiple chunks / bytes per tick), sink-before-offset each frame, and
    * record logBehind when unread growth still exceeds the per-tick bound.
+   *
+   * pipeline.log_appended is live-only (daemon routes it to emitLive); first-sight
+   * bytes never emit — attach catch-up is activeLogTails().
    */
   private emitLogTail(runId: string, step: string, logPath: string, emit: boolean): void {
+    const key = `${runId}:${step}`;
     try {
-      if (!existsSync(logPath)) return;
-      const size = statSync(logPath).size;
-      const key = `${runId}:${step}`;
+      const confined = confineLogPath(this.home, logPath);
+      if (!confined.ok) {
+        this.logPathRefusals.set(key, {
+          runId,
+          step,
+          logPath: confined.path,
+          reason: confined.reason,
+        });
+        this.logBehind.delete(key);
+        return;
+      }
+      this.logPathRefusals.delete(key);
+      const safePath = confined.path;
+      if (!existsSync(safePath)) return;
+      const size = statSync(safePath).size;
       const known = this.logOffsets.get(key);
       // First sight: seed to current size without emitting. Prior bytes are
       // served on Console attach via activeLogTails() (bounded by
-      // pipelineLogChars) so the durable event log stays append-only for new
-      // growth only.
+      // pipelineLogChars). Live frames only cover post-sight growth.
       if (known === undefined) {
         this.logOffsets.set(key, size);
         this.logBehind.delete(key);
@@ -902,7 +992,7 @@ export class PipelineWatcher {
       }
       // Non-streaming: snap to EOF immediately. Chunked catch-up here would leave
       // a residual unread region after multi-chunk growth that a later
-      // firehose/working flip would dump into the durable event log.
+      // firehose/working flip would dump onto the live path as a burst.
       if (!emit) {
         this.logOffsets.set(key, size);
         this.logBehind.delete(key);
@@ -912,7 +1002,7 @@ export class PipelineWatcher {
       let offset = known;
       let drained = 0;
       let chunks = 0;
-      const fd = openSync(logPath, "r");
+      const fd = openSync(safePath, "r");
       try {
         while (
           offset < size &&
@@ -938,7 +1028,7 @@ export class PipelineWatcher {
           }
           const chunk = raw.subarray(0, emitBytes).toString("utf8");
           const endOffset = offset + emitBytes;
-          // Sink before advancing: if append fails, the next tick retries these bytes.
+          // Sink before advancing: if fan-out fails, the next tick retries these bytes.
           // Whitespace-only chunks (\\n, \\r redraws) are real terminal output — emit them.
           this.sink({
             type: "pipeline.log_appended",

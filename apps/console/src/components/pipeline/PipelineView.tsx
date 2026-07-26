@@ -4,7 +4,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { PipelineFinding, PipelineRunSnapshot } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
-import { pruneAppliedLogIds } from "@/lib/pipelineLogState";
+import {
+  markSeededFromLogTails,
+  needsLogTailSeed,
+  pruneAppliedLogIds,
+} from "@/lib/pipelineLogState";
 import { useEventStream } from "@/lib/useEventStream";
 
 /**
@@ -34,12 +38,20 @@ type PipelineLogBehind = {
   unreadBytes: number;
 };
 
+type PipelineLogPathIssue = {
+  runId: string;
+  step: string;
+  logPath: string;
+  reason: string;
+};
+
 type PipelineStatus = {
   transport: PipelineTransport;
   compatibility: { ok: boolean; reason: string | null; missingColumns: string[] };
   lagMs: number | null;
   home: string;
   logBehind?: PipelineLogBehind[];
+  logPathIssues?: PipelineLogPathIssue[];
   profile?: {
     name: string;
     pipelineLogChars: number;
@@ -192,7 +204,10 @@ export function PipelineView() {
   const consecutivePollFailures = useRef(0);
   /** Whether we have ever painted a successful pipeline status response. */
   const hasLastKnown = useRef(false);
-  /** Keys already seeded via /v1/pipeline/log-tails (or SSE) so catch-up runs once. */
+  /**
+   * Keys already seeded via /v1/pipeline/log-tails only. Live SSE frames must
+   * not mark a key seeded — seed and live answer different questions.
+   */
   const seededCatchUpKeys = useRef(new Set<string>());
 
   // Hold retention at 0 until /v1/pipeline/status lands the real profile
@@ -340,7 +355,8 @@ export function PipelineView() {
         textChanged = true;
       }
       nextRanges[key] = { start: merged.start, end: merged.end };
-      seededCatchUpKeys.current.add(key);
+      // Do not mark seeded here. A live chunk is not evidence that attach-time
+      // catch-up was fetched; pre-sight bytes still need log-tails.
     }
 
     // Bound applied ids to the current SSE ring. Evicted frames will not
@@ -431,8 +447,7 @@ export function PipelineView() {
     const needsSeed = runs.some((run) => {
       const active = run.steps.find((s) => s.status === "running" || s.status === "fixing");
       if (active === undefined) return false;
-      const key = `${run.runId}:${active.step}`;
-      return !seededCatchUpKeys.current.has(key);
+      return needsLogTailSeed(seededCatchUpKeys.current, run.runId, active.step);
     });
     if (!needsSeed) return;
 
@@ -459,9 +474,12 @@ export function PipelineView() {
         const nextRanges = { ...logRangesRef.current };
         let textChanged = false;
         let truncChanged = false;
+        // Only keys present in the response are seeded — including empty text
+        // for a genuine zero-length file. Absent keys stay unseeded so a file
+        // created moments later is still caught up.
+        markSeededFromLogTails(seededCatchUpKeys.current, body.tails);
         for (const tail of body.tails) {
           const key = `${tail.runId}:${tail.step}`;
-          seededCatchUpKeys.current.add(key);
           if (tail.text.length === 0) continue;
           const prior = nextRanges[key];
           const merged = mergeLogRange(
@@ -479,13 +497,6 @@ export function PipelineView() {
             nextTrunc[key] = true;
             truncChanged = true;
           }
-        }
-        // Mark remaining active keys as seeded even when empty so we do not
-        // re-fetch every poll while a step has not written yet.
-        for (const run of runs) {
-          const active = run.steps.find((s) => s.status === "running" || s.status === "fixing");
-          if (active === undefined) continue;
-          seededCatchUpKeys.current.add(`${run.runId}:${active.step}`);
         }
         // Re-window after merge so a large seed cannot exceed retention.
         const retention = Math.max(0, logChars);
@@ -615,6 +626,12 @@ export function PipelineView() {
             active === undefined
               ? undefined
               : status?.logBehind?.find((b) => b.runId === run.runId && b.step === active.step);
+          const logPathIssue =
+            active === undefined
+              ? undefined
+              : status?.logPathIssues?.find(
+                  (issue) => issue.runId === run.runId && issue.step === active.step,
+                );
           return (
             <div key={run.runId} className="rounded-[10px] border border-line-1 bg-panel">
               <div className="flex flex-wrap items-center gap-3 border-b border-line-1 px-4 py-3">
@@ -719,6 +736,10 @@ export function PipelineView() {
                       Step log streaming is off under the active observability profile (
                       {status?.profile?.name ?? "quiet"}). Switch to working or firehose to see live
                       output.
+                    </p>
+                  ) : logPathIssue !== undefined ? (
+                    <p className="text-[11px] text-warn">
+                      Step log refused: {logPathIssue.reason}
                     </p>
                   ) : logText !== null && logText.length > 0 ? (
                     <pre className="max-h-[240px] overflow-auto rounded-[8px] bg-shell p-3 font-mono text-[11px] text-fg-2 whitespace-pre-wrap">
