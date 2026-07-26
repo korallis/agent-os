@@ -35,10 +35,10 @@ const BASE_ALLOWLIST = new Set([
     "TERM",
     "COLORTERM",
     "SHELL",
-    "SSH_AUTH_SOCK",
     // Path fence vars (AGENTOS_HOME, AGENTOS_SEAT_WORKSPACE, AGENTOS_GATE_WORKSPACE)
     // and session dirs are granted only via extraAllow — never ambient parent env.
     // Signing keys are never env values.
+    // SSH_AUTH_SOCK is deliberately NOT here — see grantSshAgent below.
     "AGENTOS_SESSION_ID",
     "AGENTOS_SOCKET",
     "AGENTOS_ROLE",
@@ -62,6 +62,12 @@ export function scrubEnv(parent, options = {}) {
             env[key] = value;
         }
     }
+    // Opt-in only, and never for gate code. See grantSshAgent docs on the TS side.
+    if (options.grantSshAgent === true) {
+        const sock = parent.SSH_AUTH_SOCK;
+        if (sock !== undefined && sock.length > 0)
+            env.SSH_AUTH_SOCK = sock;
+    }
     if (options.extraAllow !== undefined) {
         for (const [key, value] of Object.entries(options.extraAllow)) {
             env[key] = value;
@@ -74,6 +80,11 @@ export function scrubEnv(parent, options = {}) {
     const grant = options.grantProviderKey ?? null;
     if (grant !== null) {
         env[grant.name] = grant.value;
+    }
+    // Same discipline as provider keys: grantSshAgent is the only way in.
+    // extraAllow must not re-inject SSH_AUTH_SOCK behind the flag.
+    if (options.grantSshAgent !== true) {
+        delete env.SSH_AUTH_SOCK;
     }
     const providerKeysPresent = PROVIDER_KEY_ENV_NAMES.filter((name) => env[name] !== undefined);
     if (options.assertSingle !== false && providerKeysPresent.length > 1) {
