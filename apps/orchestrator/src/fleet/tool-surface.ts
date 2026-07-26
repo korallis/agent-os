@@ -696,6 +696,13 @@ export class ToolSurface {
       // when the pane is gone; do not require a live window for that outcome.
       if (!reopened && !this.deps.tmux.hasWindow(session.tmuxWindow)) continue;
 
+      if (
+        !reopened &&
+        [...this.questions.values()].some((q) => q.sessionId === session.sessionId)
+      ) {
+        continue;
+      }
+
       const since = session.lastActivityAt ?? session.startedAt;
       const idleMs = now - Date.parse(since);
       if (!Number.isFinite(idleMs)) continue;
@@ -751,20 +758,16 @@ export class ToolSurface {
             severity: "critical",
           });
         }
+        action = "escalated";
+        let respawnLanded = false;
         try {
           this.setWedgeRespawns(session.taskId, session.role, used + 1);
           this.respawnCrewmate({
             sessionId: session.sessionId,
             reason: `structural WEDGED — no activity for ${Math.round(idleMinutes)}m (threshold ${thresholdMinutes}m)`,
           });
-          action = "respawned";
-          // Respawn landed — provisional obligation is no longer needed.
-          if (session.taskId !== null) {
-            this.clearPendingWedgeCaptainNotify(session.taskId, session.sessionId);
-          }
-          escalateSummary = null;
+          respawnLanded = true;
         } catch {
-          action = "escalated";
           const current = this.sessions.get(session.sessionId) ?? session;
           // respawnCrewmate stops first; once status is stopped/lost the seat
           // was consumed even if spawn failed — spend stands. Leave those
@@ -775,6 +778,13 @@ export class ToolSurface {
             this.setWedgeRespawns(session.taskId, session.role, used);
             this.persistSessionWedged(current);
           }
+        }
+        if (respawnLanded) {
+          action = "respawned";
+          if (session.taskId !== null) {
+            this.clearPendingWedgeCaptainNotify(session.taskId, session.sessionId);
+          }
+          escalateSummary = null;
         }
       } else if (canRespawn && !spawnLegal) {
         // Known-illegal spawn: never stop. Escalate with the seat still live.

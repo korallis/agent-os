@@ -935,4 +935,100 @@ describe("structural WEDGED ladder", () => {
     restarted.service.tools.reconcileWedgedSessions(Date.now());
     expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
+
+  it("does not wedge a seat with an outstanding pending question past the stale window", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const questionId = "01JQ5T0000000000000000000A";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Which approach should I take?",
+      ts: new Date().toISOString(),
+    });
+    expect(service.tools.listQuestions()).toHaveLength(1);
+
+    events.length = 0;
+    const acted = service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted).toHaveLength(0);
+    expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    expect(service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status).toBe(
+      "running",
+    );
+    expect(service.tools.listQuestions()).toHaveLength(1);
+  });
+
+  it("wedges a seat again after its pending question is answered", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const questionId = "01JQ5T0000000000000000000B";
+    service.handleExtensionFrame({
+      type: "ext.question",
+      sessionId,
+      questionId,
+      question: "Need a decision before continuing.",
+      ts: new Date().toISOString(),
+    });
+    expect(service.tools.reconcileWedgedSessions(Date.now())).toHaveLength(0);
+
+    const answered = service.tools.invoke("answer_crewmate", {
+      questionId,
+      answer: "Ship the migration as-is.",
+    });
+    expect(answered.ok).toBe(true);
+    expect(service.tools.listQuestions()).toHaveLength(0);
+
+    events.length = 0;
+    const acted = service.tools.reconcileWedgedSessions(Date.now());
+    expect(acted).toHaveLength(1);
+    expect(acted[0]?.action).toBe("respawned");
+    expect(events.some((e) => e.type === "session.wedged")).toBe(true);
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+  });
+
+  it("does not escalate when pending-clear throws after a successful respawn", () => {
+    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const tools = service.tools as unknown as {
+      clearPendingWedgeCaptainNotify: (taskId: string, sessionId: string) => void;
+    };
+    const originalClear = tools.clearPendingWedgeCaptainNotify.bind(service.tools);
+    tools.clearPendingWedgeCaptainNotify = () => {
+      throw new Error("simulated clearPending I/O failure after respawn");
+    };
+
+    events.length = 0;
+    try {
+      expect(() => service.tools.reconcileWedgedSessions(Date.now())).toThrow(
+        /simulated clearPending I\/O failure/,
+      );
+    } finally {
+      tools.clearPendingWedgeCaptainNotify = originalClear;
+    }
+
+    expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+    // Spend + seat stop already landed before clear; evidence may be incomplete
+    // because the throw aborted the post-respawn path, but action must not be
+    // rewritten to escalate.
+    expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+    expect(events.filter((e) => e.type === "session.wedged")).toHaveLength(0);
+  });
 });
