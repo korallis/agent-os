@@ -1124,7 +1124,13 @@ export class ToolSurface {
    */
   private findDerivedWedgeReplacement(
     taskId: string,
-    entry: { sessionId: string; role: string; recordedAt: string; replacementSessionId?: string },
+    entry: {
+      sessionId: string;
+      role: string;
+      recordedAt: string;
+      // exactOptionalPropertyTypes: optional keys may be present as undefined
+      replacementSessionId?: string | undefined;
+    },
   ): string | null {
     const recordedMs = Date.parse(entry.recordedAt);
     if (!Number.isFinite(recordedMs)) return null;
