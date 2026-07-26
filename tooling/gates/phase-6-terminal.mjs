@@ -157,6 +157,7 @@ try {
     const ticket = await post(`/v1/sessions/${session.sessionId}/attach-ticket`, {});
     return await new Promise((resolve) => {
       const seqs = [];
+      const targets = new Set();
       let sawContent = false;
       const startedAt = Date.now();
       let lastFrameAt = null;
@@ -169,7 +170,7 @@ try {
         } catch {
           // already closing
         }
-        resolve({ seqs, sawContent, startedAt, lastFrameAt, windowMs: ms });
+        resolve({ seqs, sawContent, targets, startedAt, lastFrameAt, windowMs: ms });
       };
       ws.on("message", (raw) => {
         try {
@@ -178,6 +179,7 @@ try {
             seqs.push(frame.seq);
             lastFrameAt = Date.now();
             if (typeof frame.content === "string" && frame.content.length > 0) sawContent = true;
+            if (typeof frame.target === "string" && frame.target.length > 0) targets.add(frame.target);
           }
         } catch {
           // ignore malformed
@@ -224,21 +226,43 @@ try {
     );
   };
 
-  // T2 proves reconnect renumbers at 1 on the same pane — not a second soak.
-  // Multi-frame contiguity when the ticker is live; single-frame only when the
-  // pane cannot change (reconnect numbering still holds). Floor / near-end
-  // bars belong to T1 only; a short reconnect window is too noisy for them.
-  const reconnectOk = (stream) => {
-    const { seqs, sawContent } = stream;
+  // T2 proves a reconnect resumes THE SAME PANE and restarts its own numbering
+  // at 1.
+  //
+  // An earlier revision reduced this to `seqs.length >= 2`, on the reasoning
+  // that a short reconnect window is too noisy to carry a floor. That is the
+  // defect T1's 90% floor exists to prevent, one gate along: a reconnect that
+  // delivered two frames and died would have passed. The honest fix is to
+  // LENGTHEN THE WINDOW so a floor is affordable, not to drop the floor —
+  // hence RECONNECT_MS below is 12s rather than 4s.
+  //
+  // The floor fraction is gentler than T1's because a reattach genuinely loses
+  // time to the ticket round trip and the first capture, which a steady-state
+  // soak does not pay.
+  const RECONNECT_FLOOR_FRACTION = 0.6;
+  const minReconnectFrames = (windowMs) =>
+    Math.max(3, Math.floor(theoreticalMax(windowMs) * RECONNECT_FLOOR_FRACTION));
+
+  const reconnectOk = (stream, firstTargets) => {
+    const { seqs, sawContent, targets } = stream;
     if (!(seqs.length >= 1 && seqs[0] === 1 && sawContent)) return false;
+    // Pane identity, measured rather than inferred. Every frame now carries the
+    // tmux target it was captured from, so "same pane" is a comparison against
+    // the first stream instead of a restatement of "we saw some content".
+    const samePane =
+      targets.size === 1 &&
+      firstTargets.size === 1 &&
+      [...targets][0] === [...firstTargets][0];
+    if (!samePane) return false;
     if (!paneChanges) return seqs.length === 1 || contiguous(seqs);
-    return contiguous(seqs) && seqs.length >= 2;
+    return contiguous(seqs) && seqs.length >= minReconnectFrames(stream.windowMs);
   };
 
   // When the ticker could not start, T1 cannot pass — fail fast with a short
   // diagnostic sample instead of burning the full soak window. T2 still runs
   // its short reconnect check afterward (renumbering needs no soak).
-  const reconnectMs = Math.min(4_000, SOAK_MS);
+  // Long enough that a proportional floor is meaningful (see reconnectOk).
+  const reconnectMs = Math.min(12_000, SOAK_MS);
   const t1WindowMs = paneChanges ? SOAK_MS : reconnectMs;
   const first = await streamFor(t1WindowMs);
   const firstFloor = minFramesFor(SOAK_MS);
@@ -256,11 +280,17 @@ try {
   const second = await streamFor(reconnectMs);
   const secondContiguous =
     paneChanges ? contiguous(second.seqs) : second.seqs.length === 1 ? "n/a" : contiguous(second.seqs);
+  const firstTarget = first.targets.size === 1 ? [...first.targets][0] : null;
+  const secondTarget = second.targets.size === 1 ? [...second.targets][0] : null;
+  const samePane = firstTarget !== null && firstTarget === secondTarget;
   gate(
     "T2",
     "a reconnect resumes the same pane and restarts its own numbering at 1",
-    reconnectOk(second),
-    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${secondContiguous} samePane=${second.sawContent} windowMs=${reconnectMs}`,
+    reconnectOk(second, first.targets),
+    `frames=${second.seqs.length} restartedAt=${second.seqs[0]} contiguous=${secondContiguous} ` +
+      `samePane=${samePane} target=${secondTarget ?? "none"} firstTarget=${firstTarget ?? "none"} ` +
+      `minFrames=${minReconnectFrames(reconnectMs)} (floor=${RECONNECT_FLOOR_FRACTION} of theoretical ` +
+      `${theoreticalMax(reconnectMs)} at ${POLL_MS}ms poll) windowMs=${reconnectMs}`,
   );
 
   if (!paneChanges) {
