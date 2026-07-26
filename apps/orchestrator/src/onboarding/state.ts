@@ -122,9 +122,13 @@ export class OnboardingService {
         detail:
           pi.binary === null
             ? "Pi not installed"
-            : pi.versionMatchesPin
-              ? "pinned version present"
-              : `found ${pi.version ?? "unknown"}, want ${PI_PINNED_VERSION}`,
+            : pi.versionIsPatchDrift
+              ? // Compatible, so the check passes; say plainly that it is not
+                // the exact tested build rather than hiding the difference.
+                `found ${pi.version ?? "unknown"} — compatible with the tested ${PI_PINNED_VERSION}`
+              : pi.versionMatchesPin
+                ? "pinned version present"
+                : `found ${pi.version ?? "unknown"}, want ${PI_PINNED_VERSION} (same major.minor, patch >= pin)`,
         installHint: installHintForPi(),
       },
       whichCheck("tmux", "tmux", "3.3+"),

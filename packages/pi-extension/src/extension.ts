@@ -848,6 +848,16 @@ export function seatFenceBlockReason(
     }
     // Neutral system/temp paths outside AGENTOS_HOME.
     if (neutralRoots.some((root) => pathInsideResolvedRoot(root, realTarget))) continue;
+    // DEFAULT DENY. This used to fall through to allow, which meant the fence
+    // only ever fenced AGENTOS_HOME: every path outside it — the Captain's
+    // product checkout, their dotfiles, anywhere on the disk — was permitted.
+    // Verified against the built extension before the fix:
+    //   validatorJailBlockReason("write", {path: "<project>/src/app.py"}, …) → null
+    //   validatorJailBlockReason("write", {path: "~/.zshrc"}, …)            → null
+    // The docstring already called this a "default-deny allowlist"; it was not
+    // one, and a seat that escapes its workspace is exactly what the fence
+    // exists to stop.
+    return `${roleLabel} is tool/fs-blocked outside its seat workspace (${realSeat}): refused path ${realTarget}`;
   }
   return null;
 }
