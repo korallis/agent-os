@@ -54,7 +54,11 @@ export function listClaudeAgentSdkCatalog(): readonly string[] {
 export function assertCrossFamilyCast(builderModel: string, validatorModel: string): void {
   const bf = familyOfModelRef(builderModel);
   const vf = familyOfModelRef(validatorModel);
-  if (bf === vf) {
+  // `"other"` means "origin not recognised", not "a family of its own". Letting
+  // it compare unequal to a known family made this fail open: an Anthropic
+  // model behind an unrecognised origin would pair with an `anthropic/*`
+  // validator and be accepted. See familiesConflict() in @agent-os/protocol.
+  if (bf === vf || bf === "other" || vf === "other") {
     throw new CrossFamilyViolationError(builderModel, validatorModel, bf);
   }
 }

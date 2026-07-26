@@ -182,7 +182,34 @@ export function familyOfModelRef(modelRef: string): ModelFamily {
   }
 }
 
-/** Cross-family cast check used by resolve_cast policy (§6.2 rule 1 + R6). */
+/**
+ * Cross-family cast check used by resolve_cast policy (§6.2 rule 1 + R6).
+ *
+ * The invariant is that a validator must come from a **provably different**
+ * family than its builder, so the check is never the same family marking its
+ * own homework.
+ *
+ * `"other"` is not a family — it is *unknown origin*. Treating it as one made
+ * this fail OPEN: an Anthropic model reached through an origin this table does
+ * not recognise resolves to `"other"`, pairs with a real `anthropic/*`
+ * validator, compares unequal, and the cast is accepted. Both seats are then
+ * Anthropic and the independence the whole fusion design rests on is gone,
+ * silently and with no event to show for it.
+ *
+ * Two unknown origins are equally unprovable — they may be one vendor under two
+ * aliases — so an unknown origin on **either** side is a conflict. This matches
+ * how the rest of the substrate behaves: a missing Pi raises a typed
+ * `PI_UNAVAILABLE` rather than proceeding quietly, and an unknown cost renders
+ * as `—` rather than `$0.00`. Refusing to certify what it cannot prove is the
+ * only answer that is not a fabricated guarantee.
+ *
+ * The cost of failing closed is a Captain occasionally naming an explicit
+ * override for a genuinely novel provider. The cost of failing open is a
+ * validation that looks independent and is not.
+ */
 export function familiesConflict(a: string, b: string): boolean {
-  return familyOfModelRef(a) === familyOfModelRef(b);
+  const fa = familyOfModelRef(a);
+  const fb = familyOfModelRef(b);
+  if (fa === "other" || fb === "other") return true;
+  return fa === fb;
 }
