@@ -12,7 +12,7 @@
  *   G2  register project + create_task
  *   G3  run_gate before GATE_AUTHORING → ILLEGAL_TRANSITION
  *   G4  same-family builder/validator → POLICY_VIOLATION
- *   G5  scripted local-only SHIP → DONE on a real git worktree
+ *   G5  local-only SHIP driven from the Brain seat → DONE on a real git branch
  *   G6  fleet state readable after the run
  *   G7  BRAIN_DOWN blocks orchestration
  *   G8  kill -9 mid-task → restart rehydrates tasks and the Brain reconciles
@@ -101,6 +101,63 @@ async function callTool(base, token, tool, input) {
     body: JSON.stringify({ tool, input }),
   });
   return res.json();
+}
+
+/**
+ * Call a tool over a session channel rather than as the Captain. Passing the
+ * Brain's session id routes through invokeFromSessionAsync, so the call is
+ * authorized against the seat that is actually supposed to orchestrate — not
+ * the Captain's unconditional REST path.
+ */
+async function callToolAsSession(base, token, sessionId, tool, input) {
+  const res = await api(base, "/v1/tools/call", token, {
+    method: "POST",
+    body: JSON.stringify({ tool, input, sessionId }),
+  });
+  return res.json();
+}
+
+/**
+ * invocationIds of every successful `read_fleet_state` frame currently durable.
+ *
+ * `BrainManager.start()` is the only place in the daemon that reaches the tool
+ * surface with `read_fleet_state` (the REST /v1/fleet/state route reads the
+ * projection directly and emits nothing), so such a frame is proof a reconcile
+ * actually ran. This matters because the Brain stamps `lastReconcileAt` in the
+ * same object literal as `status: "running"` — the field is set whether or not
+ * the reconcile call survives, so asserting it is non-null cannot fail on a
+ * deleted reconcile.
+ *
+ * Identity, not a seq cursor: `EventStore.open` quarantines a corrupt log tail
+ * and restarts numbering from the last VALID envelope, so a seq taken before a
+ * kill -9 can be re-issued after it. invocationIds are ULIDs and never recur,
+ * so "a frame that was not there before" survives that renumbering.
+ */
+async function reconcileInvocationIds(base, token) {
+  const res = await api(base, "/v1/events/replay?types=tool.invoked&limit=5000", token);
+  const body = await res.json();
+  return new Set(
+    (body.events ?? [])
+      .filter(
+        (e) =>
+          e.event?.payload?.tool === "read_fleet_state" &&
+          e.event?.payload?.ok === true,
+      )
+      .map((e) => e.event.payload.invocationId),
+  );
+}
+
+/** Reconcile frames that appeared since `priorIds` was taken. */
+async function reconcilesSince(base, token, priorIds) {
+  const now = await reconcileInvocationIds(base, token);
+  return [...now].filter((id) => !priorIds.has(id));
+}
+
+/** True when `at` is a real timestamp strictly newer than `prior` (or prior is null). */
+function stampAdvanced(at, prior) {
+  if (typeof at !== "string" || !Number.isFinite(Date.parse(at))) return false;
+  if (prior === null || prior === undefined) return true;
+  return Date.parse(at) > Date.parse(prior);
 }
 
 /** A real git repository with one commit — worktrees need a HEAD. */
@@ -210,14 +267,35 @@ try {
     );
   }
 
-  // G5 — scripted local SHIP end-to-end on a real worktree
+  // G5 — local SHIP end-to-end on a real worktree, driven from the Brain seat
   {
-    await callTool(BASE, token, "resolve_cast", {
+    const gitIn = (dir, ...args) =>
+      spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", timeout: 30_000 });
+
+    // Every ship tool goes over the Brain's session channel
+    // (invokeFromSessionAsync), not the Captain's unconditional REST path, so
+    // the seat that is meant to orchestrate is the seat actually exercised.
+    const brainBefore = await (await api(BASE, "/v1/brain", token)).json();
+    const brainSessionId = brainBefore.brain?.sessionId ?? null;
+
+    // Park the naive task branch on a decoy worktree so the pool is forced to
+    // allocate a session-suffixed alternate. deliver_task falls back to
+    // `ao/<taskId10>` when task.branch is null, and that fallback is exactly
+    // the branch name the pool would otherwise have chosen — meaning a
+    // startsWith("ao/") assertion is satisfied by a string the implementation
+    // synthesised for itself. Holding the naive name elsewhere makes the real
+    // branch and the fallback differ, so the assertion below can fail.
+    const naiveBranch = `ao/${taskId.slice(0, 10).toLowerCase()}`;
+    const decoyRoot = mkdtempSync(join(tmpdir(), "agentos-gate-decoy-"));
+    cleanups.push(decoyRoot);
+    const decoyAdd = gitIn(repo, "worktree", "add", "-b", naiveBranch, join(decoyRoot, "held"), "HEAD");
+
+    await callToolAsSession(BASE, token, brainSessionId, "resolve_cast", {
       taskId,
       roles: [{ role: "builder", model: "openai/gpt-4.1", thinking: "medium", cleanRoom: true }],
       familyCheckOverride: false,
     });
-    const spawned = await callTool(BASE, token, "spawn_crewmate", {
+    const spawned = await callToolAsSession(BASE, token, brainSessionId, "spawn_crewmate", {
       taskId,
       role: "builder",
       model: "openai/gpt-4.1",
@@ -229,27 +307,86 @@ try {
     const sessionId = spawned.data?.session?.sessionId ?? null;
     const isRealWorktree =
       worktreePath !== null &&
-      spawnSync("git", ["-C", worktreePath, "rev-parse", "--is-inside-work-tree"], {
-        encoding: "utf8",
-      }).stdout.trim() === "true";
+      gitIn(worktreePath, "rev-parse", "--is-inside-work-tree").stdout.trim() === "true";
+    // Commit real content on the builder's branch. Without this every branch in
+    // the fixture points at the same seed commit, so "the delivered branch
+    // resolves to the tree's HEAD" would be true of any branch name that
+    // happens to exist — satisfied by the fixture rather than by the ship.
+    if (worktreePath !== null) {
+      writeFileSync(join(worktreePath, "builder-work.txt"), `work for ${taskId}\n`);
+      gitIn(worktreePath, "add", "-A");
+      gitIn(worktreePath, "-c", "user.email=gate@agent-os.local", "-c", "user.name=Agent OS Gate",
+        "commit", "-qm", "builder work");
+    }
+    // Ground truth from git, captured before delivery releases the lease.
+    const treeBranch =
+      worktreePath === null ? null : gitIn(worktreePath, "rev-parse", "--abbrev-ref", "HEAD").stdout.trim();
+    const treeHead =
+      worktreePath === null ? null : gitIn(worktreePath, "rev-parse", "HEAD").stdout.trim();
+    // The commit must actually have moved the branch off the seed, else the
+    // sha assertion below is back to being satisfied by the fixture.
+    const seedHead = gitIn(repo, "rev-parse", "HEAD").stdout.trim();
+    const workCommitted = treeHead !== null && treeHead.length > 0 && treeHead !== seedHead;
+    // Guard the guard: if the decoy failed to displace the naive name the
+    // branch assertion would be tautological again, so fail loudly instead.
+    const alternateForced =
+      decoyAdd.status === 0 && treeBranch !== null && treeBranch !== naiveBranch;
 
     // Stop the crewmate before deliver so the lease is not reclaimed under a live pane.
     if (sessionId !== null) {
-      await callTool(BASE, token, "stop_crewmate", {
+      await callToolAsSession(BASE, token, brainSessionId, "stop_crewmate", {
         sessionId,
         reason: "G5 ship complete",
       });
     }
 
-    const body = await callTool(BASE, token, "deliver_task", { taskId });
+    const body = await callToolAsSession(BASE, token, brainSessionId, "deliver_task", { taskId });
+    const branch = typeof body.data?.branch === "string" ? body.data.branch : null;
+    // The delivered branch must be the branch git actually has, and must resolve
+    // to the tree's HEAD in the Captain's repo — not a name deliver_task minted.
+    const branchIsTheRealTree = branch !== null && branch === treeBranch;
+    const refSha =
+      branch === null ? "" : gitIn(repo, "rev-parse", "--verify", `refs/heads/${branch}`).stdout.trim();
+    const branchIsRealRef = refSha.length > 0 && refSha === treeHead;
+
+    // DONE without the durable delivery marker is a phase field, not a ship.
+    let delivery = null;
+    try {
+      delivery = JSON.parse(readFileSync(join(home, "runs", taskId, "delivery.json"), "utf8"));
+    } catch {
+      // absent → assertion below fails
+    }
+    const deliveryDurable =
+      delivery !== null &&
+      delivery.branch === branch &&
+      delivery.mode === "local-only" &&
+      delivery.shape === "SHIP";
+
+    // The builder's tree must be verified-reset back into the pool, not left held.
+    const stateAfter = await (await api(BASE, "/v1/fleet/state", token)).json();
+    const lease = (stateAfter.state?.worktrees ?? []).find((l) => l.path === worktreePath);
+    const leaseReleased =
+      lease !== undefined && lease.state === "idle" && lease.taskId === null;
+
+    // Read the outcome back off the durable task record, not the return value.
+    const persisted = await (await api(BASE, `/v1/tasks/${taskId}`, token)).json();
+    const persistedDone =
+      persisted.task?.phase === "DONE" && persisted.task?.branch === branch;
+
     gate(
       "G5",
-      "scripted local-only SHIP → DONE on a real git worktree",
+      "local-only SHIP driven from the Brain seat → DONE on a real git branch",
       body.ok === true &&
         body.data?.phase === "DONE" &&
-        String(body.data?.branch ?? "").startsWith("ao/") &&
-        isRealWorktree,
-      `phase=${body.data?.phase} branch=${body.data?.branch} realWorktree=${isRealWorktree}`,
+        isRealWorktree &&
+        alternateForced &&
+        workCommitted &&
+        branchIsTheRealTree &&
+        branchIsRealRef &&
+        deliveryDurable &&
+        leaseReleased &&
+        persistedDone,
+      `phase=${body.data?.phase} branch=${branch} tree=${treeBranch} realWorktree=${isRealWorktree} alternate=${alternateForced} committed=${workCommitted} realRef=${branchIsRealRef} delivery=${deliveryDurable} lease=${lease?.state ?? "gone"} persisted=${persistedDone}`,
     );
   }
 
@@ -397,6 +534,11 @@ try {
   // G8 — kill -9 mid-task → rehydrate + Brain reconcile
   {
     const liveTask = await createTask(BASE, token, projectId, { title: "Survives kill -9" });
+    const brainBefore = await (await api(BASE, "/v1/brain", token)).json();
+    const priorReconcileAt = brainBefore.brain?.lastReconcileAt ?? null;
+    // Fingerprints taken while the doomed daemon is still alive; any reconcile
+    // frame not in this set is the restart's own work.
+    const priorReconciles = await reconcileInvocationIds(BASE, token);
     child.kill("SIGKILL");
     await sleep(400);
     child = startDaemon(home, PORT);
@@ -404,13 +546,19 @@ try {
 
     const rehydrated = await (await api(BASE, `/v1/tasks/${liveTask}`, token)).json();
     const brain = await (await api(BASE, "/v1/brain", token)).json();
+    // Demand the audited reconcile call itself plus a stamp that moved past the
+    // pre-crash one. `lastReconcileAt !== null` alone is stamped unconditionally
+    // beside status:"running" and survives deletion of the reconcile.
+    const reconciles = await reconcilesSince(BASE, token, priorReconciles);
+    const advanced = stampAdvanced(brain.brain?.lastReconcileAt, priorReconcileAt);
     gate(
       "G8",
       "kill -9 → tasks rehydrate and the Brain reconciles on restart",
       rehydrated.task?.id === liveTask &&
         brain.brain?.status === "running" &&
-        brain.brain?.lastReconcileAt !== null,
-      `task=${rehydrated.task?.phase} brain=${brain.brain?.status} reconciledAt=${brain.brain?.lastReconcileAt !== null}`,
+        reconciles.length >= 1 &&
+        advanced,
+      `task=${rehydrated.task?.phase} brain=${brain.brain?.status} reconcileCalls=${reconciles.length} stampAdvanced=${advanced}`,
     );
   }
 
@@ -498,6 +646,8 @@ try {
     const before = await (await api(BASE, "/v1/brain", token)).json();
     const priorSessionId = before.brain?.sessionId;
     const priorWindow = before.brain?.tmuxWindow;
+    const priorReconcileAt = before.brain?.lastReconcileAt ?? null;
+    const priorReconciles = await reconcileInvocationIds(BASE, token);
     let killed = false;
     if (typeof priorWindow === "string") {
       const kill = spawnSync("tmux", ["-L", TMUX_SOCKET, "kill-window", "-t", priorWindow], {
@@ -509,16 +659,22 @@ try {
     await sleep(2500);
     const after = await (await api(BASE, "/v1/brain", token)).json();
     const brain = after.brain;
+    // The gate's name promises read_fleet_state, so assert the audited call —
+    // `lastReconcileAt !== null` is stamped in the same literal as
+    // status:"running" and stays green with the reconcile deleted.
+    const reconciles = await reconcilesSince(BASE, token, priorReconciles);
+    const advanced = stampAdvanced(brain?.lastReconcileAt, priorReconcileAt);
     const respawned =
       brain?.status === "running" &&
-      brain?.lastReconcileAt !== null &&
       typeof brain?.sessionId === "string" &&
-      brain.sessionId !== priorSessionId;
+      brain.sessionId !== priorSessionId &&
+      reconciles.length >= 1 &&
+      advanced;
     gate(
       "G13",
       "SIGKILL Brain pane → fresh Brain reconciles (read_fleet_state)",
       killed && respawned,
-      `killed=${killed} status=${brain?.status} prior=${priorSessionId} next=${brain?.sessionId} reconciled=${brain?.lastReconcileAt !== null}`,
+      `killed=${killed} status=${brain?.status} prior=${priorSessionId} next=${brain?.sessionId} reconcileCalls=${reconciles.length} stampAdvanced=${advanced}`,
     );
   }
 

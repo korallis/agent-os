@@ -3,10 +3,10 @@
  * Phase 4 executable gates (master plan §11 Phase 4) — fusion primitives.
  *
  *   G1  `/opinion` default path spawns sides and writes per-side artifacts
- *   G2  clean-room: every side receives byte-identical rendered bytes
+ *   G2  clean-room: every side is LAUNCHED with byte-identical rendered bytes
  *   G3  same-family `/opinion` panel is refused (an echo is not an opinion)
  *   G4  `/fusion` contract enforcement — missing spans → FUSION_CONTRACT
- *   G5  aggregator family retention: recorded, and equals the architect family
+ *   G5  aggregator family = first planner's family, derived from the model
  *   G6  session-key gate: model change → new dir; restart resumes only missing role
  *   G7  template edit (global layer) changes the next run's rendered instruction
  *   G8  `{{VAR}}` with an undefined variable → typed VALIDATION_ERROR
@@ -14,13 +14,19 @@
  *   G10 customized-template detection + three-way diff data served
  *   G11 clean-room: no model-visible tools on crew sides; no cross-reads
  *
- * Runs against a real daemon; only the model is simulated.
+ * Runs against a real daemon; only the model is simulated. G2 additionally boots
+ * a second daemon on the real spawn path with a recording stand-in for the Pi
+ * binary, so the clean-room claim is measured from the bytes each side is
+ * actually launched with rather than from a hash the daemon copied into every
+ * side.
  * Usage: node tooling/gates/phase-4.mjs
  */
 
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -35,9 +41,17 @@ import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
+const STUB_PI = join(dirname(fileURLToPath(import.meta.url)), "lib", "stub-pi.mjs");
 const TMUX_SOCKET = `agentos-p4-${process.pid}`;
 const PORT = pickPort(5000, 400);
 const BASE = `http://127.0.0.1:${PORT}`;
+// G2 boots a second daemon on the REAL spawn path (recording stub Pi), so it
+// needs a port of its own.
+let stubPort = pickPort(5000, 400);
+while (stubPort === PORT) stubPort = pickPort(5000, 400);
+const STUB_BASE = `http://127.0.0.1:${stubPort}`;
+
+const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 
 const results = [];
 function gate(id, name, ok, detail) {
@@ -46,7 +60,7 @@ function gate(id, name, ok, detail) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function startDaemon(home, port) {
+function startDaemon(home, port, envOverride = {}) {
   return spawn(process.execPath, [DAEMON_BIN], {
     env: {
       ...process.env,
@@ -56,6 +70,7 @@ function startDaemon(home, port) {
       AGENTOS_FAKE_PI: "1",
       AGENTOS_FAKE_BRAIN: "1",
       AGENTOS_FAKE_GATE: "1",
+      ...envOverride,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -78,16 +93,22 @@ async function waitForHealth(home, port, timeoutMs = 20000) {
   throw new Error(`daemon did not come up on ${port}`);
 }
 
-async function api(path, token, init = {}) {
+async function apiAt(base, path, token, init = {}) {
   const headers = { ...(init.headers ?? {}), "content-type": "application/json" };
   if (token) headers.authorization = `Bearer ${token}`;
-  return fetch(`${BASE}${path}`, { ...init, headers });
+  return fetch(`${base}${path}`, { ...init, headers });
 }
-async function callTool(token, tool, input) {
-  return (await api("/v1/tools/call", token, {
+async function api(path, token, init = {}) {
+  return apiAt(BASE, path, token, init);
+}
+async function callToolAt(base, token, tool, input) {
+  return (await apiAt(base, "/v1/tools/call", token, {
     method: "POST",
     body: JSON.stringify({ tool, input }),
   })).json();
+}
+async function callTool(token, tool, input) {
+  return callToolAt(BASE, token, tool, input);
 }
 
 function fixtureRepo() {
@@ -105,6 +126,8 @@ function fixtureRepo() {
 let exitCode = 0;
 const cleanups = [];
 let child;
+/** Second daemon (real spawn path with the recording stub Pi) used by G2. */
+let stubChild;
 
 try {
   const home = mkdtempSync(join(tmpdir(), "agentos-p4-home-"));
@@ -147,7 +170,7 @@ try {
     { role: "planner", model: "openai/gpt-5.6-sol", thinking: "high", family: "openai", cleanRoom: true },
   ];
 
-  // G1 + G2 + G5 — /opinion default path, clean-room byte identity, aggregator family
+  // G1 + G5 — /opinion default path, per-side artifacts, aggregator family
   {
     const taskId = await newTask("Opinion gate");
     await callTool(token, "resolve_cast", {
@@ -189,20 +212,234 @@ try {
       `spawned=${res.data?.spawned} sides=${run?.sides?.length} artifacts=${sideArtifacts.length} paths=${distinctArtifactPaths.size}`,
     );
 
-    const hashes = new Set((run?.sides ?? []).map((s) => s.promptHash));
-    gate(
-      "G2",
-      "clean-room: every side received byte-identical rendered bytes",
-      res.data.promptsIdentical === true && hashes.size === 1,
-      `identical=${res.data.promptsIdentical} distinctHashes=${hashes.size}`,
-    );
+    // G5 — the aggregator family is the FIRST PLANNER's family, derived from the
+    // model server-side. Asserting only the cross-family panel above proves
+    // nothing: both its casts are planners, so "first planner" and `casts[0]`
+    // pick the same side, and a hard-coded "anthropic" would pass too. The
+    // three bookkeeping dispatches below (spawnSides:false — no seats, no
+    // models) separate those rules from each other:
+    //   · reversed      — flips the answer, so a constant cannot pass
+    //   · scout-first   — casts[0] is NOT a planner, so first-cast ≠ first-planner
+    //   · mislabelled   — client-supplied `family` contradicts the model
+    // §16: cast order is load-bearing; the balancer must never reorder fusion
+    // casts, and this is the assertion that would notice if it did.
+    const aggregatorOf = async (title, casts) => {
+      const id = await newTask(title);
+      const body = await callTool(token, "dispatch_fusion", {
+        taskId: id,
+        kind: "opinion",
+        casts,
+        spawnSides: false,
+        vars: { QUESTION: "q", CONTEXT: "c" },
+      });
+      if (body.ok !== true) return { reported: null, durable: null, sides: [] };
+      const durable = await (
+        await api(`/v1/tasks/${id}/fusion/${body.data.runId}`, token)
+      ).json();
+      return {
+        reported: body.data.aggregatorFamily,
+        durable: durable.run?.aggregatorFamily ?? null,
+        sides: durable.run?.sides ?? [],
+      };
+    };
+
+    const reversed = await aggregatorOf("Aggregator reversed", [
+      { role: "planner", model: "openai/gpt-5.6-sol", thinking: "high", family: "openai", cleanRoom: true },
+      { role: "planner", model: "anthropic/claude-fable-5", thinking: "high", family: "anthropic", cleanRoom: true },
+    ]);
+    const scoutFirst = await aggregatorOf("Aggregator scout first", [
+      { role: "scout", model: "openai/gpt-5.6-sol", thinking: "low", family: "openai", cleanRoom: true },
+      { role: "planner", model: "anthropic/claude-fable-5", thinking: "high", family: "anthropic", cleanRoom: true },
+      { role: "planner", model: "openai/gpt-5.6-sol", thinking: "high", family: "openai", cleanRoom: true },
+    ]);
+    // Families deliberately swapped against the models they label.
+    const mislabelled = await aggregatorOf("Aggregator mislabelled", [
+      { role: "planner", model: "openai/gpt-5.6-sol", thinking: "high", family: "anthropic", cleanRoom: true },
+      { role: "planner", model: "anthropic/claude-fable-5", thinking: "high", family: "openai", cleanRoom: true },
+    ]);
 
     gate(
       "G5",
-      "aggregator family retained from the architect side",
-      res.data.aggregatorFamily === "anthropic" && run?.aggregatorFamily === "anthropic",
-      `aggregator=${run?.aggregatorFamily}`,
+      "aggregator family = first PLANNER's family, derived from the model (not cast[0], not the client's label, not a constant)",
+      res.data.aggregatorFamily === "anthropic" &&
+        run?.aggregatorFamily === "anthropic" &&
+        reversed.reported === "openai" &&
+        reversed.durable === "openai" &&
+        scoutFirst.reported === "anthropic" &&
+        scoutFirst.durable === "anthropic" &&
+        mislabelled.reported === "openai" &&
+        mislabelled.durable === "openai" &&
+        mislabelled.sides[0]?.family === "openai" &&
+        mislabelled.sides[1]?.family === "anthropic",
+      `base=${run?.aggregatorFamily} reversed=${reversed.durable} scoutFirst=${scoutFirst.durable} mislabelled=${mislabelled.durable}/${mislabelled.sides[0]?.family}`,
     );
+  }
+
+  // G2 — clean-room byte identity, proved against the bytes each side is
+  // ACTUALLY launched with.
+  //
+  // The run record's `promptsIdentical` is `new Set(sides.map(s => s.promptHash))
+  // .size === 1` over a hash the daemon copies into every side from one
+  // variable, so it is true whatever the sides received; and the fake-Pi path
+  // never reads `input.prompt` at all. Both halves of the old assertion were
+  // therefore satisfied by construction. This boots a second daemon on the REAL
+  // spawn path with a recording stand-in for the Pi binary (PI_BINARY), and
+  // compares the `-p` bytes each side was launched with — to each other, to the
+  // per-side hash on the durable record, and to the instruction the run serves.
+  {
+    const stubDir = mkdtempSync(join(tmpdir(), "agentos-p4-stubpi-"));
+    cleanups.push(stubDir);
+    const stubBin = join(stubDir, "pi");
+    copyFileSync(STUB_PI, stubBin);
+    chmodSync(stubBin, 0o755);
+
+    // Short prefix on purpose: this daemon opens real per-session unix sockets
+    // under $HOME/sockets/<ulid>.sock, and sun_path is capped at ~104 bytes on
+    // macOS — a chattier temp name makes every spawn fail with SPAWN_FAILED.
+    const stubHome = mkdtempSync(join(tmpdir(), "p4s-"));
+    cleanups.push(stubHome);
+    const stubRepo = fixtureRepo();
+    cleanups.push(stubRepo);
+
+    stubChild = startDaemon(stubHome, stubPort, {
+      // The real spawn path is the whole point — no fake Pi here.
+      AGENTOS_FAKE_PI: "0",
+      PI_BINARY: stubBin,
+    });
+    const stubToken = await waitForHealth(stubHome, stubPort);
+
+    const stubProjectId = (
+      await (
+        await apiAt(STUB_BASE, "/v1/projects", stubToken, {
+          method: "POST",
+          body: JSON.stringify({
+            name: "p4-stub",
+            path: stubRepo,
+            mode: "local-only",
+            trusted: true,
+          }),
+        })
+      ).json()
+    ).project.id;
+    const stubTaskId = (
+      await (
+        await apiAt(STUB_BASE, "/v1/tasks", stubToken, {
+          method: "POST",
+          body: JSON.stringify({
+            spec: {
+              shape: "SHIP",
+              title: "Clean-room byte identity",
+              intent: "fusion gate fixture",
+              projectId: stubProjectId,
+              mode: "local-only",
+              yolo: true,
+            },
+          }),
+        })
+      ).json()
+    ).task.id;
+
+    await callToolAt(STUB_BASE, stubToken, "resolve_cast", {
+      taskId: stubTaskId,
+      roles: CROSS_FAMILY.map(({ role, model, thinking, cleanRoom }) => ({
+        role,
+        model,
+        thinking,
+        cleanRoom,
+      })),
+      familyCheckOverride: false,
+    });
+    const question = "Should the event log stay NDJSON?";
+    const res = await callToolAt(STUB_BASE, stubToken, "dispatch_fusion", {
+      taskId: stubTaskId,
+      kind: "opinion",
+      casts: CROSS_FAMILY,
+      vars: { QUESTION: question, CONTEXT: "100k events/day." },
+    });
+
+    const detail =
+      res.ok === true
+        ? await (
+            await apiAt(
+              STUB_BASE,
+              `/v1/tasks/${stubTaskId}/fusion/${res.data.runId}`,
+              stubToken,
+            )
+          ).json()
+        : { run: { sides: [] }, instruction: null };
+    const sides = detail.run?.sides ?? [];
+
+    // Each side's stand-in writes its argv as soon as it is exec'd; wait for
+    // both rather than assuming tmux has scheduled them.
+    const captureFor = (sessionId) => {
+      const path = join(stubDir, `capture-${sessionId}.json`);
+      if (!existsSync(path)) return null;
+      try {
+        return JSON.parse(readFileSync(path, "utf8"));
+      } catch {
+        return null;
+      }
+    };
+    let captures = [];
+    for (let attempt = 0; attempt < 100; attempt++) {
+      captures = sides.map((s) => (s.sessionId == null ? null : captureFor(s.sessionId)));
+      if (captures.length > 0 && captures.every((c) => c !== null)) break;
+      await sleep(100);
+    }
+
+    const deliveredPrompts = captures.map((c) => c?.prompt ?? null);
+    const everySideLaunched =
+      sides.length === 2 &&
+      deliveredPrompts.length === 2 &&
+      deliveredPrompts.every((p) => typeof p === "string" && p.length > 0);
+    // The bytes handed to each side are the same bytes — measured, not asserted
+    // from a single copied hash.
+    const deliveredIdentical =
+      everySideLaunched && new Set(deliveredPrompts).size === 1;
+    // …and those bytes are the ones the run says it sent, and serves as its
+    // instruction. A hash recorded from anything else fails here.
+    const hashesMatchDelivery =
+      everySideLaunched &&
+      sides.every((s, i) => s.promptHash === sha256(deliveredPrompts[i])) &&
+      typeof detail.instruction === "string" &&
+      sides.every((s) => s.promptHash === sha256(detail.instruction));
+    const renderedReachedModels =
+      everySideLaunched && deliveredPrompts.every((p) => p.includes(question));
+    const distinctModels = new Set(sides.map((s) => s.model)).size === 2;
+    // Two captures must come from two DIFFERENT Pi sessions. Without this the
+    // byte comparison above is re-readable as a tautology: if both sides record
+    // the same sessionId, `captureFor` resolves to one file, `deliveredPrompts`
+    // is that file twice, and "identical" is true because it is comparing a
+    // string to itself. Verified: pinning both sides to session[0] leaves every
+    // other clause in this gate green.
+    const distinctSessions =
+      sides.length === 2 &&
+      sides.every((s) => typeof s.sessionId === "string" && s.sessionId.length > 0) &&
+      new Set(sides.map((s) => s.sessionId)).size === 2;
+    // …and each capture is the one that side's own process wrote.
+    const capturesOwnedBySides =
+      distinctSessions && captures.every((c, i) => c?.sessionId === sides[i].sessionId);
+    const hashes = new Set(sides.map((s) => s.promptHash));
+
+    gate(
+      "G2",
+      "clean-room: both sides were LAUNCHED with byte-identical rendered bytes (recorded hash matches what Pi actually received)",
+      res.ok === true &&
+        res.data?.spawned === true &&
+        distinctModels &&
+        distinctSessions &&
+        capturesOwnedBySides &&
+        everySideLaunched &&
+        deliveredIdentical &&
+        hashesMatchDelivery &&
+        renderedReachedModels &&
+        res.data.promptsIdentical === true &&
+        hashes.size === 1,
+      `launched=${everySideLaunched} deliveredIdentical=${deliveredIdentical} hashMatchesDelivery=${hashesMatchDelivery} rendered=${renderedReachedModels} distinctSessions=${distinctSessions} ownedBySides=${capturesOwnedBySides} identical=${res.data?.promptsIdentical} distinctHashes=${hashes.size}`,
+    );
+
+    stubChild.kill("SIGKILL");
+    stubChild = undefined;
   }
 
   // G3 — same-family opinion panel refused
@@ -554,6 +791,11 @@ try {
 } finally {
   try {
     child?.kill("SIGTERM");
+  } catch {
+    // ignore
+  }
+  try {
+    stubChild?.kill("SIGTERM");
   } catch {
     // ignore
   }
