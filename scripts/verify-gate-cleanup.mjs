@@ -108,18 +108,27 @@ for (const name of readdirSync(GATE_DIR).sort()) {
     }
   }
 
+  let clean = true;
   for (let n = 0; n <= closeLine; n += 1) {
     if (/process\.exit\s*\(/.test(lines[n])) {
       violations.push(
         `${name}:${n + 1} — process.exit() before the finally block closes ` +
           `(line ${closeLine + 1}); cleanup is skipped and the daemon leaks`,
       );
+      clean = false;
     }
   }
-  checked.push(`${name} (exits after cleanup)`);
+  // Report per file honestly. This previously pushed "(exits after cleanup)"
+  // unconditionally, so a violating file was listed as ok AND failed lower
+  // down — which is how a real leak in phase-10.mjs got read as a pass from a
+  // truncated view of the output. A checker whose summary contradicts its own
+  // findings is its own kind of hollow.
+  checked.push(clean ? `${name} (exits after cleanup)` : `${name} (VIOLATION — see below)`);
 }
 
-for (const line of checked) console.log(`  ok  ${line}`);
+for (const line of checked) {
+  console.log(`  ${line.includes("VIOLATION") ? "FAIL" : "ok  "}  ${line}`);
+}
 
 if (violations.length > 0) {
   console.error(`\n${violations.length} gate(s) exit before cleanup runs:\n`);

@@ -19,11 +19,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
 const TMUX_SOCKET = `agentos-p10-${process.pid}`;
-const PORT = 4700 + 1000 + Math.floor(Math.random() * 40);
+const PORT = pickPort(5700, 40);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 const results = [];
@@ -34,6 +35,7 @@ function gate(id, name, ok, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const cleanups = [];
+let exitCode = 0;
 let daemon;
 
 try {
@@ -308,10 +310,13 @@ try {
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} gates passed`);
-  process.exit(failed.length === 0 ? 0 : 1);
+  // Set the code; exit AFTER the finally has torn everything down. Node does
+  // not unwind `finally` across process.exit(), so exiting here orphans the
+  // daemon on every run — including the passing ones.
+  exitCode = failed.length === 0 ? 0 : 1;
 } catch (error) {
   console.error(error);
-  process.exit(1);
+  exitCode = 1;
 } finally {
   try {
     daemon?.kill("SIGTERM");
@@ -340,3 +345,5 @@ function fixtureRepo(list) {
   git("commit", "-q", "-m", "seed");
   return dir;
 }
+
+process.exit(exitCode);

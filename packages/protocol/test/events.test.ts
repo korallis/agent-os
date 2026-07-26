@@ -464,6 +464,27 @@ const SAMPLES: readonly OrchestratorEvent[] = [
     },
   },
   {
+    type: "balancer.suggested",
+    payload: {
+      taskId: ULID_A,
+      suggestions: [
+        {
+          role: "builder",
+          model: "anthropic/claude-opus-4-5",
+          family: "anthropic",
+          reason: "most weekly headroom",
+        },
+      ],
+      considered: [
+        { model: "anthropic/claude-opus-4-5", usedPct: 12, tier: "live", limitReached: false },
+        { model: "openai/gpt-5", usedPct: null, tier: null, limitReached: false },
+      ],
+      costUsable: false,
+      basis: "quota-headroom",
+      refusal: null,
+    },
+  },
+  {
     type: "captain.escalation",
     payload: { taskId: ULID_A, summary: "validation exhausted", severity: "critical" },
   },
@@ -604,6 +625,7 @@ describe("ORCHESTRATOR_EVENT_TYPES", () => {
     "pipeline.run_updated",
     "pipeline.log_appended",
     "pipeline.unavailable",
+    "balancer.suggested",
     "captain.escalation",
     "task.delivery_block_resolved",
   ];
