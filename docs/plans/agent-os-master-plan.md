@@ -114,7 +114,7 @@ v1 is shipped when all of the following are true (each restated as an executable
 | Home dir | **`~/.agentos/`** (0700); secondmates under `~/.agentos/secondmates/<name>/` | [A]+[B]. |
 | **Decision-making** | **The Orchestrator Brain — a long-lived Pi process** calling a typed daemon tool surface; the daemon is a deterministic **substrate + policy enforcer** that validates transitions and enforces configured policy but decides nothing | **[R3]** — supersedes Rev-1/2's "deterministic, LLM-free Orchestrator Core makes dispatch/supervision decisions" and dissolves D11. *Rejected alternative [A, Rev-1/2]:* rule-engine core + chat-only liaison — preserved in the ledger; its testability benefit survives because the substrate (which is what's unit-testable) remains deterministic. |
 | **Configuration** | **Layered Policy Packs** (§2.6): shipped defaults → `~/.agentos/config/` → per-project `.agentos/` → per-task; **JSON5** files + prompt-template `.md` packs; zod-validated; Console-editable; hot-reload where safe | **[R3]** — JSON5 chosen over TOML: zod schemas map 1:1 onto JSON structures, deep nesting and arrays of rule objects (dispatch profiles, casts) are natural, comments/trailing commas keep it human-editable, and one parser serves daemon + console. TOML's array-of-tables syntax is hostile to exactly the nested rule shapes this system is made of. |
-| Worker harness | **Default: Pi coding agent, pinned exact version**; headless via `pi --mode json -p`; live channel via the `agent-os` extension. **[R8] Phase 12:** Captain-selectable harness per model (Claude Code, Codex CLI, Kimi CLI, OpenCode, Pi) via `HarnessAdapter` + capability declaration; absent capabilities render as stated absence | **[R2]** default + baseline; **[R8]** choice supersedes Pi-only exclusivity (§13.4 historical rejection; Phase 12 reopens with declared degradation). |
+| Worker harness | **Default: Pi coding agent, pin-compatible version** (same MAJOR.MINOR, PATCH ≥ tested pin); headless via `pi --mode json -p`; live channel via the `agent-os` extension. **[R8] Phase 12:** Captain-selectable harness per model (Claude Code, Codex CLI, Kimi CLI, OpenCode, Pi) via `HarnessAdapter` + capability declaration; absent capabilities render as stated absence | **[R2]** default + baseline; **[R8]** choice supersedes Pi-only exclusivity (§13.4 historical rejection; Phase 12 reopens with declared degradation). |
 | Model I/O | **Through the seat's configured harness** (default Pi until Phase 12); no raw AI SDK in the substrate | **[R2]** as-built; **[R8]** multi-harness route. |
 | HTTP server | **Fastify 5.x**; PTY WebSocket via `ws` on the same HTTP server's upgrade path (loopback + exact-origin) | **[CONSENSUS]** + **[Phase 6 as-built]** |
 | Semantic events transport | **SSE** (ULID ids, `Last-Event-ID` replay); **WebSocket only for the terminal attach channel** | [B]. |
@@ -137,7 +137,7 @@ v1 is shipped when all of the following are true (each restated as an executable
 | Terminal UI | Session Detail: monospace read-only pane surface (capture text); `@xterm/xterm` remains the planned surface for a future interactive attach if one ships | **[Phase 6 fourth slice as-built]**; xterm deferred with interactivity |
 | Tests | Vitest + Playwright | **[CONSENSUS]** |
 
-**Dependency policy [B, retained]:** exact pins (including Pi), zero-deprecated gates, audit-clean, strict TS flags, `no-explicit-any: error`. **Pi upgrade policy [R2]:** pinned + weekly canary CI with report; deliberate upgrades only.
+**Dependency policy [B, retained]:** exact pins for product dependencies, zero-deprecated gates, audit-clean, strict TS flags, `no-explicit-any: error`. **Pi pin policy [R2, refined Phase 18]:** `PI_PINNED_VERSION` records the version Agent OS is **tested against**, not a string-identity wall. Runtime compatibility is **same MAJOR.MINOR with PATCH at or above the pin**; a different minor or major, and any unparseable or absent version, **fail closed**. **Why not exact equality:** an exact pin is only enforceable if the product can install that exact version, and it cannot — the wizard prints an install hint (`piInstallHint`) and never runs it, so `version === PI_PINNED_VERSION` is a wall with no way over it (a patch release of Pi wedged onboarding at the doctor step on the Captain's own machine). A patch release cannot move the extension API the substrate depends on (`pi.on`, `pi.registerTool`, `pi.sendMessage`, `agent_settled`); a minor or major can, which is why those still fail closed. **Pi upgrade policy [R2]:** bump the tested pin deliberately with a canary run; weekly canary CI with report; do not reintroduce exact-equality enforcement.
 
 ### 2.2 Component architecture (mermaid)
 
@@ -630,7 +630,7 @@ A full guided first-run flow in the Console (§7 design language), **resumable**
 **Step 0 — Environment doctor.** Detect Pi (installed + version vs our pin), tmux, git, node, uv. Anything missing gets a guided install with copy-paste blocks, e.g. Pi:
 
 ```
-$ npm i -g @earendil-works/pi-coding-agent@<pinned>     # exact pinned version
+$ npm i -g @earendil-works/pi-coding-agent@<pinned>     # tested pin (same major.minor, patch ≥ pin accepted)
 ```
 
 The wizard re-runs the detection probe after each block; a step turns ✓ only when the probe passes.
@@ -1202,7 +1202,7 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 8. **Process limits:** timeout, output cap, max descendants, max workers, cancellation grace; per-role `maxTurnSeconds` + `costCeilingUsd` from policy. [B]+[R2]
 9. **Artifact rendering:** escaped/sanitized markdown; no HTML/script execution; xterm links off by default. [B]
 10. **ToS guardrails:** `pi-oauth` = `personalUseOnly`; hosted mode compile-restricted to `pi-api-key`; backups omit credential homes. [A]+[B]+[R2]
-11. **Dependency gate:** exact pins, zero-deprecated scanner, audit, license allowlist, scheduled update PRs; Pi pinned + weekly canary. **[CONSENSUS + R2]**
+11. **Dependency gate:** exact pins for product dependencies, zero-deprecated scanner, audit, license allowlist, scheduled update PRs; Pi pin-compatible (same major.minor, patch ≥ tested pin) + weekly canary. **[CONSENSUS + R2 + Phase 18]**
 13. **Third-party Pi extensions (supply chain) [R6, resolved R6.1]:** pi.dev packages execute code inside our harness. The SDK bridge is **forked and vendored into the monorepo** (`packages/pi-ext-claude-agent-sdk`, published as `@agentos/claude-agent-sdk-pi`) — built and tested by our CI, so the trust boundary is our repo, not a third-party npm publish; upstream `claude-agent-sdk-pi` changes are pulled via **reviewed diffs** on the Pi canary/approval cadence. Extensions loadable by Agent OS spawns pass through the extension-allowlist policy: only our `agent-os` bundle and our vendored SDK bridge are ever passed via `-e` or `pi install` for managed spawns — nothing else, and never anything from a repo.
 12. **Config integrity [R3]:** every config write versioned (`config_revisions`); project `.agentos/` overrides hash-acknowledged before effect and re-prompted on change; project layers cannot weaken safety policies; invalid config never partially applies (all-or-nothing per domain file).
 
@@ -1466,7 +1466,7 @@ Gates:
 
 | # | Risk | Impact | Mitigation | Src |
 |---|---|---|---|---|
-| R1 | Pi churn (flags, JSON mode, extension API, auth-store format) | spawn/telemetry/auth failures | Exact pin; contract suite; weekly canary; deliberate upgrades; opaque auth store | [R2] |
+| R1 | Pi churn (flags, JSON mode, extension API, auth-store format) | spawn/telemetry/auth failures | Pin-compatible rule (same major.minor, patch ≥ tested pin; minor/major fail closed); contract suite; weekly canary; deliberate pin bumps; opaque auth store | [R2]+[Phase 18] |
 | R2 | Subscription-automation ToS shifts | connection unusable | Interactive-equivalent use; disclosures; `pi-api-key` fallback per family; no token extraction | **[CONSENSUS]** |
 | R3 | Quota exhaustion mid-task | wedged fleet | Pre-spawn checks; exclusions; family-preserving failover (flagged); budgets pause | [A]+[B] |
 | R4 | VALIDATOR writes bad gates | false GREEN / thrash | Semantic RED, `GATE_ERROR` split, hashes+revisions, flaky-gate detector, triage, evidence UI | [A]+[B] |

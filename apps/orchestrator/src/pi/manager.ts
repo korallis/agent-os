@@ -14,13 +14,17 @@ import { scrubEnv, type ProviderKeyEnvName } from "../security/env-scrub.js";
 
 /**
  * Pi manager (master plan §4.5–§4.7).
- * Only this module builds Pi command lines. Exact pin + managed home.
+ * Only this module builds Pi command lines. Pin compatibility + managed home.
  */
 
 export interface PiDetection {
   binary: string | null;
   version: string | null;
   pinnedVersion: typeof PI_PINNED_VERSION;
+  /**
+   * Satisfies the pin rule (same major.minor, patch >= pin), not exact
+   * string equality. Set from {@link piVersionSatisfiesPin}.
+   */
   versionMatchesPin: boolean;
   /** Compatible with the pin, but not the exact tested version. */
   versionIsPatchDrift: boolean;

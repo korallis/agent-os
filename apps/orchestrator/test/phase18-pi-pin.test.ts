@@ -44,9 +44,14 @@ describe("Pi version pin", () => {
     expect(piVersionIsPatchDrift("0.83.0")).toBe(false);
   });
 
-  it("rejects an OLDER patch than the pin", () => {
-    // Downgrades are not compatible: the pin records the minimum tested build.
-    expect(piVersionSatisfiesPin("0.81.9")).toBe(false);
+  it("rejects an older PATCH on the same major.minor (the patch floor)", () => {
+    // With PI_PINNED_VERSION patch at 0 there is no same-major.minor older
+    // patch, so the floor is exercised against a synthetic pin. These three
+    // assertions isolate got[2] >= want[2]: drop that check and this test fails.
+    const pin = "0.82.3";
+    expect(piVersionSatisfiesPin("0.82.2", pin)).toBe(false);
+    expect(piVersionSatisfiesPin("0.82.3", pin)).toBe(true);
+    expect(piVersionSatisfiesPin("0.82.4", pin)).toBe(true);
   });
 
   it("rejects a different MINOR or MAJOR — those can move the extension API", () => {
@@ -55,6 +60,7 @@ describe("Pi version pin", () => {
     // check must still fail closed there.
     expect(piVersionSatisfiesPin("0.83.0")).toBe(false);
     expect(piVersionSatisfiesPin("0.81.0")).toBe(false);
+    expect(piVersionSatisfiesPin("0.81.9")).toBe(false);
     expect(piVersionSatisfiesPin("1.82.0")).toBe(false);
   });
 

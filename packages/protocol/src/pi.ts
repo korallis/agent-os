@@ -37,17 +37,21 @@ function parsePiVersion(version: string): [number, number, number] | null {
 }
 
 /**
- * True when `installed` is compatible with {@link PI_PINNED_VERSION}: identical
- * major and minor, and a patch no older than the pin.
+ * True when `installed` is compatible with the pin: identical major and minor,
+ * and a patch no older than the pin. Defaults to {@link PI_PINNED_VERSION};
+ * pass `pin` to exercise a synthetic floor in tests.
  *
  * Fails closed on anything unparseable — an unrecognised version string is not
  * evidence of compatibility, and this is the check that decides whether the
  * substrate will drive an unknown harness.
  */
-export function piVersionSatisfiesPin(installed: string | null): boolean {
+export function piVersionSatisfiesPin(
+  installed: string | null,
+  pin: string = PI_PINNED_VERSION,
+): boolean {
   if (installed === null) return false;
   const got = parsePiVersion(installed);
-  const want = parsePiVersion(PI_PINNED_VERSION);
+  const want = parsePiVersion(pin);
   if (got === null || want === null) return false;
   return got[0] === want[0] && got[1] === want[1] && got[2] >= want[2];
 }
