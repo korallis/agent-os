@@ -246,7 +246,7 @@ sequenceDiagram
 
     U->>BR: "Ship: <intent>"
     BR->>S: create_task(SHIP, mode, profile) [tool call, Idempotency-Key]
-    S->>S: validate vs policy: builder.family ≠ validator.family,<br/>≥2 planner families (configured invariants) —<br/>violating cast → typed TOOL ERROR, never scheduled
+    S->>S: validate vs policy: builder/validator must be<br/>provably different known families (fail closed on<br/>unknown origin); ≥2 independent planner families —<br/>violating cast → typed TOOL ERROR, never scheduled
     BR->>S: dispatch_fusion(plan-fusion, cast, fusion instruction)<br/>cast chosen BY THE BRAIN per dispatch profiles (editable)
     par independent clean-room spawns (substrate executes)
         S->>P1: pi --mode json -p … -e agent-os.ts
@@ -800,13 +800,13 @@ Resolves R3-Q1 (and, transitively, Rev-1's "liaison brain default" open question
 
 ### 6.2 Cross-family policy
 
-Rules unchanged (**all now safety policies, config #12 — default ON, mechanically enforced by `resolve_cast`/`dispatch_fusion`, overrides evidence-stamped [R3]**):
+Rules unchanged in intent (**all now safety policies, config #12 — default ON, mechanically enforced by `resolve_cast`/`dispatch_fusion`/`spawn_crewmate` and the claude-agent-sdk bridge, overrides evidence-stamped [R3]**). Predicate is **`familiesConflict` in `packages/protocol`** (single owner; every call site must use it — never raw family-label inequality):
 
-1. `builder.family !== validator.family` — violating cast is a typed tool error; Captain override stamps `familyCheckOverridden` + `policyOverrides[]`.
-2. Plan-fusion ≥2 distinct planner families. **[CONSENSUS]**
+1. **Builder and validator must be provably different known families.** `familiesConflict(builder.model, validator.model)` true → typed tool error. Same known family still conflicts. **`"other"` is not a family** — it is *unknown origin*; an unrecognised origin on either side is a conflict, and two unknown origins conflict as well (they may be one vendor under two aliases). Fail closed matches the rest of the substrate (`PI_UNAVAILABLE`, cost as `—` not `$0.00`). Captain override stamps `familyCheckOverridden` + `policyOverrides[]`.
+2. Plan-fusion requires ≥2 planners that are **provably independent** (at least one pair with `familiesConflict === false`). A set of labels that includes `"other"` is not proof of independence. **[CONSENSUS]**
 3. FUSION on a third family requires no disclosure; FUSION matching a planner family requires disclosure (`thirdFamilyFusion: false` stamped in `summary.json`). [B] **[R4]:** the shipped default cast deliberately sets fusion to the architect family (below) and carries that disclosure; the `preferThirdFamilyFusion` toggle remains available.
 4. Validator fallback may not re-enter the builder's family. [B]
-5. Aggregator ≠ family. [B] **[R6]:** likewise, the SDK bridge ≠ family — **`claude-agent-sdk/<model>` classifies as family `anthropic`** in the origin-keyed registry for every cross-family invariant (a `claude-agent-sdk` builder can never be validated by an `anthropic/*` validator, and vice versa).
+5. Aggregator ≠ family. [B] **[R6]:** likewise, the SDK bridge ≠ family — **`claude-agent-sdk/<model>` classifies as family `anthropic`** in the origin-keyed registry for every cross-family invariant (a `claude-agent-sdk` builder can never be validated by an `anthropic/*` validator, and vice versa). Origins absent from the registry resolve to `"other"` and fail closed under rule 1 — adding a provider id without classifying it is never a silent accept.
 6. Soft preferences (config, not policy): plan-quota subs preferred for BUILDER; Claude OAuth competes as metered (§4.4); long-context API models for high-token planning; round-robin ties. [A]+[R2]
 
 Default cast **[R4 — Captain's decision: "Fable 5 / Sol both on High"]** (shipped `default-cross-family` profile; the Brain may deviate within policy): **PLANNER A `anthropic/claude-fable-5` (thinking: high)**, **PLANNER B `openai/gpt-5.6-sol` (thinking: high)** — 2 planner families; **FUSION on the architect family: `anthropic/claude-fable-5` (high)**, disclosed per rule 3; BUILDER `openai/gpt-5.6-codex` (plan quota), VALIDATOR ≠ builder family (anthropic or xai). Where the concrete models aren't available on the user's connections, the cast resolver **substitutes best-available same-family and records the substitution in `cast.json`**. Fully user-configurable as before (config #2); the long-context soft preference (rule 6) still routes oversized planning contexts to models like `openrouter/moonshotai/kimi-k3`.
@@ -1432,7 +1432,7 @@ Gates:
 - [ ] **Fusion artifact path is an uncontained read (VERIFIED, worse than reported).** `:runId` is unvalidated, but the stronger hole is `side.artifactPath` being read absolute with no containment — anything that can plant a `run.json` gets arbitrary file read over REST. ULID-validate the params *and* containment-check every path read.
 - [ ] **Unbounded in-memory growth (VERIFIED, 6 sites).** Watcher history/queue, both idempotency maps, per-session pending tool results, and the socket-hub read buffer (no newline cap — a peer that never sends `\n` grows the string forever). Bound each with stated eviction.
 - [ ] **Doc-vs-code drift (VERIFIED).** `PROTOCOL_VERSION` still says `1.2.0-phase3`; `sockets.ts` claims frames are "zod-validated both ways" while the extension side bare-casts (`daemonControlFrameSchema` is never used at runtime); `familyOfClaudeAgentSdkModel` claims "always anthropic" and is not. These carry security weight — validate the extension side for real, then make the comments true.
-- [ ] **`protocol` has zero tests (VERIFIED)** despite being what everything else validates against. Add a suite, including pinning tests for the `familyOfModelRef` "other" bucket.
+- [x] **`protocol` package suite (closed the "zero tests" finding):** `packages/protocol/test/` pins REST/SSE/socket/tool/config schemas plus `familyOfModelRef` / `familiesConflict` — including fail-closed on unrecognised origins (`"other"` is not a family) and the Bedrock-hosted Claude case that previously passed.
 - [ ] Console: share one SSE connection per page (task detail opens **3**; analytics opens 2, not the 3 reported).
 - [ ] Marketing: the site presents **fabricated customer testimonials as real** — that directly contradicts the honesty discipline the product enforces on itself, and should be removed or labelled before anything else on that list.
 
@@ -1452,7 +1452,7 @@ Gates:
 - **Unit:** state-machine transition validation, tool-surface schemas + policy checks, config resolver (layering matrix, trust gating, all-or-nothing application), wake classification + absorb rules, env-scrub, guard policies, template interpolation, path validation, price calc, redaction, migration checksums, socket/tool frame round-trips.
 - **Integration:** daemon + real SQLite/tmp repos/tmux + **deterministic fake Pi** and a **scripted fake Brain** (canned tool-call sequences over the real bridge) so orchestration paths are testable without model calls — this preserves the testability that motivated Rev-1's deterministic core. **[R3]**
 - **Harness contract suite [R2]:** run vs pinned Pi (and weekly vs latest): JSON-mode framing, hook coverage (`agent_settled`, `tool_call` blocking, provider hooks), flag behavior, session-dir keying, auth-store presence semantics.
-- **Contract:** every REST/SSE/socket/tool/config schema round-trips through `packages/protocol`; console, daemon, and extension compile against the one package.
+- **Contract:** every REST/SSE/socket/tool/config schema round-trips through `packages/protocol` (unit suite in `packages/protocol/test/`); console, daemon, and extension compile against the one package. Cross-family independence is `familiesConflict` only (§6.2).
 - **Recovery/fault injection:** SIGKILL daemon/workers/**Brain**, socket EOFs, truncated logs, held locks, missed notifications, auth-store mtime churn, quota exhaustion, dirty worktrees, stale panes, **BRAIN_DOWN queue drain**, config-file corruption mid-reload. [R3]
 - **Security:** env contamination, billing-mismatch, traversal/symlink escapes, guard-bypass, token canaries, origins/tickets, argument injection, `.pi/extensions` non-loading, **Brain policy-bypass attempts** (tool fuzzing against POLICY_VIOLATION), **project-config weakening attempts** rejected. [R3]
 - **Browser:** Playwright desktop/mobile mapped to phase criteria (incl. Policies flows).
