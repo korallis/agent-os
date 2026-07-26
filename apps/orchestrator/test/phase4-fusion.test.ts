@@ -50,7 +50,7 @@ function gitRepo(): string {
   return dir;
 }
 
-function fleet(): { service: FleetService; events: OrchestratorEvent[] } {
+async function fleet(): Promise<{ service: FleetService; events: OrchestratorEvent[] }> {
   const home = temp("agentos-p4-home-");
   mkdirSync(join(home, "config"), { recursive: true });
   const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -68,7 +68,8 @@ function fleet(): { service: FleetService; events: OrchestratorEvent[] } {
     fakePi: true,
   });
   service.onEvent((e) => events.push(e));
-  service.start();
+  // start() is async — brain stays BRAIN_DOWN until the promise settles.
+  await service.start();
   return { service, events };
 }
 
@@ -214,8 +215,8 @@ describe("session keys (G6)", () => {
     expect(missing).toEqual([{ role: "planner", model: "openai/gpt-5.6-sol" }]);
   });
 
-  it("wires session dirs into live spawns and hands native Pi session isolation", () => {
-    const { service } = fleet();
+  it("wires session dirs into live spawns and hands native Pi session isolation", async () => {
+    const { service } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     // End-to-end G6: spawn the full cross-family cast live, then wipe one side.
@@ -405,7 +406,7 @@ describe("session keys (G6)", () => {
     ).toEqual([]);
   });
 
-  it("never inherits ambient session-dir sentinels into crewmate or Brain spawn env", () => {
+  it("never inherits ambient session-dir sentinels into crewmate or Brain spawn env", async () => {
     const sentinel = "/tmp/ambient-session-dir-CANARY";
     const prevAgentos = process.env.AGENTOS_SESSION_DIR;
     const prevPi = process.env.PI_CODING_AGENT_SESSION_DIR;
@@ -457,7 +458,7 @@ describe("session keys (G6)", () => {
         return originalNewWindow(input);
       }) as typeof service.tmux.newWindow;
 
-      const brainSnap = service.brain.start("session-dir-canary");
+      const brainSnap = await service.brain.start("session-dir-canary");
       expect(brainSnap.status).toBe("running");
       expect(brainSnap.model).not.toBeNull();
       const brainModel = brainSnap.model as string;
@@ -560,8 +561,8 @@ describe("session keys (G6)", () => {
     }
   });
 
-  it("removes a newly created session key when spawn fails so resume still sees the role missing", () => {
-    const { service } = fleet();
+  it("removes a newly created session key when spawn fails so resume still sees the role missing", async () => {
+    const { service } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
@@ -731,8 +732,8 @@ describe("fusion run store", () => {
 });
 
 describe("/opinion live path", () => {
-  it("spawns clean-room sides by default, writes artifacts, and completes only after settle", () => {
-    const { service, events } = fleet();
+  it("spawns clean-room sides by default, writes artifacts, and completes only after settle", async () => {
+    const { service, events } = await fleet();
     const { taskId } = seedShipTask(service);
 
     const result = service.tools.invoke("dispatch_fusion", {
@@ -821,8 +822,8 @@ describe("/opinion live path", () => {
     expect(byModel.get("openai/gpt-5.6-sol")).toBe("low");
   });
 
-  it("treats kind=fusion with an artifact as a contract check (no default spawn)", () => {
-    const { service, events } = fleet();
+  it("treats kind=fusion with an artifact as a contract check (no default spawn)", async () => {
+    const { service, events } = await fleet();
     const { taskId } = seedShipTask(service);
     events.length = 0;
 
@@ -866,8 +867,8 @@ describe("/opinion live path", () => {
     expect(types).not.toContain("session.spawned");
   });
 
-  it("honors spawnSides: false bookkeeping opt-out for /opinion", () => {
-    const { service, events } = fleet();
+  it("honors spawnSides: false bookkeeping opt-out for /opinion", async () => {
+    const { service, events } = await fleet();
     const { taskId } = seedShipTask(service);
     events.length = 0;
 
@@ -898,7 +899,7 @@ describe("/opinion live path", () => {
     expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 
-  it("forces clean-room argv for /opinion even when cast.cleanRoom is false", () => {
+  it("forces clean-room argv for /opinion even when cast.cleanRoom is false", async () => {
     const home = temp("agentos-p4-cleanroom-force-");
     mkdirSync(join(home, "config"), { recursive: true });
     const extensionPath = join(home, "extension.js");
@@ -936,7 +937,7 @@ describe("/opinion live path", () => {
         sendControl: () => false,
       },
     });
-    service.start();
+    await service.start();
 
     const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
     service.tmux.newWindow = ((input: Parameters<typeof originalNewWindow>[0]) => {
@@ -981,8 +982,8 @@ describe("/opinion live path", () => {
     }
   });
 
-  it("refuses crew session read_run_artifacts (no clean-room cross-reads)", () => {
-    const { service } = fleet();
+  it("refuses crew session read_run_artifacts (no clean-room cross-reads)", async () => {
+    const { service } = await fleet();
     const { taskId } = seedShipTask(service);
 
     const spawned = service.tools.invoke("spawn_crewmate", {
@@ -1007,8 +1008,8 @@ describe("/opinion live path", () => {
     expect(asCrew.error?.code).toBe("UNAUTHORIZED_TOOL");
   });
 
-  it("refuses same-family /opinion even when cast.family labels disagree", () => {
-    const { service } = fleet();
+  it("refuses same-family /opinion even when cast.family labels disagree", async () => {
+    const { service } = await fleet();
     const { taskId } = seedShipTask(service);
 
     // Two anthropic models mislabelled as different families — policy must
@@ -1039,8 +1040,8 @@ describe("/opinion live path", () => {
     expect(result.error?.message).toMatch(/distinct model families/i);
   });
 
-  it("derives durable FusionSide.family from model, overwriting client labels", () => {
-    const { service } = fleet();
+  it("derives durable FusionSide.family from model, overwriting client labels", async () => {
+    const { service } = await fleet();
     const { taskId } = seedShipTask(service);
 
     const result = service.tools.invoke("dispatch_fusion", {
@@ -1074,8 +1075,8 @@ describe("/opinion live path", () => {
     expect(run!.aggregatorFamily).toBe("anthropic");
   });
 
-  it("rebuilds fusion ownership, keeps late usage, finalizes stop without placeholders", () => {
-    const { service, events } = fleet();
+  it("rebuilds fusion ownership, keeps late usage, finalizes stop without placeholders", async () => {
+    const { service, events } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     const spawnA = service.tools.invoke("spawn_crewmate", {
@@ -1245,8 +1246,8 @@ describe("/opinion live path", () => {
   // 1) mid-dispatch never-spawned (null sessionId)
   // 2) halt-without-settle (status stopped)
   // 3) markSessionStatus(settled) before completeFusionSide (status settled, settledAt null)
-  it("boot hydrate finalizes mid-dispatch runs left with a never-spawned side", () => {
-    const { service, events } = fleet();
+  it("boot hydrate finalizes mid-dispatch runs left with a never-spawned side", async () => {
+    const { service, events } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     // kill-9 mid-dispatch: first side persisted with a sessionId, second side
@@ -1381,8 +1382,8 @@ describe("/opinion live path", () => {
     expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 
-  it("boot hydrate finalizes sides whose durable sessions are already stopped", () => {
-    const { service, events } = fleet();
+  it("boot hydrate finalizes sides whose durable sessions are already stopped", async () => {
+    const { service, events } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     // kill-9-during-deliver-halt: panes stopped without completeFusionSide.
@@ -1476,8 +1477,8 @@ describe("/opinion live path", () => {
     expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 
-  it("boot hydrate finalizes sides left settled without settledAt", () => {
-    const { service, events } = fleet();
+  it("boot hydrate finalizes sides left settled without settledAt", async () => {
+    const { service, events } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     // kill-9 between markSessionStatus(settled) and completeFusionSide:
@@ -1589,8 +1590,8 @@ describe("/opinion live path", () => {
     expect(events.map((e) => e.type)).toContain("fusion.completed");
   });
 
-  it("does not re-attribute a prior /opinion run's bytes to a sequential same-cast run", () => {
-    const { service } = fleet();
+  it("does not re-attribute a prior /opinion run's bytes to a sequential same-cast run", async () => {
+    const { service } = await fleet();
     const { taskId } = seedShipTask(service);
     const casts = [
       {
@@ -1646,8 +1647,8 @@ describe("/opinion live path", () => {
     }
   });
 
-  it("finalizes a partial multi-side spawn failure instead of stranding dispatched", () => {
-    const { service, events } = fleet();
+  it("finalizes a partial multi-side spawn failure instead of stranding dispatched", async () => {
+    const { service, events } = await fleet();
     const { taskId } = seedShipTask(service);
     events.length = 0;
 
@@ -1730,8 +1731,8 @@ describe("/opinion live path", () => {
     expect(types).toContain("session.stopped");
   });
 
-  it("cancel_task finalizes in-flight fusion sides instead of stranding them", () => {
-    const { service, events } = fleet();
+  it("cancel_task finalizes in-flight fusion sides instead of stranding them", async () => {
+    const { service, events } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     const spawnA = service.tools.invoke("spawn_crewmate", {
@@ -1838,8 +1839,8 @@ describe("/opinion live path", () => {
     expect(events.map((e) => e.type)).not.toContain("fusion.completed");
   });
 
-  it("latches an earlier side failure when a later side settles cleanly", () => {
-    const { service, events } = fleet();
+  it("latches an earlier side failure when a later side settles cleanly", async () => {
+    const { service, events } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     const spawnA = service.tools.invoke("spawn_crewmate", {
@@ -1946,8 +1947,8 @@ describe("/opinion live path", () => {
     ).toHaveLength(0);
   });
 
-  it("deliver_task abort finalizes in-flight fusion sides", () => {
-    const { service, events } = fleet();
+  it("deliver_task abort finalizes in-flight fusion sides", async () => {
+    const { service, events } = await fleet();
     const { taskId } = seedShipTask(service);
 
     // Builder first so phase is BUILDING (deliverable). Dirty tree aborts deliver.
@@ -2024,8 +2025,8 @@ describe("/opinion live path", () => {
     }
   });
 
-  it("reconcileMissingCastRoles continues after a failed respawn", () => {
-    const { service, events } = fleet();
+  it("reconcileMissingCastRoles continues after a failed respawn", async () => {
+    const { service, events } = await fleet();
     const { taskId, projectId } = seedShipTask(service);
 
     const spawnA = service.tools.invoke("spawn_crewmate", {

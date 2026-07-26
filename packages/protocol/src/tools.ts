@@ -205,13 +205,29 @@ export type NotifyCaptainInput = z.infer<typeof notifyCaptainInputSchema>;
 export const routeToSecondmateInputSchema = z.strictObject({
   name: z.string().min(1).max(64),
   taskId: ulidSchema,
+  /**
+   * Domain being handed over. Must be in the named target secondmate's
+   * charter.domains (enforced via SecondmateFleet.acceptsDomain on that
+   * charter). routeFor is first-wins auto-pick only and is not used here.
+   */
+  domain: z.string().min(1).max(64),
 });
 export type RouteToSecondmateInput = z.infer<typeof routeToSecondmateInputSchema>;
 
 export const readSecondmateBearingsInputSchema = z.strictObject({
-  name: z.string().min(1).max(64),
+  /** When omitted, probe every secondmate. */
+  name: z.string().min(1).max(64).optional(),
 });
 export type ReadSecondmateBearingsInput = z.infer<typeof readSecondmateBearingsInputSchema>;
+
+export const provisionSecondmateInputSchema = z.strictObject({
+  name: z.string().min(1).max(64),
+  domain: z.string().min(1).max(64),
+  port: z.number().int().min(1024).max(65535).optional(),
+  brainModel: z.string().min(3).optional(),
+  maxConcurrentTasks: z.number().int().min(1).max(32).optional(),
+});
+export type ProvisionSecondmateInput = z.infer<typeof provisionSecondmateInputSchema>;
 
 export const stowKnowledgeInputSchema = z.strictObject({
   projectId: ulidSchema,
@@ -278,6 +294,7 @@ export const brainToolNameSchema = z.enum([
   "notify_captain",
   "route_to_secondmate",
   "read_secondmate_bearings",
+  "provision_secondmate",
   "stow_knowledge",
   "read_policy",
   "advance_phase",

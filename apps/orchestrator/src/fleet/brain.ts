@@ -10,6 +10,7 @@ import type {
 } from "@agent-os/protocol";
 import type { ConnectionRegistry } from "../pi/connections.js";
 import { resolveProviderKeyGrant } from "../pi/connections.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 import type { PiDetection } from "../pi/manager.js";
 import { buildPiSpawnSpec } from "../pi/manager.js";
 import { familyFromModel } from "../substrate/family.js";
@@ -57,6 +58,7 @@ export interface BrainManagerDeps {
   watcher: WakeWatcher;
   sessionKeys: SessionKeyStore;
   connections?: ConnectionRegistry;
+  authBroker?: PiAuthBroker;
   pi?: PiDetection;
   extensionPath?: string;
   sockets?: SessionChannel;
@@ -128,8 +130,10 @@ export class BrainManager {
    * Start or respawn the Brain. Blocked when config.respawnBlocked (BRAIN_DOWN fixture).
    * Always tears down any prior Brain pane/socket before spawning so respawn and
    * daemon-restart reclaim cannot leave an unauthorized live pane in BRAIN_DOWN.
+   *
+   * Async so spawn-grant lock acquisition never busy-waits on the event loop.
    */
-  start(reason = "boot"): BrainSnapshot {
+  async start(reason = "boot"): Promise<BrainSnapshot> {
     if (this.config.respawnBlocked) {
       this.teardownPriorBrain();
       this.enterDown(`respawn blocked (${reason})`);
@@ -195,36 +199,56 @@ export class BrainManager {
       this.deps.tools.setBrainSessionId(sessionId);
 
       try {
-        const grant = resolveProviderKeyGrant(
-          this.deps.home,
-          model,
-          this.deps.connections,
-        );
         const sessionDir = this.deps.sessionKeys.ensure({
           projectId: BRAIN_SESSION_PROJECT_ID,
           role: "brain",
           model,
         }).dir;
-        const spec = buildPiSpawnSpec({
-          agentosHome: this.deps.home,
-          detection: this.deps.pi,
-          args: ["--mode", "json", "-p", BRAIN_SYSTEM_PROMPT, "--model", model],
-          cwd: this.deps.home,
-          sessionId,
-          role: "brain",
-          socketPath,
-          extensionPath: this.deps.extensionPath,
-          sessionDir,
-          thinking,
-          cleanRoom: false,
-          grantProviderKey: grant,
-        });
-        const win = this.deps.tmux.newWindow({
-          windowName,
-          argv: [spec.binary, ...spec.args],
-          env: spec.env,
-        });
-        this.snapshot = { ...this.snapshot, tmuxWindow: win.target };
+        const pi = this.deps.pi;
+        const extensionPath = this.deps.extensionPath;
+        if (pi === undefined || extensionPath === undefined) {
+          throw new Error("Pi detection or extension path missing");
+        }
+        const runSpawn = (): string => {
+          if (
+            this.deps.authBroker !== undefined &&
+            !this.deps.authBroker.holdsAuthLock()
+          ) {
+            throw new Error(
+              "provider grant resolution requires PiAuthBroker.withSpawnGrant (auth lock not held)",
+            );
+          }
+          const grant = resolveProviderKeyGrant(
+            this.deps.home,
+            model,
+            this.deps.connections,
+          );
+          const spec = buildPiSpawnSpec({
+            agentosHome: this.deps.home,
+            detection: pi,
+            args: ["--mode", "json", "-p", BRAIN_SYSTEM_PROMPT, "--model", model],
+            cwd: this.deps.home,
+            sessionId,
+            role: "brain",
+            socketPath,
+            extensionPath,
+            sessionDir,
+            thinking,
+            cleanRoom: false,
+            grantProviderKey: grant,
+          });
+          const win = this.deps.tmux.newWindow({
+            windowName,
+            argv: [spec.binary, ...spec.args],
+            env: spec.env,
+          });
+          return win.target;
+        };
+        const tmuxWindow =
+          this.deps.authBroker !== undefined
+            ? await this.deps.authBroker.withSpawnGrant(async () => runSpawn())
+            : runSpawn();
+        this.snapshot = { ...this.snapshot, tmuxWindow };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.deps.tools.setBrainSessionId(null);
@@ -262,7 +286,7 @@ export class BrainManager {
    * In-flight tasks are untouched: crewmate panes, leases, and task phases live
    * in the substrate, not in the Brain's context.
    */
-  handoff(toModel: string, reason: string): BrainSnapshot {
+  async handoff(toModel: string, reason: string): Promise<BrainSnapshot> {
     const fromModel = this.snapshot.model;
     const fromSessionId = this.snapshot.sessionId;
     if (toModel === fromModel) {
@@ -272,7 +296,7 @@ export class BrainManager {
     // start() tears down the prior pane, mints a fresh session id, and resolves
     // a session dir keyed to the new model — the no-replay guarantee is
     // structural rather than a rule the caller has to remember.
-    const next = this.start(`brain handoff: ${reason}`);
+    const next = await this.start(`brain handoff: ${reason}`);
     const landed = next.status === "running";
     this.persistHandoff({
       toModel,

@@ -21,6 +21,7 @@ import {
   onboardingAdvanceRequestSchema,
   PI_PINNED_VERSION,
   projectRegisterRequestSchema,
+  provisionSecondmateInputSchema,
   SAFETY_CONFIRM_HEADER,
   safetyPoliciesConfigSchema,
   taskCreateRequestSchema,
@@ -45,6 +46,7 @@ import type { ConnectionRegistry } from "../pi/connections.js";
 import { writeApiKeyFile } from "../pi/connections.js";
 import type { PiDetection } from "../pi/manager.js";
 import { listDetectedProviders } from "../pi/manager.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 import type { OnboardingService } from "../onboarding/state.js";
 import { OnboardingBlockedError } from "../onboarding/state.js";
 import { enableQuotaProviders } from "../quota-probes/enable.js";
@@ -73,6 +75,8 @@ export interface ServerDeps {
   connections?: ConnectionRegistry;
   onboarding?: OnboardingService;
   pi?: PiDetection;
+  /** Shared Pi auth broker (login/spawn choke point). */
+  authBroker?: PiAuthBroker;
   /** In-memory latest quota samples (connectionId → sample). */
   quotaSamples?: Map<string, QuotaSample>;
   /** Phase 3 fleet substrate. */
@@ -314,7 +318,9 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     });
     if (!result.ok) {
       const code = mapToolError(result.error?.code);
-      sendError(reply, code === "NOT_FOUND" ? 404 : 400, code, result.error?.message ?? "create failed");
+      const status =
+        code === "NOT_FOUND" ? 404 : code === "CONFLICT" ? 409 : 400;
+      sendError(reply, status, code, result.error?.message ?? "create failed");
       return;
     }
     return { task: result.data };
@@ -476,6 +482,180 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
         expiresAt: new Date(expiresAt).toISOString(),
         wsUrl: `ws://127.0.0.1:${deps.port}/v1/pty?ticket=${encodeURIComponent(ticket)}`,
       };
+    },
+  );
+  // ── Secondmates (master plan §5.9, Phase 7) ─────────────────────────────
+  app.get("/v1/secondmates", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { secondmates: deps.fleet.secondmates.list() };
+  });
+
+  /**
+   * Live status of every secondmate. This probes each one rather than reading a
+   * cache: a stale "healthy" is the single most misleading answer this endpoint
+   * could give, so an unreachable secondmate is reported as unreachable.
+   */
+  app.get("/v1/secondmates/bearings", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return { bearings: await deps.fleet.secondmateFleet.bearings() };
+  });
+
+  app.get("/v1/secondmates/audit", async (_request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    return deps.fleet.secondmates.auditNoAuthMaterial();
+  });
+
+  /** Provision a secondmate through the shipped API surface (not out-of-band). */
+  app.post("/v1/secondmates", async (request, reply) => {
+    if (deps.fleet === undefined) {
+      sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+      return;
+    }
+    const parsed = provisionSecondmateInputSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const path = issue?.path.join(".") || "body";
+      sendError(
+        reply,
+        400,
+        "BAD_REQUEST",
+        issue !== undefined ? `${path}: ${issue.message}` : "invalid provision body",
+      );
+      return;
+    }
+    try {
+      const secondmate = await deps.fleet.provisionSecondmate(parsed.data);
+      return { secondmate };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "provision failed";
+      sendError(reply, 400, "BAD_REQUEST", message);
+    }
+  });
+
+  app.put<{ Params: { name: string } }>(
+    "/v1/secondmates/:name/charter",
+    async (request, reply) => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return;
+      }
+      const body = request.body as {
+        domains?: unknown;
+        brainModel?: unknown;
+        maxConcurrentTasks?: unknown;
+        acceptsRouting?: unknown;
+      } | null;
+      // Partial updates merge with the current charter — omitted fields keep
+      // their existing values (never silently reset to defaults).
+      const domains =
+        body !== null && "domains" in body
+          ? Array.isArray(body.domains)
+            ? body.domains.filter((d): d is string => typeof d === "string")
+            : null
+          : undefined;
+      if (domains !== undefined && (domains === null || domains.length === 0)) {
+        sendError(reply, 400, "BAD_REQUEST", "domains must be a non-empty string array when provided");
+        return;
+      }
+      const hasBrainModel = body !== null && "brainModel" in body;
+      let brainModel: string | null | undefined;
+      if (hasBrainModel) {
+        if (body!.brainModel === null) {
+          brainModel = null;
+        } else if (typeof body!.brainModel === "string") {
+          brainModel = body!.brainModel;
+        } else {
+          sendError(reply, 400, "BAD_REQUEST", "brainModel must be a string or null");
+          return;
+        }
+      }
+      const hasMax = body !== null && "maxConcurrentTasks" in body;
+      let maxConcurrentTasks: number | undefined;
+      if (hasMax) {
+        if (typeof body!.maxConcurrentTasks !== "number") {
+          sendError(reply, 400, "BAD_REQUEST", "maxConcurrentTasks must be a number");
+          return;
+        }
+        maxConcurrentTasks = body!.maxConcurrentTasks;
+      }
+      const hasAccepts = body !== null && "acceptsRouting" in body;
+      let acceptsRouting: boolean | undefined;
+      if (hasAccepts) {
+        if (typeof body!.acceptsRouting !== "boolean") {
+          sendError(reply, 400, "BAD_REQUEST", "acceptsRouting must be a boolean");
+          return;
+        }
+        acceptsRouting = body!.acceptsRouting;
+      }
+      if (
+        domains === undefined &&
+        brainModel === undefined &&
+        maxConcurrentTasks === undefined &&
+        acceptsRouting === undefined
+      ) {
+        sendError(
+          reply,
+          400,
+          "BAD_REQUEST",
+          "charter update requires at least one of domains, brainModel, maxConcurrentTasks, acceptsRouting",
+        );
+        return;
+      }
+      try {
+        const result = await deps.fleet.syncSecondmateCharter(request.params.name, {
+          ...(domains !== undefined ? { domains } : {}),
+          ...(brainModel !== undefined ? { brainModel } : {}),
+          ...(maxConcurrentTasks !== undefined ? { maxConcurrentTasks } : {}),
+          ...(acceptsRouting !== undefined ? { acceptsRouting } : {}),
+        });
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "charter sync failed";
+        const notFound = /no secondmate named/i.test(message);
+        sendError(reply, notFound ? 404 : 400, notFound ? "NOT_FOUND" : "BAD_REQUEST", message);
+      }
+    },
+  );
+
+  app.post<{ Params: { name: string } }>(
+    "/v1/secondmates/:name/start",
+    async (request, reply) => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return;
+      }
+      try {
+        const runtime = await deps.fleet.startSecondmate(request.params.name);
+        return { runtime };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "start failed";
+        sendError(reply, 400, "BAD_REQUEST", message);
+      }
+    },
+  );
+
+  app.post<{ Params: { name: string } }>(
+    "/v1/secondmates/:name/stop",
+    async (request, reply) => {
+      if (deps.fleet === undefined) {
+        sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
+        return;
+      }
+      try {
+        return await deps.fleet.stopSecondmate(request.params.name);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "stop failed";
+        sendError(reply, 400, "BAD_REQUEST", message);
+      }
     },
   );
 
@@ -641,7 +821,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
       return;
     }
-    return { decision: deps.fleet.evaluateBrainHandoff() };
+    return { decision: await deps.fleet.evaluateBrainHandoff() };
   });
 
   app.post("/v1/tools/call", async (request, reply) => {
@@ -661,12 +841,12 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
     }
     const result =
       body.data.sessionId !== undefined
-        ? deps.fleet.tools.invokeFromSession(
+        ? await deps.fleet.tools.invokeFromSessionAsync(
             body.data.sessionId,
             toolParsed.data,
             body.data.input,
           )
-        : deps.fleet.tools.invoke(
+        : await deps.fleet.tools.invokeAsync(
             toolParsed.data,
             body.data.input,
             body.data.idempotencyKey !== undefined
@@ -686,7 +866,7 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 404, "NOT_FOUND", "fleet service unavailable");
       return;
     }
-    const brain = deps.fleet.brain.start("api");
+    const brain = await deps.fleet.brain.start("api");
     return { brain };
   });
 
@@ -738,6 +918,36 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       pi: deps.pi,
       home: deps.home,
     });
+    // Exclusive window must begin BEFORE the attach command is returned, so a
+    // concurrent withSpawnGrant cannot resolve grants mid-login. Acquire first;
+    // fire-and-forget only the long mtime poll / release.
+    if (deps.authBroker !== undefined) {
+      const baseline = deps.authBroker.authStoreMtimeMs();
+      try {
+        const { settled } = await deps.authBroker.beginLoginHold({
+          baselineMtimeMs: baseline,
+        });
+        void settled.catch((error: unknown) => {
+          const message =
+            error instanceof Error ? error.message : "login hold failed";
+          deps.logger.error({ err: error }, `auth broker login hold failed: ${message}`);
+          deps.store.append({
+            type: "captain.escalation",
+            payload: {
+              taskId: null,
+              summary: `login hold failed: ${message}`,
+              severity: "critical",
+            },
+          });
+        });
+      } catch (error: unknown) {
+        const message =
+          error instanceof Error ? error.message : "login hold acquire failed";
+        deps.logger.error({ err: error }, `auth broker login hold acquire failed: ${message}`);
+        sendError(reply, 503, "CONFLICT", message);
+        return;
+      }
+    }
     return {
       connectionId: connection.id,
       tmuxSession: session,
@@ -756,7 +966,8 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
       sendError(reply, 400, "BAD_REQUEST", "invalid api-key body");
       return;
     }
-    // Never log the key. Write to 0600 file under AGENTOS_HOME/secrets.
+    // Never log the key. Write to 0600 under resolveSecretsHome (primary when
+    // AGENTOS_SECRETS_HOME is set on a secondmate — never into an audited home).
     writeApiKeyFile(deps.home, body.data.provider, body.data.apiKey);
     const connection = deps.connections.upsertConnection({
       provider: body.data.provider,
@@ -1236,6 +1447,13 @@ export function buildServer(deps: ServerDeps): AgentosdServer {
           type: "policy.changed",
           payload: { domain: "policies", layer: "global", safetyOverride },
         });
+      }
+      // Push effective config into fleet; brain domain writes respawn the Brain
+      // so cast changes (including charter-driven secondmate models) are live.
+      if (deps.fleet !== undefined) {
+        void deps.fleet
+          .reloadConfig({ restartBrain: domain === "brain" })
+          .catch(() => undefined);
       }
       return { applied: true as const, domain, layer, contentHash };
     } catch (error) {

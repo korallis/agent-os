@@ -82,5 +82,8 @@ jobs:
       - name: Phase 6 gates
         run: node tooling/gates/phase-6.mjs
 
+      - name: Phase 7 gates
+        run: node tooling/gates/phase-7.mjs
+
       - name: Phase 8 gates
         run: node tooling/gates/phase-8.mjs

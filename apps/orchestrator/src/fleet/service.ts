@@ -6,6 +6,7 @@ import type {
   ExtensionToDaemonFrame,
   FleetSummary,
   OrchestratorEvent,
+  ProvisionSecondmateInput,
   TaskListItem,
   TaskSnapshot,
 } from "@agent-os/protocol";
@@ -22,6 +23,9 @@ import { ToolSurface, type SessionChannel } from "./tool-surface.js";
 import { BrainManager } from "./brain.js";
 import { FusionRunStore } from "./fusion-runs.js";
 import { SessionKeyStore } from "./sessions.js";
+import { SecondmateRegistry } from "./secondmates.js";
+import { SecondmateFleet } from "./secondmate-fleet.js";
+// SecondmateRegistry type used in provisionSecondmate return type
 import type { PromptService } from "../prompts/service.js";
 import { AfkService } from "./afk.js";
 import {
@@ -29,6 +33,7 @@ import {
   worstWindowPctFromSample,
   type HandoffCandidate,
 } from "./brain-handoff.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 
 export type FleetEventSink = (event: OrchestratorEvent) => void;
 
@@ -37,6 +42,7 @@ export interface FleetServiceOptions {
   config: ConfigService;
   connections?: ConnectionRegistry;
   pi?: PiDetection;
+  authBroker?: PiAuthBroker;
   extensionPath?: string;
   sockets?: SessionChannel;
   prompts?: PromptService;
@@ -45,6 +51,13 @@ export interface FleetServiceOptions {
   fakeBrain?: boolean;
   /** Latest quota samples, read live so handoff decisions use current numbers. */
   quotaSamples?: () => QuotaSample[];
+  /** Absolute path to agentosd.js for spawning secondmate processes. */
+  agentosdBin?: string;
+  /**
+   * Primary daemon listen port when known at construction. Prefer
+   * {@link setPrimaryPort} after bind when the port is ephemeral (0).
+   */
+  primaryPort?: number;
 }
 
 /**
@@ -95,6 +108,8 @@ export class FleetService {
   readonly gates: GateRunner;
   readonly fusionRuns: FusionRunStore;
   readonly sessionKeys: SessionKeyStore;
+  readonly secondmates: SecondmateRegistry;
+  readonly secondmateFleet: SecondmateFleet;
   readonly tools: ToolSurface;
   readonly brain: BrainManager;
   readonly afk: AfkService;
@@ -121,6 +136,11 @@ export class FleetService {
     this.fusionRuns = new FusionRunStore(options.home);
     this.sessionKeys = new SessionKeyStore(options.home);
     this.afk = new AfkService(join(options.home, "afk"));
+    this.secondmates = new SecondmateRegistry(
+      options.home,
+      options.primaryPort !== undefined ? { primaryPort: options.primaryPort } : undefined,
+    );
+    this.secondmateFleet = new SecondmateFleet(this.secondmates);
     this.tools = new ToolSurface({
       home: options.home,
       config: options.config,
@@ -131,8 +151,10 @@ export class FleetService {
       gates: this.gates,
       fusionRuns: this.fusionRuns,
       sessionKeys: this.sessionKeys,
+      secondmates: { registry: this.secondmates, fleet: this.secondmateFleet },
       ...(options.prompts !== undefined ? { prompts: options.prompts } : {}),
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
+      ...(options.authBroker !== undefined ? { authBroker: options.authBroker } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
@@ -147,6 +169,7 @@ export class FleetService {
       sessionKeys: this.sessionKeys,
       config: cfg.brain,
       ...(options.connections !== undefined ? { connections: options.connections } : {}),
+      ...(options.authBroker !== undefined ? { authBroker: options.authBroker } : {}),
       ...(options.pi !== undefined ? { pi: options.pi } : {}),
       ...(options.extensionPath !== undefined ? { extensionPath: options.extensionPath } : {}),
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
@@ -186,11 +209,25 @@ export class FleetService {
     this.tools.onEvent(fanout);
     this.brain.onEvent(fanout);
     this.afk.onEvent(fanout);
+    this.secondmates.onEvent(fanout);
+    this.secondmateFleet.onEvent(fanout);
+  }
+
+  /** Wire the primary's actual bound port into secondmate port-collision checks. */
+  setPrimaryPort(port: number): void {
+    this.secondmates.setPrimaryPort(port);
   }
 
   /** Boot: start brain (or enter BRAIN_DOWN if blocked) and the pane-liveness tick. */
-  start(): void {
-    this.brain.start("daemon-boot");
+  async start(): Promise<void> {
+    // Cast-role respawn under the spawn-grant lock (skipped in rehydrate when
+    // a broker is present — bare spawnCrewmate cannot resolve grants unlocked).
+    if (this.options.authBroker !== undefined) {
+      await this.tools.reconcileMissingCastRolesAsync();
+    }
+    // Re-drive handovers that crashed after pending intent (idempotent remote POST).
+    await this.tools.reconcilePendingHandoversAsync();
+    await this.brain.start("daemon-boot");
     this.startReconcileTick();
   }
 
@@ -298,7 +335,17 @@ export class FleetService {
   private onToolCall(
     frame: Extract<ExtensionToDaemonFrame, { type: "ext.tool_call" }>,
   ): void {
-    const result = this.tools.invokeFromSession(frame.sessionId, frame.tool, frame.input);
+    void this.onToolCallAsync(frame);
+  }
+
+  private async onToolCallAsync(
+    frame: Extract<ExtensionToDaemonFrame, { type: "ext.tool_call" }>,
+  ): Promise<void> {
+    const result = await this.tools.invokeFromSessionAsync(
+      frame.sessionId,
+      frame.tool,
+      frame.input,
+    );
     const reason = result.ok ? null : (result.error?.message ?? null);
     const controlFrame: Extract<DaemonControlFrame, { type: "ctl.tool_result" }> = {
       type: "ctl.tool_result",
@@ -366,18 +413,121 @@ export class FleetService {
     }
   }
 
-  stop(): void {
+  /**
+   * Provision a secondmate through the fleet surface (REST / tools / CLI).
+   * Seeds charter + brain cast under the isolated home.
+   */
+  async provisionSecondmate(
+    input: ProvisionSecondmateInput,
+  ): ReturnType<SecondmateRegistry["provision"]> {
+    return this.secondmates.provision(input);
+  }
+
+  /**
+   * Start a provisioned secondmate as a live agentosd process.
+   * Waits until the secondmate is healthy. Token lives under primary runtime/;
+   * shared Pi home is the primary managed pi. Charter brainModel is applied
+   * to the secondmate brain config before spawn.
+   */
+  async startSecondmate(name: string): Promise<{
+    name: string;
+    pid: number;
+    port: number;
+    tokenPath: string;
+    startedAt: string;
+  }> {
+    const agentosdBin = this.options.agentosdBin;
+    if (agentosdBin === undefined) {
+      throw new Error("agentosd binary path not configured — cannot start secondmate");
+    }
+    const record = this.secondmates.get(name);
+    if (record === null) {
+      throw new Error(`no secondmate named ${name}`);
+    }
+    const { charter } = this.secondmateFleet.readCharter(record);
+    this.secondmateFleet.applyCharterToBrainConfig(record, charter);
+    const sharedPiHome =
+      this.options.pi?.managedHome ??
+      `${this.options.home}/pi`;
+    return this.secondmates.start(name, {
+      agentosdBin,
+      sharedPiHome,
+      env: {
+        AGENTOS_FAKE_PI: process.env.AGENTOS_FAKE_PI,
+        AGENTOS_FAKE_BRAIN: process.env.AGENTOS_FAKE_BRAIN,
+        AGENTOS_FAKE_GATE: process.env.AGENTOS_FAKE_GATE,
+        AGENTOS_FAKE_GIT: process.env.AGENTOS_FAKE_GIT,
+        AGENTOS_FAKE_TMUX: process.env.AGENTOS_FAKE_TMUX,
+        // Do not forward AGENTOS_TMUX_SOCKET — start() forces a per-secondmate
+        // server so the primary Brain cannot share a session/window namespace.
+      },
+    });
+  }
+
+  async stopSecondmate(name: string): Promise<{ stopped: boolean; name: string }> {
+    return this.secondmates.stop(name);
+  }
+
+  /**
+   * Write + sync a secondmate charter. When the secondmate is running, pushes
+   * brain cast via its REST API and respawns its Brain so the live model moves.
+   * Partial patches merge with the current charter — omitted fields are kept.
+   */
+  async syncSecondmateCharter(
+    name: string,
+    patch: {
+      domains?: string[];
+      brainModel?: string | null;
+      maxConcurrentTasks?: number;
+      acceptsRouting?: boolean;
+    },
+  ): Promise<{
+    charter: {
+      name: string;
+      domains: string[];
+      brainModel: string | null;
+      maxConcurrentTasks: number;
+      acceptsRouting: boolean;
+    };
+    brainSynced: boolean;
+    brainModel: string | null;
+  }> {
+    const record = this.secondmates.get(name);
+    if (record === null) {
+      throw new Error(`no secondmate named ${name}`);
+    }
+    const { charter: current } = this.secondmateFleet.readCharter(record);
+    const merged = {
+      name: record.name,
+      domains: patch.domains ?? current.domains,
+      brainModel: patch.brainModel !== undefined ? patch.brainModel : current.brainModel,
+      maxConcurrentTasks: patch.maxConcurrentTasks ?? current.maxConcurrentTasks,
+      acceptsRouting: patch.acceptsRouting ?? current.acceptsRouting,
+    };
+    return this.secondmateFleet.syncCharter(record, merged);
+  }
+
+  async stop(): Promise<void> {
+    await this.secondmates.stopAll();
     // leave tmux windows alive — they survive daemon restarts
     this.stopReconcileTick();
   }
 
-  reloadConfig(): void {
+  /**
+   * Re-read effective config into fleet subsystems. When `restartBrain` is
+   * true (brain domain writes / charter sync), respawn so resolveModel() takes
+   * effect on the live snapshot.
+   */
+  async reloadConfig(options: { restartBrain?: boolean } = {}): Promise<void> {
     const cfg = this.options.config.effective().config;
     this.worktrees.updateConfig(cfg.worktrees);
     this.watcher.updateConfig(cfg.supervision);
     this.gates.updateConfig(cfg.validation);
     this.brain.updateConfig(cfg.brain);
     this.startReconcileTick();
+    if (options.restartBrain === true) {
+      await this.brain.start("config-reload");
+    }
   }
 
   summary(): FleetSummary {
@@ -417,11 +567,17 @@ export class FleetService {
    * Covers both crewmate sessions and the Brain (which is not a FleetSession).
    * Also reclaims worktree leases whose sessions are all terminal (stopped/lost
    * / missing pane) so a missed release path cannot exhaust the pool until reboot.
+   * Re-drives durable secondmate handovers (accepted → primary release; pending →
+   * idempotent remote POST) so dual ownership cannot wait for the next restart.
    */
   reconcile(): string[] {
     const lost = this.tools.reconcileDeadPanes();
     this.reconcileBrainPane();
     this.reclaimOrphanedWorktreeLeases();
+    // Accepted: finish primary release without remote I/O.
+    this.tools.reconcileAcceptedHandovers();
+    // Pending: re-drive remote POST (idempotency key); fire-and-forget on tick.
+    void this.tools.reconcilePendingHandoversAsync().catch(() => undefined);
     return lost;
   }
 
@@ -448,7 +604,7 @@ export class FleetService {
     if (snap.status !== "running" && snap.status !== "starting") return;
     if (snap.tmuxWindow === null) return;
     if (this.tmux.hasWindow(snap.tmuxWindow)) return;
-    this.brain.start("pane-died");
+    void this.brain.start("pane-died").catch(() => undefined);
   }
 
   private hydrateTasks(): void {
@@ -506,6 +662,8 @@ export class FleetService {
    * kill -9 restart-proof path: rebind control sockets for surviving sessions,
    * mark dead panes lost, reclaim orphaned worktree leases stuck in `leased`,
    * and respawn only cast roles whose session-key directory is absent (G6).
+   * When a PiAuthBroker is configured, cast-role respawn is deferred to start()
+   * so every grant resolution takes the cross-process spawn-grant lock.
    */
   private rehydrateRuntime(): void {
     // Rebuild in-flight fusion side ownership from durable run.json so a
@@ -515,7 +673,11 @@ export class FleetService {
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
     this.reclaimOrphanedWorktreeLeases();
-    this.tools.reconcileMissingCastRoles();
+    // Finish handovers accepted remotely but not yet CANCELLED on primary.
+    this.tools.reconcileAcceptedHandovers();
+    if (this.options.authBroker === undefined) {
+      this.tools.reconcileMissingCastRoles();
+    }
   }
 
   /**
@@ -528,7 +690,7 @@ export class FleetService {
    * The below-threshold case is deliberately silent: emitting an event every
    * tick for "nothing happened" would bury the one that matters.
    */
-  evaluateBrainHandoff(): ReturnType<typeof decideHandoff> | null {
+  async evaluateBrainHandoff(): Promise<ReturnType<typeof decideHandoff> | null> {
     const brainSnapshot = this.brain.getSnapshot();
     if (brainSnapshot.model === null) return null;
     const cfg = this.options.config.effective().config;
@@ -591,7 +753,7 @@ export class FleetService {
         thresholdPct: decision.thresholdPct,
       },
     });
-    const after = this.brain.handoff(decision.toModel, decision.reason);
+    const after = await this.brain.handoff(decision.toModel, decision.reason);
     // Keep one inspectable record (also durable via BrainManager): success
     // latches the long cooldown; failure latches only the short retry backoff.
     this.lastHandoff = {
@@ -640,7 +802,7 @@ export class FleetService {
     this.reconcileTimer = setInterval(() => {
       try {
         this.reconcile();
-        this.evaluateBrainHandoff();
+        void this.evaluateBrainHandoff().catch(() => undefined);
       } catch {
         // never let the tick crash the daemon
       }

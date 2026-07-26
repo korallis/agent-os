@@ -1,10 +1,18 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { monotonicFactory } from "ulid";
 import { ZodError } from "zod";
 import { spawnSync } from "node:child_process";
-import { readdirSync } from "node:fs";
+import JSON5 from "json5";
 import { enforceFusionContract } from "@agent-os/fusion-core";
 import {
   answerCrewmateInputSchema,
@@ -19,7 +27,10 @@ import {
   readTaskInputSchema,
   resolveCastInputSchema,
   resolveDeliveryBlockInputSchema,
+  readSecondmateBearingsInputSchema,
   respawnCrewmateInputSchema,
+  provisionSecondmateInputSchema,
+  routeToSecondmateInputSchema,
   runGateInputSchema,
   sendToCrewInputSchema,
   spawnCrewmateInputSchema,
@@ -28,6 +39,7 @@ import {
   updateTaskInputSchema,
   advancePhaseInputSchema,
   brainToolNameSchema,
+  secondmateCharterSchema,
   type AgentOsConfig,
   type BrainSnapshot,
   type BrainToolName,
@@ -37,6 +49,7 @@ import {
   type FusionRun,
   type FusionSide,
   type PromptTemplateInfo,
+  type SecondmateBearings,
   type OrchestratorEvent,
   type RoleCast,
   type TaskPhase,
@@ -66,6 +79,13 @@ import type { TmuxController } from "./tmux.js";
 import type { WakeWatcher } from "./watcher.js";
 import { GateRunner } from "./gate-runner.js";
 import type { FusionRunStore } from "./fusion-runs.js";
+import type { SecondmateRegistry } from "./secondmates.js";
+import {
+  SecondmateCapacityError,
+  SecondmateHandoverError,
+  type SecondmateFleet,
+} from "./secondmate-fleet.js";
+import type { PiAuthBroker } from "../pi/auth-broker.js";
 import { SessionKeyStore } from "./sessions.js";
 import type { PromptService } from "../prompts/service.js";
 
@@ -128,6 +148,29 @@ export interface ToolCallResult {
   durationMs: number;
 }
 
+/**
+ * Durable secondmate handover intent/acceptance under runs/<taskId>/handover.json.
+ *
+ * Invariant: from the moment remote acceptance becomes possible until the primary
+ * is durably terminal, exactly one durable record claims the task, it is
+ * crash-safe (tmp+rename), and only a definite outcome may clear it. While any
+ * record exists, retargeting to a different secondmate is refused — pending
+ * claims as firmly as accepted (the remote may already own the work).
+ * - pending: written before the remote POST; kept on ambiguous POST failure
+ *   (timeout/network/200-without-id) so reconcile can re-drive with the remote
+ *   idempotency key; cleared only on definite refusal (clean 4xx / capacity).
+ * - accepted: written with remoteTaskId before primary CANCELLED; survives kill-9
+ *   between those steps so reconcile can finish primary release.
+ */
+export type HandoverRecord = {
+  taskId: string;
+  secondmateName: string;
+  domain: string;
+  status: "pending" | "accepted";
+  remoteTaskId: string | null;
+  updatedAt: string;
+};
+
 export interface ToolSurfaceDeps {
   home: string;
   config: ConfigService;
@@ -140,6 +183,10 @@ export interface ToolSurfaceDeps {
   sessionKeys: SessionKeyStore;
   /** Layered prompt packs; absent only in fixtures that never dispatch fusion. */
   prompts?: PromptService;
+  /** Phase 7 secondmate fleet: registry + routing/bearings operations. */
+  secondmates?: { registry: SecondmateRegistry; fleet: SecondmateFleet };
+  /** Shared Pi auth broker — every spawn grant goes through this choke point. */
+  authBroker?: PiAuthBroker;
   connections?: ConnectionRegistry;
   pi?: PiDetection;
   extensionPath?: string;
@@ -181,6 +228,7 @@ export class ToolSurface {
   private brainDown = false;
   private readonly questions = new Map<string, PendingQuestion>();
   private brainSessionId: string | null = null;
+  private latestBearings: SecondmateBearings[] = [];
   /**
    * sessionId → fusion side ownership for O(1) usage attribution and settle
    * completion. Lifetime is owned by clearFusionRunSessionState only: entries
@@ -193,6 +241,19 @@ export class ToolSurface {
   >();
   /** sessionId → SessionKeyStore directory for this spawn. */
   private readonly sessionDirs = new Map<string, string>();
+  /**
+   * Serializes create_task admission (capacity check + insert) on this home.
+   * Depth detects re-entrant creates from event handlers during the exclusive
+   * section; concurrent create_task calls cannot interleave mid-section because
+   * the section is synchronous (no await).
+   */
+  private admissionDepth = 0;
+  /**
+   * Per-task exclusive claim for route_to_secondmate. Taken before the remote
+   * POST so overlapping routes for one taskId cannot both hand work over.
+   * Cleared in finally; terminal phase then blocks any later retry.
+   */
+  private readonly routingInProgress = new Set<string>();
 
   constructor(private readonly deps: ToolSurfaceDeps) {
     this.brain = {
@@ -283,40 +344,71 @@ export class ToolSurface {
     tool: string,
     input: Record<string, unknown>,
   ): ToolCallResult {
+    const gate = this.authorizeSessionTool(sessionId, tool);
+    if (!gate.ok) return gate.result;
+    return this.invoke(gate.name, input);
+  }
+
+  /** Async session entry — required for route_to_secondmate / read_secondmate_bearings. */
+  async invokeFromSessionAsync(
+    sessionId: string,
+    tool: string,
+    input: Record<string, unknown>,
+  ): Promise<ToolCallResult> {
+    const gate = this.authorizeSessionTool(sessionId, tool);
+    if (!gate.ok) return gate.result;
+    return this.invokeAsync(gate.name, input);
+  }
+
+  private authorizeSessionTool(
+    sessionId: string,
+    tool: string,
+  ):
+    | { ok: true; name: BrainToolName }
+    | { ok: false; result: ToolCallResult } {
     const parsed = brainToolNameSchema.safeParse(tool);
     if (!parsed.success) {
       return {
-        invocationId: nextUlid(),
         ok: false,
-        error: err("VALIDATION_ERROR", `unknown tool: ${tool}`),
-        durationMs: 0,
+        result: {
+          invocationId: nextUlid(),
+          ok: false,
+          error: err("VALIDATION_ERROR", `unknown tool: ${tool}`),
+          durationMs: 0,
+        },
       };
     }
     const name = parsed.data;
     if (CAPTAIN_ONLY_TOOLS.has(name)) {
       return {
-        invocationId: nextUlid(),
         ok: false,
-        error: err(
-          "UNAUTHORIZED_TOOL",
-          `${name} is Captain-only — not available over a session socket`,
-        ),
-        durationMs: 0,
+        result: {
+          invocationId: nextUlid(),
+          ok: false,
+          error: err(
+            "UNAUTHORIZED_TOOL",
+            `${name} is Captain-only — not available over a session socket`,
+          ),
+          durationMs: 0,
+        },
       };
     }
     const isBrain = this.brainSessionId !== null && sessionId === this.brainSessionId;
     if (!isBrain && !CREW_ALLOWED_TOOLS.has(name)) {
       return {
-        invocationId: nextUlid(),
         ok: false,
-        error: err(
-          "UNAUTHORIZED_TOOL",
-          `session ${sessionId} is not the Brain — ${name} is not available to crewmates`,
-        ),
-        durationMs: 0,
+        result: {
+          invocationId: nextUlid(),
+          ok: false,
+          error: err(
+            "UNAUTHORIZED_TOOL",
+            `session ${sessionId} is not the Brain — ${name} is not available to crewmates`,
+          ),
+          durationMs: 0,
+        },
       };
     }
-    return this.invoke(name, input);
+    return { ok: true, name };
   }
 
   isBrainDown(): boolean {
@@ -348,6 +440,7 @@ export class ToolSurface {
       projects: this.deps.projects.list(),
       brainDown: this.brainDown,
       generatedAt: new Date().toISOString(),
+      secondmateBearings: this.latestBearings,
     };
   }
 
@@ -510,9 +603,101 @@ export class ToolSurface {
    * directory is absent — surviving dirs (and their live panes) are left alone.
    * Live sessions whose key dir vanished are marked lost before respawn so a
    * wiped directory cannot leave an orphan "running" row blocking the gate.
+   *
+   * When a PiAuthBroker is configured, use reconcileMissingCastRolesAsync so
+   * every respawn takes the cross-process spawn-grant lock (grant resolution
+   * refuses to run unlocked).
    */
   reconcileMissingCastRoles(): Array<{ taskId: string; role: string; model: string }> {
+    if (this.deps.authBroker !== undefined) {
+      throw new ToolSurfaceError(
+        "INTERNAL",
+        "reconcileMissingCastRoles requires reconcileMissingCastRolesAsync when PiAuthBroker is configured",
+      );
+    }
+    return this.runMissingCastRoleReconcile((raw) => {
+      this.spawnCrewmate(raw);
+    });
+  }
+
+  /**
+   * Same as reconcileMissingCastRoles, but each respawn runs under
+   * PiAuthBroker.withSpawnGrant so boot/restart cannot bypass the choke point.
+   */
+  async reconcileMissingCastRolesAsync(): Promise<
+    Array<{ taskId: string; role: string; model: string }>
+  > {
+    if (this.deps.authBroker === undefined) {
+      return this.reconcileMissingCastRoles();
+    }
+    const broker = this.deps.authBroker;
+    return this.runMissingCastRoleReconcileAsync(async (raw) => {
+      await broker.withSpawnGrant(async () => {
+        this.spawnCrewmate(raw);
+      });
+    });
+  }
+
+  private runMissingCastRoleReconcile(
+    spawn: (raw: Record<string, unknown>) => void,
+  ): Array<{ taskId: string; role: string; model: string }> {
     const respawned: Array<{ taskId: string; role: string; model: string }> = [];
+    for (const slot of this.collectMissingCastSlots()) {
+      try {
+        this.markMissingCastSlotLost(slot);
+        spawn({
+          taskId: slot.taskId,
+          role: slot.role,
+          model: slot.model,
+          thinking: slot.thinking,
+          cleanRoom: slot.cleanRoom,
+          vars: {},
+        });
+        respawned.push({ taskId: slot.taskId, role: slot.role, model: slot.model });
+      } catch (error) {
+        this.reportReconcileSpawnFailure(slot, error);
+      }
+    }
+    return respawned;
+  }
+
+  private async runMissingCastRoleReconcileAsync(
+    spawn: (raw: Record<string, unknown>) => Promise<void>,
+  ): Promise<Array<{ taskId: string; role: string; model: string }>> {
+    const respawned: Array<{ taskId: string; role: string; model: string }> = [];
+    for (const slot of this.collectMissingCastSlots()) {
+      try {
+        this.markMissingCastSlotLost(slot);
+        await spawn({
+          taskId: slot.taskId,
+          role: slot.role,
+          model: slot.model,
+          thinking: slot.thinking,
+          cleanRoom: slot.cleanRoom,
+          vars: {},
+        });
+        respawned.push({ taskId: slot.taskId, role: slot.role, model: slot.model });
+      } catch (error) {
+        this.reportReconcileSpawnFailure(slot, error);
+      }
+    }
+    return respawned;
+  }
+
+  private collectMissingCastSlots(): Array<{
+    taskId: string;
+    role: string;
+    model: string;
+    thinking: RoleCast["thinking"];
+    cleanRoom: boolean;
+  }> {
+    const slots: Array<{
+      taskId: string;
+      role: string;
+      model: string;
+      thinking: RoleCast["thinking"];
+      cleanRoom: boolean;
+    }> = [];
     for (const task of this.listTasks()) {
       if (isTerminalPhase(task.phase)) continue;
       if (task.cast.length === 0 || task.sessions.length === 0) continue;
@@ -524,52 +709,155 @@ export class ToolSurface {
           (c) => c.role === slot.role && c.model === slot.model,
         );
         if (castEntry === undefined) continue;
-        try {
-          for (const s of [...this.sessions.values()]) {
-            if (
-              s.taskId === task.id &&
-              s.role === slot.role &&
-              s.model === slot.model &&
-              (s.status === "starting" || s.status === "running" || s.status === "settled")
-            ) {
-              this.markSessionLost(
-                s.sessionId,
-                "session-key directory missing (reconcile)",
-              );
-            }
-          }
-          this.spawnCrewmate({
-            taskId: task.id,
-            role: castEntry.role,
-            model: castEntry.model,
-            thinking: castEntry.thinking,
-            cleanRoom: castEntry.cleanRoom,
-            vars: {},
-          });
-          respawned.push({ taskId: task.id, role: slot.role, model: slot.model });
-        } catch (error) {
-          // A failed respawn must not abort boot-time rehydrate or sibling slots.
-          const message = error instanceof Error ? error.message : String(error);
-          const summary = `session-key reconcile failed to respawn ${slot.role}/${slot.model} for task ${task.id}: ${message}`;
-          this.sink({
-            type: "captain.escalation",
-            payload: {
-              taskId: task.id,
-              summary,
-              severity: "warn",
-            },
-          });
-          process.stderr.write(`[agentos] ${summary}\n`);
-        }
+        slots.push({
+          taskId: task.id,
+          role: castEntry.role,
+          model: castEntry.model,
+          thinking: castEntry.thinking,
+          cleanRoom: castEntry.cleanRoom,
+        });
       }
     }
-    return respawned;
+    return slots;
+  }
+
+  private markMissingCastSlotLost(slot: {
+    taskId: string;
+    role: string;
+    model: string;
+  }): void {
+    for (const s of [...this.sessions.values()]) {
+      if (
+        s.taskId === slot.taskId &&
+        s.role === slot.role &&
+        s.model === slot.model &&
+        (s.status === "starting" || s.status === "running" || s.status === "settled")
+      ) {
+        this.markSessionLost(s.sessionId, "session-key directory missing (reconcile)");
+      }
+    }
+  }
+
+  private reportReconcileSpawnFailure(
+    slot: { taskId: string; role: string; model: string },
+    error: unknown,
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const summary = `session-key reconcile failed to respawn ${slot.role}/${slot.model} for task ${slot.taskId}: ${message}`;
+    this.sink({
+      type: "captain.escalation",
+      payload: {
+        taskId: slot.taskId,
+        summary,
+        severity: "warn",
+      },
+    });
+    process.stderr.write(`[agentos] ${summary}\n`);
+  }
+
+  /**
+   * Structural choke: when a broker is configured, provider grant resolution
+   * may only run while this process holds the cross-process auth lock.
+   */
+  private assertSpawnGrantHeld(): void {
+    if (this.deps.authBroker === undefined) return;
+    if (!this.deps.authBroker.holdsAuthLock()) {
+      throw new ToolSurfaceError(
+        "INTERNAL",
+        "provider grant resolution requires PiAuthBroker.withSpawnGrant (auth lock not held)",
+      );
+    }
   }
 
   invoke(
     tool: BrainToolName,
     rawInput: Record<string, unknown>,
     options: { idempotencyKey?: string } = {},
+  ): ToolCallResult {
+    if (
+      tool === "route_to_secondmate" ||
+      tool === "read_secondmate_bearings" ||
+      tool === "provision_secondmate"
+    ) {
+      const started = Date.now();
+      const invocationId = nextUlid();
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err(
+          "INTERNAL",
+          `${tool} requires invokeAsync (I/O probe / remote handover / provision)`,
+        ),
+      });
+    }
+    // Spawn/fusion take the cross-process auth lock asynchronously when a
+    // broker is configured — refuse the sync path so the event loop never
+    // busy-waits under contention.
+    if (
+      this.deps.authBroker !== undefined &&
+      (tool === "spawn_crewmate" ||
+        tool === "respawn_crewmate" ||
+        tool === "dispatch_fusion")
+    ) {
+      const started = Date.now();
+      const invocationId = nextUlid();
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err(
+          "INTERNAL",
+          `${tool} requires invokeAsync when PiAuthBroker is configured (async spawn grant)`,
+        ),
+      });
+    }
+    return this.finishInvoke(tool, rawInput, options, () => this.dispatch(tool, rawInput));
+  }
+
+  /**
+   * Async tool entry for secondmate I/O and spawn-grant paths.
+   * Sync tools are delegated to the same finish path.
+   */
+  async invokeAsync(
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    options: { idempotencyKey?: string } = {},
+  ): Promise<ToolCallResult> {
+    if (tool === "route_to_secondmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.routeToSecondmate(rawInput),
+      );
+    }
+    if (tool === "read_secondmate_bearings") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.readSecondmateBearings(rawInput),
+      );
+    }
+    if (tool === "provision_secondmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, async () =>
+        this.provisionSecondmate(rawInput),
+      );
+    }
+    if (tool === "spawn_crewmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.spawnCrewmateAsync(rawInput),
+      );
+    }
+    if (tool === "respawn_crewmate") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.respawnCrewmateAsync(rawInput),
+      );
+    }
+    if (tool === "dispatch_fusion") {
+      return this.finishInvokeAsync(tool, rawInput, options, () =>
+        this.dispatchFusionAsync(rawInput),
+      );
+    }
+    return this.invoke(tool, rawInput, options);
+  }
+
+  private finishInvoke(
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    options: { idempotencyKey?: string },
+    run: () => unknown,
   ): ToolCallResult {
     const started = Date.now();
     const invocationId = nextUlid();
@@ -579,16 +867,15 @@ export class ToolSurface {
       if (cached !== undefined) return cached;
     }
 
-    // Orchestration tools blocked in BRAIN_DOWN except read_* and Captain REST.
     if (
       this.brainDown &&
       tool !== "read_fleet_state" &&
       tool !== "read_task" &&
       tool !== "read_policy" &&
       tool !== "read_run_artifacts" &&
-      tool !== "notify_captain"
+      tool !== "notify_captain" &&
+      tool !== "read_secondmate_bearings"
     ) {
-      // Captain REST may still create_task / resolve_delivery_block.
       if (tool !== "create_task" && tool !== "resolve_delivery_block") {
         return this.finish(invocationId, tool, null, started, {
           ok: false,
@@ -598,7 +885,7 @@ export class ToolSurface {
     }
 
     try {
-      const data = this.dispatch(tool, rawInput);
+      const data = run();
       const result = this.finish(invocationId, tool, extractTaskId(rawInput), started, {
         ok: true,
         data,
@@ -608,40 +895,106 @@ export class ToolSurface {
       }
       return result;
     } catch (error) {
-      if (error instanceof IllegalTransitionError) {
-        return this.finish(invocationId, tool, error.taskId, started, {
+      return this.mapInvokeError(invocationId, tool, rawInput, started, error);
+    }
+  }
+
+  private async finishInvokeAsync(
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    options: { idempotencyKey?: string },
+    run: () => Promise<unknown>,
+  ): Promise<ToolCallResult> {
+    const started = Date.now();
+    const invocationId = nextUlid();
+
+    if (options.idempotencyKey !== undefined) {
+      const cached = this.toolIdempotency.get(`${tool}:${options.idempotencyKey}`);
+      if (cached !== undefined) return cached;
+    }
+
+    if (
+      this.brainDown &&
+      tool !== "read_fleet_state" &&
+      tool !== "read_task" &&
+      tool !== "read_policy" &&
+      tool !== "read_run_artifacts" &&
+      tool !== "notify_captain" &&
+      tool !== "read_secondmate_bearings"
+    ) {
+      if (tool !== "create_task" && tool !== "resolve_delivery_block") {
+        return this.finish(invocationId, tool, null, started, {
           ok: false,
-          error: err("ILLEGAL_TRANSITION", error.message, {
-            from: error.from,
-            to: error.to,
-          }),
+          error: err("BRAIN_DOWN", "brain is down — orchestration tools are blocked"),
         });
       }
-      if (error instanceof ToolSurfaceError) {
-        return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
-          ok: false,
-          error: err(error.code, error.message, error.details),
-        });
+    }
+
+    try {
+      const data = await run();
+      const result = this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: true,
+        data,
+      });
+      if (options.idempotencyKey !== undefined) {
+        this.toolIdempotency.set(`${tool}:${options.idempotencyKey}`, result);
       }
-      // Bad tool input is the caller's error, not an internal fault — the Brain
-      // needs a path-precise VALIDATION_ERROR it can act on.
-      if (error instanceof ZodError) {
-        return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
-          ok: false,
-          error: err("VALIDATION_ERROR", `invalid input for ${tool}`, {
-            issues: error.issues.map((i) => ({
-              path: i.path.join("."),
-              message: i.message,
-            })),
-          }),
-        });
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+      return result;
+    } catch (error) {
+      return this.mapInvokeError(invocationId, tool, rawInput, started, error);
+    }
+  }
+
+  private mapInvokeError(
+    invocationId: string,
+    tool: BrainToolName,
+    rawInput: Record<string, unknown>,
+    started: number,
+    error: unknown,
+  ): ToolCallResult {
+    if (error instanceof IllegalTransitionError) {
+      return this.finish(invocationId, tool, error.taskId, started, {
         ok: false,
-        error: err("INTERNAL", message),
+        error: err("ILLEGAL_TRANSITION", error.message, {
+          from: error.from,
+          to: error.to,
+        }),
       });
     }
+    if (error instanceof ToolSurfaceError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err(error.code, error.message, error.details),
+      });
+    }
+    if (error instanceof SecondmateHandoverError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err("CONFLICT", error.message, error.details),
+      });
+    }
+    if (error instanceof SecondmateCapacityError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err("POLICY_VIOLATION", error.message, error.details),
+      });
+    }
+    if (error instanceof ZodError) {
+      return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+        ok: false,
+        error: err("VALIDATION_ERROR", `invalid input for ${tool}`, {
+          issues: error.issues.map((i) => ({
+            path: i.path.join("."),
+            message: i.message,
+          })),
+        }),
+      });
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return this.finish(invocationId, tool, extractTaskId(rawInput), started, {
+      ok: false,
+      error: err("INTERNAL", message),
+    });
   }
 
   private finish(
@@ -710,9 +1063,12 @@ export class ToolSurface {
       case "notify_captain":
         return this.notify(raw);
       case "route_to_secondmate":
-        throw new ToolSurfaceError("NOT_FOUND", "secondmates are Phase 7 — not provisioned");
       case "read_secondmate_bearings":
-        throw new ToolSurfaceError("NOT_FOUND", "secondmates are Phase 7 — not provisioned");
+      case "provision_secondmate":
+        throw new ToolSurfaceError(
+          "INTERNAL",
+          `${tool} must be invoked via invokeAsync`,
+        );
       case "stow_knowledge":
         return this.stowKnowledge(raw);
       case "read_policy":
@@ -728,6 +1084,58 @@ export class ToolSurface {
 
   private cfg(): AgentOsConfig {
     return this.deps.config.effective().config;
+  }
+
+  /**
+   * When this home is a secondmate (charter.json5 present), refuse create_task
+   * once active+queued load reaches charter.maxConcurrentTasks. Primary homes
+   * without a secondmate charter are uncapped here.
+   */
+  private assertLocalAdmissionCapacity(): void {
+    const charterPath = join(this.deps.home, "config", "charter.json5");
+    if (!existsSync(charterPath)) return;
+    let cap: number;
+    try {
+      const parsed = secondmateCharterSchema.parse(
+        JSON5.parse(readFileSync(charterPath, "utf8")),
+      );
+      cap = parsed.maxConcurrentTasks;
+    } catch {
+      // Malformed secondmate charter: fail closed on admission.
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        "secondmate charter is unreadable — cannot admit tasks",
+      );
+    }
+    const load = this.admissionLoad();
+    if (load >= cap) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `secondmate is at capacity (${load}/${cap} concurrent tasks)`,
+        { load, cap },
+      );
+    }
+  }
+
+  /** Matches fleet summary active + queued for capacity admission. */
+  private admissionLoad(): number {
+    const activePhases = new Set<TaskPhase>([
+      "BUILDING",
+      "VALIDATING",
+      "PLANNING",
+      "GATE_AUTHORING",
+      "DELIVERING",
+      "PLAN_FUSED",
+      "GATE_RED_VERIFIED",
+      "DISPATCH_RESOLVED",
+    ]);
+    let load = 0;
+    for (const task of this.listTasks()) {
+      if (activePhases.has(task.phase) || task.phase === "QUEUED" || task.phase === "WAITING_WORKTREE") {
+        load += 1;
+      }
+    }
+    return load;
   }
 
   private createTask(raw: Record<string, unknown>): TaskSnapshot {
@@ -774,11 +1182,16 @@ export class ToolSurface {
       policyOverrides: [],
     };
 
-    this.tasks.set(task.id, task);
-    if (task.idempotencyKey !== null) {
-      this.idempotency.set(task.idempotencyKey, task);
-    }
-    this.persistTask(task);
+    // Capacity check + insert share one exclusive section so concurrent creates
+    // on this home cannot both pass the cap (see runAdmissionExclusive).
+    this.runAdmissionExclusive(() => {
+      this.assertLocalAdmissionCapacity();
+      this.tasks.set(task.id, task);
+      if (task.idempotencyKey !== null) {
+        this.idempotency.set(task.idempotencyKey, task);
+      }
+      this.persistTask(task);
+    });
     this.sink({
       type: "task.created",
       payload: {
@@ -792,6 +1205,27 @@ export class ToolSurface {
       },
     });
     return task;
+  }
+
+  /**
+   * Run capacity check + task insert atomically w.r.t. other creates on this
+   * home. Synchronous: no await inside `fn`, so the event loop cannot interleave
+   * another create mid-section. Re-entrant admission (nested create from a
+   * sink/handler) is refused rather than racing the load count.
+   */
+  private runAdmissionExclusive<T>(fn: () => T): T {
+    if (this.admissionDepth > 0) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        "task admission is already in progress on this home",
+      );
+    }
+    this.admissionDepth += 1;
+    try {
+      return fn();
+    } finally {
+      this.admissionDepth -= 1;
+    }
   }
 
   private updateTask(raw: Record<string, unknown>): TaskSnapshot {
@@ -1082,6 +1516,20 @@ export class ToolSurface {
     return { taskId: next.id, cast };
   }
 
+  /**
+   * Production spawn path: holds the cross-process auth lock for grant resolution
+   * without busy-waiting the event loop.
+   */
+  private async spawnCrewmateAsync(raw: Record<string, unknown>): Promise<{
+    session: FleetSession;
+    task: TaskSnapshot;
+  }> {
+    if (this.deps.authBroker !== undefined) {
+      return this.deps.authBroker.withSpawnGrant(async () => this.spawnCrewmate(raw));
+    }
+    return this.spawnCrewmate(raw);
+  }
+
   private spawnCrewmate(raw: Record<string, unknown>): {
     session: FleetSession;
     task: TaskSnapshot;
@@ -1307,11 +1755,6 @@ export class ToolSurface {
         const prompt =
           input.prompt ??
           `Agent OS role=${input.role}. Task: ${task.title}\n\n${task.intent}`;
-        const grant = resolveProviderKeyGrant(
-          this.deps.home,
-          input.model,
-          this.deps.connections,
-        );
         // Narrowed by preflight above; TypeScript cannot see the throw path.
         if (piDetection == null || extensionPath === undefined) {
           throw new ToolSurfaceError(
@@ -1326,29 +1769,42 @@ export class ToolSurface {
         // Seat allowlist root: builder = leased worktree; validator = gate workspace.
         const seatWorkspace =
           input.role === "builder" || input.role === "validator" ? cwd : undefined;
-        const spec = buildPiSpawnSpec({
-          agentosHome: this.deps.home,
-          detection: piDetection,
-          args: ["--mode", "json", "-p", prompt, "--model", input.model],
-          cwd,
-          sessionId,
-          role: input.role,
-          socketPath,
-          extensionPath,
-          sessionDir,
-          thinking: input.thinking,
-          cleanRoom: input.cleanRoom,
-          grantProviderKey: grant,
-          ...(gateWorkspace !== undefined ? { gateWorkspace } : {}),
-          ...(seatWorkspace !== undefined ? { seatWorkspace } : {}),
-        });
-        const win = this.deps.tmux.newWindow({
-          windowName,
-          argv: [spec.binary, ...spec.args],
-          env: spec.env,
-          cwd,
-        });
-        tmuxWindow = win.target;
+        const runSpawn = (): string => {
+          // Structural choke: grant resolution is impossible without the lock
+          // when a broker is configured (assertSpawnGrantHeld). Callers must
+          // enter via withSpawnGrant — spawnCrewmateAsync, dispatchFusionAsync,
+          // reconcileMissingCastRolesAsync — not a bare spawnCrewmate.
+          this.assertSpawnGrantHeld();
+          const grant = resolveProviderKeyGrant(
+            this.deps.home,
+            input.model,
+            this.deps.connections,
+          );
+          const spec = buildPiSpawnSpec({
+            agentosHome: this.deps.home,
+            detection: piDetection,
+            args: ["--mode", "json", "-p", prompt, "--model", input.model],
+            cwd,
+            sessionId,
+            role: input.role,
+            socketPath,
+            extensionPath,
+            sessionDir,
+            thinking: input.thinking,
+            cleanRoom: input.cleanRoom,
+            grantProviderKey: grant,
+            ...(gateWorkspace !== undefined ? { gateWorkspace } : {}),
+            ...(seatWorkspace !== undefined ? { seatWorkspace } : {}),
+          });
+          const win = this.deps.tmux.newWindow({
+            windowName,
+            argv: [spec.binary, ...spec.args],
+            env: spec.env,
+            cwd,
+          });
+          return win.target;
+        };
+        tmuxWindow = runSpawn();
       }
 
       const now = new Date().toISOString();
@@ -1538,6 +1994,40 @@ export class ToolSurface {
       cleanRoom: true,
       vars: {},
     });
+  }
+
+  private async respawnCrewmateAsync(raw: Record<string, unknown>): Promise<unknown> {
+    const input = respawnCrewmateInputSchema.parse(raw);
+    const session = this.sessions.get(input.sessionId);
+    if (session === undefined || session.taskId === null) {
+      throw new ToolSurfaceError("NOT_FOUND", `session not found: ${input.sessionId}`);
+    }
+    this.stopCrewmate({ sessionId: input.sessionId, reason: input.reason });
+    return this.spawnCrewmateAsync({
+      taskId: session.taskId,
+      role: session.role,
+      model: session.model,
+      thinking: session.thinking,
+      cleanRoom: true,
+      vars: {},
+    });
+  }
+
+  /**
+   * Production fusion path: one cross-process spawn-grant window covers grant
+   * resolution for every side (no event-loop busy-wait).
+   */
+  private async dispatchFusionAsync(raw: Record<string, unknown>): Promise<{
+    runId: string;
+    promptsIdentical: boolean;
+    aggregatorFamily: string | null;
+    contractOk?: boolean;
+    spawned: boolean;
+  }> {
+    if (this.deps.authBroker !== undefined) {
+      return this.deps.authBroker.withSpawnGrant(async () => this.dispatchFusion(raw));
+    }
+    return this.dispatchFusion(raw);
   }
 
   /**
@@ -2829,8 +3319,10 @@ export class ToolSurface {
 
       const runDir = join(this.deps.home, "runs", task.id);
       mkdirSync(runDir, { recursive: true, mode: 0o700 });
+      const deliveryTarget = join(runDir, "delivery.json");
+      const deliveryTmp = `${deliveryTarget}.${process.pid}.tmp`;
       writeFileSync(
-        join(runDir, "delivery.json"),
+        deliveryTmp,
         JSON.stringify(
           {
             mode: task.mode,
@@ -2843,6 +3335,7 @@ export class ToolSurface {
         ) + "\n",
         { mode: 0o600 },
       );
+      renameSync(deliveryTmp, deliveryTarget);
 
       // DONE is only written here; clear the stamp only after the invariant holds.
       // Sessions and leases are already halted/released — transition will no-op those steps.
@@ -3081,6 +3574,445 @@ export class ToolSurface {
     return { ok: true };
   }
 
+  private async provisionSecondmate(raw: Record<string, unknown>): Promise<{
+    secondmate: {
+      name: string;
+      home: string;
+      port: number;
+      domain: string;
+      brainModel: string | null;
+      createdAt: string;
+    };
+  }> {
+    if (this.deps.secondmates === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
+    }
+    const input = provisionSecondmateInputSchema.parse(raw);
+    try {
+      const secondmate = await this.deps.secondmates.registry.provision(input);
+      return { secondmate };
+    } catch (error) {
+      if (error instanceof ZodError) throw error;
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        error instanceof Error ? error.message : "provision failed",
+      );
+    }
+  }
+
+  /**
+   * Hand a task to a secondmate. POST the task to the secondmate first; only
+   * after acceptance is it released on the primary. A failed POST leaves the
+   * task on the primary with a typed error — dropping work is worse than
+   * refusing to route. Named routing checks the target's own charter (domains +
+   * acceptsRouting); routeFor is for auto-pick/discovery only.
+   * Capacity (maxConcurrentTasks) is enforced on the live secondmate.
+   *
+   * Crash-safety: write pending intent before the remote POST, then durable
+   * acceptance (with remoteTaskId) before primary CANCELLED. Pending is cleared
+   * only on definite remote refusal; ambiguous failures keep pending so the
+   * reconcile tick (and boot) can re-drive with the remote idempotency key.
+   */
+  private async routeToSecondmate(raw: Record<string, unknown>): Promise<{
+    name: string;
+    taskId: string;
+    remoteTaskId: string;
+    accepted: boolean;
+    domain: string;
+  }> {
+    const input = routeToSecondmateInputSchema.parse(raw);
+    if (this.deps.secondmates === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
+    }
+    const task = this.requireTask(input.taskId);
+    const prior = this.readHandoverRecord(task.id);
+    if (prior !== null) {
+      if (prior.secondmateName !== input.name) {
+        throw new ToolSurfaceError(
+          "CONFLICT",
+          `task ${task.id} already has in-flight handover to secondmate ${prior.secondmateName}`,
+        );
+      }
+      if (prior.status === "accepted" && prior.remoteTaskId !== null) {
+        return this.finalizeAcceptedHandover(prior);
+      }
+    }
+    if (isTerminalPhase(task.phase)) {
+      throw new ToolSurfaceError("CONFLICT", `task ${task.id} is terminal (${task.phase})`);
+    }
+
+    if (this.routingInProgress.has(task.id)) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `task ${task.id} is already being routed`,
+      );
+    }
+    this.routingInProgress.add(task.id);
+
+    try {
+      const live = this.requireTask(input.taskId);
+      if (isTerminalPhase(live.phase)) {
+        const accepted = this.readHandoverRecord(task.id);
+        if (accepted?.status === "accepted" && accepted.remoteTaskId !== null) {
+          return this.finalizeAcceptedHandover(accepted);
+        }
+        throw new ToolSurfaceError("CONFLICT", `task ${live.id} is terminal (${live.phase})`);
+      }
+
+      const record = this.deps.secondmates.registry.get(input.name);
+      if (record === null) {
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: input.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: `no secondmate named ${input.name}`,
+            remoteTaskId: null,
+          },
+        });
+        throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
+      }
+      const { charter } = this.deps.secondmates.fleet.readCharter(record);
+      if (!charter.acceptsRouting) {
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: record.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: "charter declines routing",
+            remoteTaskId: null,
+          },
+        });
+        throw new ToolSurfaceError(
+          "POLICY_VIOLATION",
+          `secondmate ${record.name} declines routing (charter acceptsRouting=false)`,
+        );
+      }
+      // Named target's own charter — not routeFor first-wins across the fleet.
+      if (!this.deps.secondmates.fleet.acceptsDomain(record, input.domain)) {
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: record.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: `secondmate ${record.name} does not accept domain ${input.domain}`,
+            remoteTaskId: null,
+          },
+        });
+        throw new ToolSurfaceError(
+          "POLICY_VIOLATION",
+          `secondmate ${record.name} does not accept domain ${input.domain}`,
+        );
+      }
+
+      const project = this.deps.projects.get(task.projectId);
+      if (project === null) {
+        throw new ToolSurfaceError("NOT_FOUND", `project not found: ${task.projectId}`);
+      }
+
+      // Durable intent before the remote POST so a crash can re-drive safely.
+      // Existing pending (retry after ambiguous failure) uses redrive so capacity
+      // admission cannot refuse before the idempotent POST resolves remote ownership.
+      const hadPending =
+        prior !== null &&
+        prior.status === "pending" &&
+        prior.secondmateName === record.name;
+      this.writeHandoverRecord({
+        taskId: task.id,
+        secondmateName: record.name,
+        domain: input.domain,
+        status: "pending",
+        remoteTaskId: null,
+        updatedAt: new Date().toISOString(),
+      });
+
+      let remoteTaskId: string;
+      try {
+        const handed = await this.deps.secondmates.fleet.handoverTask({
+          record,
+          task: live,
+          project: {
+            name: project.name,
+            path: project.path,
+            mode: project.mode,
+            trusted: project.trusted,
+            yolo: project.yolo,
+          },
+          domain: input.domain,
+          ...(hadPending ? { redrive: true as const } : {}),
+        });
+        remoteTaskId = handed.remoteTaskId;
+      } catch (error) {
+        // Only erase pending on definite refusal. Ambiguous failures leave the
+        // durable record so reconcilePendingHandoversAsync can recover dual ownership.
+        // On redrive, never clear capacity (remote may already own the task).
+        if (
+          this.isDefiniteHandoverFailure(error) &&
+          !(hadPending && error instanceof SecondmateCapacityError)
+        ) {
+          this.clearHandoverRecord(task.id);
+        }
+        const message =
+          error instanceof SecondmateHandoverError || error instanceof SecondmateCapacityError
+            ? error.message
+            : error instanceof Error
+              ? error.message
+              : "handover failed";
+        this.sink({
+          type: "secondmate.routed",
+          payload: {
+            name: record.name,
+            taskId: task.id,
+            domain: input.domain,
+            accepted: false,
+            reason: message,
+            remoteTaskId: null,
+          },
+        });
+        if (
+          error instanceof SecondmateHandoverError ||
+          error instanceof SecondmateCapacityError
+        ) {
+          throw error;
+        }
+        // Unknown errors after pending was written are treated as ambiguous.
+        throw new SecondmateHandoverError(message, undefined, false);
+      }
+
+      // Remote accept is durable before primary release (crash window closed).
+      const acceptance: HandoverRecord = {
+        taskId: task.id,
+        secondmateName: record.name,
+        domain: input.domain,
+        status: "accepted",
+        remoteTaskId,
+        updatedAt: new Date().toISOString(),
+      };
+      this.writeHandoverRecord(acceptance);
+      return this.finalizeAcceptedHandover(acceptance);
+    } finally {
+      this.routingInProgress.delete(task.id);
+    }
+  }
+
+  /**
+   * True when the secondmate certainly did not create the task — pending may be cleared.
+   * Capacity and clean 4xx are definite; timeouts / network / 5xx / 200-without-id are not.
+   */
+  private isDefiniteHandoverFailure(error: unknown): boolean {
+    if (error instanceof SecondmateCapacityError) return true;
+    if (error instanceof SecondmateHandoverError) return error.definiteRefusal;
+    return false;
+  }
+
+  /**
+   * After remote accept is durable: release primary ownership if still live.
+   * If the primary is already terminal, still report accepted — never a false
+   * failure after work has landed on the secondmate.
+   */
+  private finalizeAcceptedHandover(record: HandoverRecord): {
+    name: string;
+    taskId: string;
+    remoteTaskId: string;
+    accepted: boolean;
+    domain: string;
+  } {
+    if (record.remoteTaskId === null) {
+      throw new ToolSurfaceError(
+        "CONFLICT",
+        `handover for task ${record.taskId} is missing remoteTaskId`,
+      );
+    }
+    const task = this.tasks.get(record.taskId);
+    if (task !== undefined && !isTerminalPhase(task.phase)) {
+      // Terminal transition choke point owns halt/release.
+      this.transition(
+        task,
+        "CANCELLED",
+        `routed to secondmate ${record.secondmateName} as ${record.remoteTaskId}`,
+      );
+    }
+    this.sink({
+      type: "secondmate.routed",
+      payload: {
+        name: record.secondmateName,
+        taskId: record.taskId,
+        domain: record.domain,
+        accepted: true,
+        reason: null,
+        remoteTaskId: record.remoteTaskId,
+      },
+    });
+    return {
+      name: record.secondmateName,
+      taskId: record.taskId,
+      remoteTaskId: record.remoteTaskId,
+      accepted: true,
+      domain: record.domain,
+    };
+  }
+
+  /**
+   * Finish handovers whose remote accept was durable but primary release did
+   * not complete (kill -9 between acceptance write and CANCELLED). Called from
+   * boot rehydrate and every reconcile tick.
+   */
+  reconcileAcceptedHandovers(): string[] {
+    const finished: string[] = [];
+    for (const task of this.tasks.values()) {
+      if (isTerminalPhase(task.phase)) continue;
+      const rec = this.readHandoverRecord(task.id);
+      if (rec === null || rec.status !== "accepted" || rec.remoteTaskId === null) continue;
+      this.finalizeAcceptedHandover(rec);
+      finished.push(task.id);
+    }
+    return finished;
+  }
+
+  /**
+   * Re-drive handovers that crashed or failed ambiguously after pending intent
+   * was durable (remote POST uses idempotency key routed-from-primary:<taskId>)
+   * then finalize primary release. Called from boot start and every reconcile
+   * tick so dual ownership cannot wait for the next daemon restart.
+   *
+   * On definite remote refusal during redrive, clear pending (same rule as
+   * routeToSecondmate). On ambiguous failure, leave pending for the next tick.
+   */
+  async reconcilePendingHandoversAsync(): Promise<string[]> {
+    if (this.deps.secondmates === undefined) return [];
+    const finished: string[] = [];
+    for (const task of [...this.tasks.values()]) {
+      if (isTerminalPhase(task.phase)) continue;
+      const rec = this.readHandoverRecord(task.id);
+      if (rec === null || rec.status !== "pending") continue;
+      if (this.routingInProgress.has(task.id)) continue;
+      this.routingInProgress.add(task.id);
+      try {
+        const record = this.deps.secondmates.registry.get(rec.secondmateName);
+        if (record === null) continue;
+        const project = this.deps.projects.get(task.projectId);
+        if (project === null) continue;
+        try {
+          const handed = await this.deps.secondmates.fleet.handoverTask({
+            record,
+            task,
+            project: {
+              name: project.name,
+              path: project.path,
+              mode: project.mode,
+              trusted: project.trusted,
+              yolo: project.yolo,
+            },
+            domain: rec.domain,
+            redrive: true,
+          });
+          const acceptance: HandoverRecord = {
+            taskId: task.id,
+            secondmateName: rec.secondmateName,
+            domain: rec.domain,
+            status: "accepted",
+            remoteTaskId: handed.remoteTaskId,
+            updatedAt: new Date().toISOString(),
+          };
+          this.writeHandoverRecord(acceptance);
+          this.finalizeAcceptedHandover(acceptance);
+          finished.push(task.id);
+        } catch (error) {
+          // Redrive never erases pending on capacity — remote may already own the
+          // task from an ambiguous prior POST. Only clear clean non-capacity 4xx.
+          if (
+            error instanceof SecondmateHandoverError &&
+            error.definiteRefusal
+          ) {
+            this.clearHandoverRecord(task.id);
+          }
+          // Capacity / ambiguous: leave pending for a later tick.
+        }
+      } finally {
+        this.routingInProgress.delete(task.id);
+      }
+    }
+    return finished;
+  }
+
+  private handoverPath(taskId: string): string {
+    return join(this.deps.home, "runs", taskId, "handover.json");
+  }
+
+  private writeHandoverRecord(record: HandoverRecord): void {
+    const dir = join(this.deps.home, "runs", record.taskId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = this.handoverPath(record.taskId);
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, target);
+  }
+
+  private readHandoverRecord(taskId: string): HandoverRecord | null {
+    const path = this.handoverPath(taskId);
+    if (!existsSync(path)) return null;
+    try {
+      const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<HandoverRecord>;
+      if (
+        typeof raw.taskId !== "string" ||
+        typeof raw.secondmateName !== "string" ||
+        typeof raw.domain !== "string" ||
+        (raw.status !== "pending" && raw.status !== "accepted")
+      ) {
+        return null;
+      }
+      return {
+        taskId: raw.taskId,
+        secondmateName: raw.secondmateName,
+        domain: raw.domain,
+        status: raw.status,
+        remoteTaskId: typeof raw.remoteTaskId === "string" ? raw.remoteTaskId : null,
+        updatedAt:
+          typeof raw.updatedAt === "string" ? raw.updatedAt : new Date().toISOString(),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private clearHandoverRecord(taskId: string): void {
+    const path = this.handoverPath(taskId);
+    try {
+      if (existsSync(path)) unlinkSync(path);
+    } catch {
+      // best-effort
+    }
+  }
+
+  /** Live status of secondmates; awaits the probe and surfaces unreachable as fact. */
+  private async readSecondmateBearings(raw: Record<string, unknown>): Promise<{
+    bearings: SecondmateBearings[];
+  }> {
+    const input = readSecondmateBearingsInputSchema.parse(raw);
+    if (this.deps.secondmates === undefined) {
+      throw new ToolSurfaceError("NOT_FOUND", "secondmate fleet unavailable");
+    }
+    const all = await this.deps.secondmates.fleet.bearings();
+    const bearings =
+      input.name === undefined ? all : all.filter((b) => b.name === input.name);
+    if (input.name !== undefined && bearings.length === 0) {
+      throw new ToolSurfaceError("NOT_FOUND", `no secondmate named ${input.name}`);
+    }
+    this.latestBearings = bearings;
+    return { bearings };
+  }
+
+  /** Most recent bearings probe result, for fleet state and REST. */
+  getLatestBearings(): SecondmateBearings[] {
+    return this.latestBearings;
+  }
+
   private stowKnowledge(raw: Record<string, unknown>): { path: string } {
     const input = stowKnowledgeInputSchema.parse(raw);
     const project = this.deps.projects.get(input.projectId);
@@ -3196,9 +4128,10 @@ export class ToolSurface {
   private persistTask(task: TaskSnapshot): void {
     const dir = join(this.deps.home, "runs", task.id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(dir, "task.json"), `${JSON.stringify(task, null, 2)}\n`, {
-      mode: 0o600,
-    });
+    const target = join(dir, "task.json");
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(task, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, target);
   }
 
   /** Record a session status reported by its extension (running → settled). */

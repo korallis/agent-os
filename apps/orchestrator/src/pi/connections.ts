@@ -385,9 +385,23 @@ function resolveCredentialPath(
   return "auth-json";
 }
 
-/** API keys are stored under AGENTOS_HOME/secrets/<provider> as 0600 files for Phase 2 (keychain later). */
+/**
+ * Home whose `secrets/` tree holds API keys. Secondmates set
+ * AGENTOS_SECRETS_HOME to the primary home so grants read keys without
+ * copying auth material into the audited secondmate home.
+ */
+export function resolveSecretsHome(agentosHome: string): string {
+  const override = process.env.AGENTOS_SECRETS_HOME;
+  if (override !== undefined && override.trim().length > 0) {
+    return override.trim();
+  }
+  return agentosHome;
+}
+
+/** API keys are stored under secretsHome/secrets/<provider> as 0600 files for Phase 2 (keychain later). */
 export function writeApiKeyFile(home: string, provider: string, apiKey: string): string {
-  const dir = join(home, "secrets");
+  const secretsHome = resolveSecretsHome(home);
+  const dir = join(secretsHome, "secrets");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${provider}.key`);
   writeFileSync(path, apiKey, { mode: 0o600 });
@@ -395,7 +409,8 @@ export function writeApiKeyFile(home: string, provider: string, apiKey: string):
 }
 
 export function readApiKeyFile(home: string, provider: string): string | null {
-  const path = join(home, "secrets", `${provider}.key`);
+  const secretsHome = resolveSecretsHome(home);
+  const path = join(secretsHome, "secrets", `${provider}.key`);
   if (!existsSync(path)) return null;
   try {
     return readFileSync(path, "utf8").trim();
@@ -421,6 +436,8 @@ export type ProviderKeyGrant = { name: ProviderKeyEnvName; value: string };
 /**
  * Resolve at most one cast-matching provider API key for a Pi spawn grant.
  * Only pi-api-key connections yield a grant; OAuth uses PI_CONFIG_DIR / auth.json.
+ * Keys are read from resolveSecretsHome(agentosHome) so a secondmate can receive
+ * a grant from the primary secrets tree without writing material under its home.
  * Never logs the secret value; never puts it in manifests (envKeys only).
  */
 export function resolveProviderKeyGrant(

@@ -568,6 +568,30 @@ export const brainHandoffCompletedEventSchema = z.strictObject({
   }),
 });
 
+/** A secondmate charter was written — its Brain or routing domains changed. */
+export const secondmateCharterChangedEventSchema = z.strictObject({
+  type: z.literal("secondmate.charter_changed"),
+  payload: z.strictObject({
+    name: z.string(),
+    brainModel: z.string().nullable(),
+    domains: z.array(z.string()),
+  }),
+});
+
+/** A task was handed to a secondmate; it leaves the primary's fleet. */
+export const secondmateRoutedEventSchema = z.strictObject({
+  type: z.literal("secondmate.routed"),
+  payload: z.strictObject({
+    name: z.string(),
+    taskId: ulidSchema,
+    domain: z.string(),
+    accepted: z.boolean(),
+    reason: z.string().nullable(),
+    /** Task id on the secondmate after a successful POST /v1/tasks handover. */
+    remoteTaskId: ulidSchema.nullable().optional(),
+  }),
+});
+
 export const captainEscalationEventSchema = z.strictObject({
   type: z.literal("captain.escalation"),
   payload: z.strictObject({
@@ -636,6 +660,8 @@ export const orchestratorEventSchema = z.discriminatedUnion("type", [
   afkAutoAnsweredEventSchema,
   brainHandoffTriggeredEventSchema,
   brainHandoffCompletedEventSchema,
+  secondmateCharterChangedEventSchema,
+  secondmateRoutedEventSchema,
   captainEscalationEventSchema,
   taskDeliveryBlockResolvedEventSchema,
 ]);
