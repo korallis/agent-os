@@ -44,6 +44,7 @@ function gate(id, name, ok, detail) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+let exitCode = 0;
 const cleanups = [];
 let daemon;
 let consoleServer;
@@ -342,10 +343,14 @@ try {
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} gates passed`);
-  process.exit(failed.length === 0 ? 0 : 1);
+  // Set the code; exit AFTER the finally block has torn everything down.
+  // process.exit() does not unwind `finally`, so exiting here would orphan the
+  // daemon, the tmux server and the temp homes on every single run — including
+  // the successful ones.
+  exitCode = failed.length === 0 ? 0 : 1;
 } catch (error) {
   console.error(error);
-  process.exit(1);
+  exitCode = 1;
 } finally {
   try {
     await browser?.close();
@@ -368,3 +373,5 @@ try {
     }
   }
 }
+
+process.exit(exitCode);
