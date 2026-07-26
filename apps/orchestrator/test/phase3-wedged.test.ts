@@ -936,6 +936,180 @@ describe("structural WEDGED ladder", () => {
     expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
 
+  it("rolls back ledger on restart when crash is between spend and stop", () => {
+    // kill -9 after setWedgeRespawns(+1) but before stopCrewmate: spend must not
+    // stick. Restart discharge rolls back; a later tick can still free-respawn.
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    type MidFlightTask = {
+      sessions: Array<{
+        sessionId: string;
+        status: string;
+        startedAt?: string;
+        lastEventAt?: string | null;
+      }>;
+      wedgeRespawnsByRole: Record<string, number>;
+      wedgePendingCaptainNotifies: Array<{
+        sessionId: string;
+        writeAheadRespawn?: boolean;
+        respawnsUsedBeforeAttempt?: number;
+      }>;
+      wedgeLadderCompletedSessionIds?: string[];
+    };
+    let midFlight: MidFlightTask | null = null;
+    const tools = service.tools as unknown as {
+      saveTask: (task: MidFlightTask) => void;
+      stopCrewmate: (raw: Record<string, unknown>) => unknown;
+    };
+    const originalSaveTask = tools.saveTask.bind(service.tools);
+    tools.saveTask = (task: MidFlightTask) => {
+      originalSaveTask(task);
+      if (midFlight !== null) return;
+      if ((task.wedgeRespawnsByRole?.[role] ?? 0) < 1) return;
+      const row = task.sessions.find((s) => s.sessionId === sessionId);
+      if (row?.status === "running" || row?.status === "starting") {
+        midFlight = JSON.parse(JSON.stringify(service.tools.getTask(taskId))) as MidFlightTask;
+      }
+    };
+    const originalStop = tools.stopCrewmate.bind(service.tools);
+    tools.stopCrewmate = () => {
+      throw new Error("simulated process death after ledger spend, before stop");
+    };
+
+    try {
+      service.tools.reconcileWedgedSessions(Date.now());
+    } finally {
+      tools.saveTask = originalSaveTask;
+      tools.stopCrewmate = originalStop;
+    }
+
+    expect(midFlight).not.toBeNull();
+    expect(midFlight!.wedgeRespawnsByRole[role]).toBe(1);
+    expect(midFlight!.sessions.find((s) => s.sessionId === sessionId)?.status).toBe("running");
+    expect(midFlight!.wedgePendingCaptainNotifies).toHaveLength(1);
+    expect(midFlight!.wedgePendingCaptainNotifies[0]?.writeAheadRespawn).toBe(true);
+    expect(midFlight!.wedgePendingCaptainNotifies[0]?.respawnsUsedBeforeAttempt).toBe(0);
+
+    // Durable crash image: spent ledger, still-live seat, write-ahead only.
+    // Freshen activity so the first post-restart tick only discharges (rollback)
+    // without immediately re-classifying a still-stale seat.
+    const nowIso = new Date().toISOString();
+    const crashImage = {
+      ...midFlight!,
+      sessions: midFlight!.sessions.map((s) =>
+        s.sessionId === sessionId
+          ? { ...s, startedAt: nowIso, lastEventAt: nowIso, status: "running" as const }
+          : s,
+      ),
+    };
+    writeFileSync(
+      join(home, "runs", taskId, "task.json"),
+      `${JSON.stringify(crashImage, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const restarted = fleet({ home, start: false });
+    const reEvents: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => reEvents.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+    expect(
+      restarted.service.tools.listSessions().find((s) => s.sessionId === sessionId)?.status,
+    ).toBe("running");
+
+    // (a) discharge rolls ledger to pre-attempt; seat stays eligible (no escalate).
+    const actedDischarge = restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(actedDischarge).toHaveLength(0);
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role] ?? 0).toBe(0);
+    expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
+      0,
+    );
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(restarted.service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+
+    // (b) recovered free respawn then succeeds without escalate.
+    backdateSession(restarted.service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+    reEvents.length = 0;
+    const actedRespawn = restarted.service.tools.reconcileWedgedSessions(Date.now());
+    expect(actedRespawn.some((a) => a.action === "respawned")).toBe(true);
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
+    expect(restarted.service.tools.getTask(taskId)?.phase).not.toBe("NEEDS_CAPTAIN");
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+    expect(
+      restarted.service.tools
+        .listSessions()
+        .some((s) => s.taskId === taskId && s.role === role && s.status === "running"),
+    ).toBe(true);
+  });
+
+  it("does not roll back ledger when stop already landed before crash", () => {
+    // Genuine failure path that DID reach stop: spend stands across restart.
+    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { taskId, sessionId, role } = seedBuilder(service);
+    backdateSession(service, sessionId, {
+      idleMinutes: 60,
+      lastEventAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    type MidFlightTask = {
+      sessions: Array<{ sessionId: string; status: string }>;
+      wedgeRespawnsByRole: Record<string, number>;
+      wedgePendingCaptainNotifies: unknown[];
+    };
+    let midFlight: MidFlightTask | null = null;
+    const tools = service.tools as unknown as {
+      saveTask: (task: MidFlightTask) => void;
+    };
+    const originalSaveTask = tools.saveTask.bind(service.tools);
+    tools.saveTask = (task: MidFlightTask) => {
+      originalSaveTask(task);
+      if (midFlight !== null) return;
+      const row = task.sessions.find((s) => s.sessionId === sessionId);
+      if (row?.status === "stopped" && (task.wedgeRespawnsByRole?.[role] ?? 0) >= 1) {
+        midFlight = JSON.parse(JSON.stringify(service.tools.getTask(taskId))) as MidFlightTask;
+      }
+    };
+    const originalNewWindow = service.tmux.newWindow.bind(service.tmux);
+    service.tmux.newWindow = () => {
+      throw new Error("simulated spawn refusal after stop");
+    };
+
+    try {
+      service.tools.reconcileWedgedSessions(Date.now());
+    } finally {
+      tools.saveTask = originalSaveTask;
+      service.tmux.newWindow = originalNewWindow;
+    }
+
+    expect(midFlight).not.toBeNull();
+    expect(midFlight!.wedgeRespawnsByRole[role]).toBe(1);
+    expect(midFlight!.sessions.find((s) => s.sessionId === sessionId)?.status).toBe("stopped");
+
+    writeFileSync(
+      join(home, "runs", taskId, "task.json"),
+      `${JSON.stringify(midFlight, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const restarted = fleet({ home, start: false });
+    const reEvents: OrchestratorEvent[] = [];
+    restarted.service.onEvent((e) => reEvents.push(e));
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+
+    restarted.service.tools.reconcileWedgedSessions(Date.now());
+    // Stop was reached: spend must not roll back; escalate once.
+    expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
+    expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(1);
+    expect(restarted.service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
+  });
+
   it("does not wedge a seat with an outstanding pending question past the stale window", () => {
     const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);

@@ -198,9 +198,17 @@ export const taskSnapshotSchema = z.strictObject({
         /**
          * True when this entry is the write-ahead obligation recorded before a
          * respawn attempt. Incomplete recovery (original still starting/running,
-         * no derived live replacement) clears the provisional entry without escalate.
+         * no derived live replacement) rolls the ledger back to
+         * `respawnsUsedBeforeAttempt` and clears the provisional entry without
+         * escalate so a crash before stop does not burn the free respawn.
          */
         writeAheadRespawn: z.boolean().optional(),
+        /**
+         * Ledger count before this write-ahead respawn attempt spent +1.
+         * Used to roll back exactly when recovery dies before stop (cap > 1
+         * safe). Optional for older snapshots; discharge falls back to current − 1.
+         */
+        respawnsUsedBeforeAttempt: z.number().int().min(0).optional(),
       }),
     )
     .default([]),

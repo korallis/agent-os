@@ -657,10 +657,11 @@ export class ToolSurface {
    * spend, and the second wedge is far more likely to be the task than the seat.
    *
    * Respawn ledger + preflight (one policy):
-   * - The ledger counts attempts that cost the fleet a seat. It is spent
-   *   before the attempt so a crash cannot lose the spend, and rolled back
-   *   only when the attempt demonstrably did not reach the stop (once stop
-   *   has happened the spend stands even if the subsequent spawn fails).
+   * - The ledger counts attempts that reached the destructive step (stop). It
+   *   is spent before the attempt so a crash after stop cannot lose the spend,
+   *   and rolled back only when the attempt demonstrably did not reach stop
+   *   (in-process catch and restart incomplete-recovery share one helper).
+   *   Once stop has happened the spend stands even if the subsequent spawn fails.
    * - If the task is already NEEDS_CAPTAIN, or the role cannot legally spawn
    *   in the current phase, do not stop the seat at all: escalate directly,
    *   spend nothing, and leave the live seat for the Captain to inspect.
@@ -676,8 +677,9 @@ export class ToolSurface {
    *   and before stop. It survives seat state (stopped / lost / wedged / dead
    *   pane), process death and restart, and is discharged exactly once when
    *   `captain.escalation` is actually sunk. A successful respawn clears the
-   *   provisional entry without escalate; failure or incomplete recovery
-   *   discharges it. Seat shape is secondary to that.
+   *   provisional entry without escalate; failure discharges it; incomplete
+   *   recovery (pre-stop crash) rolls the ledger back and clears without
+   *   escalate. Seat shape is secondary to that.
    */
   reconcileWedgedSessions(now = Date.now()): Array<{ sessionId: string; action: string }> {
     // Coalesce hot activity stamps before idle checks so the durable clock
@@ -773,6 +775,7 @@ export class ToolSurface {
             summary: escalateSummary,
             severity: "critical",
             writeAheadRespawn: true,
+            respawnsUsedBeforeAttempt: used,
           });
         }
         action = "escalated";
@@ -792,7 +795,7 @@ export class ToolSurface {
           // strands a seat nothing reconsiders. Write-ahead pending already
           // records the Captain obligation and is discharged below.
           if (current.status !== "stopped" && current.status !== "lost") {
-            this.setWedgeRespawns(session.taskId, session.role, used);
+            this.rollbackWedgeRespawnSpend(session.taskId, session.role, used);
             this.persistSessionWedged(current);
           }
         }
@@ -931,6 +934,24 @@ export class ToolSurface {
     });
   }
 
+  /**
+   * Restore the durable wedge-respawn ledger to the pre-attempt count.
+   *
+   * The ledger records ATTEMPTS THAT REACHED THE DESTRUCTIVE STEP. An attempt
+   * that died before stopping anything cost nothing and must not be charged,
+   * whether it died by exception or by process death. Those two are the same
+   * event from the ledger's point of view — both the in-process catch path and
+   * the restart incomplete-recovery path call this single helper so they cannot
+   * drift.
+   */
+  private rollbackWedgeRespawnSpend(
+    taskId: string | null,
+    role: string,
+    countBeforeSpend: number,
+  ): void {
+    this.setWedgeRespawns(taskId, role, countBeforeSpend);
+  }
+
   private persistSessionWedged(session: FleetSession): void {
     this.pendingActivityAt.delete(session.sessionId);
     this.sessions.set(session.sessionId, { ...session, status: "wedged" });
@@ -1007,6 +1028,7 @@ export class ToolSurface {
       severity: "info" | "warn" | "critical";
       replacementSessionId?: string;
       writeAheadRespawn?: boolean;
+      respawnsUsedBeforeAttempt?: number;
     },
   ): void {
     const task = this.tasks.get(taskId);
@@ -1030,6 +1052,9 @@ export class ToolSurface {
             : {}),
           ...(entry.writeAheadRespawn !== undefined
             ? { writeAheadRespawn: entry.writeAheadRespawn }
+            : {}),
+          ...(entry.respawnsUsedBeforeAttempt !== undefined
+            ? { respawnsUsedBeforeAttempt: entry.respawnsUsedBeforeAttempt }
             : {}),
         },
       ],
@@ -1170,8 +1195,16 @@ export class ToolSurface {
         original !== undefined &&
         (original.status === "running" || original.status === "starting")
       ) {
-        // Crash/incomplete before stop: provisional write-ahead only. Drop it
-        // without completing the ladder so the next tick can re-classify.
+        // Crash/incomplete before stop: attempt never reached the destructive
+        // step — roll the ledger back (same helper as the in-process catch) and
+        // drop the provisional write-ahead so the next classify can re-attempt.
+        const before =
+          typeof entry.respawnsUsedBeforeAttempt === "number" &&
+          Number.isFinite(entry.respawnsUsedBeforeAttempt) &&
+          entry.respawnsUsedBeforeAttempt >= 0
+            ? entry.respawnsUsedBeforeAttempt
+            : Math.max(0, this.getWedgeRespawns(taskId, entry.role) - 1);
+        this.rollbackWedgeRespawnSpend(taskId, entry.role, before);
         this.clearPendingWedgeCaptainNotify(taskId, sessionId);
         return false;
       }
