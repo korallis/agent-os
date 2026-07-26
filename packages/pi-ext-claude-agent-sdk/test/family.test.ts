@@ -19,4 +19,24 @@ describe("claude-agent-sdk family classification", () => {
       assertCrossFamilyCast("claude-agent-sdk/claude-opus-4-5", "anthropic/claude-fable-5"),
     ).toThrow(CrossFamilyViolationError);
   });
+
+  it("reports both families when one origin is unrecognised", () => {
+    try {
+      assertCrossFamilyCast("anthropic/claude-opus-4-5", "amazon-bedrock/anthropic.claude-3-5");
+      expect.unreachable("expected CrossFamilyViolationError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(CrossFamilyViolationError);
+      const violation = err as CrossFamilyViolationError;
+      expect(violation.builderFamily).toBe("anthropic");
+      expect(violation.validatorFamily).toBe("other");
+      expect(violation.message).toMatch(/validator origin is unrecognised/);
+      expect(violation.message).not.toMatch(/both family anthropic/);
+    }
+  });
+
+  it("accepts genuinely different known families", () => {
+    expect(() =>
+      assertCrossFamilyCast("claude-agent-sdk/claude-opus-4-5", "openai/gpt-5"),
+    ).not.toThrow();
+  });
 });

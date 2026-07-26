@@ -22,6 +22,7 @@ import {
   deliverTaskInputSchema,
   dispatchFusionInputSchema,
   escalateToCaptainInputSchema,
+  familiesConflict,
   notifyCaptainInputSchema,
   readPolicyInputSchema,
   readTaskInputSchema,
@@ -1446,28 +1447,42 @@ export class ToolSurface {
       }
     }
 
-    // Cross-family builder ≠ validator
+    // Cross-family builder ≠ validator. Route through familiesConflict so
+    // unrecognised origins ("other") fail closed rather than comparing unequal
+    // labels and looking independently validated.
     const builder = cast.find((c) => c.role === "builder");
     const validator = cast.find((c) => c.role === "validator");
     if (
       policies.crossFamilyBuilderValidator &&
       builder !== undefined &&
       validator !== undefined &&
-      builder.family === validator.family &&
+      familiesConflict(builder.model, validator.model) &&
       !input.familyCheckOverride
     ) {
       throw new ToolSurfaceError(
         "POLICY_VIOLATION",
-        `builder family (${builder.family}) must differ from validator family (${validator.family})`,
+        `builder family (${builder.family}) must be a provably different known family from validator family (${validator.family})`,
         { builder: builder.model, validator: validator.model },
       );
     }
 
-    // Distinct planner families for plan-fusion casts
+    // Distinct planner families for plan-fusion casts — same predicate: a pair
+    // is independent only when familiesConflict is false (both known, different).
     const planners = cast.filter((c) => c.role === "planner");
-    if (policies.distinctPlannerFamilies && planners.length >= 2) {
-      const families = new Set(planners.map((p) => p.family));
-      if (families.size < 2 && !input.familyCheckOverride) {
+    if (policies.distinctPlannerFamilies && planners.length >= 2 && !input.familyCheckOverride) {
+      let hasDistinctPair = false;
+      for (let i = 0; i < planners.length; i++) {
+        for (let j = i + 1; j < planners.length; j++) {
+          const a = planners[i];
+          const b = planners[j];
+          if (a !== undefined && b !== undefined && !familiesConflict(a.model, b.model)) {
+            hasDistinctPair = true;
+            break;
+          }
+        }
+        if (hasDistinctPair) break;
+      }
+      if (!hasDistinctPair) {
         throw new ToolSurfaceError(
           "POLICY_VIOLATION",
           "plan-fusion requires ≥2 distinct planner families",
@@ -1597,23 +1612,26 @@ export class ToolSurface {
     // that skips or reshapes resolve_cast cannot slip a same-family
     // builder/validator pair past the check (master plan §11 Phase 5:
     // "same-family builder/validator impossible via API, CLI, profile import,
-    // recovery, AND Brain tool calls").
+    // recovery, AND Brain tool calls"). Uses familiesConflict so "other" fails
+    // closed the same way resolve_cast does.
     if (this.cfg().policies.crossFamilyBuilderValidator && !this.hasFamilyOverride(task)) {
       const counterpartRole = input.role === "validator" ? "builder" : "validator";
       if (input.role === "validator" || input.role === "builder") {
-        const counterpartFamilies = new Set<string>();
+        const counterparts: string[] = [];
         for (const cast of task.cast.filter((c) => c.role === counterpartRole)) {
-          counterpartFamilies.add(familyFromModel(cast.model));
+          counterparts.push(cast.model);
         }
         for (const session of task.sessions.filter((s) => s.role === counterpartRole)) {
-          counterpartFamilies.add(familyFromModel(session.model));
+          counterparts.push(session.model);
         }
-        if (counterpartFamilies.has(family)) {
-          throw new ToolSurfaceError(
-            "POLICY_VIOLATION",
-            `cannot spawn ${input.role} on family ${family}: the task's ${counterpartRole} is the same family`,
-            { role: input.role, family, counterpartRole },
-          );
+        for (const counterpart of counterparts) {
+          if (familiesConflict(input.model, counterpart)) {
+            throw new ToolSurfaceError(
+              "POLICY_VIOLATION",
+              `cannot spawn ${input.role} on family ${family}: conflicts with the task's ${counterpartRole} (same family or unrecognised origin)`,
+              { role: input.role, family, counterpartRole, model: input.model, counterpart },
+            );
+          }
         }
       }
     }
@@ -2058,12 +2076,26 @@ export class ToolSurface {
     }));
 
     // Cross-family invariants: an opinion or a plan-fusion whose sides all
-    // share a family is not a second opinion, it is an echo.
+    // share a family is not a second opinion, it is an echo. Independence is
+    // proved only by familiesConflict === false (both known, different) — a
+    // Set of labels would still accept anthropic + other as "two families".
     const families = new Set(casts.map((c) => c.family));
-    if (input.kind === "plan-fusion" && policies.distinctPlannerFamilies && families.size < 2) {
+    let hasDistinctPair = false;
+    for (let i = 0; i < casts.length; i++) {
+      for (let j = i + 1; j < casts.length; j++) {
+        const a = casts[i];
+        const b = casts[j];
+        if (a !== undefined && b !== undefined && !familiesConflict(a.model, b.model)) {
+          hasDistinctPair = true;
+          break;
+        }
+      }
+      if (hasDistinctPair) break;
+    }
+    if (input.kind === "plan-fusion" && policies.distinctPlannerFamilies && !hasDistinctPair) {
       throw new ToolSurfaceError("POLICY_VIOLATION", "plan-fusion requires ≥2 distinct families");
     }
-    if (input.kind === "opinion" && casts.length >= 2 && families.size < 2) {
+    if (input.kind === "opinion" && casts.length >= 2 && !hasDistinctPair) {
       throw new ToolSurfaceError(
         "POLICY_VIOLATION",
         "/opinion requires ≥2 distinct model families — a same-family panel is not an independent opinion",

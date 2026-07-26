@@ -132,6 +132,10 @@ export type ProviderConnection = z.infer<typeof providerConnectionSchema>;
 /**
  * Origin-keyed family registry (§6.2 rule 5 + [R6]):
  * `claude-agent-sdk/<model>` classifies as anthropic.
+ *
+ * Single source of truth for every call site (protocol, orchestrator substrate,
+ * claude-agent-sdk bridge). Alias set is the union of every origin previously
+ * recognised here or in the orchestrator's former parallel table.
  */
 export function familyOfModelRef(modelRef: string): ModelFamily {
   const slash = modelRef.indexOf("/");
@@ -142,15 +146,19 @@ export function familyOfModelRef(modelRef: string): ModelFamily {
       return "anthropic";
     case "openai":
     case "github-copilot":
+    case "chatgpt":
       return "openai";
     case "xai":
+    case "grok":
       return "xai";
     case "google":
     case "google-gemini-cli":
     case "google-vertex":
       return "google";
     case "moonshot":
+    case "moonshotai":
     case "kimi-coding":
+    case "kimi":
       return "moonshot";
     case "mistral":
       return "mistral";

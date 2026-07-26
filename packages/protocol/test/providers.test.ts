@@ -150,7 +150,11 @@ describe("familiesConflict — known families", () => {
       [
         ["claude-agent-sdk/claude-opus-4-5", "anthropic/claude-opus-4-5", "openai/gpt-5"],
         ["github-copilot/gpt-5", "openai/gpt-5", "anthropic/claude-opus-4-5"],
+        ["chatgpt/gpt-5", "openai/gpt-5", "anthropic/claude-opus-4-5"],
+        ["grok/grok-4", "xai/grok-4", "openai/gpt-5"],
         ["kimi-coding/kimi-k2", "moonshot/kimi-k2", "anthropic/claude-opus-4-5"],
+        ["moonshotai/kimi-k2", "moonshot/kimi-k2", "anthropic/claude-opus-4-5"],
+        ["kimi/kimi-k2", "moonshot/kimi-k2", "anthropic/claude-opus-4-5"],
         ["google-vertex/gemini-2.5-pro", "google/gemini-2.5-pro", "openai/gpt-5"],
         [
           "google-gemini-cli/gemini-2.5-pro",
@@ -211,18 +215,22 @@ const ORIGIN_TABLE: ReadonlyArray<readonly [string, ModelFamily]> = [
   // anthropic arm — including the claude-agent-sdk alias (§4.10 R6.1).
   ["anthropic/claude-opus-4-5", "anthropic"],
   ["claude-agent-sdk/claude-opus-4-5", "anthropic"],
-  // openai arm — including the github-copilot alias.
+  // openai arm — including github-copilot and chatgpt aliases.
   ["openai/gpt-5", "openai"],
   ["github-copilot/gpt-5", "openai"],
-  // xai arm.
+  ["chatgpt/gpt-5", "openai"],
+  // xai arm — including the grok alias.
   ["xai/grok-4", "xai"],
+  ["grok/grok-4", "xai"],
   // google arm — three origins collapse to one family.
   ["google/gemini-2.5-pro", "google"],
   ["google-gemini-cli/gemini-2.5-pro", "google"],
   ["google-vertex/gemini-2.5-pro", "google"],
-  // moonshot arm — including the kimi-coding alias.
+  // moonshot arm — including kimi-coding, moonshotai, and kimi aliases.
   ["moonshot/kimi-k2", "moonshot"],
+  ["moonshotai/kimi-k2", "moonshot"],
   ["kimi-coding/kimi-k2", "moonshot"],
+  ["kimi/kimi-k2", "moonshot"],
   // single-origin arms.
   ["mistral/mistral-large-latest", "mistral"],
   ["deepseek/deepseek-v3", "deepseek"],

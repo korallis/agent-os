@@ -1,4 +1,8 @@
-import { familyOfModelRef, type ModelFamily } from "@agent-os/protocol";
+import {
+  familiesConflict,
+  familyOfModelRef,
+  type ModelFamily,
+} from "@agent-os/protocol";
 
 /**
  * Vendored claude-agent-sdk-pi bridge (master plan §4.10, R6.1).
@@ -49,17 +53,17 @@ export function listClaudeAgentSdkCatalog(): readonly string[] {
 
 /**
  * Cross-family check: a claude-agent-sdk builder must not pair with an
- * anthropic/* validator (and vice versa) — same family.
+ * anthropic/* validator (and vice versa) — same family. Also fails closed on
+ * unrecognised origins via `familiesConflict`.
  */
 export function assertCrossFamilyCast(builderModel: string, validatorModel: string): void {
-  const bf = familyOfModelRef(builderModel);
-  const vf = familyOfModelRef(validatorModel);
-  // `"other"` means "origin not recognised", not "a family of its own". Letting
-  // it compare unequal to a known family made this fail open: an Anthropic
-  // model behind an unrecognised origin would pair with an `anthropic/*`
-  // validator and be accepted. See familiesConflict() in @agent-os/protocol.
-  if (bf === vf || bf === "other" || vf === "other") {
-    throw new CrossFamilyViolationError(builderModel, validatorModel, bf);
+  if (familiesConflict(builderModel, validatorModel)) {
+    throw new CrossFamilyViolationError(
+      builderModel,
+      validatorModel,
+      familyOfModelRef(builderModel),
+      familyOfModelRef(validatorModel),
+    );
   }
 }
 
@@ -68,10 +72,21 @@ export class CrossFamilyViolationError extends Error {
   constructor(
     readonly builderModel: string,
     readonly validatorModel: string,
-    readonly family: ModelFamily,
+    readonly builderFamily: ModelFamily,
+    readonly validatorFamily: ModelFamily,
   ) {
+    const unknown =
+      builderFamily === "other" || validatorFamily === "other"
+        ? builderFamily === "other" && validatorFamily === "other"
+          ? " — both seats have unrecognised origin"
+          : builderFamily === "other"
+            ? " — builder origin is unrecognised"
+            : " — validator origin is unrecognised"
+        : "";
     super(
-      `cross-family violation: builder ${builderModel} and validator ${validatorModel} both family ${family}`,
+      builderFamily === validatorFamily && builderFamily !== "other"
+        ? `cross-family violation: builder ${builderModel} and validator ${validatorModel} both family ${builderFamily}`
+        : `cross-family violation: builder ${builderModel} (family ${builderFamily}) and validator ${validatorModel} (family ${validatorFamily})${unknown}`,
     );
     this.name = "CrossFamilyViolationError";
   }
