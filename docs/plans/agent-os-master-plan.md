@@ -1228,7 +1228,7 @@ Trusted: the user, and registered repos *as execution inputs*. Untrusted: model 
 - [x] launchd template (macOS-only v1 [R4]); `doctor` reports tmux/git/gh/node/pi/**uv** (warnings when absent). [B]+[R2] (G5)
 
 **Phase 2 — Pi integration & provider connections (2 wk)** — Rev 2 base + [R5]/[R5.1] quota & onboarding gates:
-- [ ] Pi pinned + verified; weekly canary workflow green.
+- [ ] Pi pin-compatible (same major.minor, patch ≥ tested pin) + verified; weekly canary workflow green.
 - [x] Usage/lifecycle frames **persisted and projected** through the real store and analytics derivation (`tooling/gates/phase-2b.mjs` P1 — fake-Pi fixture path; asserts durable `ext.usage` + `session.spawned` and that analytics `totals.inputTokens` equals the summed `ext.usage` inputTokens). The live extension socket path (`ext.hello` over the socket) is exercised by the real-Pi flows, not this fixture gate — that claim stays with the open real-credential items.
 - [ ] `/login`//`/logout` flows via visible tmux window flip `authStorePresence` within one probe cycle; setup terminal excluded from recording.
 - [x] Auth-store integrity (P2): a fixture `auth.json` is **byte-identical** after a full session, and a planted token canary appears in **nothing durable** — not the event log, not the projection, not any API response.
@@ -1385,7 +1385,7 @@ The Captain's requirement: every model should be runnable through its native CLI
 
 **This reverses a founding decision.** The pre-R8 `AGENTS.md` line was "build worker execution around Pi as the single backend harness (not vendor CLIs)". The same change set amends `AGENTS.md` so Pi is the **default** and capability baseline, with harness choice scoped here as Phase 12 — recorded as a superseding decision rather than a silent overwrite.
 
-**What the substrate actually depends on from Pi** (audited, not assumed): the exact version pin; `--session-dir` for per-model session keys; `--thinking` for graded effort; clean-room `--no-skills --no-extensions --no-context-files`; `-e` extension injection; blockable `tool_call` hooks for the seat write-fence; `pi.registerTool()` proxying all 24 Brain tools; `pi.sendMessage()` for wake digests and verbatim gate FAILs; per-message `usage.input/output/cost.total`; and `agent_settled` — a Pi-specific "nothing left to retry" signal that fusion `settledAt` and the zero-token watcher both consume.
+**What the substrate actually depends on from Pi** (audited, not assumed): pin-compatible version (same MAJOR.MINOR, PATCH ≥ tested pin — §2.1); `--session-dir` for per-model session keys; `--thinking` for graded effort; clean-room `--no-skills --no-extensions --no-context-files`; `-e` extension injection; blockable `tool_call` hooks for the seat write-fence; `pi.registerTool()` proxying all 24 Brain tools; `pi.sendMessage()` for wake digests and verbatim gate FAILs; per-message `usage.input/output/cost.total`; and `agent_settled` — a Pi-specific "nothing left to retry" signal that fusion `settledAt` and the zero-token watcher both consume.
 
 **Capability matrix** (researched against installed CLIs and vendor docs; `?` = undetermined):
 
