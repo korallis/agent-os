@@ -54,7 +54,7 @@ This is an unusually disciplined codebase — the backend engineering is genuine
 
 ### Lower priority
 
-12. **Add tests where they're missing**: `protocol` has zero tests despite being the package everything validates against; pi-extension's reconnect/pending/inbound-dispatch paths are untested (exactly where the bug lives); orchestrator's `OnboardingService` (579 lines) has no suite; the `familyOfModelRef` "other"-bucket causes false cross-family rejections (`providers.ts:180-188`) and needs pinning tests.
+12. **Add tests where they're missing**: **`protocol` suite — closed** (status owner: master plan Phase 13; code: `packages/protocol/test/`, fail-closed `familiesConflict` in `packages/protocol/src/providers.ts` §6.2). Still open at review time: pi-extension's reconnect/pending/inbound-dispatch paths (exactly where the bug lives); orchestrator's `OnboardingService` (579 lines) has no suite.
 
 13. **Process hygiene**: commit or drop the staged `react-doctor.yml` (currently uncommitted and advisory-only); note that the product is macOS-only but CI runs Ubuntu, so launchd/Keychain paths are never exercised; the Phase 6 Figma-fidelity gate is still unchecked — side-by-sides exist only for the 8 Phase-1 routes; align `@types/node` versions across apps (20.x in marketing, 26.x in console).
 
