@@ -266,9 +266,15 @@ describe("SSE replay & resume", () => {
     const resumed = await readSse(
       "/v1/events",
       { "last-event-id": cursor.id },
-      (frames) => frames.length >= all.length - 2,
+      (frames) => frames.length >= Math.max(1, all.length - 2),
     );
-    expect(resumed[0]?.seq).toBe(cursor.seq + 1);
+    // Visibility profiles filter the live path, so durable seqs are not always
+    // contiguous on the wire (e.g. prompt.installed is suppressed under quiet).
+    // Resume must skip already-seen frames and only emit later-or-equal-live ones.
+    expect(resumed.length).toBeGreaterThan(0);
+    expect(resumed[0]?.seq).toBeGreaterThan(cursor.seq);
+    expect(resumed.every((frame) => frame.seq > cursor.seq)).toBe(true);
+    expect(resumed.some((frame) => frame.id === cursor.id)).toBe(false);
   });
 
   it("REST replay honors after + limit with truncation flag", async () => {

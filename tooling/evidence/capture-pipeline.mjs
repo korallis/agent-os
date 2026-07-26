@@ -10,7 +10,7 @@
  * Usage: node tooling/evidence/capture-pipeline.mjs <outputDir>
  */
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -89,7 +89,8 @@ try {
     db.prepare("UPDATE runs SET updated_at=? WHERE id=?").run(Math.floor(Date.now() / 1000), "01EVRUN0000000000000000001");
     await sleep(400);
   }
-  await page.goto(`http://127.0.0.1:${CONSOLE_PORT}/pipeline`, { waitUntil: "networkidle" });
+  // `networkidle` never settles with the Console's long-lived EventSource open.
+  await page.goto(`http://127.0.0.1:${CONSOLE_PORT}/pipeline`, { waitUntil: "load" });
   await sleep(2000);
   await page.screenshot({ path: join(OUT, "pipeline-live.png"), fullPage: true });
   console.log("captured pipeline-live.png");
@@ -102,7 +103,7 @@ try {
       AGENTOS_FAKE_PI: "1", AGENTOS_FAKE_BRAIN: "1", AGENTOS_NO_MISTAKES_HOME: gateHome }, stdio: "ignore" });
   for (let i = 0; i < 200; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/v1/health`)).ok) break; } catch {} await sleep(150); }
   await sleep(1500);
-  await page.goto(`http://127.0.0.1:${CONSOLE_PORT}/pipeline`, { waitUntil: "networkidle" });
+  await page.goto(`http://127.0.0.1:${CONSOLE_PORT}/pipeline`, { waitUntil: "load" });
   await sleep(1500);
   await page.screenshot({ path: join(OUT, "pipeline-schema-drift.png"), fullPage: true });
   console.log("captured pipeline-schema-drift.png");

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 
 /**
  * Render a timestamp in the VIEWER's locale and timezone, after mount.
@@ -12,13 +12,22 @@ import { useEffect, useState } from "react";
  *
  * Before mount it renders the stable ISO time portion, so the server and the
  * first client render agree and the value is never blank.
+ *
+ * `useSyncExternalStore` (not an effect) is the React-recommended client-only
+ * gate: getServerSnapshot is false, the client snapshot is true.
  */
+function subscribeNoop(): () => void {
+  return () => {};
+}
+function clientTrue(): boolean {
+  return true;
+}
+function serverFalse(): boolean {
+  return false;
+}
+
 export function LocalTime({ iso, mode = "time" }: { iso: string; mode?: "time" | "datetime" }) {
-  // Only the MOUNTED flag lives in state; the text is derived during render.
-  // Copying the formatted string into state would duplicate a value that is
-  // already a pure function of the props.
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  const mounted = useSyncExternalStore(subscribeNoop, clientTrue, serverFalse);
 
   // SSR + first client paint both render the locale-independent ISO slice, so
   // they agree; the viewer's own clock takes over once mounted.

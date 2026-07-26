@@ -7,7 +7,8 @@
  *   G2  step log output streams incrementally, not as a replay
  *   G3  a run parked on a gate is unmistakably "needs a decision", with findings
  *   G4  schema drift degrades VISIBLY — never stale rows rendered as current
- *   G5  the transport in use is reported as fact (live vs polled), with lag
+ *   G5  the transport in use is reported as fact (wal-assisted / interval-only), with lag
+ *   G5b Console states that transport rather than implying a live push stream
  *   G6  read-only proof: zero writes anywhere under the no-mistakes home
  *   G7  visibility profiles change what reaches the Console, hot-reloaded
  *   G8  unchanged state emits nothing — no per-tick event spam
@@ -236,8 +237,17 @@ try {
     if (profile !== "quiet") {
       throw new Error(`G1 requires the shipped quiet default; activeProfile=${profile}`);
     }
-    await page.goto(`${CONSOLE}/pipeline`, { waitUntil: "networkidle" });
-    await sleep(800);
+    // `networkidle` never settles: the Console keeps an EventSource open for SSE.
+    await page.goto(`${CONSOLE}/pipeline`, { waitUntil: "load" });
+    // Wait for client hydration + first BFF poll so body text is live React state.
+    await page.waitForFunction(
+      () => (document.body?.innerText ?? "").includes("WAL-ASSISTED") ||
+        (document.body?.innerText ?? "").includes("INTERVAL-ONLY") ||
+        (document.body?.innerText ?? "").includes("UNAVAILABLE"),
+      null,
+      { timeout: 15_000 },
+    );
+    await sleep(400);
     const branch = "phase-x/second";
     const started = Date.now();
     seedRun(fixtureDb, "01RUNFIXTURE0000000000002", branch, [
@@ -348,11 +358,11 @@ try {
     await sleep(200);
     appendFileSync(logPath, `${marker}\n`);
     while (Date.now() - started < 4000 && !streamed) {
-      pending ??= reader.read();
+      pending ??= reader.read().catch((err) => ({ done: true, value: undefined, err }));
       const race = await Promise.race([pending, sleep(100).then(() => "timeout")]);
       if (race === "timeout") continue;
       pending = null;
-      if (race.done) break;
+      if (race.done || race.err) break;
       buffer += decoder.decode(race.value, { stream: true });
       let sep = buffer.indexOf("\n\n");
       while (sep !== -1) {
@@ -377,7 +387,12 @@ try {
     }
     controller.abort();
     try {
-      reader.cancel();
+      await pending;
+    } catch {
+      // abort rejects in-flight read — already absorbed above via .catch
+    }
+    try {
+      await reader.cancel();
     } catch {
       // ignore
     }
@@ -428,7 +443,8 @@ try {
       },
     ]);
     await sleep(1500);
-    await page.goto(`${CONSOLE}/pipeline`, { waitUntil: "networkidle" });
+    // `networkidle` never settles: the Console keeps an EventSource open for SSE.
+    await page.goto(`${CONSOLE}/pipeline`, { waitUntil: "load" });
     await sleep(1200);
     const text = (await page.textContent("body")) ?? "";
     gate(
@@ -493,7 +509,8 @@ try {
     await sleep(1500);
 
     const status = (await get("/v1/pipeline/status")).pipeline;
-    await page.goto(`${CONSOLE}/pipeline`, { waitUntil: "networkidle" });
+    // `networkidle` never settles: the Console keeps an EventSource open for SSE.
+    await page.goto(`${CONSOLE}/pipeline`, { waitUntil: "load" });
     await sleep(1200);
     const text = (await page.textContent("body")) ?? "";
     gate(
@@ -504,6 +521,12 @@ try {
         text.includes("Pipeline state unreadable"),
       `compatible=${status.compatibility.ok} missing=${status.compatibility.missingColumns.join(",")} uiStates=${text.includes("Pipeline state unreadable")}`,
     );
+
+    // Restore the fixture column so later gates (G7 seedRun + log appends) can
+    // write against the real schema again. The watcher re-probes on each tick
+    // while unavailable and recovers without a daemon bounce.
+    fixtureDb.exec("ALTER TABLE step_results RENAME COLUMN findings_blob TO findings_json");
+    await sleep(2000);
   }
 
   // ── G7 — visibility profiles change BEHAVIOUR, hot-reloaded ───────────
@@ -535,14 +558,14 @@ try {
       let pending = null;
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        pending ??= reader.read();
+        pending ??= reader.read().catch((err) => ({ done: true, value: undefined, err }));
         const race = await Promise.race([pending, sleep(100).then(() => "timeout")]);
         if (race === "timeout") {
           if (until(frames)) break;
           continue;
         }
         pending = null;
-        if (race.done) break;
+        if (race.done || race.err) break;
         buffer += decoder.decode(race.value, { stream: true });
         let sep = buffer.indexOf("\n\n");
         while (sep !== -1) {
@@ -562,7 +585,12 @@ try {
       }
       controller.abort();
       try {
-        reader.cancel();
+        await pending;
+      } catch {
+        // abort rejects in-flight read
+      }
+      try {
+        await reader.cancel();
       } catch {
         // ignore
       }
@@ -572,12 +600,23 @@ try {
     const setActiveProfile = async (name) => {
       const configPath = join(home, "config", "observability.json5");
       const raw = readFileSync(configPath, "utf8");
-      let next = raw.replace(/activeProfile:\s*"[^"]+"/, `activeProfile: "${name}"`);
+      // Global layer files embed shipped defaults as // comments. A bare
+      // /activeProfile/ replace hits the comment first and can leave the live
+      // override (e.g. working) unchanged when switching back to quiet.
+      let next = raw.replace(
+        /^(\s*activeProfile:\s*")[^"]+(")/m,
+        `$1${name}$2`,
+      );
       if (next === raw) {
         next = raw.replace(/\{\s*\}\s*$/, `{\n  activeProfile: "${name}",\n}\n`);
       }
-      if (next === raw && !raw.includes(`activeProfile: "${name}"`)) {
-        throw new Error(`G7 could not set activeProfile to ${name}`);
+      if (next === raw) {
+        // Already the live value, or only present in comments — force override object.
+        if (/^(\s*activeProfile:\s*")[^"]+(")/m.test(raw)) {
+          // live line already set to name
+        } else {
+          next = `${raw.trimEnd()}\n\n{\n  activeProfile: "${name}",\n}\n`;
+        }
       }
       writeFileSync(configPath, next);
       const deadline = Date.now() + 15_000;
@@ -726,8 +765,15 @@ try {
     const firehoseNotDurable = !durableLogAfterFirehose;
 
     const firehoseRunId = `01RUNG7FIRE${String(Date.now()).slice(-10)}`;
+    // Wait for THIS run — recovery after G4 re-emits other pipeline.run_updated
+    // frames that would close a broad "any run_updated" wait too early.
     const firehoseSsePromise = readSse(
-      (frames) => frames.some((f) => f.event?.type === "pipeline.run_updated"),
+      (frames) =>
+        frames.some(
+          (f) =>
+            f.event?.type === "pipeline.run_updated" &&
+            f.event?.payload?.runId === firehoseRunId,
+        ),
       6000,
     );
     await sleep(200);
@@ -741,13 +787,33 @@ try {
     );
 
     // firehose wakeOn includes pipeline.unavailable — turning watch off raises it.
+    // Must write the live override object (not the // commented shipped defaults).
     const wakesBeforeUnavail = ((await get("/v1/wakes")).wakes ?? []).length;
     const unavailConfigPath = join(home, "config", "observability.json5");
     const unavailRaw = readFileSync(unavailConfigPath, "utf8");
-    writeFileSync(
-      unavailConfigPath,
-      unavailRaw.replace(/watchPipeline:\s*true/, "watchPipeline: false"),
+    let unavailNext = unavailRaw.replace(
+      /^(\s*activeProfile:\s*"[^"]+"\s*,?)/m,
+      `$1\n  watchPipeline: false,`,
     );
+    if (unavailNext === unavailRaw || !/^(\s*watchPipeline:\s*false)/m.test(unavailNext)) {
+      // No live activeProfile line — force a full override object.
+      unavailNext = unavailRaw.replace(
+        /\{\s*activeProfile:\s*"[^"]+"\s*,?\s*\}/,
+        '{\n  activeProfile: "firehose",\n  watchPipeline: false,\n}',
+      );
+    }
+    if (unavailNext === unavailRaw) {
+      unavailNext = `${unavailRaw.trimEnd()}\n\n{\n  activeProfile: "firehose",\n  watchPipeline: false,\n}\n`;
+    }
+    writeFileSync(unavailConfigPath, unavailNext);
+    {
+      const offDeadline = Date.now() + 10_000;
+      while (Date.now() < offDeadline) {
+        const probe = await get("/v1/config/effective");
+        if (probe.config?.observability?.watchPipeline === false) break;
+        await sleep(250);
+      }
+    }
     let firehoseWakeOnUnavailable = false;
     const unavailDeadline = Date.now() + 10_000;
     while (Date.now() < unavailDeadline) {
@@ -766,13 +832,11 @@ try {
       }
       await sleep(200);
     }
-    // Restore watch so later cleanup is clean.
+    // Restore watch so later cleanup is clean — edit the live override only.
+    const restoreRaw = readFileSync(unavailConfigPath, "utf8");
     writeFileSync(
       unavailConfigPath,
-      readFileSync(unavailConfigPath, "utf8").replace(
-        /watchPipeline:\s*false/,
-        "watchPipeline: true",
-      ),
+      restoreRaw.replace(/^(\s*)watchPipeline:\s*false/m, "$1watchPipeline: true"),
     );
     await sleep(500);
 
