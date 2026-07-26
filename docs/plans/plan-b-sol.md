@@ -1,14 +1,17 @@
 ---
 title: "Agent OS: Local-First Multi-Provider Orchestration Console — Plan B"
 created: 2026-07-24
-status: implementation-ready
+status: superseded-historical-source
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: implementation-ready
+artifact_readiness: do-not-implement
 product_contract_source: user-brief
 owner: Agent OS
+authoritative_plan: docs/plans/agent-os-master-plan.md
 ---
 
 # Agent OS: Local-First Multi-Provider Orchestration Console
+
+> **Superseded historical source.** Authoritative plan: `docs/plans/agent-os-master-plan.md` (current **[R9]**). Do not implement from this document. Marketing `/site` fold-in and related claims here are **void** — the product is local-only and has no marketing app.
 
 ## 0. Executive decision
 

@@ -1,7 +1,7 @@
 <!-- BEGIN:nextjs-agent-rules -->
 # This is NOT the Next.js you know
 
-This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `apps/marketing/node_modules/next/dist/docs/` or `apps/console/node_modules/next/dist/docs/` (or the Next.js package docs under the app that depends on Next) before writing any code. Heed deprecation notices.
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `apps/console/node_modules/next/dist/docs/` (or the Next.js package docs under the app that depends on Next) before writing any code. Heed deprecation notices.
 <!-- END:nextjs-agent-rules -->
 
 ## Learned User Preferences
@@ -16,5 +16,6 @@ This version has breaking changes — APIs, conventions, and file structure may 
 ## Learned Workspace Facts
 
 - Public GitHub repo: [github.com/korallis/agent-os](https://github.com/korallis/agent-os).
-- Workspace is a pnpm + Turborepo monorepo (`apps/marketing`, `apps/console`, `apps/orchestrator`, shared `packages/*`).
+- Workspace is a pnpm + Turborepo monorepo (`apps/console`, `apps/orchestrator`, shared `packages/*`).
+- Agent OS is a **local-only, single-user web app**. There is no marketing site: `apps/marketing` was removed on the Captain's ruling (2026-07-26, plan [R9]) because a local app has no audience for one, and maintaining it forced claims the product could not evidence. Do not reintroduce one.
 - Product build source of truth: `docs/plans/agent-os-master-plan.md`.

@@ -8,6 +8,8 @@
 @import "./theme.css";
 @import "./base.css";
 
-/* Scan the design-system source so utilities used by shared
-   primitives (e.g. TextAnimations) are always generated. */
+/* Scan the design-system source so utilities referenced from shared code are
+   always generated. This used to name TextAnimations, which lived here only
+   for the marketing site and went with it ([R9]); the scan still earns its
+   keep for anything the package adds in future. */
 @source "../";

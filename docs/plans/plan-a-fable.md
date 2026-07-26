@@ -1,7 +1,8 @@
 # PLAN A — Agent OS: Local-First Agentic Orchestration System
 
 > **Plan provenance:** PLAN A of a two-plan fusion exercise, authored independently by Fable 5.
-> **Status:** Proposed. **Date:** 2026-07-24.
+> **Status:** Superseded historical source. **Date:** 2026-07-24.
+> **Authoritative plan:** `docs/plans/agent-os-master-plan.md` (current **[R9]**). Do not implement from this document. In particular, its `apps/marketing` / marketing-site decisions are **void** — the product is local-only and has no marketing app.
 > **Scope discipline:** This plan is opinionated and decisive. Where alternatives exist, one is chosen and justified; alternatives are noted only when the trade-off is genuinely close.
 
 ---
