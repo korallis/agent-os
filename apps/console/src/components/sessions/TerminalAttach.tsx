@@ -5,12 +5,16 @@ import { cn } from "@agent-os/ui";
 import type { AttachTicketResponse } from "@agent-os/protocol";
 
 /**
- * Read-only terminal attach (master plan §7.2).
+ * Read-only terminal attach (master plan §7.2, §8.2).
  *
  * Mints a single-use ticket over authenticated REST, then opens the PTY
  * WebSocket with it. The stream is deliberately read-only — the Console never
  * types into a crewmate's pane. Taking over is the Captain running the attach
  * command in their own terminal, which the session page shows alongside this.
+ *
+ * Pane frames carry a per-stream `seq`; gaps are counted and shown (never
+ * silently tolerated). A reconnect is a new stream, so the gap counter resets
+ * with it — carrying the old sequence would false-positive every reconnect.
  *
  * The ticket is one-shot, so reconnecting mints a fresh one; a ticket captured
  * from a log or history is already spent.
@@ -22,12 +26,19 @@ interface PaneFrame {
   type: "pane" | "closed" | "notice";
   content?: string;
   reason?: string;
+  /** Monotonic per-stream frame number; a gap means a genuine drop. */
+  seq?: number;
+  lastSeq?: number;
 }
 
 export function TerminalAttach({ sessionId }: { sessionId: string }) {
   const [status, setStatus] = useState<Status>("idle");
   const [pane, setPane] = useState<string>("");
   const [message, setMessage] = useState<string | null>(null);
+  /** Frames received and any gaps seen — surfaced, never silently tolerated. */
+  const [frames, setFrames] = useState(0);
+  const [dropped, setDropped] = useState(0);
+  const lastSeqRef = useRef(0);
   const socketRef = useRef<WebSocket | null>(null);
   const boundSession = useRef(sessionId);
   /** Bumped on session change, reconnect, and unmount to drop stale in-flight work. */
@@ -43,6 +54,9 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
       setStatus("idle");
       setPane("");
       setMessage(null);
+      lastSeqRef.current = 0;
+      setFrames(0);
+      setDropped(0);
     }
   }, [sessionId]);
 
@@ -63,6 +77,12 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
 
     setStatus("connecting");
     setMessage(null);
+    // A reconnect is a NEW stream with its own numbering, so the gap counter
+    // resets with it — carrying the old sequence over would report a false
+    // drop on every reconnect.
+    lastSeqRef.current = 0;
+    setFrames(0);
+    setDropped(0);
     try {
       const res = await fetch(`/api/agentos/sessions/${forSession}/attach-ticket`, {
         method: "POST",
@@ -102,8 +122,27 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
         try {
           const frame = JSON.parse(String(event.data)) as PaneFrame;
           if (frame.type === "pane" && frame.content !== undefined) {
+            // A pane that does not change sends nothing, so "no frame" is
+            // normal. A frame whose seq skips ahead is a real loss, and the
+            // Captain should be told rather than shown a quietly stale pane.
+            if (typeof frame.seq === "number") {
+              const expected = lastSeqRef.current + 1;
+              if (frame.seq > expected) {
+                setDropped((count) => count + (frame.seq as number) - expected);
+              }
+              lastSeqRef.current = frame.seq;
+            }
+            setFrames((count) => count + 1);
             setPane(frame.content);
           } else if (frame.type === "closed") {
+            if (
+              typeof frame.lastSeq === "number" &&
+              frame.lastSeq > lastSeqRef.current
+            ) {
+              setDropped(
+                (count) => count + (frame.lastSeq as number) - lastSeqRef.current,
+              );
+            }
             setStatus("closed");
             setMessage(frame.reason ?? "Stream closed.");
           } else if (frame.type === "notice") {
@@ -134,6 +173,27 @@ export function TerminalAttach({ sessionId }: { sessionId: string }) {
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold text-fg-1">Terminal (read-only)</h3>
         <div className="flex items-center gap-2">
+          {(frames > 0 || dropped > 0) && (
+            /* Frame continuity, stated. A quiet pane sends nothing, so silence
+               is normal — a seq GAP is a real loss and must not be hidden. */
+            <span
+              className={cn(
+                "text-[11px] font-mono",
+                dropped > 0 ? "text-danger" : "text-fg-3",
+              )}
+              title={
+                dropped > 0
+                  ? frames === 0
+                    ? `all ${dropped} frame(s) lost — no pane frames received`
+                    : `${dropped} frame(s) lost — sequence gap detected`
+                  : "no sequence gaps observed"
+              }
+            >
+              {frames === 0
+                ? `0 frames · ${dropped} dropped`
+                : `${frames} frames${dropped > 0 ? ` · ${dropped} dropped` : " · no gaps"}`}
+            </span>
+          )}
           <span
             className={cn(
               "text-[11px] font-medium",
