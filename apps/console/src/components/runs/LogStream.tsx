@@ -75,6 +75,7 @@ function levelOf(envelope: EventEnvelope): Level {
         : "INFO";
     case "pipeline.run_updated":
     case "pipeline.log_appended":
+    case "balancer.suggested":
       return "INFO";
     case "pipeline.unavailable":
       return "WARN";
@@ -151,6 +152,8 @@ function sourceOf(envelope: EventEnvelope): string {
     case "pipeline.log_appended":
     case "pipeline.unavailable":
       return "pipeline";
+    case "balancer.suggested":
+      return "balancer";
     case "worktree.leased":
     case "worktree.released":
       return "worktrees";
@@ -312,6 +315,12 @@ function messageOf(envelope: EventEnvelope): string {
       return `Pipeline ${event.payload.step}: ${event.payload.chunk.trim().split("\n").at(-1) ?? ""}`;
     case "pipeline.unavailable":
       return `Pipeline view unavailable — ${event.payload.reason}`;
+    case "balancer.suggested":
+      return event.payload.refusal !== null
+        ? `Balancer declined to suggest — ${event.payload.refusal}`
+        : `Balancer suggests ${event.payload.suggestions
+            .map((s) => `${s.role}=${s.model}`)
+            .join(", ")} (${event.payload.basis})`;
     case "captain.escalation":
       return `Captain [${event.payload.severity}] ${event.payload.summary}`;
     default: {

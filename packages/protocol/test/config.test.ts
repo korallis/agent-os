@@ -179,6 +179,20 @@ const validConfig: AgentOsConfig = {
     watchPipeline: true,
     pipelinePollMs: 1000,
   },
+  balancer: {
+    enabled: false,
+    // Two families on purpose: a single-family roster is refused at WRITE time,
+    // because cross-family builder/validator and /opinion could never be cast
+    // legally from it. A fixture that could not be saved is not a valid fixture.
+    roster: [
+      { model: "anthropic/claude-opus-4-5", brainCapable: true },
+      { model: "openai/gpt-5", brainCapable: false },
+    ],
+    // Below the Brain handoff threshold, so crew work steers away first and the
+    // Brain only moves when steering was not enough.
+    steerAwayPct: 60,
+    useReportedCost: false,
+  },
 };
 
 const validMetric: QuotaMetric = {

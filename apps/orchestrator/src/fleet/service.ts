@@ -58,6 +58,8 @@ export interface FleetServiceOptions {
    * {@link setPrimaryPort} after bind when the port is ephemeral (0).
    */
   primaryPort?: number;
+  /** Cost coverage for the balancer's optional dollar refinement. */
+  costCoverage?: () => "complete" | "partial" | "absent";
 }
 
 /**
@@ -160,6 +162,8 @@ export class FleetService {
       ...(options.sockets !== undefined ? { sockets: options.sockets } : {}),
       ...(options.fakePi !== undefined ? { fakePi: options.fakePi } : {}),
       afk: this.afk,
+      ...(options.quotaSamples !== undefined ? { quotaSamples: options.quotaSamples } : {}),
+      ...(options.costCoverage !== undefined ? { costCoverage: options.costCoverage } : {}),
     });
     this.brain = new BrainManager({
       home: options.home,
