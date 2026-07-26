@@ -25,13 +25,14 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pickPort } from "./lib/ports.mjs";
 import { chromium } from "playwright";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
 const TMUX_SOCKET = `agentos-p6-${process.pid}`;
-const DAEMON_PORT = 4700 + 800 + Math.floor(Math.random() * 100);
-const CONSOLE_PORT = 3300 + Math.floor(Math.random() * 200);
+const DAEMON_PORT = pickPort(5500, 100);
+const CONSOLE_PORT = pickPort(3300, 200);
 const BASE = `http://127.0.0.1:${DAEMON_PORT}`;
 const CONSOLE = `http://127.0.0.1:${CONSOLE_PORT}`;
 

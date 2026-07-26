@@ -58,6 +58,11 @@ jobs:
       - name: Gate-cleanup gate
         run: node scripts/verify-gate-cleanup.mjs
 
+      # Also before the gates: a gate that draws a Chromium-restricted port
+      # fails with ERR_UNSAFE_PORT and looks like a product regression.
+      - name: Gate-port gate
+        run: node scripts/verify-gate-ports.mjs
+
       - name: Phase 1 gates
         run: node tooling/gates/phase-1.mjs
 

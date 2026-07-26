@@ -31,11 +31,12 @@ import {
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
 const TMUX_SOCKET = `agentos-p4-${process.pid}`;
-const PORT = 4700 + 300 + Math.floor(Math.random() * 400);
+const PORT = pickPort(5000, 400);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 const results = [];

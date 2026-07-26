@@ -504,9 +504,11 @@ agent-os/
 │   └── fusion-core/                  # pure fusion contract/templates/attribution (no I/O) [B]
 ├── scripts/
 │   ├── verify-no-deprecated.mjs      # zero-deprecated dependency gate (CI)
-│   └── verify-gate-cleanup.mjs       # gates must exit after try/finally (CI; prevents orphaned agentosd)
+│   ├── verify-gate-cleanup.mjs       # gates must exit after try/finally (CI; prevents orphaned agentosd)
+│   └── verify-gate-ports.mjs         # gates must use pickPort (CI; skips Chromium-restricted ports)
 └── tooling/
-    ├── gates/phase-{1,2,2b,3,4,5,6,7,8}.mjs # executable phase gates (2b: Phase 2 fixture completion; phase-6/8: Playwright + real daemon where noted; phase-7: secondmates)
+    ├── gates/                        # phase-{1,2,2b,3,4,5,6,7,8}.mjs + lib/ports.mjs (Chromium-safe pickPort)
+    │                                 #   (2b: Phase 2 fixture completion; phase-6/8: Playwright + real daemon where noted; phase-7: secondmates)
     ├── evidence/capture-console.mjs    # full Console proof packs (docs/qa/runs/)
     └── screenshots/capture-console.mjs  # Playwright PR evidence (pnpm screenshots)
 ```
