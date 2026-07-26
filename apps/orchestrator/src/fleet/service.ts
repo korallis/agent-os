@@ -245,6 +245,7 @@ export class FleetService {
         this.onLifecycle(frame);
         break;
       case "ext.usage":
+        this.tools.touchSessionActivity(frame.sessionId);
         // Per-side fusion telemetry: attribute the tokens to whichever fusion
         // run owns this session, so the Console's side-by-side shows real cost.
         this.tools.attributeFusionUsage(frame.sessionId, {
@@ -292,6 +293,7 @@ export class FleetService {
       case "turn_start":
       case "tool_call":
       case "tool_result":
+        this.tools.touchSessionActivity(frame.sessionId);
         this.watcher.classify({
           class: "PROGRESS",
           sessionId: frame.sessionId,
@@ -299,6 +301,7 @@ export class FleetService {
         });
         break;
       case "turn_end":
+        this.tools.touchSessionActivity(frame.sessionId);
         this.watcher.classify({
           class: "TURN_SETTLED",
           sessionId: frame.sessionId,
@@ -335,6 +338,7 @@ export class FleetService {
   private onToolCall(
     frame: Extract<ExtensionToDaemonFrame, { type: "ext.tool_call" }>,
   ): void {
+    this.tools.touchSessionActivity(frame.sessionId);
     void this.onToolCallAsync(frame);
   }
 
@@ -346,6 +350,7 @@ export class FleetService {
       frame.tool,
       frame.input,
     );
+
     const reason = result.ok ? null : (result.error?.message ?? null);
     const controlFrame: Extract<DaemonControlFrame, { type: "ctl.tool_result" }> = {
       type: "ctl.tool_result",
@@ -578,6 +583,10 @@ export class FleetService {
     this.tools.reconcileAcceptedHandovers();
     // Pending: re-drive remote POST (idempotency key); fire-and-forget on tick.
     void this.tools.reconcilePendingHandoversAsync().catch(() => undefined);
+    // A wedged seat passes every check above — its pane is alive — so it needs
+    // its own pass on EVERY tick, not just at boot where nothing is wedged yet.
+    this.tools.reconcileWedgedSessions();
+
     return lost;
   }
 
@@ -670,6 +679,15 @@ export class FleetService {
     // restart still receives artifacts + fusion.completed for live sides.
     this.tools.hydrateFusionOwnership();
     this.tools.rebindSessionListeners();
+    // Fake tmux has no cross-process pane state. Re-bind virtual windows for
+    // still-running seats so restart fixtures match real tmux persistence and
+    // do not false-mark-lost (which would also wipe durable pending questions).
+    if (this.tmux.isFake) {
+      for (const session of this.tools.listSessions()) {
+        if (session.status !== "starting" && session.status !== "running") continue;
+        this.tmux.ensureFakeWindow(session.tmuxWindow);
+      }
+    }
     this.tools.reconcileDeadPanes();
     // Route through ToolSurface so dirty quarantine stamps deliveryBlocked on the task.
     this.reclaimOrphanedWorktreeLeases();

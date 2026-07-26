@@ -151,6 +151,19 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     const eventStore = store;
     config.onEvent((event) => {
       eventStore.append(event);
+      // FleetService.reloadConfig existed but nothing ever called it, so a
+      // hot-reloaded change reached `/v1/config/effective` while the fleet's
+      // own subsystems — watcher thresholds, worktree pool, gate runner, Brain
+      // cast, and the reconcile cadence — kept running on boot-time values.
+      // "Valid changes hot-reload" has to mean the fleet, not just the reader.
+      if (event.type === "config.changed" || event.type === "policy.changed") {
+        try {
+          fleetRef?.reloadConfig();
+        } catch {
+          // A bad reload must never take the daemon down; the previous
+          // in-memory config keeps running and the rejection is already logged.
+        }
+      }
     });
     if (installed.length > 0) {
       store.append({ type: "config.installed", payload: { domains: installed } });
@@ -204,6 +217,11 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     prompts.installDefaults();
 
     const agentosdBin = resolveAgentosdBin();
+    // Assigned after FleetService construction; the config listener above
+    // closes over this ref so hot-reload can reach the fleet.
+    let fleetRef: FleetService | null = null;
+
+
     const fleet = new FleetService({
       home,
       config,
@@ -221,6 +239,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       // stale sample is a decision about a window that already moved.
       quotaSamples: () => [...quotaSamples.values()],
     });
+    fleetRef = fleet;
     fleet.onEvent((event) => {
       eventStore.append(event);
     });

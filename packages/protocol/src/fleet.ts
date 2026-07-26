@@ -110,6 +110,12 @@ export const fleetSessionSchema = z.strictObject({
   status: z.enum(["starting", "running", "settled", "stopped", "lost", "wedged"]),
   worktreePath: z.string().nullable(),
   startedAt: isoTimestampSchema,
+  /**
+   * Last time this seat did anything observable — a lifecycle frame or a usage
+   * report. null means it has produced nothing since it was spawned, which is
+   * itself the signal structural wedging is detected from.
+   */
+  lastActivityAt: isoTimestampSchema.nullable(),
 });
 export type FleetSession = z.infer<typeof fleetSessionSchema>;
 

@@ -400,6 +400,19 @@ const SAMPLES: readonly OrchestratorEvent[] = [
     },
   },
   {
+    type: "session.wedged",
+    payload: {
+      sessionId: ULID_A,
+      taskId: ULID_B,
+      role: "builder",
+      idleMinutes: 12.5,
+      thresholdMinutes: 10,
+      respawnsUsed: 0,
+      respawnCap: 1,
+      action: "respawned",
+    },
+  },
+  {
     type: "captain.escalation",
     payload: { taskId: ULID_A, summary: "validation exhausted", severity: "critical" },
   },
@@ -536,6 +549,7 @@ describe("ORCHESTRATOR_EVENT_TYPES", () => {
     "brain.handoff_completed",
     "secondmate.charter_changed",
     "secondmate.routed",
+    "session.wedged",
     "captain.escalation",
     "task.delivery_block_resolved",
   ];

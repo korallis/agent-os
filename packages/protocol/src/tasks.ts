@@ -169,6 +169,70 @@ export const taskSnapshotSchema = z.strictObject({
   redProof: taskRedProofSchema.nullable().default(null),
   /** Daemon-authoritative last FAIL lines for verbatim inject. */
   lastFailLedger: taskFailLedgerSchema.nullable().default(null),
+  /**
+   * Per-role structural-WEDGED respawns already spent on this task.
+   * Survives daemon restart so the respawn-once spend bound cannot reset on bounce.
+   */
+  wedgeRespawnsByRole: z.record(z.string(), z.number().int().min(0)).default({}),
+  /**
+   * Outstanding captain.escalation obligations from the WEDGED ladder.
+   * Recorded when the substrate decides the Captain must be told; cleared only
+   * after captain.escalation is sunk. Survives seat state, process death, and
+   * restart — discharged exactly once on a later reconcile tick if needed.
+   */
+  wedgePendingCaptainNotifies: z
+    .array(
+      z.strictObject({
+        sessionId: z.string().min(1),
+        role: z.string().min(1),
+        summary: z.string().min(1),
+        severity: z.enum(["info", "warn", "critical"]),
+        recordedAt: isoTimestampSchema,
+        /**
+         * Optional optimisation only: session id of a known wedge replacement.
+         * Discharge must derive success from durable seat state (live same-role
+         * seat created after recordedAt). If stamp and derivation disagree,
+         * derivation wins — never retire solely because this id is set.
+         */
+        replacementSessionId: z.string().min(1).optional(),
+        /**
+         * True when this entry is the write-ahead obligation recorded before a
+         * respawn attempt. Incomplete recovery (original still starting/running,
+         * no derived live replacement) rolls the ledger back to
+         * `respawnsUsedBeforeAttempt` and clears the provisional entry without
+         * escalate so a crash before stop does not burn the free respawn.
+         */
+        writeAheadRespawn: z.boolean().optional(),
+        /**
+         * Ledger count before this write-ahead respawn attempt spent +1.
+         * Used to roll back exactly when recovery dies before stop (cap > 1
+         * safe). Optional for older snapshots; discharge falls back to current − 1.
+         */
+        respawnsUsedBeforeAttempt: z.number().int().min(0).optional(),
+      }),
+    )
+    .default([]),
+  /**
+   * Session ids whose WEDGED ladder fully finished (respawn done, or captain
+   * escalation sunk). Durable so a daemon restart cannot re-open a completed
+   * escalate seat and re-arm a cleared Captain-notify obligation.
+   */
+  wedgeLadderCompletedSessionIds: z.array(z.string().min(1)).default([]),
+  /**
+   * Outstanding crewmate questions awaiting Captain/Brain answer.
+   * Rehydrated into the live pending-questions view on boot so the structural
+   * WEDGED open-question exemption and answer_crewmate survive daemon restart.
+   */
+  pendingQuestions: z
+    .array(
+      z.strictObject({
+        questionId: z.string().min(1),
+        sessionId: z.string().min(1),
+        question: z.string().min(1),
+        askedAt: isoTimestampSchema,
+      }),
+    )
+    .default([]),
   idempotencyKey: z.string().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,

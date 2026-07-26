@@ -165,6 +165,19 @@ export class TmuxController {
   }
 
   /**
+   * Re-register a virtual window in fake mode so a daemon restart fixture can
+   * approximate real tmux pane persistence. No-op outside fake mode.
+   */
+  ensureFakeWindow(target: string): void {
+    if (!this.fake) return;
+    if (this.fakeWindows.has(target)) return;
+    const colon = target.indexOf(":");
+    const session = colon === -1 ? "agentos" : target.slice(0, colon);
+    const window = colon === -1 ? target : target.slice(colon + 1);
+    this.fakeWindows.set(target, { session, window, cmd: "true" });
+  }
+
+  /**
    * Read pane contents without blocking the event loop.
    * Returns null when the window is missing or capture fails (PTY liveness signal).
    */
