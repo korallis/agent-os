@@ -339,9 +339,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
       },
     });
     pipelineWatcherRef = pipelineWatcher;
-    applyPipelineObservability(configService, pipelineWatcher);
 
-    // wakeOn: event types that raise a Captain/Brain wake under the active profile.
+    // Ordering rule: listeners must exist before the first append, because
+    // append has no replay for late subscribers. applyPipelineObservability
+    // may start() the watcher and synchronously sink pipeline.unavailable
+    // (or run_updated) on a cold gate — wakeOn must already be registered or
+    // that one-shot boot signal is permanently swallowed for the profile.
     eventStore.subscribe((envelope: { event: OrchestratorEvent }) => {
       try {
         const { profile } = resolveActiveProfile(configService.effective().config.observability);
@@ -360,6 +363,8 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
         // Wake classification must never break append fan-out.
       }
     });
+
+    applyPipelineObservability(configService, pipelineWatcher);
 
     const deps = {
       store,

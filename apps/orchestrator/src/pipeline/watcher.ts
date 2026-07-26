@@ -204,8 +204,12 @@ export function utf8CompletePrefixLength(buffer: Buffer): number {
  * Read the last `maxChars` UTF-16 code units (JS string length) of a log file,
  * reporting the file byte range that produced them. Matches Console retention
  * (`String.prototype.slice`) so attach seed and live window agree on characters.
+ *
+ * Always honor `readSync`'s byte count: a size measured before the open can
+ * overstate the file (truncate/rotate), and decoding the full pre-alloc buffer
+ * would inject NULs and desync every subsequent offset merge.
  */
-function readLogTailByChars(
+export function readLogTailByChars(
   logPath: string,
   size: number,
   maxChars: number,
@@ -215,16 +219,27 @@ function readLogTailByChars(
   }
   // Over-read: UTF-8 uses at most 4 bytes per Unicode code point.
   const maxBytes = Math.min(size, maxChars * 4);
-  const readStart = size - maxBytes;
+  const readStart = Math.max(0, size - maxBytes);
   const buffer = Buffer.alloc(maxBytes);
+  let bytesRead = 0;
   const fd = openSync(logPath, "r");
   try {
-    readSync(fd, buffer, 0, maxBytes, readStart);
+    bytesRead = readSync(fd, buffer, 0, maxBytes, readStart);
   } finally {
     closeSync(fd);
   }
-  const leadSkip = readStart === 0 ? 0 : utf8LeadingSkip(buffer);
-  const slice = buffer.subarray(leadSkip);
+  if (bytesRead <= 0) {
+    return {
+      text: "",
+      startOffset: readStart,
+      endOffset: readStart,
+      truncated: readStart > 0,
+    };
+  }
+  const actual = buffer.subarray(0, bytesRead);
+  const readEnd = readStart + bytesRead;
+  const leadSkip = readStart === 0 ? 0 : utf8LeadingSkip(actual);
+  const slice = actual.subarray(leadSkip);
   let text = slice.toString("utf8");
   let startOffset = readStart + leadSkip;
   if (text.length > maxChars) {
@@ -235,7 +250,7 @@ function readLogTailByChars(
   return {
     text,
     startOffset,
-    endOffset: size,
+    endOffset: readEnd,
     truncated: startOffset > 0,
   };
 }

@@ -13,12 +13,13 @@ import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { observabilityConfigSchema, type OrchestratorEvent } from "@agent-os/protocol";
 import { ConfigService } from "../src/config/service.js";
-import { SHIPPED_DEFAULTS_DIR } from "../src/daemon.js";
+import { SHIPPED_DEFAULTS_DIR, startDaemon } from "../src/daemon.js";
 import {
   PIPELINE_LOG_CHUNK_MAX,
   PIPELINE_LOG_DRAIN_MAX_BYTES,
   PIPELINE_LOG_DRAIN_MAX_CHUNKS,
   PipelineWatcher,
+  readLogTailByChars,
 } from "../src/pipeline/watcher.js";
 import { buildServer } from "../src/server/app.js";
 import {
@@ -27,6 +28,7 @@ import {
   resolveActiveProfile,
   wakeClassForEvent,
 } from "../src/observability/profile.js";
+import { pruneAppliedLogIds } from "../../console/src/lib/pipelineLogState.ts";
 
 /** Real no-mistakes stores unix epoch seconds — fixtures must match or unit bugs pass. */
 function nowUnixSeconds(): number {
@@ -1496,5 +1498,90 @@ describe("PipelineWatcher", () => {
     // Byte-budget read of `retention` bytes would yield only 5 α's — not 10.
     expect(tail.text).not.toBe("α".repeat(Math.floor(retention / 2)));
     watcher.stop();
+  });
+
+  it("readLogTailByChars ignores unread buffer bytes after a short read (truncate race)", () => {
+    const gateHome = mkdtempSync(join(tmpdir(), "p9-short-read-"));
+    homes.push(gateHome);
+    const logPath = join(gateHome, "truncated.log");
+    // Actual file is short; size claims a larger window so readSync returns short.
+    writeFileSync(logPath, "hello-world");
+    const claimedSize = 64;
+    const result = readLogTailByChars(logPath, claimedSize, 100);
+    expect(result.text.includes("\0")).toBe(false);
+    expect(result.text).toBe("hello-world");
+    expect(result.endOffset).toBe(Buffer.byteLength("hello-world", "utf8"));
+    expect(result.endOffset).toBe(result.startOffset + Buffer.byteLength(result.text, "utf8"));
+  });
+});
+
+describe("wakeOn subscription order", () => {
+  it("delivers pipeline.unavailable wake on cold start under firehose", async () => {
+    const home = mkdtempSync(join(tmpdir(), "agentos-wakeon-boot-"));
+    homes.push(home);
+    const missingGate = mkdtempSync(join(tmpdir(), "agentos-missing-gate-"));
+    homes.push(missingGate);
+    mkdirSync(join(home, "config"), { recursive: true });
+    // Layer override only — ships quiet by default; firehose opts into gate wakes.
+    writeFileSync(
+      join(home, "config", "observability.json5"),
+      `{ activeProfile: "firehose" }\n`,
+      { mode: 0o600 },
+    );
+
+    const prevGate = process.env.AGENTOS_NO_MISTAKES_HOME;
+    process.env.AGENTOS_NO_MISTAKES_HOME = missingGate;
+    process.env.AGENTOS_FAKE_TMUX = "1";
+    process.env.AGENTOS_FAKE_PI = "1";
+    process.env.AGENTOS_FAKE_BRAIN = "1";
+
+    const daemon = await startDaemon({ home, port: 0, stdout: false });
+    try {
+      const response = await fetch(`http://127.0.0.1:${daemon.port}/v1/wakes`, {
+        headers: { authorization: `Bearer ${daemon.token}` },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        wakes: Array<{
+          class: string;
+          summary: string;
+          detail?: { eventType?: string; source?: string };
+        }>;
+      };
+      const bootWake = body.wakes.find(
+        (w) =>
+          w.detail?.source === "observability.wakeOn" &&
+          w.detail?.eventType === "pipeline.unavailable",
+      );
+      expect(bootWake).toBeDefined();
+      expect(bootWake?.class).toBe("GATE_FAILED");
+      expect(bootWake?.summary).toMatch(/pipeline unreadable/i);
+    } finally {
+      await daemon.close();
+      if (prevGate === undefined) delete process.env.AGENTOS_NO_MISTAKES_HOME;
+      else process.env.AGENTOS_NO_MISTAKES_HOME = prevGate;
+      delete process.env.AGENTOS_FAKE_TMUX;
+      delete process.env.AGENTOS_FAKE_PI;
+      delete process.env.AGENTOS_FAKE_BRAIN;
+    }
+  });
+});
+
+describe("Console appliedLogIds growth", () => {
+  it("prunes ids that have left the live SSE ring", () => {
+    const applied = new Set(["old-1", "old-2", "still-live"]);
+    pruneAppliedLogIds(applied, ["still-live", "fresh"]);
+    expect(applied.has("old-1")).toBe(false);
+    expect(applied.has("old-2")).toBe(false);
+    expect(applied.has("still-live")).toBe(true);
+    expect(applied.size).toBe(1);
+
+    // Simulate many historical frames leaving a fixed-size ring.
+    for (let i = 0; i < 10_000; i += 1) applied.add(`hist-${i}`);
+    const ring = Array.from({ length: 50 }, (_, i) => `ring-${i}`);
+    for (const id of ring) applied.add(id);
+    pruneAppliedLogIds(applied, ring);
+    expect(applied.size).toBe(ring.length);
+    for (const id of ring) expect(applied.has(id)).toBe(true);
   });
 });

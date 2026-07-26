@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@agent-os/ui";
 import type { PipelineFinding, PipelineRunSnapshot } from "@agent-os/protocol";
 import { EmptyState } from "@/components/shell/EmptyState";
+import { pruneAppliedLogIds } from "@/lib/pipelineLogState";
 import { useEventStream } from "@/lib/useEventStream";
 
 /**
@@ -341,6 +342,13 @@ export function PipelineView() {
       nextRanges[key] = { start: merged.start, end: merged.end };
       seededCatchUpKeys.current.add(key);
     }
+
+    // Bound applied ids to the current SSE ring. Evicted frames will not
+    // reappear; keeping their ids forever is unbounded growth under firehose.
+    pruneAppliedLogIds(
+      appliedLogIds.current,
+      events.map((envelope) => envelope.id),
+    );
 
     // Re-window against current retention (overflow from new chunks or profile shrink).
     for (const [key, text] of Object.entries(next)) {
