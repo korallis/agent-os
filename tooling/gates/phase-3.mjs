@@ -37,6 +37,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
@@ -146,7 +147,7 @@ let home;
 let child;
 let exitCode = 0;
 const cleanups = [];
-const PORT = 4700 + Math.floor(Math.random() * 1000) + 200;
+const PORT = pickPort(4900, 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 try {

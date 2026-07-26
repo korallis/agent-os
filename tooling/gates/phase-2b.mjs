@@ -39,11 +39,12 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pickPort } from "./lib/ports.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.js");
 const TMUX_SOCKET = `agentos-p2b-${process.pid}`;
-const PORT = 4700 + 1400 + Math.floor(Math.random() * 40);
+const PORT = pickPort(6100, 40);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 /** Planted in the fixture auth store; must never reach anything durable. */

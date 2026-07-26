@@ -31,6 +31,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pickPort } from "./lib/ports.mjs";
 import { chromium } from "playwright";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -38,8 +39,9 @@ const DAEMON_BIN = join(ROOT, "apps", "orchestrator", "dist", "bin", "agentosd.j
 const TMUX_SOCKET = `agentos-p8-${process.pid}`;
 // Non-overlapping with phase-6 (daemon 5500–5599 / console 3300–3499) so
 // concurrent local or matrix runs cannot collide on bind ports.
-const PORT = 4700 + 1000 + Math.floor(Math.random() * 60); // 5700–5759
-const CONSOLE_PORT = 3000 + 1000 + Math.floor(Math.random() * 60); // 4000–4059
+const PORT = pickPort(5700, 60);
+// 4000–4059 contains 4045 (lockd), which Chromium refuses to navigate to.
+const CONSOLE_PORT = pickPort(4000, 60);
 const BASE = `http://127.0.0.1:${PORT}`;
 const CONSOLE = `http://127.0.0.1:${CONSOLE_PORT}`;
 
