@@ -382,6 +382,24 @@ const SAMPLES: readonly OrchestratorEvent[] = [
     },
   },
   {
+    type: "secondmate.charter_changed",
+    payload: {
+      name: "docs",
+      brainModel: "openai/gpt-5",
+      domains: ["docs", "changelog"],
+    },
+  },
+  {
+    type: "secondmate.routed",
+    payload: {
+      name: "docs",
+      taskId: ULID_A,
+      domain: "docs",
+      accepted: true,
+      reason: null,
+    },
+  },
+  {
     type: "captain.escalation",
     payload: { taskId: ULID_A, summary: "validation exhausted", severity: "critical" },
   },
@@ -516,6 +534,8 @@ describe("ORCHESTRATOR_EVENT_TYPES", () => {
     "afk.auto_answered",
     "brain.handoff_triggered",
     "brain.handoff_completed",
+    "secondmate.charter_changed",
+    "secondmate.routed",
     "captain.escalation",
     "task.delivery_block_resolved",
   ];
