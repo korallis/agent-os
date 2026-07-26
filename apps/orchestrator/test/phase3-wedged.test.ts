@@ -38,12 +38,12 @@ function gitRepo(): string {
   return dir;
 }
 
-function fleet(options: {
+async function fleet(options: {
   home?: string;
   staleBuildMinutes?: number;
   respawnPerStage?: number;
   start?: boolean;
-} = {}): { service: FleetService; events: OrchestratorEvent[]; home: string; config: ConfigService } {
+} = {}): Promise<{ service: FleetService; events: OrchestratorEvent[]; home: string; config: ConfigService }> {
   const home = options.home ?? temp("agentos-wedged-home-");
   mkdirSync(join(home, "config"), { recursive: true });
   const config = new ConfigService(SHIPPED_DEFAULTS_DIR, join(home, "config"));
@@ -67,7 +67,8 @@ function fleet(options: {
   });
   service.onEvent((e) => events.push(e));
   if (options.start !== false) {
-    service.start();
+    // start() is async — brain stays BRAIN_DOWN until handover reconcile + boot settle.
+    await service.start();
   }
   return { service, events, home, config };
 }
@@ -154,8 +155,8 @@ afterEach(() => {
 });
 
 describe("structural WEDGED ladder", () => {
-  it("does not fire while the seat is still producing activity", () => {
-    const { service } = fleet({ staleBuildMinutes: 30 });
+  it("does not fire while the seat is still producing activity", async () => {
+    const { service } = await fleet({ staleBuildMinutes: 30 });
     const { sessionId } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -165,8 +166,8 @@ describe("structural WEDGED ladder", () => {
     expect(acted).toHaveLength(0);
   });
 
-  it("ignores a seat whose pane is GONE — that is SESSION_LOST, not wedged", () => {
-    const { service } = fleet({ staleBuildMinutes: 30 });
+  it("ignores a seat whose pane is GONE — that is SESSION_LOST, not wedged", async () => {
+    const { service } = await fleet({ staleBuildMinutes: 30 });
     const { sessionId } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -178,8 +179,8 @@ describe("structural WEDGED ladder", () => {
     expect(acted).toHaveLength(0);
   });
 
-  it("respawns once on the first wedge", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("respawns once on the first wedge", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -200,8 +201,8 @@ describe("structural WEDGED ladder", () => {
     expect(task?.wedgeRespawnsByRole[role]).toBe(1);
   });
 
-  it("escalates on the second wedge instead of respawning forever", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("escalates on the second wedge instead of respawning forever", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -230,8 +231,8 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
   });
 
-  it("treats a seat that never reported anything as idle since spawn", () => {
-    const { service } = fleet({ staleBuildMinutes: 30 });
+  it("treats a seat that never reported anything as idle since spawn", async () => {
+    const { service } = await fleet({ staleBuildMinutes: 30 });
     const { sessionId } = seedBuilder(service);
     // lastActivityAt null must not read as "active now" — that would hide the
     // seat that wedged immediately on spawn, the worst case of all.
@@ -244,8 +245,8 @@ describe("structural WEDGED ladder", () => {
     expect(acted[0]?.action).toBe("respawned");
   });
 
-  it("keeps the ladder per task+role on the same task", () => {
-    const { service } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("keeps the ladder per task+role on the same task", async () => {
+    const { service } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     // Same task, two roles — ledger keys are taskId:role, not a global counter.
     const { taskId, sessionId: builderSessionId } = seedBuilder(service, {
       role: "builder",
@@ -303,8 +304,8 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole.validator).toBe(1);
   });
 
-  it("honours a respawn cap of zero by escalating immediately", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+  it("honours a respawn cap of zero by escalating immediately", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
     const { sessionId } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -322,8 +323,8 @@ describe("structural WEDGED ladder", () => {
     }
   });
 
-  it("persists the respawn ledger across daemon rehydrate", () => {
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("persists the respawn ledger across daemon rehydrate", async () => {
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -338,7 +339,7 @@ describe("structural WEDGED ladder", () => {
 
     // Bounce: empty process-local ledger, rebuild from task.json.
     // Boot reconcile marks panes missing under a fresh fake tmux as lost.
-    const restarted = fleet({ home, start: true });
+    const restarted = await fleet({ home, start: true });
     expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
 
     const phase = restarted.service.tools.getTask(taskId)?.phase;
@@ -377,8 +378,8 @@ describe("structural WEDGED ladder", () => {
     expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
   });
 
-  it("stamps activity from progress frames so healthy seats are not false-wedged", () => {
-    const { service } = fleet({ staleBuildMinutes: 12 });
+  it("stamps activity from progress frames so healthy seats are not false-wedged", async () => {
+    const { service } = await fleet({ staleBuildMinutes: 12 });
     const { sessionId } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -397,8 +398,8 @@ describe("structural WEDGED ladder", () => {
     expect(session?.lastActivityAt).not.toBeNull();
   });
 
-  it("emits a second captain.escalation when already NEEDS_CAPTAIN", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+  it("emits a second captain.escalation when already NEEDS_CAPTAIN", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
     const { taskId, sessionId } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -420,8 +421,8 @@ describe("structural WEDGED ladder", () => {
     expect(events.some((e) => e.type === "task.phase_changed")).toBe(false);
   });
 
-  it("preflights known-illegal respawns: escalate without stop or spend", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("preflights known-illegal respawns: escalate without stop or spend", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -453,8 +454,8 @@ describe("structural WEDGED ladder", () => {
     expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
   });
 
-  it("does not stop a first-wedge seat when the task is already NEEDS_CAPTAIN", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("does not stop a first-wedge seat when the task is already NEEDS_CAPTAIN", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId: builderSessionId } = seedBuilder(service, {
       role: "builder",
       model: "openai/gpt-4.1",
@@ -512,8 +513,8 @@ describe("structural WEDGED ladder", () => {
     }
   });
 
-  it("keeps the ledger spent when stop ran but spawn failed, without re-wedging the stopped seat", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("keeps the ledger spent when stop ran but spawn failed, without re-wedging the stopped seat", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -546,8 +547,8 @@ describe("structural WEDGED ladder", () => {
     expect(events.some((e) => e.type === "captain.escalation")).toBe(true);
   });
 
-  it("rolls the ledger back when the respawn attempt fails before stop", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("rolls the ledger back when the respawn attempt fails before stop", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -577,8 +578,8 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(0);
   });
 
-  it("discharges a durable pending Captain notify for a stopped seat without re-wedging", () => {
-    const { service, events, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("discharges a durable pending Captain notify for a stopped seat without re-wedging", async () => {
+    const { service, events, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     // Simulate stop-then-spawn-fail that recorded the obligation but never
     // sank captain.escalation (process death / throw after record).
@@ -630,8 +631,8 @@ describe("structural WEDGED ladder", () => {
     expect(durable.wedgePendingCaptainNotifies).toEqual([]);
   });
 
-  it("discharges pending Captain notify after rehydrate even when the pane is gone", () => {
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+  it("discharges pending Captain notify after rehydrate even when the pane is gone", async () => {
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
     const { taskId, sessionId, role } = seedBuilder(service);
     const task = service.tools.getTask(taskId)!;
     const summary = `Seat ${role} wedged again after 0 respawns — deferred notify`;
@@ -660,7 +661,7 @@ describe("structural WEDGED ladder", () => {
     );
 
     // Fresh fake tmux has no windows — pane is gone; notify must still discharge.
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const events: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => events.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies).toHaveLength(1);
@@ -686,8 +687,8 @@ describe("structural WEDGED ladder", () => {
     expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
 
-  it("records pending notify before escalate so a failed sink is retried next tick", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+  it("records pending notify before escalate so a failed sink is retried next tick", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -732,8 +733,8 @@ describe("structural WEDGED ladder", () => {
     }
   });
 
-  it("does not re-arm Captain notify after successful discharge survives restart", () => {
-    const { service, events, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+  it("does not re-arm Captain notify after successful discharge survives restart", async () => {
+    const { service, events, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
     const { taskId, sessionId } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -746,7 +747,7 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
 
     // Persist is already on disk via saveTask; bounce with empty process state.
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const reEvents: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => reEvents.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(
@@ -759,8 +760,8 @@ describe("structural WEDGED ladder", () => {
     );
   });
 
-  it("still escalates after restart when discharge never succeeded", () => {
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+  it("still escalates after restart when discharge never succeeded", async () => {
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -795,7 +796,7 @@ describe("structural WEDGED ladder", () => {
       { mode: 0o600 },
     );
 
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const reEvents: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => reEvents.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies).toHaveLength(1);
@@ -818,8 +819,8 @@ describe("structural WEDGED ladder", () => {
     );
   });
 
-  it("does not clear wedge pending when AFK FAQ would match the summary", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
+  it("does not clear wedge pending when AFK FAQ would match the summary", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 0 });
     const { taskId, sessionId } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -862,8 +863,8 @@ describe("structural WEDGED ladder", () => {
     expect(events.some((e) => e.type === "afk.auto_answered")).toBe(true);
   });
 
-  it("write-ahead pending before seat-consuming respawn so crash after stop still escalates", () => {
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("write-ahead pending before seat-consuming respawn so crash after stop still escalates", async () => {
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -916,7 +917,7 @@ describe("structural WEDGED ladder", () => {
       { mode: 0o600 },
     );
 
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const reEvents: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => reEvents.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies).toHaveLength(1);
@@ -936,10 +937,10 @@ describe("structural WEDGED ladder", () => {
     expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
 
-  it("rolls back ledger on restart when crash is between spend and stop", () => {
+  it("rolls back ledger on restart when crash is between spend and stop", async () => {
     // kill -9 after setWedgeRespawns(+1) but before stopCrewmate: spend must not
     // stick. Restart discharge rolls back; a later tick can still free-respawn.
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -1013,7 +1014,7 @@ describe("structural WEDGED ladder", () => {
       { mode: 0o600 },
     );
 
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const reEvents: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => reEvents.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
@@ -1049,9 +1050,9 @@ describe("structural WEDGED ladder", () => {
     ).toBe(true);
   });
 
-  it("does not roll back ledger when stop already landed before crash", () => {
+  it("does not roll back ledger when stop already landed before crash", async () => {
     // Genuine failure path that DID reach stop: spend stands across restart.
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -1098,7 +1099,7 @@ describe("structural WEDGED ladder", () => {
       { mode: 0o600 },
     );
 
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const reEvents: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => reEvents.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
@@ -1110,8 +1111,8 @@ describe("structural WEDGED ladder", () => {
     expect(restarted.service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
   });
 
-  it("does not wedge a seat with an outstanding pending question past the stale window", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("does not wedge a seat with an outstanding pending question past the stale window", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
 
     const questionId = "01JQ5T0000000000000000000A";
@@ -1142,8 +1143,8 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.listQuestions()).toHaveLength(1);
   });
 
-  it("does not wedge on the next tick after a long-pending question is answered", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("does not wedge on the next tick after a long-pending question is answered", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
 
     const questionId = "01JQ5T0000000000000000000B";
@@ -1177,8 +1178,8 @@ describe("structural WEDGED ladder", () => {
     );
   });
 
-  it("wedges after a further full stale window of silence following an answer", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("wedges after a further full stale window of silence following an answer", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
 
     const questionId = "01JQ5T0000000000000000000C";
@@ -1215,8 +1216,8 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
   });
 
-  it("keeps an open question across daemon restart (exemption + answer_crewmate)", () => {
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("keeps an open question across daemon restart (exemption + answer_crewmate)", async () => {
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     const preRestart = service.tools.listSessions().find((s) => s.sessionId === sessionId)!;
     const windowName = preRestart.tmuxWindow.includes(":")
@@ -1241,7 +1242,7 @@ describe("structural WEDGED ladder", () => {
 
     // Bounce empties process-local Maps; only task.json rehydrates the view.
     // start:true so Brain is up (answer_crewmate is orchestration-gated).
-    const restarted = fleet({ home, start: true });
+    const restarted = await fleet({ home, start: true });
     expect(restarted.service.tools.listQuestions()).toHaveLength(1);
     expect(restarted.service.tools.listQuestions()[0]?.questionId).toBe(questionId);
     expect(restarted.service.tools.getTask(taskId)?.pendingQuestions).toHaveLength(1);
@@ -1285,8 +1286,8 @@ describe("structural WEDGED ladder", () => {
     expect(restarted.service.tools.getTask(taskId)?.pendingQuestions ?? []).toHaveLength(0);
   });
 
-  it("after restart, answering resets activity so wedge needs a further full window", () => {
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("after restart, answering resets activity so wedge needs a further full window", async () => {
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     const preRestart = service.tools.listSessions().find((s) => s.sessionId === sessionId)!;
     const windowName = preRestart.tmuxWindow.includes(":")
@@ -1302,7 +1303,7 @@ describe("structural WEDGED ladder", () => {
       ts: new Date().toISOString(),
     });
 
-    const restarted = fleet({ home, start: true });
+    const restarted = await fleet({ home, start: true });
     restarted.service.tmux.newWindow({
       windowName,
       argv: ["true"],
@@ -1357,8 +1358,8 @@ describe("structural WEDGED ladder", () => {
     expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
   });
 
-  it("stamps activity when a question is recorded so near-threshold seats are not wedged", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("stamps activity when a question is recorded so near-threshold seats are not wedged", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     // Seat is already idle for almost the full window.
     const almostStaleAt = new Date(Date.now() - 29 * 60_000).toISOString();
@@ -1401,8 +1402,8 @@ describe("structural WEDGED ladder", () => {
     );
   });
 
-  it("does not escalate when pending-clear throws after a successful respawn", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("does not escalate when pending-clear throws after a successful respawn", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -1447,10 +1448,10 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
   });
 
-  it("derives successful respawn without replacementSessionId stamp (spawn→bookkeeping kill)", () => {
+  it("derives successful respawn without replacementSessionId stamp (spawn→bookkeeping kill)", async () => {
     // Kill -9 after spawn lands in task.json but before any follow-up stamp/clear:
     // write-ahead remains, no replacementSessionId, original stopped, replacement live.
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -1512,8 +1513,8 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionId);
   });
 
-  it("does not false-escalate when pending survives a successful respawn", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("does not false-escalate when pending survives a successful respawn", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -1564,10 +1565,10 @@ describe("structural WEDGED ladder", () => {
     expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
 
-  it("escalates once after failed respawn with only write-ahead durable state", () => {
+  it("escalates once after failed respawn with only write-ahead durable state", async () => {
     // Respawn fails and process dies before any post-failure bookkeeping beyond
     // the write-ahead + stop: next reconcile must escalate exactly once.
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     const task = service.tools.getTask(taskId)!;
     const crashed = {
@@ -1596,7 +1597,7 @@ describe("structural WEDGED ladder", () => {
       { mode: 0o600 },
     );
 
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const reEvents: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => reEvents.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
@@ -1623,8 +1624,8 @@ describe("structural WEDGED ladder", () => {
     expect(reEvents.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
 
-  it("does not let a pre-wedge same-role peer satisfy derived respawn success", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("does not let a pre-wedge same-role peer satisfy derived respawn success", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId: sessionB, role } = seedBuilder(service);
     const peerSpawn = service.tools.invoke("spawn_crewmate", {
       taskId,
@@ -1676,8 +1677,8 @@ describe("structural WEDGED ladder", () => {
     ).toBe("running");
   });
 
-  it("still escalates once across restart when a wedge respawn genuinely failed", () => {
-    const { service, events, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("still escalates once across restart when a wedge respawn genuinely failed", async () => {
+    const { service, events, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     backdateSession(service, sessionId, {
       idleMinutes: 60,
@@ -1699,7 +1700,7 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.phase).toBe("NEEDS_CAPTAIN");
     expect(service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
 
-    const restarted = fleet({ home, start: false });
+    const restarted = await fleet({ home, start: false });
     const reEvents: OrchestratorEvent[] = [];
     restarted.service.onEvent((e) => reEvents.push(e));
     expect(restarted.service.tools.getTask(taskId)?.wedgePendingCaptainNotifies ?? []).toHaveLength(
@@ -1711,8 +1712,8 @@ describe("structural WEDGED ladder", () => {
     expect(restarted.service.tools.getTask(taskId)?.wedgeRespawnsByRole[role]).toBe(1);
   });
 
-  it("preflights missing RED proof: escalate without stop or ledger spend", () => {
-    const { service, events, config } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("preflights missing RED proof: escalate without stop or ledger spend", async () => {
+    const { service, events, config } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     config.writeGlobal("policies", "{ redBaselineGateRequired: true }\n");
     const { taskId, sessionId, role } = seedBuilder(service);
     // Spawn used a Captain override; strip it so policy re-engages without proof.
@@ -1749,8 +1750,8 @@ describe("structural WEDGED ladder", () => {
     }
   });
 
-  it("escalates when seat B's respawn fails even if same-role peer A is live", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("escalates when seat B's respawn fails even if same-role peer A is live", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId: sessionB, role } = seedBuilder(service);
     // Peer A: second builder on the same task (first-class multi-seat shape).
     const peerSpawn = service.tools.invoke("spawn_crewmate", {
@@ -1802,8 +1803,8 @@ describe("structural WEDGED ladder", () => {
     expect(events.filter((e) => e.type === "captain.escalation")).toHaveLength(0);
   });
 
-  it("retires write-ahead only for B's derived replacement, not peer A", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("retires write-ahead only for B's derived replacement, not peer A", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId: sessionB, role } = seedBuilder(service);
     const peerSpawn = service.tools.invoke("spawn_crewmate", {
       taskId,
@@ -1863,8 +1864,8 @@ describe("structural WEDGED ladder", () => {
     expect(service.tools.getTask(taskId)?.wedgeLadderCompletedSessionIds).toContain(sessionB);
   });
 
-  it("clears unanswered questions when a seat is stopped or lost", () => {
-    const { service, home } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("clears unanswered questions when a seat is stopped or lost", async () => {
+    const { service, home } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId } = seedBuilder(service);
     const questionId = "01JQ5T0000000000000000001A";
     service.handleExtensionFrame({
@@ -1927,8 +1928,8 @@ describe("structural WEDGED ladder", () => {
     expect(answerLost.error?.code).toBe("NOT_FOUND");
   });
 
-  it("keeps open questions and wedge exemption while seat is merely waiting", () => {
-    const { service, events } = fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
+  it("keeps open questions and wedge exemption while seat is merely waiting", async () => {
+    const { service, events } = await fleet({ staleBuildMinutes: 30, respawnPerStage: 1 });
     const { taskId, sessionId, role } = seedBuilder(service);
     const questionId = "01JQ5T0000000000000000001C";
     service.handleExtensionFrame({
