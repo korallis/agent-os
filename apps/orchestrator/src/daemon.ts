@@ -217,9 +217,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<RunningD
     prompts.installDefaults();
 
     const agentosdBin = resolveAgentosdBin();
-    // eslint-disable-next-line prefer-const -- assigned immediately below; the
-    // config listener above needs a reference that exists before construction.
+    // Assigned after FleetService construction; the config listener above
+    // closes over this ref so hot-reload can reach the fleet.
     let fleetRef: FleetService | null = null;
+
 
     const fleet = new FleetService({
       home,
